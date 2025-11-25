@@ -1,8 +1,10 @@
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pysradb import cli
+from pysradb import SRAweb, cli
 
 app = FastAPI()
+client = SRAweb()
 
 # CORS
 origins = [
@@ -18,8 +20,27 @@ app.add_middleware(
 )
 
 
+def format_df(df: pd.DataFrame | None):
+    if df is not None:
+        grouped_by_srp = (
+            df.groupby("study_accession")
+            .apply(
+                lambda g: g.drop(columns="study_accession").to_dict(orient="records")
+            )
+            .to_dict()
+        )
+        return grouped_by_srp
+    else:
+        return {"error": "No dataframe returned"}
+
+
 @app.get("/")
-def read_root(q: str = ""):
+def read_root():
+    return {"message": "Namaste! pysradb-server is up and running!"}
+
+
+@app.get("/search")
+def search(q: str = ""):
     if not q:
         return {"error": "missing 'q' query parameter"}
     try:
@@ -33,7 +54,17 @@ def read_root(q: str = ""):
             detailed=None,
             phrase=q,
         )
-        print(df.columns)
-        return df.to_dict(orient="records")
+        return format_df(df)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/experiments")
+def get_experiments(srp: str):
+    if not srp:
+        return {"error": "missing 'srp' query parameter"}
+    try:
+        df = client.sra_metadata(srp)
+        return format_df(df)
     except Exception as e:
         return {"error": str(e)}
