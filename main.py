@@ -1,3 +1,4 @@
+import pandas as pd
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
