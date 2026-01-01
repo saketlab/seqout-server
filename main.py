@@ -9,6 +9,7 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SEARCH_SQL,
+    SIMILAR_PROJECT_SQL,
     SRA_SEARCH_SQL,
 )
 
@@ -56,44 +57,74 @@ def hello():
 
 @app.get("/search/geo")
 def search_geo(
-    q: str = Query(..., min_length=1),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    q: str,
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
 ):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(GEO_SEARCH_SQL, (q, limit, offset))
-            return cur.fetchall()
+            cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            rows = cur.fetchall()
+
+    return {
+        "results": rows,
+        "next_cursor": None
+        if not rows
+        else {
+            "rank": rows[-1]["rank"],
+            "accession": rows[-1]["accession"],
+        },
+    }
 
 
 @app.get("/search/sra")
 def search_sra(
-    q: str = Query(..., min_length=1),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    q: str,
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
 ):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SRA_SEARCH_SQL, (q, limit, offset))
-            return cur.fetchall()
+            cur.execute(SRA_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            rows = cur.fetchall()
+
+    return {
+        "results": rows,
+        "next_cursor": None
+        if not rows
+        else {
+            "rank": rows[-1]["accession"],
+            "accession": rows[-1]["accession"],
+        },
+    }
 
 
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
     db: str | None = Query(None, pattern="^(geo|sra)$"),
 ):
     if db == "geo":
-        return search_geo(q, limit, offset)
+        return search_geo(q, 20, 0)
     elif db == "sra":
-        return search_sra(q, limit, offset)
+        return search_sra(q, 20, 0)
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SEARCH_SQL, (q, limit, offset))
-            return cur.fetchall()
+            cur.execute(SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            rows = cur.fetchall()
+
+    return {
+        "results": rows,
+        "next_cursor": None
+        if not rows
+        else {
+            "rank": rows[-1]["rank"],
+            "accession": rows[-1]["accession"],
+        },
+    }
 
 
 @app.get("/project/{accession}")
@@ -106,3 +137,15 @@ def get_project(accession: str):
             row = cur.fetchone()
 
     return row
+
+
+@app.get("/search-similar")
+def search_similar(
+    q: str = Query(..., min_length=3),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SIMILAR_PROJECT_SQL, (q, limit, offset))
+            return cur.fetchall()
