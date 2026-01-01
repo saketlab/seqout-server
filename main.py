@@ -28,6 +28,20 @@ app.add_middleware(
 )
 
 
+def format_df(df: pd.DataFrame | None):
+    if df is not None:
+        grouped_by_srp = (
+            df.groupby("study_accession")
+            .apply(
+                lambda g: g.drop(columns="study_accession").to_dict(orient="records")
+            )
+            .to_dict()
+        )
+        return grouped_by_srp
+    else:
+        return {"error": "No dataframe returned"}
+
+
 @app.get("/")
 def hello():
     return {"message": "pysradb-server is up and running!", "errors": None}
