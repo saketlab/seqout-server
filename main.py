@@ -1,10 +1,20 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pysradb import cli
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from queries import GEO_SEARCH_SQL, SEARCH_SQL, SRA_SEARCH_SQL
+
+pool = ConnectionPool(
+    "postgresql://postgres:postgres@localhost:5432/postgres",
+    min_size=1,
+    max_size=10,
+    kwargs={"autocommit": True},
+)
+
 
 app = FastAPI()
 
-# CORS
 origins = [
     "http://localhost",
     "http://localhost:3000",
@@ -19,21 +29,41 @@ app.add_middleware(
 
 
 @app.get("/")
-def read_root(q: str = ""):
-    if not q:
-        return {"error": "missing 'q' query parameter"}
-    try:
-        df = cli.infer_search(
-            saveto=None,
-            verbosity=2,
-            return_max=20,
-            run_description=None,
-            stats=None,
-            graphs=None,
-            detailed=None,
-            phrase=q,
-        )
-        print(df.columns)
-        return df.to_dict(orient="records")
-    except Exception as e:
-        return {"error": str(e)}
+def hello():
+    return {"message": "pysradb-server is up and running!", "errors": None}
+
+
+@app.get("/search")
+def search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SEARCH_SQL, (q, limit, offset))
+            return cur.fetchall()
+
+
+@app.get("/search/geo")
+def search_geo(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(GEO_SEARCH_SQL, (q, limit, offset))
+            return cur.fetchall()
+
+
+@app.get("/search/sra")
+def search_sra(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SRA_SEARCH_SQL, (q, limit, offset))
+            return cur.fetchall()
