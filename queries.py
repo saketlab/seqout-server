@@ -109,39 +109,3 @@ SELECT
 FROM sra_studies
 WHERE accession = %s;
 """
-
-SIMILAR_PROJECT_SQL = """
-WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
-),
-geo AS (
-    SELECT
-        accession,
-        title,
-        summary,
-        published_at,
-        ts_rank_cd(tsv, q.q) AS score,
-        'geo'::text AS source
-    FROM geo_series, q
-    WHERE tsv @@ q.q
-),
-sra AS (
-    SELECT
-        accession,
-        title,
-        abstract AS summary,
-        NULL::date AS published_at,
-        ts_rank_cd(tsv, q.q) * 0.6 AS score,
-        'sra'::text AS source
-    FROM sra_studies, q
-    WHERE tsv @@ q.q
-)
-SELECT *
-FROM (
-    SELECT * FROM geo
-    UNION ALL
-    SELECT * FROM sra
-) u
-ORDER BY score DESC
-LIMIT %s OFFSET %s;
-"""

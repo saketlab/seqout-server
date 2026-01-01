@@ -9,7 +9,6 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SEARCH_SQL,
-    SIMILAR_PROJECT_SQL,
     SRA_SEARCH_SQL,
 )
 
@@ -137,15 +136,3 @@ def get_project(accession: str):
             row = cur.fetchone()
 
     return row
-
-
-@app.get("/search-similar")
-def search_similar(
-    q: str = Query(..., min_length=3),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-):
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SIMILAR_PROJECT_SQL, (q, limit, offset))
-            return cur.fetchall()
