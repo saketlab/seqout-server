@@ -2,13 +2,13 @@
 
 GEO_SEARCH_SQL = """
 WITH q AS (
-    SELECT websearch_to_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS q
 )
 SELECT
     accession,
     title,
     summary,
-    published_at,
+    updated_at,
     ts_rank(tsv, q.q) AS rank,
     'geo'::text AS source
 FROM geo_series, q
@@ -19,7 +19,7 @@ LIMIT %s OFFSET %s;
 
 SRA_SEARCH_SQL = """
 WITH q AS (
-    SELECT websearch_to_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS q
 )
 SELECT
     accession,
@@ -37,14 +37,14 @@ LIMIT %s OFFSET %s;
 
 SEARCH_SQL = """
 WITH q AS (
-    SELECT websearch_to_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS q
 ),
 geo AS (
     SELECT
         accession,
         title,
         summary,
-        published_at,
+        updated_at,
         ts_rank(tsv, q.q) AS rank,
         'geo'::text AS source
     FROM geo_series, q
@@ -77,4 +77,31 @@ FROM (
 ) u
 ORDER BY rank DESC
 LIMIT %s OFFSET %s;
+"""
+PROJECT_GEO_SQL = """
+SELECT
+    accession,
+    title,
+    summary,
+    overall_design,
+    pubmed_id,
+    samples_ref,
+    series_type,
+    relation,
+    supplementary_data,
+    published_at,
+    updated_at
+FROM geo_series
+WHERE accession = %s;
+"""
+PROJECT_SRA_SQL = """
+SELECT
+    accession,
+    alias,
+    title,
+    abstract,
+    submission,
+    study_type
+FROM sra_studies
+WHERE accession = %s;
 """
