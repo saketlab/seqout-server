@@ -8,8 +8,10 @@ from queries import (
     GEO_SEARCH_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
+    SAMPLE_SQL,
     SEARCH_SQL,
     SRA_SEARCH_SQL,
+    STUDY_EXPERIMENTS_SQL,
 )
 
 pool = ConnectionPool(
@@ -136,3 +138,19 @@ def get_project(accession: str):
             row = cur.fetchone()
 
     return row
+
+
+@app.get("/project/{study}/experiments")
+def get_study_experiments(study: str):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
+            return cur.fetchall()
+
+
+@app.get("/sample/{accession}")
+def get_sample(accession: str):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SAMPLE_SQL, (accession,))
+            return cur.fetchone()

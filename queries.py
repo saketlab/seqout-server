@@ -26,7 +26,7 @@ SELECT
     accession,
     title,
     abstract AS summary,
-    NULL::date AS published_at,
+    updated_at,
     ts_rank(tsv, q.q) AS rank,
     'sra'::text AS source
 FROM sra_studies, q
@@ -60,7 +60,7 @@ sra AS (
         s.accession,
         s.title,
         s.abstract AS summary,
-        NULL::date AS updated_at,
+        updated_at,
         ts_rank(s.tsv, q.q) * 0.7 AS rank,
         'sra'::text AS source
     FROM sra_studies s, q
@@ -105,7 +105,42 @@ SELECT
     title,
     abstract,
     submission,
-    study_type
+    study_type,
+    published_at,
+    updated_at
 FROM sra_studies
+WHERE accession = %s;
+"""
+
+STUDY_EXPERIMENTS_SQL = """
+SELECT
+    accession,
+    title,
+    design_description,
+    library_layout,
+    library_name,
+    library_selection,
+    library_source,
+    library_strategy,
+    samples,
+    platform,
+    instrument_model,
+    submission
+FROM sra_experiments
+WHERE study = %s;
+"""
+SAMPLE_SQL = """
+SELECT
+    accession,
+    alias,
+    description,
+    title,
+    scientific_name,
+    taxon_id,
+    external_id,
+    attributes_json,
+    submission,
+    links
+FROM sra_samples
 WHERE accession = %s;
 """
