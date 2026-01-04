@@ -144,3 +144,11 @@ SELECT
 FROM sra_samples
 WHERE accession = %s;
 """
+
+GEO_SERIES_SAMPLES_SQL = """
+SELECT s.*
+FROM geo_samples s
+JOIN geo_series g
+  ON s.accession = ANY (g.samples_ref)
+WHERE g.accession = %s
+"""

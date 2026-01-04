@@ -6,6 +6,7 @@ from psycopg_pool import ConnectionPool
 
 from queries import (
     GEO_SEARCH_SQL,
+    GEO_SERIES_SAMPLES_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SAMPLE_SQL,
@@ -154,3 +155,13 @@ def get_sample(accession: str):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(SAMPLE_SQL, (accession,))
             return cur.fetchone()
+
+
+@app.get("/geo/series/{accession}/samples")
+def get_geo_series_samples(accession: str):
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
+            rows = cur.fetchall()
+
+    return rows
