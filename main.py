@@ -130,7 +130,7 @@ def search(
 
 @app.get("/project/{accession}")
 def get_project(accession: str):
-    sql = PROJECT_SRA_SQL if accession.upper().startswith("S") else PROJECT_GEO_SQL
+    sql = PROJECT_GEO_SQL if accession.upper().startswith("G") else PROJECT_SRA_SQL
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
