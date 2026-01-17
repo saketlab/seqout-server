@@ -1,4 +1,7 @@
+import os
+
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
@@ -15,8 +18,10 @@ from queries import (
     STUDY_EXPERIMENTS_SQL,
 )
 
+load_dotenv()
+
 pool = ConnectionPool(
-    "postgresql://postgres:postgres@localhost:5432/postgres",
+    os.environ["DATABASE_URL"],
     min_size=1,
     max_size=10,
     kwargs={"autocommit": True},
