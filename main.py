@@ -1,4 +1,5 @@
 import os
+import time
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -65,20 +66,26 @@ def search_geo(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    start = time.perf_counter()
+
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
             rows = cur.fetchall()
 
+    took_ms = (time.perf_counter() - start) * 1000
+    total = rows[0]["total_count"] if rows else 0
+
     return {
         "results": rows,
-        "next_cursor": None
-        if not rows
-        else {
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": None if not rows else {
             "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
+
 
 
 @app.get("/search/sra")
@@ -87,20 +94,26 @@ def search_sra(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    start = time.perf_counter()
+
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(SRA_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
             rows = cur.fetchall()
 
+    took_ms = (time.perf_counter() - start) * 1000
+    total = rows[0]["total_count"] if rows else 0
+
     return {
         "results": rows,
-        "next_cursor": None
-        if not rows
-        else {
-            "rank": rows[-1]["accession"],
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": None if not rows else {
+            "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
+
 
 
 @app.get("/search")
@@ -111,24 +124,30 @@ def search(
     db: str | None = Query(None, pattern="^(geo|sra)$"),
 ):
     if db == "geo":
-        return search_geo(q, 20, 0)
+        return search_geo(q, cursor_rank, cursor_acc)
     elif db == "sra":
-        return search_sra(q, 20, 0)
+        return search_sra(q, cursor_rank, cursor_acc)
+
+    start = time.perf_counter()
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
             rows = cur.fetchall()
 
+    took_ms = (time.perf_counter() - start) * 1000
+    total = rows[0]["total_count"] if rows else 0
+
     return {
         "results": rows,
-        "next_cursor": None
-        if not rows
-        else {
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": None if not rows else {
             "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
+
 
 
 @app.get("/project/{accession}")

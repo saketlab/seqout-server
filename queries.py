@@ -3,38 +3,60 @@
 GEO_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
+),
+ranked AS (
+    SELECT
+        accession,
+        title,
+        summary,
+        updated_at,
+        ts_rank(tsv, q.q) AS rank,
+        'geo'::text AS source
+    FROM geo_series, q
+    WHERE tsv @@ q.q
+),
+paged AS (
+    SELECT *
+    FROM ranked
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession,
-    title,
-    summary,
-    updated_at,
-    ts_rank(tsv, q.q) AS rank,
-    'geo'::text AS source
-FROM geo_series, q
-WHERE tsv @@ q.q
-  AND (%s::float8 IS NULL OR (ts_rank(tsv, q.q), accession) < (%s::float8, %s::text))
+    *,
+    COUNT(*) OVER () AS total_count
+FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
 """
 
+
 SRA_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
+),
+ranked AS (
+    SELECT
+        accession,
+        title,
+        abstract AS summary,
+        updated_at,
+        ts_rank(tsv, q.q) AS rank,
+        'sra'::text AS source
+    FROM sra_studies, q
+    WHERE tsv @@ q.q
+),
+paged AS (
+    SELECT *
+    FROM ranked
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession,
-    title,
-    abstract AS summary,
-    updated_at,
-    ts_rank(tsv, q.q) AS rank,
-    'sra'::text AS source
-FROM sra_studies, q
-WHERE tsv @@ q.q
-  AND (%s::float8 IS NULL OR (ts_rank(tsv, q.q), accession) < (%s::float8, %s::text))
+    *,
+    COUNT(*) OVER () AS total_count
+FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
 """
+
 
 
 SEARCH_SQL = """
@@ -60,7 +82,7 @@ sra AS (
         s.accession,
         s.title,
         s.abstract AS summary,
-        updated_at,
+        s.updated_at,
         ts_rank(s.tsv, q.q) * 0.7 AS rank,
         'sra'::text AS source
     FROM sra_studies s, q
@@ -73,10 +95,16 @@ u AS (
     SELECT * FROM geo
     UNION ALL
     SELECT * FROM sra
+),
+paged AS (
+    SELECT *
+    FROM u
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
-SELECT *
-FROM u
-WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+SELECT
+    *,
+    COUNT(*) OVER () AS total_count
+FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
 """
