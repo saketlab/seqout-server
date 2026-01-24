@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from queries import (
+    BIO_PROJECT_GEO_SERIES_SQL,
     GEO_SEARCH_SQL,
     GEO_SERIES_SAMPLES_SQL,
     PROJECT_GEO_SQL,
@@ -360,20 +361,36 @@ def bulk_metadata(payload: dict):
                     if acc.startswith("SRP"):
                         rows = flatten_sra_study(cur, acc)
                         name = f"{acc}_experiments.csv"
+                        if rows:
+                            csv_buf = io.StringIO()
+                            writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+                            writer.writeheader()
+                            writer.writerows(rows)
+                            zf.writestr(name, csv_buf.getvalue())
                     elif acc.startswith("GSE"):
                         rows = flatten_geo_series(cur, acc)
                         name = f"{acc}_samples.csv"
+                        if rows:
+                            csv_buf = io.StringIO()
+                            writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+                            writer.writeheader()
+                            writer.writerows(rows)
+                            zf.writestr(name, csv_buf.getvalue())
+                    elif acc.startswith("PRJNA"):
+                        cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
+                        series_list = cur.fetchall()
+                        for series in series_list:
+                            gse = series['accession']
+                            rows = flatten_geo_series(cur, gse)
+                            name = f"{gse}_samples.csv"
+                            if rows:
+                                csv_buf = io.StringIO()
+                                writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+                                writer.writeheader()
+                                writer.writerows(rows)
+                                zf.writestr(name, csv_buf.getvalue())
                     else:
                         continue
-
-                    if not rows:
-                        continue
-
-                    csv_buf = io.StringIO()
-                    writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
-                    writer.writeheader()
-                    writer.writerows(rows)
-                    zf.writestr(name, csv_buf.getvalue())
 
     buf.seek(0)
     return StreamingResponse(

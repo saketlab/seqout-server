@@ -180,3 +180,7 @@ JOIN geo_series g
   ON s.accession = ANY (g.samples_ref)
 WHERE g.accession = %s
 """
+
+BIO_PROJECT_GEO_SERIES_SQL = """
+SELECT accession FROM geo_series WHERE bioproject_id = %s;
+"""
