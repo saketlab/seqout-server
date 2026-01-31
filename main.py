@@ -36,16 +36,15 @@ pool = ConnectionPool(
 
 
 app = FastAPI()
-if os.environ["ENVIRONMENT"] == "DEV":
-    origins = ["*"]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
-    )
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 
 
 def classify_accession(acc: str) -> str | None:
