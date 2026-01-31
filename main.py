@@ -36,16 +36,16 @@ pool = ConnectionPool(
 
 
 app = FastAPI()
-
-origins = ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
+if os.environ["ENVIRONMENT"] == "DEV":
+    origins = ["*"]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+    )
 
 
 def classify_accession(acc: str) -> str | None:
@@ -54,6 +54,7 @@ def classify_accession(acc: str) -> str | None:
     if acc.startswith("SRP"):
         return "sra"
     return None
+
 
 def rows_to_csv(rows: list[dict]) -> str:
     if not rows:
@@ -64,6 +65,7 @@ def rows_to_csv(rows: list[dict]) -> str:
     writer.writeheader()
     writer.writerows(rows)
     return buf.getvalue()
+
 
 def flatten_sra_study(cur, study: str) -> list[dict]:
     # 1. Fetch experiments (like /project/{study}/experiments endpoint)
@@ -77,10 +79,10 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
     for e in experiments:
         if e.get("samples") and len(e["samples"]) > 0:
             sample_accessions.append(e["samples"][0])
-    
+
     # Remove duplicates while preserving order
     unique_sample_accs = list(dict.fromkeys(sample_accessions))
-    
+
     # Fetch all samples and parse attributes_json
     samples_map = {}
     for sample_acc in unique_sample_accs:
@@ -126,7 +128,8 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
             "Sample Alias": (sample.get("alias") if sample else None) or "-",
             "Sample Title": (sample.get("title") if sample else None) or "-",
             "Description": (sample.get("description") if sample else None) or "-",
-            "Scientific Name": (sample.get("scientific_name") if sample else None) or "-",
+            "Scientific Name": (sample.get("scientific_name") if sample else None)
+            or "-",
             "Taxon ID": (sample.get("taxon_id") if sample else None) or "-",
         }
 
@@ -139,8 +142,9 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
                 row[key] = "-"
 
         rows.append(row)
-    
+
     return rows
+
 
 def flatten_geo_series(cur, series: str) -> list[dict]:
     cur.execute(GEO_SERIES_SAMPLES_SQL, (series,))
@@ -239,12 +243,13 @@ def search_geo(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None if not rows else {
+        "next_cursor": None
+        if not rows
+        else {
             "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
-
 
 
 @app.get("/search/sra")
@@ -267,11 +272,14 @@ def search_sra(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None if not rows else {
+        "next_cursor": None
+        if not rows
+        else {
             "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
+
 
 @app.get("/search")
 def search(
@@ -299,12 +307,13 @@ def search(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None if not rows else {
+        "next_cursor": None
+        if not rows
+        else {
             "rank": rows[-1]["rank"],
             "accession": rows[-1]["accession"],
         },
     }
-
 
 
 @app.get("/project/{accession}")
@@ -344,6 +353,7 @@ def get_geo_series_samples(accession: str):
 
     return rows
 
+
 @app.post("/bulk/metadata")
 def bulk_metadata(payload: dict):
     accessions = payload.get("accessions", [])
@@ -380,12 +390,14 @@ def bulk_metadata(payload: dict):
                         cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
                         series_list = cur.fetchall()
                         for series in series_list:
-                            gse = series['accession']
+                            gse = series["accession"]
                             rows = flatten_geo_series(cur, gse)
                             name = f"{gse}_samples.csv"
                             if rows:
                                 csv_buf = io.StringIO()
-                                writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+                                writer = csv.DictWriter(
+                                    csv_buf, fieldnames=rows[0].keys()
+                                )
                                 writer.writeheader()
                                 writer.writerows(rows)
                                 zf.writestr(name, csv_buf.getvalue())
