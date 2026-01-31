@@ -10,6 +10,7 @@ ranked AS (
         title,
         summary,
         updated_at,
+        organisms,
         ts_rank(tsv, q.q) AS rank,
         'geo'::text AS source
     FROM geo_series, q
@@ -39,6 +40,7 @@ ranked AS (
         title,
         abstract AS summary,
         updated_at,
+        organisms,
         ts_rank(tsv, q.q) AS rank,
         'sra'::text AS source
     FROM sra_studies, q
@@ -58,7 +60,6 @@ LIMIT 20;
 """
 
 
-
 SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
@@ -69,6 +70,7 @@ geo AS (
         title,
         summary,
         updated_at,
+        organisms,
         ts_rank(tsv, q.q) AS rank,
         'geo'::text AS source
     FROM geo_series, q
@@ -83,6 +85,7 @@ sra AS (
         s.title,
         s.abstract AS summary,
         s.updated_at,
+        s.organisms,
         ts_rank(s.tsv, q.q) * 0.7 AS rank,
         'sra'::text AS source
     FROM sra_studies s, q
