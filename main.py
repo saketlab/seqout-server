@@ -8,7 +8,6 @@ import zipfile
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -36,15 +35,6 @@ pool = ConnectionPool(
 
 
 app = FastAPI()
-origins = ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
 
 
 def classify_accession(acc: str) -> str | None:
