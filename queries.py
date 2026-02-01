@@ -4,57 +4,45 @@ GEO_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
-exact_match AS (
-    SELECT
-        accession,
-        title,
-        summary,
-        updated_at,
-        organisms,
-        100.0::float8 AS rank,
-        'geo'::text AS source
+all_matches AS (
+    -- Exact accession match (priority 1)
+    SELECT accession, title, summary, updated_at, organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority
     FROM geo_series
     WHERE UPPER(accession) = UPPER(%s)
-),
-gsm_match AS (
-    SELECT
-        g.accession,
-        g.title,
-        g.summary,
-        g.updated_at,
-        g.organisms,
-        100.0::float8 AS rank,
-        'geo'::text AS source
+
+    UNION ALL
+
+    -- GSM sample match (priority 2) - uses GIN index
+    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority
     FROM geo_series g
-    WHERE EXISTS (
-        SELECT 1 FROM unnest(g.samples_ref) AS sample_acc
-        WHERE UPPER(sample_acc) = UPPER(%s)
-    )
-      AND g.accession NOT IN (SELECT accession FROM exact_match)
-),
-fts_match AS (
-    SELECT
-        accession,
-        title,
-        summary,
-        updated_at,
-        organisms,
-        ts_rank(tsv, q.q) AS rank,
-        'geo'::text AS source
+    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
+
+    UNION ALL
+
+    -- PRJNA bioproject match (priority 3)
+    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+
+    UNION ALL
+
+    -- Full-text search match (priority 4)
+    SELECT accession, title, summary, updated_at, organisms,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
-      AND accession NOT IN (SELECT accession FROM exact_match)
-      AND accession NOT IN (SELECT accession FROM gsm_match)
 ),
-ranked AS (
-    SELECT * FROM exact_match
-    UNION ALL
-    SELECT * FROM gsm_match
-    UNION ALL
-    SELECT * FROM fts_match
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM ranked
+    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
 ),
 paged AS (
     SELECT *
@@ -73,55 +61,55 @@ SRA_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
-exact_match AS (
-    SELECT
-        accession,
-        title,
-        abstract AS summary,
-        updated_at,
-        organisms,
-        100.0::float8 AS rank,
-        'sra'::text AS source
+all_matches AS (
+    -- Exact SRP/ERP/DRP accession match (priority 1)
+    SELECT accession, title, abstract AS summary, updated_at, organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 1 AS priority
     FROM sra_studies
     WHERE UPPER(accession) = UPPER(%s)
-),
-srx_match AS (
-    SELECT
-        s.accession,
-        s.title,
-        s.abstract AS summary,
-        s.updated_at,
-        s.organisms,
-        100.0::float8 AS rank,
-        'sra'::text AS source
+
+    UNION ALL
+
+    -- SRX/ERX/DRX experiment match (priority 2)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 2 AS priority
     FROM sra_experiments e
     JOIN sra_studies s ON s.accession = e.study
     WHERE UPPER(e.accession) = UPPER(%s)
-      AND s.accession NOT IN (SELECT accession FROM exact_match)
-),
-fts_match AS (
-    SELECT
-        accession,
-        title,
-        abstract AS summary,
-        updated_at,
-        organisms,
-        ts_rank(tsv, q.q) AS rank,
-        'sra'::text AS source
+
+    UNION ALL
+
+    -- PRJNA alias match (priority 3)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 3 AS priority
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+
+    UNION ALL
+
+    -- SRS/ERS/DRS sample match (priority 4) - uses GIN index
+    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE e.samples @> ARRAY[UPPER(%s)]
+
+    UNION ALL
+
+    -- Full-text search match (priority 5)
+    SELECT accession, title, abstract AS summary, updated_at, organisms,
+           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 5 AS priority
     FROM sra_studies, q
     WHERE tsv @@ q.q
-      AND accession NOT IN (SELECT accession FROM exact_match)
-      AND accession NOT IN (SELECT accession FROM srx_match)
 ),
-ranked AS (
-    SELECT * FROM exact_match
-    UNION ALL
-    SELECT * FROM srx_match
-    UNION ALL
-    SELECT * FROM fts_match
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM ranked
+    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
 ),
 paged AS (
     SELECT *
@@ -140,125 +128,97 @@ SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
-geo_exact AS (
-    SELECT
-        accession,
-        title,
-        summary,
-        updated_at,
-        organisms,
-        100.0::float8 AS rank,
-        'geo'::text AS source
+all_matches AS (
+    -- GEO exact accession match (priority 1)
+    SELECT accession, title, summary, updated_at, organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority,
+           accession AS dedup_key
     FROM geo_series
     WHERE UPPER(accession) = UPPER(%s)
-),
-gsm_match AS (
-    SELECT
-        g.accession,
-        g.title,
-        g.summary,
-        g.updated_at,
-        g.organisms,
-        100.0::float8 AS rank,
-        'geo'::text AS source
+
+    UNION ALL
+
+    -- GEO GSM sample match (priority 2) - uses GIN index
+    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority,
+           g.accession AS dedup_key
     FROM geo_series g
-    WHERE EXISTS (
-        SELECT 1 FROM unnest(g.samples_ref) AS sample_acc
-        WHERE UPPER(sample_acc) = UPPER(%s)
-    )
-      AND g.accession NOT IN (SELECT accession FROM geo_exact)
-),
-sra_exact AS (
-    SELECT
-        s.accession,
-        s.title,
-        s.abstract AS summary,
-        s.updated_at,
-        s.organisms,
-        100.0::float8 AS rank,
-        'sra'::text AS source
+    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
+
+    UNION ALL
+
+    -- GEO PRJNA bioproject match (priority 3)
+    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority,
+           g.accession AS dedup_key
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+
+    UNION ALL
+
+    -- SRA exact accession match (priority 4)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s
     WHERE UPPER(s.accession) = UPPER(%s)
-      AND NOT EXISTS (
-          SELECT 1 FROM geo_exact g WHERE g.accession = s.alias
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
-      )
-),
-srx_match AS (
-    SELECT
-        s.accession,
-        s.title,
-        s.abstract AS summary,
-        s.updated_at,
-        s.organisms,
-        100.0::float8 AS rank,
-        'sra'::text AS source
+
+    UNION ALL
+
+    -- SRA SRX experiment match (priority 5)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 5 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_experiments e
     JOIN sra_studies s ON s.accession = e.study
     WHERE UPPER(e.accession) = UPPER(%s)
-      AND s.accession NOT IN (SELECT accession FROM sra_exact)
-      AND NOT EXISTS (
-          SELECT 1 FROM geo_exact g WHERE g.accession = s.alias
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
-      )
-),
-geo AS (
-    SELECT
-        accession,
-        title,
-        summary,
-        updated_at,
-        organisms,
-        ts_rank(tsv, q.q) AS rank,
-        'geo'::text AS source
+
+    UNION ALL
+
+    -- SRA PRJNA alias match (priority 6)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 6 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+
+    UNION ALL
+
+    -- SRA SRS sample match (priority 7) - uses GIN index
+    SELECT DISTINCT ON (s.accession)
+           s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           100.0::float8 AS rank, 'sra'::text AS source, 7 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE e.samples @> ARRAY[UPPER(%s)]
+
+    UNION ALL
+
+    -- GEO full-text search (priority 8)
+    SELECT accession, title, summary, updated_at, organisms,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 8 AS priority,
+           accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
-      AND accession NOT IN (SELECT accession FROM geo_exact)
-      AND accession NOT IN (SELECT accession FROM gsm_match)
-),
-geo_accs AS (
-    SELECT accession FROM geo
-    UNION
-    SELECT accession FROM geo_exact
-    UNION
-    SELECT accession FROM gsm_match
-),
-sra AS (
-    SELECT
-        s.accession,
-        s.title,
-        s.abstract AS summary,
-        s.updated_at,
-        s.organisms,
-        ts_rank(s.tsv, q.q) * 0.7 AS rank,
-        'sra'::text AS source
+
+    UNION ALL
+
+    -- SRA full-text search (priority 9, lower rank multiplier)
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 9 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
-      AND s.accession NOT IN (SELECT accession FROM sra_exact)
-      AND s.accession NOT IN (SELECT accession FROM srx_match)
-      AND NOT EXISTS (
-          SELECT 1 FROM geo_accs g WHERE g.accession = s.alias
-      )
 ),
-u AS (
-    SELECT * FROM geo_exact
-    UNION ALL
-    SELECT * FROM gsm_match
-    UNION ALL
-    SELECT * FROM sra_exact
-    UNION ALL
-    SELECT * FROM srx_match
-    UNION ALL
-    SELECT * FROM geo
-    UNION ALL
-    SELECT * FROM sra
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY dedup_key, priority, rank DESC
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM u
+    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
 ),
 paged AS (
     SELECT *

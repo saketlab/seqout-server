@@ -1,16 +1,21 @@
 import csv
 import io
 import json
+import logging
 import os
+import re
 import time
 import zipfile
 
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
@@ -26,6 +31,23 @@ from queries import (
 
 load_dotenv()
 
+_STUDY_PREFIX = r"[SED]RP"
+_EXPERIMENT_PREFIX = r"[SED]RX"
+_SAMPLE_PREFIX = r"[SED]RS"
+
+STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
+SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
+PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX})\d+$", re.IGNORECASE)
+BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA)\d+$", re.IGNORECASE)
+
+STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
+SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
+PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX})\d+$"
+GEO_SERIES_REGEX = r"^GSE\d+$"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
     min_size=1,
@@ -33,14 +55,23 @@ pool = ConnectionPool(
     kwargs={"autocommit": True},
 )
 
-
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"error": "Rate limit exceeded. Please try again later."},
+    )
 
 
 def classify_accession(acc: str) -> str | None:
     if acc.startswith("GSE"):
         return "geo"
-    if acc.startswith("SRP"):
+    if STUDY_PATTERN.match(acc):
         return "sra"
     return None
 
@@ -141,7 +172,6 @@ def flatten_geo_series(cur, series: str) -> list[dict]:
     if not samples:
         return []
 
-    # collect characteristic tags
     tags = set()
     for s in samples:
         for ch in s.get("channels") or []:
@@ -213,17 +243,25 @@ def hello():
 
 
 @app.get("/search/geo")
+@limiter.limit("100/minute")
 def search_geo(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
     start = time.perf_counter()
 
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(GEO_SEARCH_SQL, (q, q, q, cursor_rank, cursor_rank, cursor_acc))
-            rows = cur.fetchall()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    GEO_SEARCH_SQL, (q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in search_geo")
+        raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
     total = rows[0]["total_count"] if rows else 0
@@ -244,17 +282,26 @@ def search_geo(
 
 
 @app.get("/search/sra")
+@limiter.limit("100/minute")
 def search_sra(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
     start = time.perf_counter()
 
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SRA_SEARCH_SQL, (q, q, q, cursor_rank, cursor_rank, cursor_acc))
-            rows = cur.fetchall()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    SRA_SEARCH_SQL,
+                    (q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in search_sra")
+        raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
     total = rows[0]["total_count"] if rows else 0
@@ -275,25 +322,32 @@ def search_sra(
 
 
 @app.get("/search")
+@limiter.limit("100/minute")
 def search(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
     db: str | None = Query(None, pattern="^(geo|sra)$"),
 ):
     if db == "geo":
-        return search_geo(q, cursor_rank, cursor_acc)
+        return search_geo(request, q, cursor_rank, cursor_acc)
     elif db == "sra":
-        return search_sra(q, cursor_rank, cursor_acc)
+        return search_sra(request, q, cursor_rank, cursor_acc)
 
     start = time.perf_counter()
 
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                SEARCH_SQL, (q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
-            )
-            rows = cur.fetchall()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    SEARCH_SQL,
+                    (q, q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in search")
+        raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
     total = rows[0]["total_count"] if rows else 0
@@ -314,84 +368,103 @@ def search(
 
 
 @app.get("/project/{accession}")
-def get_project(accession: str):
+@limiter.limit("100/minute")
+def get_project(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
     sql = PROJECT_GEO_SQL if accession.upper().startswith("G") else PROJECT_SRA_SQL
 
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, (accession,))
-            row = cur.fetchone()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, (accession,))
+                row = cur.fetchone()
+    except Exception as e:
+        logger.exception("Database error in get_project")
+        raise HTTPException(500, "Internal server error")
 
     return row
 
 
 @app.get("/project/{study}/experiments")
-def get_study_experiments(study: str):
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
-            return cur.fetchall()
+@limiter.limit("100/minute")
+def get_study_experiments(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
+                return cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in get_study_experiments")
+        raise HTTPException(500, "Internal server error")
 
 
 @app.get("/sample/{accession}")
-def get_sample(accession: str):
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SAMPLE_SQL, (accession,))
-            return cur.fetchone()
+@limiter.limit("100/minute")
+def get_sample(
+    request: Request,
+    accession: str = Path(..., pattern=SAMPLE_REGEX),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SAMPLE_SQL, (accession,))
+                return cur.fetchone()
+    except Exception as e:
+        logger.exception("Database error in get_sample")
+        raise HTTPException(500, "Internal server error")
 
 
 @app.get("/geo/series/{accession}/samples")
-def get_geo_series_samples(accession: str):
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
-            rows = cur.fetchall()
+@limiter.limit("100/minute")
+def get_geo_series_samples(
+    request: Request,
+    accession: str = Path(..., pattern=GEO_SERIES_REGEX),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in get_geo_series_samples")
+        raise HTTPException(500, "Internal server error")
 
     return rows
 
 
 @app.post("/bulk/metadata")
-def bulk_metadata(payload: dict):
+@limiter.limit("20/minute")
+def bulk_metadata(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
         raise HTTPException(400, "No accessions provided")
     if len(accessions) > 100:
         raise HTTPException(400, "Maximum 100 accessions allowed per request")
 
-    buf = io.BytesIO()
+    validated = []
+    for acc in accessions:
+        if not isinstance(acc, str):
+            raise HTTPException(400, f"Invalid accession type: {type(acc).__name__}")
+        acc = acc.strip().upper()
+        if not BULK_PATTERN.match(acc):
+            raise HTTPException(400, f"Invalid accession format: {acc}")
+        validated.append(acc)
 
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                for acc in accessions:
-                    acc = acc.strip().upper()
+    try:
+        buf = io.BytesIO()
 
-                    if acc.startswith("SRP"):
-                        rows = flatten_sra_study(cur, acc)
-                        name = f"{acc}_experiments.csv"
-                        if rows:
-                            csv_buf = io.StringIO()
-                            writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
-                            writer.writeheader()
-                            writer.writerows(rows)
-                            zf.writestr(name, csv_buf.getvalue())
-                    elif acc.startswith("GSE"):
-                        rows = flatten_geo_series(cur, acc)
-                        name = f"{acc}_samples.csv"
-                        if rows:
-                            csv_buf = io.StringIO()
-                            writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
-                            writer.writeheader()
-                            writer.writerows(rows)
-                            zf.writestr(name, csv_buf.getvalue())
-                    elif acc.startswith("PRJNA"):
-                        cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
-                        series_list = cur.fetchall()
-                        for series in series_list:
-                            gse = series["accession"]
-                            rows = flatten_geo_series(cur, gse)
-                            name = f"{gse}_samples.csv"
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    for acc in validated:
+                        if STUDY_PATTERN.match(acc):
+                            rows = flatten_sra_study(cur, acc)
+                            name = f"{acc}_experiments.csv"
                             if rows:
                                 csv_buf = io.StringIO()
                                 writer = csv.DictWriter(
@@ -400,12 +473,39 @@ def bulk_metadata(payload: dict):
                                 writer.writeheader()
                                 writer.writerows(rows)
                                 zf.writestr(name, csv_buf.getvalue())
-                    else:
-                        continue
+                        elif acc.startswith("GSE"):
+                            rows = flatten_geo_series(cur, acc)
+                            name = f"{acc}_samples.csv"
+                            if rows:
+                                csv_buf = io.StringIO()
+                                writer = csv.DictWriter(
+                                    csv_buf, fieldnames=rows[0].keys()
+                                )
+                                writer.writeheader()
+                                writer.writerows(rows)
+                                zf.writestr(name, csv_buf.getvalue())
+                        elif acc.startswith("PRJNA"):
+                            cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
+                            series_list = cur.fetchall()
+                            for series in series_list:
+                                gse = series["accession"]
+                                rows = flatten_geo_series(cur, gse)
+                                name = f"{gse}_samples.csv"
+                                if rows:
+                                    csv_buf = io.StringIO()
+                                    writer = csv.DictWriter(
+                                        csv_buf, fieldnames=rows[0].keys()
+                                    )
+                                    writer.writeheader()
+                                    writer.writerows(rows)
+                                    zf.writestr(name, csv_buf.getvalue())
 
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=bulk_metadata.zip"},
-    )
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=bulk_metadata.zip"},
+        )
+    except Exception as e:
+        logger.exception("Error in bulk_metadata")
+        raise HTTPException(500, "Internal server error")
