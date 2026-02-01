@@ -138,6 +138,14 @@ GENERATED ALWAYS AS (
 CREATE INDEX IF NOT EXISTS sra_studies_fts_idx ON sra_studies USING GIN(tsv);
 CREATE INDEX IF NOT EXISTS geo_series_fts_idx ON geo_series USING GIN(tsv);
 
+-- Create functional indexes for case-insensitive accession lookups
+CREATE INDEX IF NOT EXISTS sra_studies_accession_upper_idx ON sra_studies (UPPER(accession));
+CREATE INDEX IF NOT EXISTS geo_series_accession_upper_idx ON geo_series (UPPER(accession));
+CREATE INDEX IF NOT EXISTS sra_experiments_accession_upper_idx ON sra_experiments (UPPER(accession));
+
+-- Index for SRX to SRP lookups (join on study column)
+CREATE INDEX IF NOT EXISTS sra_experiments_study_idx ON sra_experiments (study);
+
 EOF
 
 echo ""

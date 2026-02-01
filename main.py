@@ -214,7 +214,7 @@ def hello():
 
 @app.get("/search/geo")
 def search_geo(
-    q: str,
+    q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
@@ -222,7 +222,7 @@ def search_geo(
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            cur.execute(GEO_SEARCH_SQL, (q, q, q, cursor_rank, cursor_rank, cursor_acc))
             rows = cur.fetchall()
 
     took_ms = (time.perf_counter() - start) * 1000
@@ -232,18 +232,20 @@ def search_geo(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None
-        if not rows
-        else {
-            "rank": rows[-1]["rank"],
-            "accession": rows[-1]["accession"],
-        },
+        "next_cursor": (
+            None
+            if not rows
+            else {
+                "rank": rows[-1]["rank"],
+                "accession": rows[-1]["accession"],
+            }
+        ),
     }
 
 
 @app.get("/search/sra")
 def search_sra(
-    q: str,
+    q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
@@ -251,7 +253,7 @@ def search_sra(
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SRA_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            cur.execute(SRA_SEARCH_SQL, (q, q, q, cursor_rank, cursor_rank, cursor_acc))
             rows = cur.fetchall()
 
     took_ms = (time.perf_counter() - start) * 1000
@@ -261,18 +263,20 @@ def search_sra(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None
-        if not rows
-        else {
-            "rank": rows[-1]["rank"],
-            "accession": rows[-1]["accession"],
-        },
+        "next_cursor": (
+            None
+            if not rows
+            else {
+                "rank": rows[-1]["rank"],
+                "accession": rows[-1]["accession"],
+            }
+        ),
     }
 
 
 @app.get("/search")
 def search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
     db: str | None = Query(None, pattern="^(geo|sra)$"),
@@ -286,7 +290,9 @@ def search(
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+            cur.execute(
+                SEARCH_SQL, (q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
+            )
             rows = cur.fetchall()
 
     took_ms = (time.perf_counter() - start) * 1000
@@ -296,12 +302,14 @@ def search(
         "results": rows,
         "total": total,
         "took_ms": round(took_ms, 2),
-        "next_cursor": None
-        if not rows
-        else {
-            "rank": rows[-1]["rank"],
-            "accession": rows[-1]["accession"],
-        },
+        "next_cursor": (
+            None
+            if not rows
+            else {
+                "rank": rows[-1]["rank"],
+                "accession": rows[-1]["accession"],
+            }
+        ),
     }
 
 
@@ -348,6 +356,8 @@ def bulk_metadata(payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
         raise HTTPException(400, "No accessions provided")
+    if len(accessions) > 100:
+        raise HTTPException(400, "Maximum 100 accessions allowed per request")
 
     buf = io.BytesIO()
 
