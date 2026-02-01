@@ -295,7 +295,8 @@ def search_sra(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    SRA_SEARCH_SQL, (q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
+                    SRA_SEARCH_SQL,
+                    (q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
                 )
                 rows = cur.fetchall()
     except Exception as e:
@@ -341,7 +342,7 @@ def search(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SEARCH_SQL,
-                    (q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                    (q, q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
                 )
                 rows = cur.fetchall()
     except Exception as e:

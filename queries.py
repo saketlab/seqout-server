@@ -130,6 +130,25 @@ prjna_match AS (
       AND s.accession NOT IN (SELECT accession FROM exact_match)
       AND s.accession NOT IN (SELECT accession FROM srx_match)
 ),
+srs_match AS (
+    SELECT
+        s.accession,
+        s.title,
+        s.abstract AS summary,
+        s.updated_at,
+        s.organisms,
+        100.0::float8 AS rank,
+        'sra'::text AS source
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE EXISTS (
+        SELECT 1 FROM unnest(e.samples) AS sample_acc
+        WHERE UPPER(sample_acc) = UPPER(%s)
+    )
+      AND s.accession NOT IN (SELECT accession FROM exact_match)
+      AND s.accession NOT IN (SELECT accession FROM srx_match)
+      AND s.accession NOT IN (SELECT accession FROM prjna_match)
+),
 fts_match AS (
     SELECT
         accession,
@@ -144,6 +163,7 @@ fts_match AS (
       AND accession NOT IN (SELECT accession FROM exact_match)
       AND accession NOT IN (SELECT accession FROM srx_match)
       AND accession NOT IN (SELECT accession FROM prjna_match)
+      AND accession NOT IN (SELECT accession FROM srs_match)
 ),
 ranked AS (
     SELECT * FROM exact_match
@@ -151,6 +171,8 @@ ranked AS (
     SELECT * FROM srx_match
     UNION ALL
     SELECT * FROM prjna_match
+    UNION ALL
+    SELECT * FROM srs_match
     UNION ALL
     SELECT * FROM fts_match
 ),
@@ -283,6 +305,34 @@ sra_prjna_match AS (
           SELECT 1 FROM geo_prjna_match g WHERE g.accession = s.alias
       )
 ),
+srs_match AS (
+    SELECT
+        s.accession,
+        s.title,
+        s.abstract AS summary,
+        s.updated_at,
+        s.organisms,
+        100.0::float8 AS rank,
+        'sra'::text AS source
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE EXISTS (
+        SELECT 1 FROM unnest(e.samples) AS sample_acc
+        WHERE UPPER(sample_acc) = UPPER(%s)
+    )
+      AND s.accession NOT IN (SELECT accession FROM sra_exact)
+      AND s.accession NOT IN (SELECT accession FROM srx_match)
+      AND s.accession NOT IN (SELECT accession FROM sra_prjna_match)
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_exact g WHERE g.accession = s.alias
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_prjna_match g WHERE g.accession = s.alias
+      )
+),
 geo AS (
     SELECT
         accession,
@@ -321,6 +371,7 @@ sra AS (
       AND s.accession NOT IN (SELECT accession FROM sra_exact)
       AND s.accession NOT IN (SELECT accession FROM srx_match)
       AND s.accession NOT IN (SELECT accession FROM sra_prjna_match)
+      AND s.accession NOT IN (SELECT accession FROM srs_match)
       AND NOT EXISTS (
           SELECT 1 FROM geo_accs g WHERE g.accession = s.alias
       )
@@ -337,6 +388,8 @@ u AS (
     SELECT * FROM srx_match
     UNION ALL
     SELECT * FROM sra_prjna_match
+    UNION ALL
+    SELECT * FROM srs_match
     UNION ALL
     SELECT * FROM geo
     UNION ALL
