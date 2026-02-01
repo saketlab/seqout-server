@@ -31,9 +31,9 @@ from queries import (
 
 load_dotenv()
 
-_STUDY_PREFIX = r"[SE]RP"
-_EXPERIMENT_PREFIX = r"[SE]RX"
-_SAMPLE_PREFIX = r"[SE]RS"
+_STUDY_PREFIX = r"[SED]RP"
+_EXPERIMENT_PREFIX = r"[SED]RX"
+_SAMPLE_PREFIX = r"[SED]RS"
 
 STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
 SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
