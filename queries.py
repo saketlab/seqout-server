@@ -32,6 +32,20 @@ gsm_match AS (
     )
       AND g.accession NOT IN (SELECT accession FROM exact_match)
 ),
+prjna_match AS (
+    SELECT
+        g.accession,
+        g.title,
+        g.summary,
+        g.updated_at,
+        g.organisms,
+        100.0::float8 AS rank,
+        'geo'::text AS source
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+      AND g.accession NOT IN (SELECT accession FROM exact_match)
+      AND g.accession NOT IN (SELECT accession FROM gsm_match)
+),
 fts_match AS (
     SELECT
         accession,
@@ -45,11 +59,14 @@ fts_match AS (
     WHERE tsv @@ q.q
       AND accession NOT IN (SELECT accession FROM exact_match)
       AND accession NOT IN (SELECT accession FROM gsm_match)
+      AND accession NOT IN (SELECT accession FROM prjna_match)
 ),
 ranked AS (
     SELECT * FROM exact_match
     UNION ALL
     SELECT * FROM gsm_match
+    UNION ALL
+    SELECT * FROM prjna_match
     UNION ALL
     SELECT * FROM fts_match
 ),
@@ -99,6 +116,20 @@ srx_match AS (
     WHERE UPPER(e.accession) = UPPER(%s)
       AND s.accession NOT IN (SELECT accession FROM exact_match)
 ),
+prjna_match AS (
+    SELECT
+        s.accession,
+        s.title,
+        s.abstract AS summary,
+        s.updated_at,
+        s.organisms,
+        100.0::float8 AS rank,
+        'sra'::text AS source
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+      AND s.accession NOT IN (SELECT accession FROM exact_match)
+      AND s.accession NOT IN (SELECT accession FROM srx_match)
+),
 fts_match AS (
     SELECT
         accession,
@@ -112,11 +143,14 @@ fts_match AS (
     WHERE tsv @@ q.q
       AND accession NOT IN (SELECT accession FROM exact_match)
       AND accession NOT IN (SELECT accession FROM srx_match)
+      AND accession NOT IN (SELECT accession FROM prjna_match)
 ),
 ranked AS (
     SELECT * FROM exact_match
     UNION ALL
     SELECT * FROM srx_match
+    UNION ALL
+    SELECT * FROM prjna_match
     UNION ALL
     SELECT * FROM fts_match
 ),
@@ -168,6 +202,20 @@ gsm_match AS (
     )
       AND g.accession NOT IN (SELECT accession FROM geo_exact)
 ),
+geo_prjna_match AS (
+    SELECT
+        g.accession,
+        g.title,
+        g.summary,
+        g.updated_at,
+        g.organisms,
+        100.0::float8 AS rank,
+        'geo'::text AS source
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+      AND g.accession NOT IN (SELECT accession FROM geo_exact)
+      AND g.accession NOT IN (SELECT accession FROM gsm_match)
+),
 sra_exact AS (
     SELECT
         s.accession,
@@ -184,6 +232,9 @@ sra_exact AS (
       )
       AND NOT EXISTS (
           SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_prjna_match g WHERE g.accession = s.alias
       )
 ),
 srx_match AS (
@@ -205,6 +256,32 @@ srx_match AS (
       AND NOT EXISTS (
           SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
       )
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_prjna_match g WHERE g.accession = s.alias
+      )
+),
+sra_prjna_match AS (
+    SELECT
+        s.accession,
+        s.title,
+        s.abstract AS summary,
+        s.updated_at,
+        s.organisms,
+        100.0::float8 AS rank,
+        'sra'::text AS source
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+      AND s.accession NOT IN (SELECT accession FROM sra_exact)
+      AND s.accession NOT IN (SELECT accession FROM srx_match)
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_exact g WHERE g.accession = s.alias
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM gsm_match g WHERE g.accession = s.alias
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM geo_prjna_match g WHERE g.accession = s.alias
+      )
 ),
 geo AS (
     SELECT
@@ -219,6 +296,7 @@ geo AS (
     WHERE tsv @@ q.q
       AND accession NOT IN (SELECT accession FROM geo_exact)
       AND accession NOT IN (SELECT accession FROM gsm_match)
+      AND accession NOT IN (SELECT accession FROM geo_prjna_match)
 ),
 geo_accs AS (
     SELECT accession FROM geo
@@ -226,6 +304,8 @@ geo_accs AS (
     SELECT accession FROM geo_exact
     UNION
     SELECT accession FROM gsm_match
+    UNION
+    SELECT accession FROM geo_prjna_match
 ),
 sra AS (
     SELECT
@@ -240,6 +320,7 @@ sra AS (
     WHERE s.tsv @@ q.q
       AND s.accession NOT IN (SELECT accession FROM sra_exact)
       AND s.accession NOT IN (SELECT accession FROM srx_match)
+      AND s.accession NOT IN (SELECT accession FROM sra_prjna_match)
       AND NOT EXISTS (
           SELECT 1 FROM geo_accs g WHERE g.accession = s.alias
       )
@@ -249,9 +330,13 @@ u AS (
     UNION ALL
     SELECT * FROM gsm_match
     UNION ALL
+    SELECT * FROM geo_prjna_match
+    UNION ALL
     SELECT * FROM sra_exact
     UNION ALL
     SELECT * FROM srx_match
+    UNION ALL
+    SELECT * FROM sra_prjna_match
     UNION ALL
     SELECT * FROM geo
     UNION ALL
