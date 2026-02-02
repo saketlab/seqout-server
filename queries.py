@@ -307,3 +307,44 @@ WHERE g.accession = %s
 BIO_PROJECT_GEO_SERIES_SQL = """
 SELECT accession FROM geo_series WHERE bioproject_id = %s;
 """
+
+# Get SRA study accession from sample accession
+SRA_SAMPLE_TO_STUDY_SQL = """
+SELECT DISTINCT s.accession
+FROM sra_experiments e
+JOIN sra_studies s ON s.accession = e.study
+WHERE e.samples @> ARRAY[UPPER(%s)]
+LIMIT 1;
+"""
+
+# Get GEO series accession from GSM sample accession
+GEO_SAMPLE_TO_SERIES_SQL = """
+SELECT accession
+FROM geo_series
+WHERE samples_ref @> ARRAY[UPPER(%s)]
+LIMIT 1;
+"""
+
+# Get SRA study accession from experiment accession
+SRA_EXPERIMENT_TO_STUDY_SQL = """
+SELECT study
+FROM sra_experiments
+WHERE accession = UPPER(%s)
+LIMIT 1;
+"""
+
+# Get GEO series by PRJNA bioproject_id
+PRJNA_TO_GEO_SERIES_SQL = """
+SELECT accession
+FROM geo_series
+WHERE bioproject_id = %s
+LIMIT 1;
+"""
+
+# Get SRA study by PRJ accession (for PRJNA, PRJDA, PRJEB, etc.)
+PRJ_TO_SRA_STUDY_SQL = """
+SELECT accession
+FROM sra_studies
+WHERE bioproject_id = %s
+LIMIT 1;
+"""

@@ -19,12 +19,17 @@ from slowapi.util import get_remote_address
 
 from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
+    GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SEARCH_SQL,
     GEO_SERIES_SAMPLES_SQL,
+    PRJ_TO_SRA_STUDY_SQL,
+    PRJNA_TO_GEO_SERIES_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SAMPLE_SQL,
     SEARCH_SQL,
+    SRA_EXPERIMENT_TO_STUDY_SQL,
+    SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
 )
@@ -37,11 +42,17 @@ _SAMPLE_PREFIX = r"[SED]RS"
 
 STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
 SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
+EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
+GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
+PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
 PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX})\d+$", re.IGNORECASE)
 BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA)\d+$", re.IGNORECASE)
 
 STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
 SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
+EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
+GEO_SAMPLE_REGEX = r"^GSM\d+$"
+PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
 PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX})\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
 
@@ -508,4 +519,95 @@ def bulk_metadata(request: Request, payload: dict):
         )
     except Exception as e:
         logger.exception("Error in bulk_metadata")
+        raise HTTPException(500, "Internal server error")
+
+
+@app.get("/accession/{accession}/project")
+@limiter.limit("100/minute")
+def get_project_from_accession(
+    request: Request,
+    accession: str = Path(
+        ..., pattern=f"({SAMPLE_REGEX}|{EXPERIMENT_REGEX}|{GEO_SAMPLE_REGEX})"
+    ),
+):
+    """
+    Get the project accession (study/series) for a given sample or experiment accession (SRS/DRS/ERS/SRX/ERX/DRX/GSM).
+
+    Returns the project accession that contains the given sample or experiment.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if GEO_SAMPLE_PATTERN.match(accession):
+                    # GSM sample - find GEO series
+                    cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["accession"]}
+                elif EXPERIMENT_PATTERN.match(accession):
+                    # SRX/ERX/DRX experiment - get SRA study directly
+                    cur.execute(SRA_EXPERIMENT_TO_STUDY_SQL, (accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["study"]}
+                else:
+                    # SRS/DRS/ERS sample - find SRA study
+                    cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["accession"]}
+
+                # If no result found
+                raise HTTPException(404, f"No project found for accession {accession}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Database error in get_project_from_accession")
+        raise HTTPException(500, "Internal server error")
+
+
+@app.get("/prj/{prj_accession}")
+@limiter.limit("100/minute")
+def get_prj_info(
+    request: Request,
+    prj_accession: str = Path(..., pattern=PRJ_REGEX),
+):
+    """
+    Get the project accession for a PRJ accession.
+
+    For PRJNA: searches geo_series first (bioproject_id), then sra_studies.
+    For PRJDA/PRJEB: searches only sra_studies.
+
+    Returns the project accession.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if prj_accession.upper().startswith("PRJNA"):
+                    # PRJNA: search geo_series first, then sra_studies
+                    cur.execute(PRJNA_TO_GEO_SERIES_SQL, (prj_accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["accession"]}
+
+                    # If not found in geo_series, search sra_studies
+                    cur.execute(PRJ_TO_SRA_STUDY_SQL, (prj_accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["accession"]}
+                else:
+                    # PRJDA, PRJEB, etc.: search only sra_studies
+                    cur.execute(PRJ_TO_SRA_STUDY_SQL, (prj_accession,))
+                    result = cur.fetchone()
+                    if result:
+                        return {"project_accession": result["accession"]}
+
+                # If no result found
+                raise HTTPException(
+                    404, f"No project found for PRJ accession {prj_accession}"
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Database error in get_prj_info")
         raise HTTPException(500, "Internal server error")
