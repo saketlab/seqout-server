@@ -1,11 +1,12 @@
 [project]
 name = "pysradb-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "HTTP server for pysraweb"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard]>=0.121.3",
+    "fastmcp<3",
     "instructor[groq]>=1.13.0",
     "pandas>=2.3.3",
     "psycopg[binary,pool]>=3.3.2",
