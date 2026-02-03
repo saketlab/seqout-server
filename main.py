@@ -514,7 +514,7 @@ def get_prj_info(
 mcp = FastMCP.from_fastapi(
     app=api_app,
     name="pysraweb MCP",
-    description="MCP tools mirroring pysraweb API routes.",
+    description="MCP tools mirroring pysraweb API routes. This lets you explore datasets from SRA and GEO.",
 )
 mcp_app = mcp.http_app(path="/mcp")
 
