@@ -257,6 +257,8 @@ SELECT
     abstract,
     submission,
     study_type,
+    external_id,
+    links,
     published_at,
     updated_at
 FROM sra_studies
