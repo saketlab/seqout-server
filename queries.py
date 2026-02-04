@@ -236,6 +236,7 @@ LIMIT 20;
 PROJECT_GEO_SQL = """
 SELECT
     accession,
+    alias,
     title,
     summary,
     overall_design,
