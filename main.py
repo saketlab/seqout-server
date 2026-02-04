@@ -265,7 +265,11 @@ def hello():
     summary="Search GEO",
     description=(
         "Full-text search over GEO series and related metadata. "
-        "Use cursors (rank + accession) for pagination."
+        "Use cursors (rank + accession) for pagination. "
+        "Results objects: {accession: string, title: string, summary: string | null, "
+        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'geo'}. "
+        "Returns {results: object[], total: int, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}."
     ),
     operation_id="search_geo",
 )
@@ -312,7 +316,11 @@ def search_geo(
     summary="Search SRA",
     description=(
         "Full-text search over SRA studies/experiments and related metadata. "
-        "Use cursors (rank + accession) for pagination."
+        "Use cursors (rank + accession) for pagination. "
+        "Results objects: {accession: string, title: string, summary: string | null, "
+        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'sra'}. "
+        "Returns {results: object[], total: int, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}."
     ),
     operation_id="search_sra",
 )
@@ -360,7 +368,11 @@ def search_sra(
     summary="Search all databases",
     description=(
         "Unified search across GEO and SRA. Optionally restrict by db=geo|sra. "
-        "Use cursors (rank + accession) for pagination."
+        "Use cursors (rank + accession) for pagination. "
+        "Results objects: {accession: string, title: string, summary: string | null, "
+        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'geo' | 'sra'}. "
+        "Returns {results: object[], total: int, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}."
     ),
     operation_id="search_all",
 )
