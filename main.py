@@ -196,7 +196,8 @@ def flatten_geo_series(cur, series: str) -> list[dict]:
             chars = ch.get("Characteristics")
             if isinstance(chars, list):
                 for c in chars:
-                    tags.add(c.get("@tag"))
+                    if isinstance(c, dict):
+                        tags.add(c.get("@tag"))
             elif isinstance(chars, dict):
                 tags.add(chars.get("@tag"))
 
