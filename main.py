@@ -255,11 +255,8 @@ def format_df(df: pd.DataFrame | None):
         return {"error": "No dataframe returned"}
 
 
-def build_year_params(year_from: int | None, year_to: int | None, repeats: int) -> list:
-    params = []
-    for _ in range(repeats):
-        params.extend([year_from, year_from, year_to, year_to])
-    return params
+def year_params(year_from: int | None, year_to: int | None) -> list:
+    return [year_from, year_from, year_to, year_to]
 
 
 @api_app.get(
@@ -636,16 +633,31 @@ def download_by_query(
 
     if db == "geo":
         sql = GEO_QUERY_ACCESSIONS_SQL
-        params = [q, q, q, q]
-        params.extend(build_year_params(updated_year_from, updated_year_to, 4))
+        params = [q]
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend(year_params(updated_year_from, updated_year_to))
     elif db == "sra":
         sql = SRA_QUERY_ACCESSIONS_SQL
-        params = [q, q, q, q, q]
-        params.extend(build_year_params(updated_year_from, updated_year_to, 5))
+        params = [q]
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend(year_params(updated_year_from, updated_year_to))
     else:
         sql = ALL_QUERY_ACCESSIONS_SQL
-        params = [q, q, q, q, q, q, q, q]
-        params.extend(build_year_params(updated_year_from, updated_year_to, 9))
+        params = [q]
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend([q, *year_params(updated_year_from, updated_year_to)])
+        params.extend(year_params(updated_year_from, updated_year_to))
+        params.extend(year_params(updated_year_from, updated_year_to))
 
     params.append(MAX_QUERY_DOWNLOAD)
 
