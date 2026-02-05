@@ -233,6 +233,251 @@ LIMIT 20;
 """
 
 
+GEO_QUERY_ACCESSIONS_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- Exact accession match (priority 1)
+    SELECT accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority
+    FROM geo_series
+    WHERE UPPER(accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GSM sample match (priority 2) - uses GIN index
+    SELECT g.accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority
+    FROM geo_series g
+    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- PRJNA bioproject match (priority 3)
+    SELECT g.accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 4)
+    SELECT accession,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
+    FROM geo_series, q
+    WHERE tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+),
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
+)
+SELECT
+    accession, rank, source
+FROM deduped
+ORDER BY rank DESC, accession DESC
+LIMIT %s;
+"""
+
+
+SRA_QUERY_ACCESSIONS_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- Exact SRP/ERP/DRP accession match (priority 1)
+    SELECT accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 1 AS priority
+    FROM sra_studies
+    WHERE UPPER(accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRX/ERX/DRX experiment match (priority 2)
+    SELECT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 2 AS priority
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE UPPER(e.accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- PRJNA alias match (priority 3)
+    SELECT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 3 AS priority
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRS/ERS/DRS sample match (priority 4) - uses GIN index
+    SELECT DISTINCT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE e.samples @> ARRAY[UPPER(%s)]
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 5)
+    SELECT accession,
+           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 5 AS priority
+    FROM sra_studies, q
+    WHERE tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+),
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
+)
+SELECT
+    accession, rank, source
+FROM deduped
+ORDER BY rank DESC, accession DESC
+LIMIT %s;
+"""
+
+
+ALL_QUERY_ACCESSIONS_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- GEO exact accession match (priority 1)
+    SELECT accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority,
+           accession AS dedup_key
+    FROM geo_series
+    WHERE UPPER(accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GEO GSM sample match (priority 2) - uses GIN index
+    SELECT g.accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority,
+           g.accession AS dedup_key
+    FROM geo_series g
+    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GEO PRJNA bioproject match (priority 3)
+    SELECT g.accession,
+           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority,
+           g.accession AS dedup_key
+    FROM geo_series g
+    WHERE UPPER(g.bioproject_id) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRA exact accession match (priority 4)
+    SELECT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_studies s
+    WHERE UPPER(s.accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRA SRX experiment match (priority 5)
+    SELECT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 5 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE UPPER(e.accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRA PRJNA alias match (priority 6)
+    SELECT s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 6 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_studies s
+    WHERE UPPER(s.alias) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRA SRS sample match (priority 7) - uses GIN index
+    SELECT DISTINCT ON (s.accession)
+           s.accession,
+           100.0::float8 AS rank, 'sra'::text AS source, 7 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_experiments e
+    JOIN sra_studies s ON s.accession = e.study
+    WHERE e.samples @> ARRAY[UPPER(%s)]
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GEO full-text search (priority 8)
+    SELECT accession,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 8 AS priority,
+           accession AS dedup_key
+    FROM geo_series, q
+    WHERE tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- SRA full-text search (priority 9, lower rank multiplier)
+    SELECT s.accession,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 9 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_studies s, q
+    WHERE s.tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+),
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, rank, source
+    FROM all_matches
+    ORDER BY dedup_key, priority, rank DESC
+)
+SELECT
+    accession, rank, source
+FROM deduped
+ORDER BY rank DESC, accession DESC
+LIMIT %s;
+"""
+
+
 PROJECT_GEO_SQL = """
 SELECT
     accession,

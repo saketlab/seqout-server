@@ -20,7 +20,9 @@ from slowapi.util import get_remote_address
 
 from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
+    ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
+    GEO_QUERY_ACCESSIONS_SQL,
     GEO_SEARCH_SQL,
     GEO_SERIES_SAMPLES_SQL,
     PRJ_TO_SRA_STUDY_SQL,
@@ -28,6 +30,7 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SAMPLE_SQL,
+    SRA_QUERY_ACCESSIONS_SQL,
     SEARCH_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
@@ -59,6 +62,8 @@ GEO_SERIES_REGEX = r"^GSE\d+$"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+MAX_QUERY_DOWNLOAD = 100
 
 
 pool = ConnectionPool(
@@ -248,6 +253,13 @@ def format_df(df: pd.DataFrame | None):
         return grouped_by_srp
     else:
         return {"error": "No dataframe returned"}
+
+
+def build_year_params(year_from: int | None, year_to: int | None, repeats: int) -> list:
+    params = []
+    for _ in range(repeats):
+        params.extend([year_from, year_from, year_to, year_to])
+    return params
 
 
 @api_app.get(
@@ -592,6 +604,95 @@ def bulk_metadata(request: Request, payload: dict):
         )
     except Exception as e:
         logger.exception("Error in bulk_metadata")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/download/query",
+    summary="Download metadata by query",
+    description=(
+        "Generate a ZIP of CSV files for query-matched projects. "
+        "Accepts q, optional db=geo|sra, and optional updated year filters. "
+        "Results are capped at 100 projects."
+    ),
+    operation_id="download_by_query",
+)
+@limiter.limit("20/minute")
+def download_by_query(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=500),
+    db: str | None = Query(None, pattern="^(geo|sra)$"),
+    updated_year_from: int | None = Query(None, ge=1900, le=2100),
+    updated_year_to: int | None = Query(None, ge=1900, le=2100),
+):
+    if (
+        updated_year_from is not None
+        and updated_year_to is not None
+        and updated_year_from > updated_year_to
+    ):
+        raise HTTPException(
+            400, "updated_year_from must be less than or equal to updated_year_to"
+        )
+
+    if db == "geo":
+        sql = GEO_QUERY_ACCESSIONS_SQL
+        params = [q, q, q, q]
+        params.extend(build_year_params(updated_year_from, updated_year_to, 4))
+    elif db == "sra":
+        sql = SRA_QUERY_ACCESSIONS_SQL
+        params = [q, q, q, q, q]
+        params.extend(build_year_params(updated_year_from, updated_year_to, 5))
+    else:
+        sql = ALL_QUERY_ACCESSIONS_SQL
+        params = [q, q, q, q, q, q, q, q]
+        params.extend(build_year_params(updated_year_from, updated_year_to, 9))
+
+    params.append(MAX_QUERY_DOWNLOAD)
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in download_by_query")
+        raise HTTPException(500, "Internal server error")
+
+    if not rows:
+        raise HTTPException(404, "No results found for query")
+
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    for row in rows:
+                        acc = row["accession"]
+                        source = row["source"]
+                        if source == "sra":
+                            data_rows = flatten_sra_study(cur, acc)
+                            name = f"{acc}_experiments.csv"
+                        else:
+                            data_rows = flatten_geo_series(cur, acc)
+                            name = f"{acc}_samples.csv"
+
+                        if data_rows:
+                            csv_buf = io.StringIO()
+                            writer = csv.DictWriter(
+                                csv_buf, fieldnames=data_rows[0].keys()
+                            )
+                            writer.writeheader()
+                            writer.writerows(data_rows)
+                            zf.writestr(name, csv_buf.getvalue())
+
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=query_metadata.zip"},
+        )
+    except Exception:
+        logger.exception("Error in download_by_query")
         raise HTTPException(500, "Internal server error")
 
 
