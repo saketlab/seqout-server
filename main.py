@@ -215,6 +215,20 @@ def flatten_geo_series(cur, series: str) -> list[dict]:
                 elif isinstance(chars, dict):
                     char_map[chars.get("@tag")] = chars.get("#text")
 
+            organism_val = None
+            if ch:
+                org = ch.get("Organism")
+                if isinstance(org, dict):
+                    organism_val = org.get("#text")
+                elif isinstance(org, list):
+                    first = org[0] if org else None
+                    if isinstance(first, dict):
+                        organism_val = first.get("#text")
+                    else:
+                        organism_val = first
+                else:
+                    organism_val = org
+
             row = {
                 "Sample": s["accession"],
                 "Title": s["title"],
@@ -226,7 +240,7 @@ def flatten_geo_series(cur, series: str) -> list[dict]:
                 "Label": ch.get("Label") if ch else None,
                 "Source": ch.get("Source") if ch else None,
                 "Molecule": ch.get("Molecule") if ch else None,
-                "Organism": ch.get("Organism", {}).get("#text") if ch else None,
+                "Organism": organism_val,
                 "Label Protocol": ch.get("Label-Protocol") if ch else None,
                 "Extract Protocol": ch.get("Extract-Protocol") if ch else None,
                 "Hybridization Protocol": s["hybridization_protocol"],
