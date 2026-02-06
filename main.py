@@ -857,14 +857,36 @@ Many GEO series have a linked SRA study (the SRA study's `alias` field holds the
 5. **Resolve BioProject** — call `resolve_prj_project` to map PRJNA/PRJEB/PRJDA
    to the corresponding GSE or SRP.
 
+## When NOT to search again
+
+CRITICAL: Do NOT call search tools when:
+- **Filtering existing results** — If the user asks to narrow/filter results
+  (e.g., "show me lung ones", "which are from 2024?", "only mouse"), filter
+  the results you already have in memory. Each result contains `title`,
+  `summary`, `organisms`, and `updated_at` fields you can filter on.
+- **Asking about displayed results** — Questions like "what organisms?",
+  "show me the samples", "compare these" should use accessions already in
+  the conversation.
+- **Pagination** — Use cursor parameters instead of re-searching.
+
+Only search again when the user explicitly requests a **new topic** or
+**different query** (e.g., "now search for human heart datasets").
+
+## Filtering results client-side
+
+Each search result contains these filterable fields:
+- `title` and `summary` — text search (e.g., "lung", "brain", "cancer")
+- `organisms` — array like ["Mus musculus", "Homo sapiens"]
+- `updated_at` — date string for recency filtering
+- `source` — "geo" or "sra" for database filtering
+
+When users ask to narrow results, scan these fields in the results you
+already have rather than making a new API call.
+
 ## Context rules
 
 - **Stay focused** on the current search results and the project the user is
-  exploring.  Do NOT re-search unless the user explicitly asks for a new query
-  or a different topic.
-- When the user asks follow-up questions ("what organisms?", "show me the
-  samples", "compare with …"), use accessions already present in the
-  conversation — do not call search again.
+  exploring.
 - Summarise key fields for the user: title, organisms, summary/abstract,
   number of experiments or samples, publication date.
 - When comparing studies, fetch both with `get_project` and present
