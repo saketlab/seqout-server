@@ -835,6 +835,27 @@ MCP_INSTRUCTIONS = """\
 You are connected to pysraweb, a genomics study search engine covering
 NCBI GEO and SRA/ENA/DDBJ databases.
 
+## CRITICAL: Search tool usage rules
+
+BEFORE calling `search_all`, `search_geo`, or `search_sra`, ask yourself:
+
+**"Do I already have search results from this conversation that could answer
+the user's current request?"**
+
+If YES → DO NOT call any search tool. Filter/analyze results in memory instead.
+If NO → Proceed with the search.
+
+A new search is ONLY appropriate when the user requests a genuinely new topic
+that cannot be answered by filtering, summarizing, or analyzing existing results.
+
+Filtering, narrowing, subsetting, summarizing, or asking questions about
+existing results should NEVER trigger a new search. The `title`, `summary`,
+`organisms`, `updated_at`, and `source` fields in each result contain all
+the information needed for client-side filtering.
+
+For pagination (more results from the same query), use cursor parameters
+(`cursor_rank`, `cursor_acc`) instead of re-searching.
+
 ## Data hierarchy
 
 GEO side:  Series (GSE) → Samples (GSM)
@@ -856,32 +877,6 @@ Many GEO series have a linked SRA study (the SRA study's `alias` field holds the
    `resolve_accession_project` to find its parent study/series.
 5. **Resolve BioProject** — call `resolve_prj_project` to map PRJNA/PRJEB/PRJDA
    to the corresponding GSE or SRP.
-
-## When NOT to search again
-
-CRITICAL: Do NOT call search tools when:
-- **Filtering existing results** — If the user asks to narrow/filter results
-  (e.g., "show me lung ones", "which are from 2024?", "only mouse"), filter
-  the results you already have in memory. Each result contains `title`,
-  `summary`, `organisms`, and `updated_at` fields you can filter on.
-- **Asking about displayed results** — Questions like "what organisms?",
-  "show me the samples", "compare these" should use accessions already in
-  the conversation.
-- **Pagination** — Use cursor parameters instead of re-searching.
-
-Only search again when the user explicitly requests a **new topic** or
-**different query** (e.g., "now search for human heart datasets").
-
-## Filtering results client-side
-
-Each search result contains these filterable fields:
-- `title` and `summary` — text search (e.g., "lung", "brain", "cancer")
-- `organisms` — array like ["Mus musculus", "Homo sapiens"]
-- `updated_at` — date string for recency filtering
-- `source` — "geo" or "sra" for database filtering
-
-When users ask to narrow results, scan these fields in the results you
-already have rather than making a new API call.
 
 ## Context rules
 
