@@ -20,7 +20,7 @@ from slowapi.util import get_remote_address
 
 from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
-    BULK_PROJECT_ORGANISMS_SQL,
+    BULK_PROJECT_METADATA_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
@@ -622,16 +622,16 @@ def bulk_metadata(request: Request, payload: dict):
 
 
 @api_app.post(
-    "/bulk/organisms",
-    summary="Bulk accession organisms lookup",
+    "/bulk/project-metadata",
+    summary="Bulk project metadata lookup",
     description=(
-        "Return accession and organisms for GEO/SRA project accessions "
+        "Return accession, title, description, and organisms for GEO/SRA project accessions "
         "(GSE, SRP, ERP, DRP)."
     ),
-    operation_id="bulk_organisms",
+    operation_id="bulk_project_metadata",
 )
 @limiter.limit("30/minute")
-def bulk_organisms(request: Request, payload: dict):
+def bulk_project_metadata(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
         raise HTTPException(400, "No accessions provided")
@@ -651,11 +651,11 @@ def bulk_organisms(request: Request, payload: dict):
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(BULK_PROJECT_ORGANISMS_SQL, (validated,))
+                cur.execute(BULK_PROJECT_METADATA_SQL, (validated,))
                 rows = cur.fetchall()
                 return rows
     except Exception:
-        logger.exception("Database error in bulk_organisms")
+        logger.exception("Database error in bulk_project_metadata")
         raise HTTPException(500, "Internal server error")
 
 
