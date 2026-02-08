@@ -20,6 +20,7 @@ from slowapi.util import get_remote_address
 
 from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
+    BULK_PROJECT_ORGANISMS_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
@@ -617,6 +618,46 @@ def bulk_metadata(request: Request, payload: dict):
         )
     except Exception as e:
         logger.exception("Error in bulk_metadata")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.post(
+    "/bulk/organisms",
+    summary="Bulk accession organisms lookup",
+    description=(
+        "Return accession and organisms for GEO/SRA project accessions "
+        "(GSE, SRP, ERP, DRP). If more than 300 are provided, only the first 300 "
+        "are processed."
+    ),
+    operation_id="bulk_organisms",
+)
+@limiter.limit("30/minute")
+def bulk_organisms(request: Request, payload: dict):
+    accessions = payload.get("accessions", [])
+    if not accessions:
+        raise HTTPException(400, "No accessions provided")
+    accessions = accessions[:300]
+
+    validated = []
+    seen = set()
+    for acc in accessions:
+        if not isinstance(acc, str):
+            raise HTTPException(400, f"Invalid accession type: {type(acc).__name__}")
+        normalized = acc.strip().upper()
+        if not PROJECT_PATTERN.match(normalized):
+            raise HTTPException(400, f"Invalid accession format: {acc}")
+        if normalized not in seen:
+            seen.add(normalized)
+            validated.append(normalized)
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(BULK_PROJECT_ORGANISMS_SQL, (validated,))
+                rows = cur.fetchall()
+                return rows
+    except Exception:
+        logger.exception("Database error in bulk_organisms")
         raise HTTPException(500, "Internal server error")
 
 

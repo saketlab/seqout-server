@@ -604,3 +604,28 @@ FROM sra_studies
 WHERE bioproject_id = %s
 LIMIT 1;
 """
+
+BULK_PROJECT_ORGANISMS_SQL = """
+WITH input AS (
+    SELECT accession, MIN(ord)::int AS ord
+    FROM UNNEST(%s::text[]) WITH ORDINALITY AS t(accession, ord)
+    GROUP BY accession
+),
+matched AS (
+    SELECT g.accession, g.organisms
+    FROM geo_series g
+    JOIN input i ON i.accession = g.accession
+
+    UNION ALL
+
+    SELECT s.accession, s.organisms
+    FROM sra_studies s
+    JOIN input i ON i.accession = s.accession
+)
+SELECT
+    m.accession,
+    m.organisms
+FROM input i
+JOIN matched m ON m.accession = i.accession
+ORDER BY i.ord;
+"""
