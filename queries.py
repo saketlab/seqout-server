@@ -491,7 +491,10 @@ SELECT
     relation,
     supplementary_data,
     published_at,
-    updated_at
+    updated_at,
+    coords_2d,
+    coords_3d,
+    neighbors
 FROM geo_series
 WHERE accession = %s;
 """
@@ -506,7 +509,10 @@ SELECT
     external_id,
     links,
     published_at,
-    updated_at
+    updated_at,
+    coords_2d,
+    coords_3d,
+    neighbors
 FROM sra_studies
 WHERE accession = %s;
 """
