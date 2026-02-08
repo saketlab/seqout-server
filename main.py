@@ -626,8 +626,7 @@ def bulk_metadata(request: Request, payload: dict):
     summary="Bulk accession organisms lookup",
     description=(
         "Return accession and organisms for GEO/SRA project accessions "
-        "(GSE, SRP, ERP, DRP). If more than 300 are provided, only the first 300 "
-        "are processed."
+        "(GSE, SRP, ERP, DRP)."
     ),
     operation_id="bulk_organisms",
 )
@@ -636,7 +635,6 @@ def bulk_organisms(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
         raise HTTPException(400, "No accessions provided")
-    accessions = accessions[:300]
 
     validated = []
     seen = set()
