@@ -494,7 +494,8 @@ SELECT
     updated_at,
     coords_2d,
     coords_3d,
-    neighbors
+    neighbors,
+    organisms
 FROM geo_series
 WHERE accession = %s;
 """
@@ -512,7 +513,8 @@ SELECT
     updated_at,
     coords_2d,
     coords_3d,
-    neighbors
+    neighbors,
+    organisms
 FROM sra_studies
 WHERE accession = %s;
 """
