@@ -95,8 +95,18 @@ SELECT
 FROM eligible
 ORDER BY accession;
 """
+CLUSTERS_SQL = """
+SELECT
+    title,
+    centroid,
+    num_points
+FROM clusters
+ORDER BY title;
+"""
 _bin_cache_lock = threading.Lock()
 _bin_cache = {"ready": False, "points": b"", "accessions": b""}
+_clusters_cache_lock = threading.Lock()
+_clusters_cache = {"ready": False, "rows": []}
 
 
 pool = ConnectionPool(
@@ -341,6 +351,21 @@ def _get_binary_payloads() -> tuple[bytes, bytes]:
         return points_bytes, accessions_bytes
 
 
+def _get_clusters_rows() -> list[dict]:
+    with _clusters_cache_lock:
+        if _clusters_cache["ready"]:
+            return _clusters_cache["rows"]
+
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(CLUSTERS_SQL)
+                rows = cur.fetchall()
+
+        _clusters_cache["ready"] = True
+        _clusters_cache["rows"] = rows
+        return rows
+
+
 @api_app.get(
     "/",
     summary="Health check",
@@ -389,6 +414,26 @@ def get_accessions_bin(request: Request):
         raise HTTPException(500, "Internal server error")
 
     return Response(content=accessions_bytes, media_type="application/octet-stream")
+
+
+@api_app.get(
+    "/clusters.json",
+    summary="Get clusters",
+    description=(
+        "Return static cluster rows with title, centroid, and num_points. "
+        "Results are loaded once and cached in memory."
+    ),
+    operation_id="get_clusters",
+)
+@limiter.limit("20/minute")
+def get_clusters(request: Request):
+    try:
+        rows = _get_clusters_rows()
+    except Exception:
+        logger.exception("Database error in get_clusters")
+        raise HTTPException(500, "Internal server error")
+
+    return rows
 
 
 @api_app.get(
