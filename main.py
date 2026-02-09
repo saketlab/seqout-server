@@ -4,13 +4,15 @@ import json
 import logging
 import os
 import re
+import struct
+import threading
 import time
 import zipfile
 
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastmcp import FastMCP
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -66,6 +68,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_QUERY_DOWNLOAD = 100
+COMBINED_BIN_ROWS_SQL = """
+WITH combined AS (
+    SELECT accession, coords_2d
+    FROM geo_series
+    WHERE coords_2d IS NOT NULL
+    UNION ALL
+    SELECT accession, coords_2d
+    FROM sra_studies
+    WHERE coords_2d IS NOT NULL
+),
+eligible AS (
+    SELECT
+        accession,
+        coords_2d
+    FROM combined
+    WHERE array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND accession ~ '^[A-Za-z]+\\d+$'
+)
+SELECT
+    accession,
+    coords_2d[1]::real AS x,
+    coords_2d[2]::real AS y
+FROM eligible
+ORDER BY accession;
+"""
+_bin_cache_lock = threading.Lock()
+_bin_cache = {"ready": False, "points": b"", "accessions": b""}
 
 
 pool = ConnectionPool(
@@ -277,6 +308,39 @@ def year_params(year_from: int | None, year_to: int | None) -> list:
     return [year_from, year_from, year_to, year_to]
 
 
+def _build_binary_payloads() -> tuple[bytes, bytes]:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(COMBINED_BIN_ROWS_SQL)
+            rows = cur.fetchall()
+
+    points_buf = bytearray(len(rows) * 8)
+    accessions_buf = bytearray()
+    offset = 0
+
+    for accession, x, y in rows:
+        struct.pack_into("<ff", points_buf, offset, x, y)
+        offset += 8
+
+        encoded = accession.encode("utf-8")
+        accessions_buf.extend(struct.pack("<I", len(encoded)))
+        accessions_buf.extend(encoded)
+
+    return bytes(points_buf), bytes(accessions_buf)
+
+
+def _get_binary_payloads() -> tuple[bytes, bytes]:
+    with _bin_cache_lock:
+        if _bin_cache["ready"]:
+            return _bin_cache["points"], _bin_cache["accessions"]
+
+        points_bytes, accessions_bytes = _build_binary_payloads()
+        _bin_cache["ready"] = True
+        _bin_cache["points"] = points_bytes
+        _bin_cache["accessions"] = accessions_bytes
+        return points_bytes, accessions_bytes
+
+
 @api_app.get(
     "/",
     summary="Health check",
@@ -285,6 +349,46 @@ def year_params(year_from: int | None, year_to: int | None) -> list:
 )
 def hello():
     return {"message": "pysradb-server is up and running!", "errors": None}
+
+
+@api_app.get(
+    "/points.bin",
+    summary="Download 2D points as binary",
+    description=(
+        "Return all GEO+SRA 2D coordinates in accession order as packed little-endian "
+        "float32 pairs (x, y)."
+    ),
+    operation_id="get_points_bin",
+)
+@limiter.limit("20/minute")
+def get_points_bin(request: Request):
+    try:
+        points_bytes, _ = _get_binary_payloads()
+    except Exception:
+        logger.exception("Database error in get_points_bin")
+        raise HTTPException(500, "Internal server error")
+
+    return Response(content=points_bytes, media_type="application/octet-stream")
+
+
+@api_app.get(
+    "/accessions.bin",
+    summary="Download accessions as binary",
+    description=(
+        "Return all GEO+SRA full accessions in accession order as packed "
+        "length-prefixed UTF-8 records."
+    ),
+    operation_id="get_accessions_bin",
+)
+@limiter.limit("20/minute")
+def get_accessions_bin(request: Request):
+    try:
+        _, accessions_bytes = _get_binary_payloads()
+    except Exception:
+        logger.exception("Database error in get_accessions_bin")
+        raise HTTPException(500, "Internal server error")
+
+    return Response(content=accessions_bytes, media_type="application/octet-stream")
 
 
 @api_app.get(
