@@ -19,6 +19,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from queries import (
+    AE_EXPERIMENT_SAMPLES_SQL,
+    AE_QUERY_ACCESSIONS_SQL,
+    AE_SEARCH_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
@@ -28,6 +31,7 @@ from queries import (
     GEO_SERIES_SAMPLES_SQL,
     PRJ_TO_SRA_STUDY_SQL,
     PRJNA_TO_GEO_SERIES_SQL,
+    PROJECT_AE_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     SAMPLE_SQL,
@@ -50,15 +54,17 @@ SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
 EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
-PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX})\d+$", re.IGNORECASE)
-BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA)\d+$", re.IGNORECASE)
+AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
+PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|E-[A-Z]{{4}}-)\d+$", re.IGNORECASE)
+BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA|E-[A-Z]{{4}}-)\d+$", re.IGNORECASE)
 
 STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
 SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
 EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
-PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX})\d+$"
+AE_REGEX = r"^E-[A-Z]{4}-\d+$"
+PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|E-[A-Z]{{4}}-)\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
 
 logging.basicConfig(level=logging.INFO)
@@ -92,6 +98,8 @@ def classify_accession(acc: str) -> str | None:
         return "geo"
     if STUDY_PATTERN.match(acc):
         return "sra"
+    if AE_PATTERN.match(acc):
+        return "arrayexpress"
     return None
 
 
@@ -258,6 +266,51 @@ def flatten_geo_series(cur, series: str) -> list[dict]:
     return rows
 
 
+def flatten_ae_experiment(cur, accession: str) -> list[dict]:
+    cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
+    samples = cur.fetchall()
+    if not samples:
+        return []
+
+    # Collect all attribute keys across samples
+    attribute_keys = set()
+    for s in samples:
+        attrs = s.get("attributes_json")
+        if attrs and isinstance(attrs, dict):
+            attribute_keys.update(attrs.keys())
+    attribute_keys = sorted(attribute_keys)
+
+    rows = []
+    for s in samples:
+        row = {
+            "Experiment": s.get("experiment_accession") or "-",
+            "Source Name": s.get("source_name") or "-",
+            "Organism": s.get("organism") or "-",
+            "Organism Part": s.get("organism_part") or "-",
+            "Cell Type": s.get("cell_type") or "-",
+            "Genotype": s.get("genotype") or "-",
+            "Sample Source Name": s.get("sample_source_name") or "-",
+            "Sample Title": s.get("sample_title") or "-",
+            "Sample Description": s.get("sample_description") or "-",
+            "Library Strategy": s.get("library_strategy") or "-",
+            "Library Source": s.get("library_source") or "-",
+            "Library Selection": s.get("library_selection") or "-",
+            "ENA Experiment": s.get("ena_experiment") or "-",
+            "ENA Run": s.get("ena_run") or "-",
+        }
+
+        attrs = s.get("attributes_json")
+        for key in attribute_keys:
+            if isinstance(attrs, dict):
+                row[key] = attrs.get(key, "-")
+            else:
+                row[key] = "-"
+
+        rows.append(row)
+
+    return rows
+
+
 def format_df(df: pd.DataFrame | None):
     if df is not None:
         grouped_by_srp = (
@@ -390,13 +443,67 @@ def search_sra(
 
 
 @api_app.get(
+    "/search/arrayexpress",
+    summary="Search ArrayExpress",
+    description=(
+        "Full-text search over ArrayExpress experiments and related metadata. "
+        "Use cursors (rank + accession) for pagination. "
+        "Results objects: {accession: string, title: string, summary: string | null, "
+        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'arrayexpress'}. "
+        "Returns {results: object[], total: int, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}."
+    ),
+    operation_id="search_arrayexpress",
+)
+@limiter.limit("100/minute")
+def search_arrayexpress(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=500),
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
+):
+    start = time.perf_counter()
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    AE_SEARCH_SQL,
+                    (q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in search_arrayexpress")
+        raise HTTPException(500, "Internal server error")
+
+    took_ms = (time.perf_counter() - start) * 1000
+    total = rows[0]["total_count"] if rows else 0
+
+    return {
+        "results": rows,
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": (
+            None
+            if not rows
+            else {
+                "rank": rows[-1]["rank"],
+                "accession": rows[-1]["accession"],
+            }
+        ),
+    }
+
+
+@api_app.get(
     "/search",
     summary="Search all databases",
     description=(
-        "Unified search across GEO and SRA. Optionally restrict by db=geo|sra. "
+        "Unified search across GEO, SRA, and ArrayExpress. "
+        "Optionally restrict by db=geo|sra|arrayexpress. "
         "Use cursors (rank + accession) for pagination. "
         "Results objects: {accession: string, title: string, summary: string | null, "
-        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'geo' | 'sra'}. "
+        "updated_at: string | null, organisms: string[] | null, rank: float, "
+        "source: 'geo' | 'sra' | 'arrayexpress'}. "
         "Returns {results: object[], total: int, took_ms: float, "
         "next_cursor: {rank: float, accession: string} | null}."
     ),
@@ -408,12 +515,14 @@ def search(
     q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
-    db: str | None = Query(None, pattern="^(geo|sra)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress)$"),
 ):
     if db == "geo":
         return search_geo(request, q, cursor_rank, cursor_acc)
     elif db == "sra":
         return search_sra(request, q, cursor_rank, cursor_acc)
+    elif db == "arrayexpress":
+        return search_arrayexpress(request, q, cursor_rank, cursor_acc)
 
     start = time.perf_counter()
 
@@ -422,7 +531,7 @@ def search(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SEARCH_SQL,
-                    (q, q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                    (q, q, q, q, q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
                 )
                 rows = cur.fetchall()
     except Exception as e:
@@ -460,7 +569,12 @@ def get_project(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
-    sql = PROJECT_GEO_SQL if accession.upper().startswith("G") else PROJECT_SRA_SQL
+    if accession.upper().startswith("E-"):
+        sql = PROJECT_AE_SQL
+    elif accession.upper().startswith("G"):
+        sql = PROJECT_GEO_SQL
+    else:
+        sql = PROJECT_SRA_SQL
 
     try:
         with pool.connection() as conn:
@@ -539,6 +653,29 @@ def get_geo_series_samples(
     return rows
 
 
+@api_app.get(
+    "/arrayexpress/experiment/{accession}/samples",
+    summary="List ArrayExpress experiment samples",
+    description="List all samples for an ArrayExpress experiment accession (E-XXXX-NNN).",
+    operation_id="get_ae_experiment_samples",
+)
+@limiter.limit("100/minute")
+def get_ae_experiment_samples(
+    request: Request,
+    accession: str = Path(..., pattern=AE_REGEX),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.exception("Database error in get_ae_experiment_samples")
+        raise HTTPException(500, "Internal server error")
+
+    return rows
+
+
 @api_app.post(
     "/bulk/metadata",
     summary="Bulk metadata download",
@@ -594,6 +731,17 @@ def bulk_metadata(request: Request, payload: dict):
                                 writer.writeheader()
                                 writer.writerows(rows)
                                 zf.writestr(name, csv_buf.getvalue())
+                        elif AE_PATTERN.match(acc):
+                            rows = flatten_ae_experiment(cur, acc)
+                            name = f"{acc}_samples.csv"
+                            if rows:
+                                csv_buf = io.StringIO()
+                                writer = csv.DictWriter(
+                                    csv_buf, fieldnames=rows[0].keys()
+                                )
+                                writer.writeheader()
+                                writer.writerows(rows)
+                                zf.writestr(name, csv_buf.getvalue())
                         elif acc.startswith("PRJNA"):
                             cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
                             series_list = cur.fetchall()
@@ -625,8 +773,8 @@ def bulk_metadata(request: Request, payload: dict):
     "/bulk/project-metadata",
     summary="Bulk project metadata lookup",
     description=(
-        "Return accession, title, description, and organisms for GEO/SRA project accessions "
-        "(GSE, SRP, ERP, DRP)."
+        "Return accession, title, description, and organisms for GEO/SRA/ArrayExpress project accessions "
+        "(GSE, SRP, ERP, DRP, E-XXXX)."
     ),
     operation_id="bulk_project_metadata",
 )
@@ -664,7 +812,7 @@ def bulk_project_metadata(request: Request, payload: dict):
     summary="Download metadata by query",
     description=(
         "Generate a ZIP of CSV files for query-matched projects. "
-        "Accepts q, optional db=geo|sra, and optional updated year filters. "
+        "Accepts q, optional db=geo|sra|arrayexpress, and optional updated year filters. "
         "Results are capped at 100 projects."
     ),
     operation_id="download_by_query",
@@ -673,7 +821,7 @@ def bulk_project_metadata(request: Request, payload: dict):
 def download_by_query(
     request: Request,
     q: str = Query(..., min_length=1, max_length=500),
-    db: str | None = Query(None, pattern="^(geo|sra)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress)$"),
     updated_year_from: int | None = Query(None, ge=1900, le=2100),
     updated_year_to: int | None = Query(None, ge=1900, le=2100),
 ):
@@ -686,33 +834,48 @@ def download_by_query(
             400, "updated_year_from must be less than or equal to updated_year_to"
         )
 
+    yp = year_params(updated_year_from, updated_year_to)
+
     if db == "geo":
         sql = GEO_QUERY_ACCESSIONS_SQL
         params = [q]
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend(year_params(updated_year_from, updated_year_to))
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend(yp)
     elif db == "sra":
         sql = SRA_QUERY_ACCESSIONS_SQL
         params = [q]
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend(year_params(updated_year_from, updated_year_to))
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend(yp)
+    elif db == "arrayexpress":
+        sql = AE_QUERY_ACCESSIONS_SQL
+        params = [q]
+        params.extend([q, *yp])
+        params.extend([q, q, *yp])
+        params.extend(yp)
     else:
         sql = ALL_QUERY_ACCESSIONS_SQL
         params = [q]
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend([q, *year_params(updated_year_from, updated_year_to)])
-        params.extend(year_params(updated_year_from, updated_year_to))
-        params.extend(year_params(updated_year_from, updated_year_to))
+        # GEO: exact, GSM, PRJNA
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        # SRA: exact, SRX, PRJNA alias, SRS sample
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        params.extend([q, *yp])
+        # GEO FTS, SRA FTS
+        params.extend(yp)
+        params.extend(yp)
+        # AE: exact, ENA match, FTS
+        params.extend([q, *yp])
+        params.extend([q, q, *yp])
+        params.extend(yp)
 
     params.append(MAX_QUERY_DOWNLOAD)
 
@@ -739,6 +902,9 @@ def download_by_query(
                         if source == "sra":
                             data_rows = flatten_sra_study(cur, acc)
                             name = f"{acc}_experiments.csv"
+                        elif source == "arrayexpress":
+                            data_rows = flatten_ae_experiment(cur, acc)
+                            name = f"{acc}_samples.csv"
                         else:
                             data_rows = flatten_geo_series(cur, acc)
                             name = f"{acc}_samples.csv"
@@ -872,11 +1038,12 @@ def get_prj_info(
 
 MCP_INSTRUCTIONS = """\
 You are connected to pysraweb, a genomics study search engine covering
-NCBI GEO and SRA/ENA/DDBJ databases.
+NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
 
 ## CRITICAL: Search tool usage rules
 
-BEFORE calling `search_all`, `search_geo`, or `search_sra`, ask yourself:
+BEFORE calling `search_all`, `search_geo`, `search_sra`, or
+`search_arrayexpress`, ask yourself:
 
 **"Do I already have search results from this conversation that could answer
 the user's current request?"**
@@ -899,19 +1066,23 @@ For pagination (more results from the same query), use cursor parameters
 
 GEO side:  Series (GSE) → Samples (GSM)
 SRA side:  Study (SRP/ERP/DRP) → Experiments (SRX/ERX/DRX) → Samples (SRS/ERS/DRS)
-BioProject (PRJNA/PRJEB/PRJDA) can link to either or both.
+ArrayExpress side:  Experiment (E-MTAB-NNN) → Samples (with ENA experiment/run links)
+BioProject (PRJNA/PRJEB/PRJDA) can link to GEO or SRA.
 Many GEO series have a linked SRA study (the SRA study's `alias` field holds the GSE accession).
 
 ## Recommended workflow
 
 1. **Search** — call `search_all` with the user's query.
    The `source` field in each result tells you whether it came from GEO or SRA.
-   Pass `db="geo"` or `db="sra"` only when the user explicitly asks to restrict.
+   Pass `db="geo"`, `db="sra"`, or `db="arrayexpress"` only when the user
+   explicitly asks to restrict.
 2. **Drill into a result** — call `get_project` with the accession the user
-   picked (or the best match).  This returns full metadata for a GSE or SRP.
+   picked (or the best match).  This returns full metadata for a GSE, SRP,
+   or E-XXXX accession.
 3. **Explore experiments / samples**:
    - SRA study → `get_study_experiments`, then `get_sample` for samples of interest.
    - GEO series → `get_geo_series_samples`.
+   - ArrayExpress experiment → `get_ae_experiment_samples`.
 4. **Resolve child → parent** — given a sample or experiment accession, call
    `resolve_accession_project` to find its parent study/series.
 5. **Resolve BioProject** — call `resolve_prj_project` to map PRJNA/PRJEB/PRJDA

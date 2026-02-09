@@ -124,6 +124,56 @@ LIMIT 20;
 """
 
 
+AE_SEARCH_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- Exact accession match (priority 1)
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 1 AS priority
+    FROM arrayexpress_experiments
+    WHERE UPPER(accession) = UPPER(%s)
+
+    UNION ALL
+
+    -- ENA experiment/run match (priority 2) - find parent experiment via samples
+    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 2 AS priority
+    FROM arrayexpress_samples s
+    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
+    WHERE UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s)
+
+    UNION ALL
+
+    -- Full-text search match (priority 3)
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 3 AS priority
+    FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.q
+),
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
+),
+counted AS (
+    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+),
+paged AS (
+    SELECT *
+    FROM counted
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+)
+SELECT
+    accession, title, summary, updated_at, organisms, rank, source, total_count
+FROM paged
+ORDER BY rank DESC, accession DESC
+LIMIT 20;
+"""
+
+
 SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
@@ -210,6 +260,34 @@ all_matches AS (
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
+
+    UNION ALL
+
+    -- ArrayExpress exact accession match (priority 10)
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 10 AS priority,
+           accession AS dedup_key
+    FROM arrayexpress_experiments
+    WHERE UPPER(accession) = UPPER(%s)
+
+    UNION ALL
+
+    -- ArrayExpress ENA experiment/run match (priority 11)
+    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
+           e.accession AS dedup_key
+    FROM arrayexpress_samples s
+    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
+    WHERE UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s)
+
+    UNION ALL
+
+    -- ArrayExpress full-text search (priority 12)
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           accession AS dedup_key
+    FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.q
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
@@ -463,6 +541,40 @@ all_matches AS (
     WHERE s.tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- ArrayExpress exact accession match (priority 10)
+    SELECT accession,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 10 AS priority,
+           accession AS dedup_key
+    FROM arrayexpress_experiments
+    WHERE UPPER(accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) <= %s::int)
+
+    UNION ALL
+
+    -- ArrayExpress ENA experiment/run match (priority 11)
+    SELECT DISTINCT e.accession,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
+           e.accession AS dedup_key
+    FROM arrayexpress_samples s
+    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
+    WHERE (UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s))
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
+
+    UNION ALL
+
+    -- ArrayExpress full-text search (priority 12)
+    SELECT accession,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           accession AS dedup_key
+    FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) <= %s::int)
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
@@ -605,6 +717,97 @@ WHERE bioproject_id = %s
 LIMIT 1;
 """
 
+PROJECT_AE_SQL = """
+SELECT
+    accession,
+    title,
+    organism,
+    description,
+    study_type,
+    release_date,
+    submission_date,
+    experimental_factors,
+    experimental_factor_types,
+    contact_name,
+    contact_email,
+    contact_affiliation,
+    pubmed_id,
+    protocol_names,
+    protocol_types,
+    attributes_json,
+    organisms
+FROM arrayexpress_experiments
+WHERE accession = %s;
+"""
+
+AE_EXPERIMENT_SAMPLES_SQL = """
+SELECT
+    experiment_accession,
+    source_name,
+    organism,
+    organism_part,
+    cell_type,
+    genotype,
+    sample_source_name,
+    sample_title,
+    sample_description,
+    library_strategy,
+    library_source,
+    library_selection,
+    ena_experiment,
+    ena_run,
+    attributes_json
+FROM arrayexpress_samples
+WHERE experiment_accession = %s;
+"""
+
+AE_QUERY_ACCESSIONS_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- Exact accession match (priority 1)
+    SELECT accession,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 1 AS priority
+    FROM arrayexpress_experiments
+    WHERE UPPER(accession) = UPPER(%s)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) <= %s::int)
+
+    UNION ALL
+
+    -- ENA experiment/run match (priority 2)
+    SELECT DISTINCT e.accession,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 2 AS priority
+    FROM arrayexpress_samples s
+    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
+    WHERE (UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s))
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 3)
+    SELECT accession,
+           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 3 AS priority
+    FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.q
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) <= %s::int)
+),
+deduped AS (
+    SELECT DISTINCT ON (accession)
+        accession, rank, source
+    FROM all_matches
+    ORDER BY accession, priority, rank DESC
+)
+SELECT
+    accession, rank, source
+FROM deduped
+ORDER BY rank DESC, accession DESC
+LIMIT %s;
+"""
+
 BULK_PROJECT_METADATA_SQL = """
 WITH input AS (
     SELECT accession, MIN(ord)::int AS ord
@@ -629,6 +832,16 @@ matched AS (
         s.organisms
     FROM sra_studies s
     JOIN input i ON i.accession = s.accession
+
+    UNION ALL
+
+    SELECT
+        ae.accession,
+        ae.title,
+        ae.description,
+        ae.organisms
+    FROM arrayexpress_experiments ae
+    JOIN input i ON i.accession = ae.accession
 )
 SELECT
     m.accession,
