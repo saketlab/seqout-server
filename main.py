@@ -54,18 +54,17 @@ SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
 EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
-AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
-PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|E-[A-Z]{{4}}-)\d+$", re.IGNORECASE)
-BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA|E-[A-Z]{{4}}-)\d+$", re.IGNORECASE)
+PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE)
+BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE)
 
 STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
 SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
 EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
-AE_REGEX = r"^E-[A-Z]{4}-\d+$"
-PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|E-[A-Z]{{4}}-)\d+$"
+PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
+AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -94,13 +93,49 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 
 def classify_accession(acc: str) -> str | None:
+    """Classify accession into database source."""
     if acc.startswith("GSE"):
         return "geo"
+    if acc.startswith("E-"):
+        return "arrayexpress"
     if STUDY_PATTERN.match(acc):
         return "sra"
-    if AE_PATTERN.match(acc):
-        return "arrayexpress"
     return None
+
+
+def _transform_ae_sample_to_geo(sample: dict) -> dict:
+    """Transform ArrayExpress sample to GEO-compatible format for frontend."""
+    attrs = sample.get("attributes_json") or {}
+    if isinstance(attrs, str):
+        try:
+            attrs = json.loads(attrs)
+        except:
+            attrs = {}
+
+    characteristics = [
+        {"@tag": k, "#text": v}
+        for k, v in attrs.items()
+        if not k.startswith("comment[")
+    ]
+
+    return {
+        "accession": sample.get("ena_run") or sample.get("ena_experiment") or sample.get("source_name"),
+        "title": sample.get("sample_title") or sample.get("source_name"),
+        "description": sample.get("sample_description"),
+        "channel_count": 1,
+        "sample_type": sample.get("library_strategy"),
+        "platform_ref": None,
+        "organism": sample.get("organism"),
+        "channels": [{
+            "Characteristics": characteristics,
+            "Source": sample.get("sample_source_name") or sample.get("source_name"),
+            "Organism": {"#text": sample.get("organism"), "@taxid": ""},
+            "Label": sample.get("library_strategy"),
+            "@position": "1"
+        }],
+        "hybridization_protocol": None,
+        "scan_protocol": None,
+    }
 
 
 def rows_to_csv(rows: list[dict]) -> str:
@@ -443,58 +478,6 @@ def search_sra(
 
 
 @api_app.get(
-    "/search/arrayexpress",
-    summary="Search ArrayExpress",
-    description=(
-        "Full-text search over ArrayExpress experiments and related metadata. "
-        "Use cursors (rank + accession) for pagination. "
-        "Results objects: {accession: string, title: string, summary: string | null, "
-        "updated_at: string | null, organisms: string[] | null, rank: float, source: 'arrayexpress'}. "
-        "Returns {results: object[], total: int, took_ms: float, "
-        "next_cursor: {rank: float, accession: string} | null}."
-    ),
-    operation_id="search_arrayexpress",
-)
-@limiter.limit("100/minute")
-def search_arrayexpress(
-    request: Request,
-    q: str = Query(..., min_length=1, max_length=500),
-    cursor_rank: float | None = Query(None),
-    cursor_acc: str | None = Query(None),
-):
-    start = time.perf_counter()
-
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    AE_SEARCH_SQL,
-                    (q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
-                )
-                rows = cur.fetchall()
-    except Exception as e:
-        logger.exception("Database error in search_arrayexpress")
-        raise HTTPException(500, "Internal server error")
-
-    took_ms = (time.perf_counter() - start) * 1000
-    total = rows[0]["total_count"] if rows else 0
-
-    return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {
-                "rank": rows[-1]["rank"],
-                "accession": rows[-1]["accession"],
-            }
-        ),
-    }
-
-
-@api_app.get(
     "/search",
     summary="Search all databases",
     description=(
@@ -522,7 +505,35 @@ def search(
     elif db == "sra":
         return search_sra(request, q, cursor_rank, cursor_acc)
     elif db == "arrayexpress":
-        return search_arrayexpress(request, q, cursor_rank, cursor_acc)
+        start = time.perf_counter()
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        AE_SEARCH_SQL,
+                        (q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            logger.exception("Database error in search_arrayexpress")
+            raise HTTPException(500, "Internal server error")
+
+        took_ms = (time.perf_counter() - start) * 1000
+        total = rows[0]["total_count"] if rows else 0
+
+        return {
+            "results": rows,
+            "total": total,
+            "took_ms": round(took_ms, 2),
+            "next_cursor": (
+                None
+                if not rows
+                else {
+                    "rank": rows[-1]["rank"],
+                    "accession": rows[-1]["accession"],
+                }
+            ),
+        }
 
     start = time.perf_counter()
 
@@ -569,9 +580,11 @@ def get_project(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
-    if accession.upper().startswith("E-"):
+    accession = accession.upper()
+
+    if accession.startswith("E-"):
         sql = PROJECT_AE_SQL
-    elif accession.upper().startswith("G"):
+    elif accession.startswith("G"):
         sql = PROJECT_GEO_SQL
     else:
         sql = PROJECT_SRA_SQL
@@ -632,25 +645,32 @@ def get_sample(
 
 @api_app.get(
     "/geo/series/{accession}/samples",
-    summary="List GEO series samples",
-    description="List all GSM samples for a GEO series accession (GSE).",
+    summary="List GEO series or ArrayExpress experiment samples",
+    description="List all samples for a GEO series (GSE) or ArrayExpress experiment (E-XXXX-NNN).",
     operation_id="get_geo_series_samples",
 )
 @limiter.limit("100/minute")
 def get_geo_series_samples(
     request: Request,
-    accession: str = Path(..., pattern=GEO_SERIES_REGEX),
+    accession: str = Path(...),
 ):
+    accession = accession.upper()
+    source = classify_accession(accession)
+    if source not in ["geo", "arrayexpress"]:
+        raise HTTPException(400, f"Invalid accession format: {accession}")
+
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
-                rows = cur.fetchall()
+                if source == "arrayexpress":
+                    cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
+                    return [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
+                else:
+                    cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
+                    return cur.fetchall()
     except Exception as e:
         logger.exception("Database error in get_geo_series_samples")
         raise HTTPException(500, "Internal server error")
-
-    return rows
 
 
 @api_app.get(
@@ -709,47 +729,25 @@ def bulk_metadata(request: Request, payload: dict):
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     for acc in validated:
-                        if STUDY_PATTERN.match(acc):
+                        source = classify_accession(acc)
+
+                        if source == "sra":
                             rows = flatten_sra_study(cur, acc)
                             name = f"{acc}_experiments.csv"
-                            if rows:
-                                csv_buf = io.StringIO()
-                                writer = csv.DictWriter(
-                                    csv_buf, fieldnames=rows[0].keys()
-                                )
-                                writer.writeheader()
-                                writer.writerows(rows)
-                                zf.writestr(name, csv_buf.getvalue())
-                        elif acc.startswith("GSE"):
+                        elif source == "geo":
                             rows = flatten_geo_series(cur, acc)
                             name = f"{acc}_samples.csv"
-                            if rows:
-                                csv_buf = io.StringIO()
-                                writer = csv.DictWriter(
-                                    csv_buf, fieldnames=rows[0].keys()
-                                )
-                                writer.writeheader()
-                                writer.writerows(rows)
-                                zf.writestr(name, csv_buf.getvalue())
-                        elif AE_PATTERN.match(acc):
+                        elif source == "arrayexpress":
                             rows = flatten_ae_experiment(cur, acc)
                             name = f"{acc}_samples.csv"
-                            if rows:
-                                csv_buf = io.StringIO()
-                                writer = csv.DictWriter(
-                                    csv_buf, fieldnames=rows[0].keys()
-                                )
-                                writer.writeheader()
-                                writer.writerows(rows)
-                                zf.writestr(name, csv_buf.getvalue())
                         elif acc.startswith("PRJNA"):
                             cur.execute(BIO_PROJECT_GEO_SERIES_SQL, (acc,))
                             series_list = cur.fetchall()
                             for series in series_list:
                                 gse = series["accession"]
                                 rows = flatten_geo_series(cur, gse)
-                                name = f"{gse}_samples.csv"
                                 if rows:
+                                    name = f"{gse}_samples.csv"
                                     csv_buf = io.StringIO()
                                     writer = csv.DictWriter(
                                         csv_buf, fieldnames=rows[0].keys()
@@ -757,6 +755,16 @@ def bulk_metadata(request: Request, payload: dict):
                                     writer.writeheader()
                                     writer.writerows(rows)
                                     zf.writestr(name, csv_buf.getvalue())
+                            continue
+                        else:
+                            continue
+
+                        if rows:
+                            csv_buf = io.StringIO()
+                            writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+                            writer.writeheader()
+                            writer.writerows(rows)
+                            zf.writestr(name, csv_buf.getvalue())
 
         buf.seek(0)
         return StreamingResponse(
@@ -1042,68 +1050,64 @@ NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
 
 ## CRITICAL: Search tool usage rules
 
-BEFORE calling `search_all`, `search_geo`, `search_sra`, or
-`search_arrayexpress`, ask yourself:
+BEFORE calling `search_all` or any database-specific search, ask yourself:
 
 **"Do I already have search results from this conversation that could answer
 the user's current request?"**
 
-If YES → DO NOT call any search tool. Filter/analyze results in memory instead.
+If YES → DO NOT search again. Filter/analyze existing results instead.
 If NO → Proceed with the search.
 
 A new search is ONLY appropriate when the user requests a genuinely new topic
 that cannot be answered by filtering, summarizing, or analyzing existing results.
 
-Filtering, narrowing, subsetting, summarizing, or asking questions about
-existing results should NEVER trigger a new search. The `title`, `summary`,
-`organisms`, `updated_at`, and `source` fields in each result contain all
-the information needed for client-side filtering.
+Filtering, narrowing, subsetting, or summarizing existing results should NEVER
+trigger a new search. The `title`, `summary`, `organisms`, `updated_at`, and
+`source` fields contain all information needed for client-side filtering.
 
-For pagination (more results from the same query), use cursor parameters
+For pagination (more results from same query), use cursor parameters
 (`cursor_rank`, `cursor_acc`) instead of re-searching.
 
 ## Data hierarchy
 
-GEO side:  Series (GSE) → Samples (GSM)
-SRA side:  Study (SRP/ERP/DRP) → Experiments (SRX/ERX/DRX) → Samples (SRS/ERS/DRS)
-ArrayExpress side:  Experiment (E-MTAB-NNN) → Samples (with ENA experiment/run links)
-BioProject (PRJNA/PRJEB/PRJDA) can link to GEO or SRA.
-Many GEO series have a linked SRA study (the SRA study's `alias` field holds the GSE accession).
+GEO:  Series (GSE) → Samples (GSM)
+SRA:  Study (SRP/ERP/DRP) → Experiments (SRX/ERX/DRX) → Samples (SRS/ERS/DRS)
+ArrayExpress:  Experiment (E-MTAB-NNN, E-GEOD-NNN, etc.) → Samples (with ENA links)
+BioProject:  PRJNA/PRJEB/PRJDA can link to GEO or SRA
+
+Many GEO series have a linked SRA study (the SRA study's `alias` field = GSE accession).
 
 ## Recommended workflow
 
 1. **Search** — call `search_all` with the user's query.
-   The `source` field in each result tells you whether it came from GEO or SRA.
-   Pass `db="geo"`, `db="sra"`, or `db="arrayexpress"` only when the user
-   explicitly asks to restrict.
-2. **Drill into a result** — call `get_project` with the accession the user
-   picked (or the best match).  This returns full metadata for a GSE, SRP,
-   or E-XXXX accession.
-3. **Explore experiments / samples**:
-   - SRA study → `get_study_experiments`, then `get_sample` for samples of interest.
-   - GEO series → `get_geo_series_samples`.
-   - ArrayExpress experiment → `get_ae_experiment_samples`.
-4. **Resolve child → parent** — given a sample or experiment accession, call
-   `resolve_accession_project` to find its parent study/series.
-5. **Resolve BioProject** — call `resolve_prj_project` to map PRJNA/PRJEB/PRJDA
-   to the corresponding GSE or SRP.
+   The `source` field tells you: 'geo', 'sra', or 'arrayexpress'.
+   Only pass `db="geo"|"sra"|"arrayexpress"` if user explicitly restricts.
+
+2. **Drill into a result** — call `get_project` with the accession.
+   Returns full metadata for GSE, SRP, or E-XXXX.
+
+3. **Explore samples/experiments**:
+   - SRA study → `get_study_experiments`, then `get_sample` for individual samples
+   - GEO series → `get_geo_series_samples`
+   - ArrayExpress experiment → `get_ae_experiment_samples`
+
+4. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
+   to their parent study/series.
+
+5. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
 ## Context rules
 
-- **Stay focused** on the current search results and the project the user is
-  exploring.
-- Summarise key fields for the user: title, organisms, summary/abstract,
-  number of experiments or samples, publication date.
-- When comparing studies, fetch both with `get_project` and present
-  differences side-by-side.
+- **Stay focused** on current search results unless user explicitly requests new search.
+- Summarize key fields: title, organisms, summary, sample/experiment count, dates.
+- When comparing studies, fetch both with `get_project` and present side-by-side.
 
 ## Tools to avoid
 
-- `bulk_metadata` and `download_by_query` return binary ZIP files you cannot
-  read.  If the user wants bulk downloads, tell them to use the REST API or
-  web interface directly.
-- `health_check` is only useful for connectivity checks, not for answering
-  questions.
+- `bulk_metadata`, `download_by_query`, `bulk_project_metadata` return binary/bulk data
+  useless for LLMs. Tell users to use the REST API or web interface directly.
+- `health_check` is only for connectivity checks.
+- `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
 """
 
 mcp = FastMCP.from_fastapi(

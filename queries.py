@@ -721,21 +721,20 @@ PROJECT_AE_SQL = """
 SELECT
     accession,
     title,
-    organism,
-    description,
-    study_type,
-    release_date,
-    submission_date,
-    experimental_factors,
-    experimental_factor_types,
-    contact_name,
-    contact_email,
-    contact_affiliation,
-    pubmed_id,
-    protocol_names,
-    protocol_types,
-    attributes_json,
-    organisms
+    description AS summary,
+    NULL AS overall_design,
+    organisms,
+    CASE WHEN pubmed_id IS NOT NULL THEN ARRAY[pubmed_id] ELSE NULL END AS pubmed_id,
+    NULL AS samples_ref,
+    study_type AS series_type,
+    NULL AS relation,
+    NULL AS supplementary_data,
+    release_date AS published_at,
+    release_date AS updated_at,
+    NULL::real[] AS coords_2d,
+    NULL::real[] AS coords_3d,
+    NULL::jsonb AS neighbors,
+    NULL AS alias
 FROM arrayexpress_experiments
 WHERE accession = %s;
 """
