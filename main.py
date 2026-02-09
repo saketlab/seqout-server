@@ -54,8 +54,12 @@ SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
 EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
-PROJECT_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE)
-BULK_PATTERN = re.compile(rf"^(GSE|{_STUDY_PREFIX}|PRJNA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE)
+PROJECT_PATTERN = re.compile(
+    rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
+)
+BULK_PATTERN = re.compile(
+    rf"^(GSE|{_STUDY_PREFIX}|PRJNA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
+)
 
 STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
 SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
@@ -119,20 +123,24 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
     ]
 
     return {
-        "accession": sample.get("ena_run") or sample.get("ena_experiment") or sample.get("source_name"),
+        "accession": sample.get("ena_run")
+        or sample.get("ena_experiment")
+        or sample.get("source_name"),
         "title": sample.get("sample_title") or sample.get("source_name"),
         "description": sample.get("sample_description"),
         "channel_count": 1,
         "sample_type": sample.get("library_strategy"),
         "platform_ref": None,
         "organism": sample.get("organism"),
-        "channels": [{
-            "Characteristics": characteristics,
-            "Source": sample.get("sample_source_name") or sample.get("source_name"),
-            "Organism": {"#text": sample.get("organism"), "@taxid": ""},
-            "Label": sample.get("library_strategy"),
-            "@position": "1"
-        }],
+        "channels": [
+            {
+                "Characteristics": characteristics,
+                "Source": sample.get("sample_source_name") or sample.get("source_name"),
+                "Organism": {"#text": sample.get("organism"), "@taxid": ""},
+                "Label": sample.get("library_strategy"),
+                "@position": "1",
+            }
+        ],
         "hybridization_protocol": None,
         "scan_protocol": None,
     }
@@ -542,7 +550,22 @@ def search(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SEARCH_SQL,
-                    (q, q, q, q, q, q, q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc),
+                    (
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        q,
+                        cursor_rank,
+                        cursor_rank,
+                        cursor_acc,
+                    ),
                 )
                 rows = cur.fetchall()
     except Exception as e:
