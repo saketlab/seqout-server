@@ -625,6 +625,49 @@ def get_project(
 
 
 @api_app.get(
+    "/project/{accession}/metadata",
+    summary="Get project title and description",
+    description=(
+        "Return only title and description for a GEO series (GSE) or "
+        "SRA study (SRP/DRP/ERP) accession."
+    ),
+    operation_id="get_project_metadata",
+)
+@limiter.limit("100/minute")
+def get_project_metadata(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    sql = (
+        """
+        SELECT accession, title, summary AS description
+        FROM geo_series
+        WHERE accession = %s;
+        """
+        if accession.upper().startswith("G")
+        else """
+        SELECT accession, title, abstract AS description
+        FROM sra_studies
+        WHERE accession = %s;
+        """
+    )
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, (accession,))
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_project_metadata")
+        raise HTTPException(500, "Internal server error")
+
+    if not row:
+        raise HTTPException(404, f"Project not found: {accession}")
+
+    return row
+
+
+@api_app.get(
     "/project/{study}/experiments",
     summary="List study experiments",
     description="List all experiments for an SRA study accession (SRP/DRP/ERP).",
