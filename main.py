@@ -661,8 +661,8 @@ def bulk_project_metadata(request: Request, payload: dict):
     "/bulk/project-samples-metadata",
     summary="Bulk project metadata with flattened samples",
     description=(
-        "Return project title/description plus flattened sample rows for project accessions "
-        "(GSE, SRP, ERP, DRP)."
+        "Return project title/description/overall_design/source plus flattened sample rows "
+        "for project accessions (GSE, SRP, ERP, DRP)."
     ),
     operation_id="bulk_project_samples_metadata",
 )
@@ -697,6 +697,8 @@ def bulk_project_samples_metadata(request: Request, payload: dict):
                                 "accession": acc,
                                 "title": project.get("title"),
                                 "description": project.get("summary"),
+                                "overall_design": project.get("overall_design"),
+                                "source": "geo",
                                 "samples": samples,
                             }
                         )
@@ -711,6 +713,8 @@ def bulk_project_samples_metadata(request: Request, payload: dict):
                                 "accession": acc,
                                 "title": project.get("title"),
                                 "description": project.get("abstract"),
+                                "overall_design": None,
+                                "source": "sra",
                                 "samples": samples,
                             }
                         )
