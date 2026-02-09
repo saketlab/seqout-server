@@ -23,6 +23,7 @@ from queries import (
     BULK_PROJECT_METADATA_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
+    GEO_SERIES_NEIGHBORS_COORDS_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
     GEO_SEARCH_SQL,
     GEO_SERIES_SAMPLES_SQL,
@@ -537,6 +538,27 @@ def get_geo_series_samples(
         raise HTTPException(500, "Internal server error")
 
     return rows
+
+
+@api_app.get(
+    "/geo/series/{accession}/neighbors",
+    summary="Get GEO series neighbors and 3D coordinates",
+    description="Return only neighbors and coords_3d for a GEO series accession (GSE).",
+    operation_id="get_geo_series_neighbors_coords",
+)
+@limiter.limit("100/minute")
+def get_geo_series_neighbors_coords(
+    request: Request,
+    accession: str = Path(..., pattern=GEO_SERIES_REGEX),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(GEO_SERIES_NEIGHBORS_COORDS_SQL, (accession,))
+                return cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_geo_series_neighbors_coords")
+        raise HTTPException(500, "Internal server error")
 
 
 @api_app.post(

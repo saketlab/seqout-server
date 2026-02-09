@@ -560,6 +560,14 @@ JOIN geo_series g
 WHERE g.accession = %s
 """
 
+GEO_SERIES_NEIGHBORS_COORDS_SQL = """
+SELECT
+    coords_3d,
+    neighbors
+FROM geo_series
+WHERE accession = %s;
+"""
+
 BIO_PROJECT_GEO_SERIES_SQL = """
 SELECT accession FROM geo_series WHERE bioproject_id = %s;
 """
