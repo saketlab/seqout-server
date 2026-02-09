@@ -543,7 +543,7 @@ def get_geo_series_samples(
     "/bulk/metadata",
     summary="Bulk metadata download",
     description=(
-        "Generate a ZIP of CSV files for up to 100 accessions. "
+        "Generate a ZIP of CSV files for bulk accessions. "
         "Accepts GSE, SRP/DRP/ERP, or PRJNA accessions."
     ),
     operation_id="bulk_metadata",
@@ -553,8 +553,6 @@ def bulk_metadata(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
         raise HTTPException(400, "No accessions provided")
-    if len(accessions) > 100:
-        raise HTTPException(400, "Maximum 100 accessions allowed per request")
 
     validated = []
     for acc in accessions:
@@ -656,6 +654,70 @@ def bulk_project_metadata(request: Request, payload: dict):
                 return rows
     except Exception:
         logger.exception("Database error in bulk_project_metadata")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.post(
+    "/bulk/project-samples-metadata",
+    summary="Bulk project metadata with flattened samples",
+    description=(
+        "Return project title/description plus flattened sample rows for project accessions "
+        "(GSE, SRP, ERP, DRP)."
+    ),
+    operation_id="bulk_project_samples_metadata",
+)
+@limiter.limit("20/minute")
+def bulk_project_samples_metadata(request: Request, payload: dict):
+    accessions = payload.get("accessions", [])
+    if not accessions:
+        raise HTTPException(400, "No accessions provided")
+
+    validated = []
+    for acc in accessions:
+        if not isinstance(acc, str):
+            raise HTTPException(400, f"Invalid accession type: {type(acc).__name__}")
+        normalized = acc.strip().upper()
+        if not PROJECT_PATTERN.match(normalized):
+            raise HTTPException(400, f"Invalid accession format: {acc}")
+        validated.append(normalized)
+
+    try:
+        out = []
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                for acc in validated:
+                    if acc.startswith("GSE"):
+                        cur.execute(PROJECT_GEO_SQL, (acc,))
+                        project = cur.fetchone()
+                        if not project:
+                            continue
+                        samples = flatten_geo_series(cur, acc)
+                        out.append(
+                            {
+                                "accession": acc,
+                                "title": project.get("title"),
+                                "description": project.get("summary"),
+                                "samples": samples,
+                            }
+                        )
+                    else:
+                        cur.execute(PROJECT_SRA_SQL, (acc,))
+                        project = cur.fetchone()
+                        if not project:
+                            continue
+                        samples = flatten_sra_study(cur, acc)
+                        out.append(
+                            {
+                                "accession": acc,
+                                "title": project.get("title"),
+                                "description": project.get("abstract"),
+                                "samples": samples,
+                            }
+                        )
+
+        return out
+    except Exception:
+        logger.exception("Database error in bulk_project_samples_metadata")
         raise HTTPException(500, "Internal server error")
 
 
