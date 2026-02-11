@@ -730,19 +730,52 @@ SELECT
     accession,
     title,
     description AS summary,
-    NULL AS overall_design,
+    protocols_description AS overall_design,
     organisms,
     CASE WHEN pubmed_id IS NOT NULL THEN ARRAY[pubmed_id] ELSE NULL END AS pubmed_id,
     NULL AS samples_ref,
     study_type AS series_type,
-    NULL AS relation,
-    NULL AS supplementary_data,
+    CASE
+        WHEN external_links IS NOT NULL THEN
+            (SELECT jsonb_agg(
+                jsonb_build_object(
+                    '@type',
+                    CASE
+                        WHEN link->>'type' = 'ENA' THEN 'ENA'
+                        WHEN link->>'type' = 'GEO' THEN 'GEO'
+                        WHEN link->>'type' = 'gxa' THEN 'ArrayExpress Atlas'
+                        ELSE link->>'type'
+                    END,
+                    '@target',
+                    CASE
+                        WHEN link->>'type' = 'ENA' THEN 'https://www.ebi.ac.uk/ena/browser/view/' || (link->>'url')
+                        WHEN link->>'type' = 'GEO' THEN 'https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=' || (link->>'url')
+                        WHEN link->>'type' = 'gxa' THEN 'https://www.ebi.ac.uk/gxa/experiments/' || (link->>'url')
+                        ELSE link->>'url'
+                    END
+                )
+            )
+            FROM jsonb_array_elements(external_links) AS link)
+        ELSE NULL
+    END AS relation,
+    processed_data_files AS supplementary_data,
     release_date AS published_at,
     release_date AS updated_at,
     NULL::real[] AS coords_2d,
     NULL::real[] AS coords_3d,
     NULL::jsonb AS neighbors,
-    NULL AS alias
+    NULL AS alias,
+    publication_title,
+    publication_authors,
+    publication_doi,
+    external_links,
+    experimental_factors_detail,
+    authors,
+    organizations,
+    assay_count,
+    technology,
+    assay_by_molecule,
+    minseqe_score
 FROM arrayexpress_experiments
 WHERE accession = %s;
 """
