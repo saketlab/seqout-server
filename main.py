@@ -79,18 +79,19 @@ logger = logging.getLogger(__name__)
 MAX_QUERY_DOWNLOAD = 100
 COMBINED_BIN_ROWS_SQL = """
 WITH combined AS (
-    SELECT accession, coords_2d
+    SELECT accession, coords_2d, countries
     FROM geo_series
     WHERE coords_2d IS NOT NULL
     UNION ALL
-    SELECT accession, coords_2d
+    SELECT accession, coords_2d, countries
     FROM sra_studies
     WHERE coords_2d IS NOT NULL
 ),
 eligible AS (
     SELECT
         accession,
-        coords_2d
+        coords_2d,
+        countries
     FROM combined
     WHERE array_length(coords_2d, 1) >= 2
       AND coords_2d[1] IS NOT NULL
@@ -99,6 +100,7 @@ eligible AS (
 )
 SELECT
     accession,
+    countries,
     coords_2d[1]::real AS x,
     coords_2d[2]::real AS y
 FROM eligible
@@ -424,13 +426,20 @@ def _build_binary_payloads() -> tuple[bytes, bytes]:
     accessions_buf = bytearray()
     offset = 0
 
-    for accession, x, y in rows:
+    for accession, countries, x, y in rows:
         struct.pack_into("<ff", points_buf, offset, x, y)
         offset += 8
 
-        encoded = accession.encode("utf-8")
-        accessions_buf.extend(struct.pack("<I", len(encoded)))
-        accessions_buf.extend(encoded)
+        accession_encoded = accession.encode("utf-8")
+        accessions_buf.extend(struct.pack("<I", len(accession_encoded)))
+        accessions_buf.extend(accession_encoded)
+
+        country_values = countries or []
+        accessions_buf.extend(struct.pack("<I", len(country_values)))
+        for country in country_values:
+            country_encoded = country.encode("utf-8")
+            accessions_buf.extend(struct.pack("<I", len(country_encoded)))
+            accessions_buf.extend(country_encoded)
 
     return bytes(points_buf), bytes(accessions_buf)
 
@@ -496,8 +505,9 @@ def get_points_bin(request: Request):
     "/accessions.bin",
     summary="Download accessions as binary",
     description=(
-        "Return all GEO+SRA full accessions in accession order as packed "
-        "length-prefixed UTF-8 records."
+        "Return all GEO+SRA full accessions and countries in accession order. "
+        "Record format: accession_len(uint32 LE), accession_utf8, "
+        "country_count(uint32 LE), then repeated country_len(uint32 LE), country_utf8."
     ),
     operation_id="get_accessions_bin",
 )
