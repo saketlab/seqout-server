@@ -29,9 +29,18 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 4)
+    -- Contributor organization match (priority 4)
+    SELECT DISTINCT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           50.0::float8 AS rank, 'geo'::text AS source, 4 AS priority
+    FROM geo_contributors c
+    JOIN geo_series g ON g.accession = c.accession
+    WHERE c.organization ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- Full-text search match (priority 5)
     SELECT accession, title, summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 5 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
 ),
@@ -50,7 +59,28 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, rank, source, total_count,
+    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+        'organization', c.organization,
+        'department', c.department,
+        'formatted_address', gc.geo_formatted_address,
+        'latitude', gc.geo_latitude,
+        'longitude', gc.geo_longitude,
+        'city', gc.geo_city,
+        'district', gc.geo_district,
+        'state', gc.geo_state,
+        'postcode', gc.geo_postcode,
+        'country', gc.geo_country,
+        'country_code', gc.geo_country_code,
+        'place_name', gc.geo_place_name
+     ))
+     FROM geo_contributors c
+     LEFT JOIN geo_geocode gc ON gc.address_key =
+        c.organization || '|' || COALESCE(c.department,'') || '|' ||
+        COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
+        COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
+     WHERE c.accession = paged.accession
+    ) AS center
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -96,9 +126,18 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 5)
+    -- Submission center name match (priority 5)
+    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           50.0::float8 AS rank, 'sra'::text AS source, 5 AS priority
+    FROM sra_submissions sub
+    JOIN sra_studies s ON s.submission = sub.accession
+    WHERE sub.center_name ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- Full-text search match (priority 6)
     SELECT accession, title, abstract AS summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 5 AS priority
+           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 6 AS priority
     FROM sra_studies, q
     WHERE tsv @@ q.q
 ),
@@ -117,7 +156,26 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, rank, source, total_count,
+    (SELECT jsonb_build_object(
+        'organization', sub.center_name,
+        'formatted_address', COALESCE(sg.formatted_address, eg.formatted_address),
+        'latitude', COALESCE(sg.latitude, eg.latitude),
+        'longitude', COALESCE(sg.longitude, eg.longitude),
+        'city', COALESCE(sg.city, eg.city),
+        'district', COALESCE(sg.district, eg.district),
+        'state', COALESCE(sg.state, eg.state),
+        'postcode', COALESCE(sg.postcode, eg.postcode),
+        'country', COALESCE(sg.country, eg.country),
+        'country_code', sg.country_code,
+        'place_name', sg.place_name
+     )
+     FROM sra_studies s2
+     JOIN sra_submissions sub ON sub.accession = s2.submission
+     LEFT JOIN sra_geocode sg ON sg.center_name = sub.center_name
+     LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
+     WHERE s2.accession = paged.accession
+    ) AS center
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -146,9 +204,18 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 3)
+    -- Organization name match (priority 3)
+    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 3 AS priority
+    FROM arrayexpress_experiments e
+    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    WHERE org->>'name' ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- Full-text search match (priority 4)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 3 AS priority
+           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 4 AS priority
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
 ),
@@ -167,7 +234,24 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, rank, source, total_count,
+    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+        'organization', aeg.organization,
+        'formatted_address', aeg.geo_formatted_address,
+        'latitude', aeg.geo_latitude,
+        'longitude', aeg.geo_longitude,
+        'city', aeg.geo_city,
+        'district', aeg.geo_district,
+        'state', aeg.geo_state,
+        'postcode', aeg.geo_postcode,
+        'country', aeg.geo_country,
+        'place_name', aeg.geo_place_name
+     ))
+     FROM arrayexpress_experiments ae2
+     CROSS JOIN LATERAL jsonb_array_elements(ae2.organizations) AS org
+     LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
+     WHERE ae2.accession = paged.accession
+    ) AS center
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -245,36 +329,56 @@ all_matches AS (
 
     UNION ALL
 
-    -- GEO full-text search (priority 8)
+    -- SRA/ENA submission center name match (priority 8)
+    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+           50.0::float8 AS rank, 'sra'::text AS source, 8 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_submissions sub
+    JOIN sra_studies s ON s.submission = sub.accession
+    WHERE sub.center_name ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- GEO contributor organization match (priority 9)
+    SELECT DISTINCT g.accession, g.title, g.summary, g.updated_at, g.organisms,
+           50.0::float8 AS rank, 'geo'::text AS source, 9 AS priority,
+           g.accession AS dedup_key
+    FROM geo_contributors c
+    JOIN geo_series g ON g.accession = c.accession
+    WHERE c.organization ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- GEO full-text search (priority 10)
     SELECT accession, title, summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 8 AS priority,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 10 AS priority,
            accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
 
     UNION ALL
 
-    -- SRA full-text search (priority 9, lower rank multiplier)
+    -- SRA full-text search (priority 11, lower rank multiplier)
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 9 AS priority,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 11 AS priority,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
 
     UNION ALL
 
-    -- ArrayExpress exact accession match (priority 10)
+    -- ArrayExpress exact accession match (priority 12)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 10 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments
     WHERE UPPER(accession) = UPPER(%s)
 
     UNION ALL
 
-    -- ArrayExpress ENA experiment/run match (priority 11)
+    -- ArrayExpress ENA experiment/run match (priority 13)
     SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_samples s
     JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
@@ -282,9 +386,19 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress full-text search (priority 12)
+    -- ArrayExpress organization name match (priority 14)
+    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
+           e.accession AS dedup_key
+    FROM arrayexpress_experiments e
+    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    WHERE org->>'name' ILIKE '%%' || %s || '%%'
+
+    UNION ALL
+
+    -- ArrayExpress full-text search (priority 15)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 15 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
@@ -304,7 +418,69 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, rank, source, total_count,
+    CASE
+        WHEN source = 'geo' THEN (
+            SELECT jsonb_agg(DISTINCT jsonb_build_object(
+                'organization', c.organization,
+                'department', c.department,
+                'formatted_address', gc.geo_formatted_address,
+                'latitude', gc.geo_latitude,
+                'longitude', gc.geo_longitude,
+                'city', gc.geo_city,
+                'district', gc.geo_district,
+                'state', gc.geo_state,
+                'postcode', gc.geo_postcode,
+                'country', gc.geo_country,
+                'country_code', gc.geo_country_code,
+                'place_name', gc.geo_place_name
+            ))
+            FROM geo_contributors c
+            LEFT JOIN geo_geocode gc ON gc.address_key =
+                c.organization || '|' || COALESCE(c.department,'') || '|' ||
+                COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
+                COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
+            WHERE c.accession = paged.accession
+        )
+        WHEN source = 'sra' THEN (
+            SELECT jsonb_build_object(
+                'organization', sub.center_name,
+                'formatted_address', COALESCE(sg.formatted_address, eg.formatted_address),
+                'latitude', COALESCE(sg.latitude, eg.latitude),
+                'longitude', COALESCE(sg.longitude, eg.longitude),
+                'city', COALESCE(sg.city, eg.city),
+                'district', COALESCE(sg.district, eg.district),
+                'state', COALESCE(sg.state, eg.state),
+                'postcode', COALESCE(sg.postcode, eg.postcode),
+                'country', COALESCE(sg.country, eg.country),
+                'country_code', sg.country_code,
+                'place_name', sg.place_name
+            )
+            FROM sra_studies s2
+            JOIN sra_submissions sub ON sub.accession = s2.submission
+            LEFT JOIN sra_geocode sg ON sg.center_name = sub.center_name
+            LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
+            WHERE s2.accession = paged.accession
+        )
+        WHEN source = 'arrayexpress' THEN (
+            SELECT jsonb_agg(DISTINCT jsonb_build_object(
+                'organization', aeg.organization,
+                'formatted_address', aeg.geo_formatted_address,
+                'latitude', aeg.geo_latitude,
+                'longitude', aeg.geo_longitude,
+                'city', aeg.geo_city,
+                'district', aeg.geo_district,
+                'state', aeg.geo_state,
+                'postcode', aeg.geo_postcode,
+                'country', aeg.geo_country,
+                'place_name', aeg.geo_place_name
+            ))
+            FROM arrayexpress_experiments ae2
+            CROSS JOIN LATERAL jsonb_array_elements(ae2.organizations) AS org
+            LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
+            WHERE ae2.accession = paged.accession
+        )
+    END AS center
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -346,9 +522,20 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 4)
+    -- Contributor organization match (priority 4)
+    SELECT DISTINCT g.accession,
+           50.0::float8 AS rank, 'geo'::text AS source, 4 AS priority
+    FROM geo_contributors c
+    JOIN geo_series g ON g.accession = c.accession
+    WHERE c.organization ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 5)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 5 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
@@ -415,9 +602,20 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 5)
+    -- Submission center name match (priority 5)
+    SELECT DISTINCT s.accession,
+           50.0::float8 AS rank, 'sra'::text AS source, 5 AS priority
+    FROM sra_submissions sub
+    JOIN sra_studies s ON s.submission = sub.accession
+    WHERE sub.center_name ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 6)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 5 AS priority
+           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 6 AS priority
     FROM sra_studies, q
     WHERE tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
@@ -522,9 +720,33 @@ all_matches AS (
 
     UNION ALL
 
-    -- GEO full-text search (priority 8)
+    -- SRA/ENA submission center name match (priority 8)
+    SELECT DISTINCT s.accession,
+           50.0::float8 AS rank, 'sra'::text AS source, 8 AS priority,
+           COALESCE(s.alias, s.accession) AS dedup_key
+    FROM sra_submissions sub
+    JOIN sra_studies s ON s.submission = sub.accession
+    WHERE sub.center_name ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM s.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GEO contributor organization match (priority 9)
+    SELECT DISTINCT g.accession,
+           50.0::float8 AS rank, 'geo'::text AS source, 9 AS priority,
+           g.accession AS dedup_key
+    FROM geo_contributors c
+    JOIN geo_series g ON g.accession = c.accession
+    WHERE c.organization ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
+
+    UNION ALL
+
+    -- GEO full-text search (priority 10)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 8 AS priority,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 10 AS priority,
            accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
@@ -533,9 +755,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- SRA full-text search (priority 9, lower rank multiplier)
+    -- SRA full-text search (priority 11, lower rank multiplier)
     SELECT s.accession,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 9 AS priority,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 11 AS priority,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
@@ -544,9 +766,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress exact accession match (priority 10)
+    -- ArrayExpress exact accession match (priority 12)
     SELECT accession,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 10 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments
     WHERE UPPER(accession) = UPPER(%s)
@@ -555,9 +777,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress ENA experiment/run match (priority 11)
+    -- ArrayExpress ENA experiment/run match (priority 13)
     SELECT DISTINCT e.accession,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_samples s
     JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
@@ -567,9 +789,21 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress full-text search (priority 12)
+    -- ArrayExpress organization name match (priority 14)
+    SELECT DISTINCT e.accession,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
+           e.accession AS dedup_key
+    FROM arrayexpress_experiments e
+    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    WHERE org->>'name' ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
+
+    UNION ALL
+
+    -- ArrayExpress full-text search (priority 15)
     SELECT accession,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 15 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
@@ -607,28 +841,65 @@ SELECT
     coords_2d,
     coords_3d,
     neighbors,
-    organisms
+    organisms,
+    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+        'organization', c.organization,
+        'department', c.department,
+        'formatted_address', gc.geo_formatted_address,
+        'latitude', gc.geo_latitude,
+        'longitude', gc.geo_longitude,
+        'city', gc.geo_city,
+        'district', gc.geo_district,
+        'state', gc.geo_state,
+        'postcode', gc.geo_postcode,
+        'country', gc.geo_country,
+        'country_code', gc.geo_country_code,
+        'place_name', gc.geo_place_name
+     ))
+     FROM geo_contributors c
+     LEFT JOIN geo_geocode gc ON gc.address_key =
+        c.organization || '|' || COALESCE(c.department,'') || '|' ||
+        COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
+        COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
+     WHERE c.accession = geo_series.accession
+    ) AS center
 FROM geo_series
 WHERE accession = %s;
 """
 PROJECT_SRA_SQL = """
 SELECT
-    accession,
-    alias,
-    title,
-    abstract,
-    submission,
-    study_type,
-    external_id,
-    links,
-    published_at,
-    updated_at,
-    coords_2d,
-    coords_3d,
-    neighbors,
-    organisms
-FROM sra_studies
-WHERE accession = %s;
+    s.accession,
+    s.alias,
+    s.title,
+    s.abstract,
+    s.submission,
+    s.study_type,
+    s.external_id,
+    s.links,
+    s.published_at,
+    s.updated_at,
+    s.coords_2d,
+    s.coords_3d,
+    s.neighbors,
+    s.organisms,
+    jsonb_build_object(
+        'organization', sub.center_name,
+        'formatted_address', COALESCE(sg.formatted_address, eg.formatted_address),
+        'latitude', COALESCE(sg.latitude, eg.latitude),
+        'longitude', COALESCE(sg.longitude, eg.longitude),
+        'city', COALESCE(sg.city, eg.city),
+        'district', COALESCE(sg.district, eg.district),
+        'state', COALESCE(sg.state, eg.state),
+        'postcode', COALESCE(sg.postcode, eg.postcode),
+        'country', COALESCE(sg.country, eg.country),
+        'country_code', sg.country_code,
+        'place_name', sg.place_name
+    ) AS center
+FROM sra_studies s
+LEFT JOIN sra_submissions sub ON sub.accession = s.submission
+LEFT JOIN sra_geocode sg ON sg.center_name = sub.center_name
+LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
+WHERE s.accession = %s;
 """
 
 STUDY_EXPERIMENTS_SQL = """
@@ -727,16 +998,16 @@ LIMIT 1;
 
 PROJECT_AE_SQL = """
 SELECT
-    accession,
-    title,
-    description AS summary,
-    protocols_description AS overall_design,
-    organisms,
-    CASE WHEN pubmed_id IS NOT NULL THEN ARRAY[pubmed_id] ELSE NULL END AS pubmed_id,
+    ae.accession,
+    ae.title,
+    ae.description AS summary,
+    ae.protocols_description AS overall_design,
+    ae.organisms,
+    CASE WHEN ae.pubmed_id IS NOT NULL THEN ARRAY[ae.pubmed_id] ELSE NULL END AS pubmed_id,
     NULL AS samples_ref,
-    study_type AS series_type,
+    ae.study_type AS series_type,
     CASE
-        WHEN external_links IS NOT NULL THEN
+        WHEN ae.external_links IS NOT NULL THEN
             (SELECT jsonb_agg(
                 jsonb_build_object(
                     '@type',
@@ -755,29 +1026,44 @@ SELECT
                     END
                 )
             )
-            FROM jsonb_array_elements(external_links) AS link)
+            FROM jsonb_array_elements(ae.external_links) AS link)
         ELSE NULL
     END AS relation,
-    processed_data_files AS supplementary_data,
-    release_date AS published_at,
-    release_date AS updated_at,
+    ae.processed_data_files AS supplementary_data,
+    ae.release_date AS published_at,
+    ae.release_date AS updated_at,
     NULL::real[] AS coords_2d,
     NULL::real[] AS coords_3d,
     NULL::jsonb AS neighbors,
     NULL AS alias,
-    publication_title,
-    publication_authors,
-    publication_doi,
-    external_links,
-    experimental_factors_detail,
-    authors,
-    organizations,
-    assay_count,
-    technology,
-    assay_by_molecule,
-    minseqe_score
-FROM arrayexpress_experiments
-WHERE accession = %s;
+    ae.publication_title,
+    ae.publication_authors,
+    ae.publication_doi,
+    ae.external_links,
+    ae.experimental_factors_detail,
+    ae.authors,
+    ae.organizations,
+    ae.assay_count,
+    ae.technology,
+    ae.assay_by_molecule,
+    ae.minseqe_score,
+    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+        'organization', aeg.organization,
+        'formatted_address', aeg.geo_formatted_address,
+        'latitude', aeg.geo_latitude,
+        'longitude', aeg.geo_longitude,
+        'city', aeg.geo_city,
+        'district', aeg.geo_district,
+        'state', aeg.geo_state,
+        'postcode', aeg.geo_postcode,
+        'country', aeg.geo_country,
+        'place_name', aeg.geo_place_name
+     ))
+     FROM jsonb_array_elements(ae.organizations) AS org
+     LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
+    ) AS center
+FROM arrayexpress_experiments ae
+WHERE ae.accession = %s;
 """
 
 AE_EXPERIMENT_SAMPLES_SQL = """
@@ -827,9 +1113,20 @@ all_matches AS (
 
     UNION ALL
 
-    -- Full-text search match (priority 3)
+    -- Organization name match (priority 3)
+    SELECT DISTINCT e.accession,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 3 AS priority
+    FROM arrayexpress_experiments e
+    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    WHERE org->>'name' ILIKE '%%' || %s || '%%'
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
+      AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
+
+    UNION ALL
+
+    -- Full-text search match (priority 4)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 3 AS priority
+           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 4 AS priority
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)

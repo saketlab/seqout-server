@@ -123,6 +123,7 @@ ADD COLUMN IF NOT EXISTS tsv tsvector
 GENERATED ALWAYS AS (
     setweight(to_tsvector('english', coalesce(title,'')),    'A') ||
     setweight(to_tsvector('english', coalesce(abstract,'')), 'B') ||
+    setweight(to_tsvector('english', coalesce(center_project_name,'')), 'C') ||
     setweight(to_tsvector('english', coalesce(study_type,'')),'D')
 ) STORED;
 
