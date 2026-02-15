@@ -568,7 +568,7 @@ def search_geo(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    GEO_SEARCH_SQL, (q, q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
+                    GEO_SEARCH_SQL, (q, q, q, q, cursor_rank, cursor_rank, cursor_acc)
                 )
                 rows = cur.fetchall()
     except Exception as e:
@@ -711,7 +711,6 @@ def search(
                 cur.execute(
                     SEARCH_SQL,
                     (
-                        q,
                         q,
                         q,
                         q,
@@ -1166,8 +1165,6 @@ def download_by_query(
         params.extend([q, *yp])
         params.extend([q, *yp])
         params.extend([q, *yp])
-        # Contributor org match
-        params.extend([q, *yp])
         params.extend(yp)
     elif db == "sra":
         sql = SRA_QUERY_ACCESSIONS_SQL
@@ -1199,8 +1196,7 @@ def download_by_query(
         params.extend([q, *yp])
         params.extend([q, *yp])
         params.extend([q, *yp])
-        # SRA/ENA center name match, GEO contributor org match
-        params.extend([q, *yp])
+        # SRA/ENA center name match
         params.extend([q, *yp])
         # GEO FTS, SRA FTS
         params.extend(yp)

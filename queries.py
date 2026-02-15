@@ -29,18 +29,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- Contributor organization match (priority 4)
-    SELECT DISTINCT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           50.0::float8 AS rank, 'geo'::text AS source, 4 AS priority
-    FROM geo_contributors c
-    JOIN geo_series g ON g.accession = c.accession
-    WHERE c.organization ILIKE '%%' || %s || '%%'
-
-    UNION ALL
-
-    -- Full-text search match (priority 5)
+    -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 5 AS priority
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
 ),
@@ -339,46 +330,36 @@ all_matches AS (
 
     UNION ALL
 
-    -- GEO contributor organization match (priority 9)
-    SELECT DISTINCT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           50.0::float8 AS rank, 'geo'::text AS source, 9 AS priority,
-           g.accession AS dedup_key
-    FROM geo_contributors c
-    JOIN geo_series g ON g.accession = c.accession
-    WHERE c.organization ILIKE '%%' || %s || '%%'
-
-    UNION ALL
-
-    -- GEO full-text search (priority 10)
+    -- GEO full-text search (priority 9; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 10 AS priority,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 9 AS priority,
            accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
 
     UNION ALL
 
-    -- SRA full-text search (priority 11, lower rank multiplier)
+    -- SRA full-text search (priority 10, lower rank multiplier)
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 11 AS priority,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 10 AS priority,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
 
     UNION ALL
 
-    -- ArrayExpress exact accession match (priority 12)
+    -- ArrayExpress exact accession match (priority 11)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments
     WHERE UPPER(accession) = UPPER(%s)
 
     UNION ALL
 
-    -- ArrayExpress ENA experiment/run match (priority 13)
+    -- ArrayExpress ENA experiment/run match (priority 12)
     SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_samples s
     JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
@@ -386,9 +367,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress organization name match (priority 14)
+    -- ArrayExpress organization name match (priority 13)
     SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           50.0::float8 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_experiments e
     CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
@@ -396,9 +377,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress full-text search (priority 15)
+    -- ArrayExpress full-text search (priority 14)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 15 AS priority,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
@@ -522,20 +503,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- Contributor organization match (priority 4)
-    SELECT DISTINCT g.accession,
-           50.0::float8 AS rank, 'geo'::text AS source, 4 AS priority
-    FROM geo_contributors c
-    JOIN geo_series g ON g.accession = c.accession
-    WHERE c.organization ILIKE '%%' || %s || '%%'
-      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
-      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
-
-    UNION ALL
-
-    -- Full-text search match (priority 5)
+    -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 5 AS priority
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM updated_at) >= %s::int)
@@ -732,21 +702,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- GEO contributor organization match (priority 9)
-    SELECT DISTINCT g.accession,
-           50.0::float8 AS rank, 'geo'::text AS source, 9 AS priority,
-           g.accession AS dedup_key
-    FROM geo_contributors c
-    JOIN geo_series g ON g.accession = c.accession
-    WHERE c.organization ILIKE '%%' || %s || '%%'
-      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) >= %s::int)
-      AND (%s::int IS NULL OR EXTRACT(YEAR FROM g.updated_at) <= %s::int)
-
-    UNION ALL
-
-    -- GEO full-text search (priority 10)
+    -- GEO full-text search (priority 9; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 10 AS priority,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 9 AS priority,
            accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
@@ -755,9 +713,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- SRA full-text search (priority 11, lower rank multiplier)
+    -- SRA full-text search (priority 10, lower rank multiplier)
     SELECT s.accession,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 11 AS priority,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 10 AS priority,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
@@ -766,9 +724,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress exact accession match (priority 12)
+    -- ArrayExpress exact accession match (priority 11)
     SELECT accession,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments
     WHERE UPPER(accession) = UPPER(%s)
@@ -777,9 +735,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress ENA experiment/run match (priority 13)
+    -- ArrayExpress ENA experiment/run match (priority 12)
     SELECT DISTINCT e.accession,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
+           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_samples s
     JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
@@ -789,9 +747,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress organization name match (priority 14)
+    -- ArrayExpress organization name match (priority 13)
     SELECT DISTINCT e.accession,
-           50.0::float8 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
+           50.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
            e.accession AS dedup_key
     FROM arrayexpress_experiments e
     CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
@@ -801,9 +759,9 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress full-text search (priority 15)
+    -- ArrayExpress full-text search (priority 14)
     SELECT accession,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 15 AS priority,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
            accession AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
