@@ -5,30 +5,6 @@ WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
 all_matches AS (
-    -- Exact accession match (priority 1)
-    SELECT accession, title, summary, updated_at, organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority
-    FROM geo_series
-    WHERE UPPER(accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- GSM sample match (priority 2) - uses GIN index
-    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority
-    FROM geo_series g
-    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
-
-    UNION ALL
-
-    -- PRJNA bioproject match (priority 3)
-    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority
-    FROM geo_series g
-    WHERE UPPER(g.bioproject_id) = UPPER(%s)
-
-    UNION ALL
-
     -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms,
            ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
@@ -83,49 +59,6 @@ WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
 all_matches AS (
-    -- Exact SRP/ERP/DRP accession match (priority 1)
-    SELECT accession, title, abstract AS summary, updated_at, organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 1 AS priority
-    FROM sra_studies
-    WHERE UPPER(accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRX/ERX/DRX experiment match (priority 2)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 2 AS priority
-    FROM sra_experiments e
-    JOIN sra_studies s ON s.accession = e.study
-    WHERE UPPER(e.accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- PRJNA alias match (priority 3)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 3 AS priority
-    FROM sra_studies s
-    WHERE UPPER(s.alias) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRS/ERS/DRS sample match (priority 4) - uses GIN index
-    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority
-    FROM sra_experiments e
-    JOIN sra_studies s ON s.accession = e.study
-    WHERE e.samples @> ARRAY[UPPER(%s)]
-
-    UNION ALL
-
-    -- Submission center name match (priority 5)
-    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           50.0::float8 AS rank, 'sra'::text AS source, 5 AS priority
-    FROM sra_submissions sub
-    JOIN sra_studies s ON s.submission = sub.accession
-    WHERE sub.center_name ILIKE '%%' || %s || '%%'
-
-    UNION ALL
-
     -- Full-text search match (priority 6)
     SELECT accession, title, abstract AS summary, updated_at, organisms,
            ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 6 AS priority
@@ -178,32 +111,6 @@ WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
 all_matches AS (
-    -- Exact accession match (priority 1)
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 1 AS priority
-    FROM arrayexpress_experiments
-    WHERE UPPER(accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- ENA experiment/run match (priority 2) - find parent experiment via samples
-    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 2 AS priority
-    FROM arrayexpress_samples s
-    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
-    WHERE UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s)
-
-    UNION ALL
-
-    -- Organization name match (priority 3)
-    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           50.0::float8 AS rank, 'arrayexpress'::text AS source, 3 AS priority
-    FROM arrayexpress_experiments e
-    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
-    WHERE org->>'name' ILIKE '%%' || %s || '%%'
-
-    UNION ALL
-
     -- Full-text search match (priority 4)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
            ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 4 AS priority
@@ -254,82 +161,6 @@ WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
 all_matches AS (
-    -- GEO exact accession match (priority 1)
-    SELECT accession, title, summary, updated_at, organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 1 AS priority,
-           accession AS dedup_key
-    FROM geo_series
-    WHERE UPPER(accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- GEO GSM sample match (priority 2) - uses GIN index
-    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 2 AS priority,
-           g.accession AS dedup_key
-    FROM geo_series g
-    WHERE g.samples_ref @> ARRAY[UPPER(%s)]
-
-    UNION ALL
-
-    -- GEO PRJNA bioproject match (priority 3)
-    SELECT g.accession, g.title, g.summary, g.updated_at, g.organisms,
-           100.0::float8 AS rank, 'geo'::text AS source, 3 AS priority,
-           g.accession AS dedup_key
-    FROM geo_series g
-    WHERE UPPER(g.bioproject_id) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRA exact accession match (priority 4)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 4 AS priority,
-           COALESCE(s.alias, s.accession) AS dedup_key
-    FROM sra_studies s
-    WHERE UPPER(s.accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRA SRX experiment match (priority 5)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 5 AS priority,
-           COALESCE(s.alias, s.accession) AS dedup_key
-    FROM sra_experiments e
-    JOIN sra_studies s ON s.accession = e.study
-    WHERE UPPER(e.accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRA PRJNA alias match (priority 6)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 6 AS priority,
-           COALESCE(s.alias, s.accession) AS dedup_key
-    FROM sra_studies s
-    WHERE UPPER(s.alias) = UPPER(%s)
-
-    UNION ALL
-
-    -- SRA SRS sample match (priority 7) - uses GIN index
-    SELECT DISTINCT ON (s.accession)
-           s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           100.0::float8 AS rank, 'sra'::text AS source, 7 AS priority,
-           COALESCE(s.alias, s.accession) AS dedup_key
-    FROM sra_experiments e
-    JOIN sra_studies s ON s.accession = e.study
-    WHERE e.samples @> ARRAY[UPPER(%s)]
-
-    UNION ALL
-
-    -- SRA/ENA submission center name match (priority 8)
-    SELECT DISTINCT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           50.0::float8 AS rank, 'sra'::text AS source, 8 AS priority,
-           COALESCE(s.alias, s.accession) AS dedup_key
-    FROM sra_submissions sub
-    JOIN sra_studies s ON s.submission = sub.accession
-    WHERE sub.center_name ILIKE '%%' || %s || '%%'
-
-    UNION ALL
-
     -- GEO full-text search (priority 9; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms,
            ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 9 AS priority,
@@ -345,35 +176,6 @@ all_matches AS (
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
-
-    UNION ALL
-
-    -- ArrayExpress exact accession match (priority 11)
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
-           accession AS dedup_key
-    FROM arrayexpress_experiments
-    WHERE UPPER(accession) = UPPER(%s)
-
-    UNION ALL
-
-    -- ArrayExpress ENA experiment/run match (priority 12)
-    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
-           e.accession AS dedup_key
-    FROM arrayexpress_samples s
-    JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
-    WHERE UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s)
-
-    UNION ALL
-
-    -- ArrayExpress organization name match (priority 13)
-    SELECT DISTINCT e.accession, e.title, e.description AS summary, e.release_date AS updated_at, e.organisms,
-           50.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
-           e.accession AS dedup_key
-    FROM arrayexpress_experiments e
-    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
-    WHERE org->>'name' ILIKE '%%' || %s || '%%'
 
     UNION ALL
 
