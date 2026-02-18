@@ -26,28 +26,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count,
-    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
-        'organization', c.organization,
-        'department', c.department,
-        'formatted_address', gc.geo_formatted_address,
-        'latitude', gc.geo_latitude,
-        'longitude', gc.geo_longitude,
-        'city', gc.geo_city,
-        'district', gc.geo_district,
-        'state', gc.geo_state,
-        'postcode', gc.geo_postcode,
-        'country', gc.geo_country,
-        'country_code', gc.geo_country_code,
-        'place_name', gc.geo_place_name
-     ))
-     FROM geo_contributors c
-     LEFT JOIN geo_geocode gc ON gc.address_key =
-        c.organization || '|' || COALESCE(c.department,'') || '|' ||
-        COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
-        COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
-     WHERE c.accession = paged.accession
-    ) AS center
+    accession, title, summary, updated_at, organisms, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -80,26 +59,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count,
-    (SELECT jsonb_build_object(
-        'organization', sub.center_name,
-        'formatted_address', COALESCE(sg.formatted_address, eg.formatted_address),
-        'latitude', COALESCE(sg.latitude, eg.latitude),
-        'longitude', COALESCE(sg.longitude, eg.longitude),
-        'city', COALESCE(sg.city, eg.city),
-        'district', COALESCE(sg.district, eg.district),
-        'state', COALESCE(sg.state, eg.state),
-        'postcode', COALESCE(sg.postcode, eg.postcode),
-        'country', COALESCE(sg.country, eg.country),
-        'country_code', sg.country_code,
-        'place_name', sg.place_name
-     )
-     FROM sra_studies s2
-     JOIN sra_submissions sub ON sub.accession = s2.submission
-     LEFT JOIN sra_geocode sg ON sg.center_name = sub.center_name
-     LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
-     WHERE s2.accession = paged.accession
-    ) AS center
+    accession, title, summary, updated_at, organisms, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -132,24 +92,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count,
-    (SELECT jsonb_agg(DISTINCT jsonb_build_object(
-        'organization', aeg.organization,
-        'formatted_address', aeg.geo_formatted_address,
-        'latitude', aeg.geo_latitude,
-        'longitude', aeg.geo_longitude,
-        'city', aeg.geo_city,
-        'district', aeg.geo_district,
-        'state', aeg.geo_state,
-        'postcode', aeg.geo_postcode,
-        'country', aeg.geo_country,
-        'place_name', aeg.geo_place_name
-     ))
-     FROM arrayexpress_experiments ae2
-     CROSS JOIN LATERAL jsonb_array_elements(ae2.organizations) AS org
-     LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
-     WHERE ae2.accession = paged.accession
-    ) AS center
+    accession, title, summary, updated_at, organisms, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -161,27 +104,27 @@ WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
 ),
 all_matches AS (
-    -- GEO full-text search (priority 9; includes contributors/departments/organizations in geo_series.tsv)
+    -- GEO full-text search (includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 9 AS priority,
+           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,
            accession AS dedup_key
     FROM geo_series, q
     WHERE tsv @@ q.q
 
     UNION ALL
 
-    -- SRA full-text search (priority 10, lower rank multiplier)
+    -- SRA full-text search (lower rank multiplier)
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source, 10 AS priority,
+           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
     WHERE s.tsv @@ q.q
 
     UNION ALL
 
-    -- ArrayExpress full-text search (priority 14)
+    -- ArrayExpress full-text search
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,
            accession AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
@@ -190,7 +133,7 @@ deduped AS (
     SELECT DISTINCT ON (dedup_key)
         accession, title, summary, updated_at, organisms, rank, source
     FROM all_matches
-    ORDER BY dedup_key, priority, rank DESC
+    ORDER BY dedup_key, rank DESC
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM deduped
@@ -201,69 +144,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count,
-    CASE
-        WHEN source = 'geo' THEN (
-            SELECT jsonb_agg(DISTINCT jsonb_build_object(
-                'organization', c.organization,
-                'department', c.department,
-                'formatted_address', gc.geo_formatted_address,
-                'latitude', gc.geo_latitude,
-                'longitude', gc.geo_longitude,
-                'city', gc.geo_city,
-                'district', gc.geo_district,
-                'state', gc.geo_state,
-                'postcode', gc.geo_postcode,
-                'country', gc.geo_country,
-                'country_code', gc.geo_country_code,
-                'place_name', gc.geo_place_name
-            ))
-            FROM geo_contributors c
-            LEFT JOIN geo_geocode gc ON gc.address_key =
-                c.organization || '|' || COALESCE(c.department,'') || '|' ||
-                COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
-                COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
-            WHERE c.accession = paged.accession
-        )
-        WHEN source = 'sra' THEN (
-            SELECT jsonb_build_object(
-                'organization', sub.center_name,
-                'formatted_address', COALESCE(sg.formatted_address, eg.formatted_address),
-                'latitude', COALESCE(sg.latitude, eg.latitude),
-                'longitude', COALESCE(sg.longitude, eg.longitude),
-                'city', COALESCE(sg.city, eg.city),
-                'district', COALESCE(sg.district, eg.district),
-                'state', COALESCE(sg.state, eg.state),
-                'postcode', COALESCE(sg.postcode, eg.postcode),
-                'country', COALESCE(sg.country, eg.country),
-                'country_code', sg.country_code,
-                'place_name', sg.place_name
-            )
-            FROM sra_studies s2
-            JOIN sra_submissions sub ON sub.accession = s2.submission
-            LEFT JOIN sra_geocode sg ON sg.center_name = sub.center_name
-            LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
-            WHERE s2.accession = paged.accession
-        )
-        WHEN source = 'arrayexpress' THEN (
-            SELECT jsonb_agg(DISTINCT jsonb_build_object(
-                'organization', aeg.organization,
-                'formatted_address', aeg.geo_formatted_address,
-                'latitude', aeg.geo_latitude,
-                'longitude', aeg.geo_longitude,
-                'city', aeg.geo_city,
-                'district', aeg.geo_district,
-                'state', aeg.geo_state,
-                'postcode', aeg.geo_postcode,
-                'country', aeg.geo_country,
-                'place_name', aeg.geo_place_name
-            ))
-            FROM arrayexpress_experiments ae2
-            CROSS JOIN LATERAL jsonb_array_elements(ae2.organizations) AS org
-            LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
-            WHERE ae2.accession = paged.accession
-        )
-    END AS center
+    accession, title, summary, updated_at, organisms, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
