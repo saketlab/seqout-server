@@ -11,14 +11,8 @@ all_matches AS (
     FROM geo_series, q
     WHERE tsv @@ q.q
 ),
-deduped AS (
-    SELECT DISTINCT ON (accession)
-        accession, title, summary, updated_at, organisms, rank, source
-    FROM all_matches
-    ORDER BY accession, priority, rank DESC
-),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -44,14 +38,8 @@ all_matches AS (
     FROM sra_studies, q
     WHERE tsv @@ q.q
 ),
-deduped AS (
-    SELECT DISTINCT ON (accession)
-        accession, title, summary, updated_at, organisms, rank, source
-    FROM all_matches
-    ORDER BY accession, priority, rank DESC
-),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -77,14 +65,8 @@ all_matches AS (
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
 ),
-deduped AS (
-    SELECT DISTINCT ON (accession)
-        accession, title, summary, updated_at, organisms, rank, source
-    FROM all_matches
-    ORDER BY accession, priority, rank DESC
-),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
