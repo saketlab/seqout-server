@@ -709,6 +709,7 @@ WHERE ae.accession = %s;
 
 AE_EXPERIMENT_SAMPLES_SQL = """
 SELECT
+    id,
     experiment_accession,
     source_name,
     organism,

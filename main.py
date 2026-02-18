@@ -167,6 +167,7 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
     ]
 
     return {
+        "id": sample.get("id"),
         "accession": sample.get("ena_run")
         or sample.get("ena_experiment")
         or sample.get("source_name"),
