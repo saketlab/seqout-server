@@ -1372,12 +1372,30 @@ If NO → Proceed with the search.
 A new search is ONLY appropriate when the user requests a genuinely new topic
 that cannot be answered by filtering, summarizing, or analyzing existing results.
 
-Filtering, narrowing, subsetting, or summarizing existing results should NEVER
-trigger a new search. The `title`, `summary`, `organisms`, `updated_at`, and
-`source` fields contain all information needed for client-side filtering.
+### What counts as filtering (NEVER re-search for these)
 
-For pagination (more results from same query), use cursor parameters
-(`cursor_rank`, `cursor_acc`) instead of re-searching.
+- Narrowing by keyword: "show only liver results" → check `title` and `summary` fields
+  for the keyword.
+- Narrowing by organism: "only human studies" → check `organisms` array.
+- Narrowing by source: "only GEO" → check `source` field.
+- Narrowing by date: "after 2020" → check `updated_at` field.
+- Summarizing, counting, or comparing existing results.
+
+All of these are client-side operations on data you already have. Use `title`,
+`summary`, `organisms`, `updated_at`, and `source` fields.
+
+### Paginate-and-filter pattern
+
+Each search returns up to 20 results, a `total` count, and a `next_cursor`.
+When the user asks to filter and the current page has few or no matches:
+
+1. Check `total` — if it's much larger than results seen so far, more pages exist.
+2. Call `search_all` again with the **SAME `q`** parameter plus `cursor_rank` and
+   `cursor_acc` from `next_cursor` to fetch the next page.
+3. Filter that page. Repeat until you find enough matches or exhaust results.
+
+This is NOT a new search — it is pagination of the original query. The `q` parameter
+must stay the same. Only `cursor_rank` and `cursor_acc` change.
 
 ## Data hierarchy
 
