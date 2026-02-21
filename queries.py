@@ -960,22 +960,23 @@ def build_structured_search(
             )
         if center:
             w.append("es.center_name ILIKE '%%' || %(center)s || '%%'")
+        ena_date = "NULLIF(es.first_public, '')::date"
         if year_from is not None:
-            w.append("es.first_public::date >= make_date(%(year_from)s, 1, 1)")
+            w.append(f"{ena_date} >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
-            w.append("es.first_public::date <= make_date(%(year_to)s, 12, 31)")
+            w.append(f"{ena_date} <= make_date(%(year_to)s, 12, 31)")
 
         rank = (
             f"ts_rank({ena_tsv}," f" plainto_tsquery('english', %(q)s)) * 0.7"
             if q
-            else "COALESCE(EXTRACT(EPOCH FROM es.first_public::date), 0)"
+            else f"COALESCE(EXTRACT(EPOCH FROM {ena_date}), 0)"
         )
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT es.study_accession AS accession,"
             f" es.study_title AS title,"
             f" es.study_description AS summary,"
-            f" es.first_public::date AS updated_at,"
+            f" {ena_date} AS updated_at,"
             f" CASE WHEN es.scientific_name IS NOT NULL"
             f" THEN ARRAY[es.scientific_name] END AS organisms,"
             f" {rank} AS rank, 'ena'::text AS source,"

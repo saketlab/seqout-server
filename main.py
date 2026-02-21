@@ -1413,9 +1413,18 @@ def search_structured(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET LOCAL statement_timeout = '30s'")
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-    except Exception:
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "canceling statement" in err_msg or "timeout" in err_msg:
+            logger.warning("search_structured timed out: %s", params)
+            raise HTTPException(
+                504,
+                "Query timed out. Try narrowing your search with more filters, "
+                "adding a text query (q=), or restricting to a single source.",
+            )
         logger.exception("Database error in search_structured")
         raise HTTPException(500, "Internal server error")
 
@@ -1438,17 +1447,17 @@ def search_structured(
 
 
 @api_app.get(
-    "/project/{accession}/related",
-    summary="Find related projects across archives",
+    "/project/{accession}/xref",
+    summary="Cross-reference lookup across archives",
     description=(
-        "Discover related studies across GEO, SRA, ArrayExpress and ENA by following "
-        "cross-reference links, SRA aliases, and E-GEOD naming conventions. "
-        "Returns {accession: string, related: [{accession, link_type, source}]}."
+        "Discover cross-references for a study across GEO, SRA, ArrayExpress and ENA "
+        "by following cross-reference links, SRA aliases, and E-GEOD naming conventions. "
+        "Returns {accession: string, xref: [{accession, link_type, source}]}."
     ),
-    operation_id="get_related_projects",
+    operation_id="get_project_xref",
 )
 @limiter.limit("100/minute")
-def get_related_projects(
+def get_project_xref(
     request: Request,
     accession: str = Path(...),
 ):
@@ -1459,7 +1468,7 @@ def get_related_projects(
                 cur.execute(RELATED_SQL, {"acc": accession})
                 rows = cur.fetchall()
     except Exception:
-        logger.exception("Database error in get_related_projects")
+        logger.exception("Database error in get_project_xref")
         raise HTTPException(500, "Internal server error")
 
     # Deduplicate by accession (keep first occurrence)
@@ -1471,7 +1480,7 @@ def get_related_projects(
             seen.add(acc)
             unique.append(row)
 
-    return {"accession": accession, "related": unique}
+    return {"accession": accession, "xref": unique}
 
 
 MCP_INSTRUCTIONS = """\
@@ -1559,8 +1568,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    - GEO series → `get_geo_series_samples`
    - ArrayExpress experiment → `get_ae_experiment_samples`
 
-5. **Cross-archive discovery** — call `get_related_projects` with any accession (GSE, SRP,
-   E-XXXX, PRJNA) to discover the same study across all archives. Shows cross-reference
+5. **Cross-reference lookup** — call `get_project_xref` with any accession (GSE, SRP,
+   E-XXXX, PRJNA) to discover cross-references across all archives. Shows cross-reference
    links (SRA, BioProject, ENA, GEO), naming convention links (E-GEOD ↔ GSE), and
    SRA alias connections. Use this when the user asks "is this study also in SRA/GEO?"
    or wants to find all versions of a dataset.
