@@ -26,6 +26,7 @@ from queries import (
     AE_SEARCH_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
+    COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SERIES_NEIGHBORS_COORDS_SQL,
@@ -858,6 +859,39 @@ def get_sample(
     except Exception as e:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/common-name",
+    summary="Get common name by scientific name",
+    description=(
+        "Return matching common names from the common_names table for a scientific name."
+    ),
+    operation_id="get_common_name_by_scientific_name",
+)
+@limiter.limit("100/minute")
+def get_common_name_by_scientific_name(
+    request: Request,
+    scientific_name: str = Query(..., min_length=1, max_length=255),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    COMMON_NAME_BY_SCIENTIFIC_NAME_SQL, (scientific_name.strip(),)
+                )
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_common_name_by_scientific_name")
+        raise HTTPException(500, "Internal server error")
+
+    if not rows:
+        raise HTTPException(
+            404,
+            f"No common names found for scientific_name '{scientific_name}'",
+        )
+
+    return rows
 
 
 @api_app.get(

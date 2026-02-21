@@ -558,6 +558,16 @@ FROM sra_samples
 WHERE accession = %s;
 """
 
+COMMON_NAME_BY_SCIENTIFIC_NAME_SQL = """
+SELECT
+    tax_id,
+    scientific_name,
+    common_name
+FROM common_names
+WHERE LOWER(scientific_name) = LOWER(%s)
+ORDER BY common_name;
+"""
+
 GEO_SERIES_SAMPLES_SQL = """
 SELECT s.*
 FROM geo_samples s
