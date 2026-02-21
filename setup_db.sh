@@ -147,6 +147,13 @@ CREATE INDEX IF NOT EXISTS sra_experiments_accession_upper_idx ON sra_experiment
 -- Index for SRX to SRP lookups (join on study column)
 CREATE INDEX IF NOT EXISTS sra_experiments_study_idx ON sra_experiments (study);
 
+-- Indexes for structured search filters
+CREATE INDEX IF NOT EXISTS idx_sra_exp_library_strategy ON sra_experiments (library_strategy);
+CREATE INDEX IF NOT EXISTS idx_sra_exp_platform ON sra_experiments (platform);
+CREATE INDEX IF NOT EXISTS idx_geo_series_organisms ON geo_series USING GIN (organisms);
+CREATE INDEX IF NOT EXISTS idx_sra_studies_organisms ON sra_studies USING GIN (organisms);
+CREATE INDEX IF NOT EXISTS idx_geo_contributors_country ON geo_contributors (address_country);
+
 EOF
 
 echo ""

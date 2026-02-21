@@ -779,6 +779,369 @@ ORDER BY rank DESC, accession DESC
 LIMIT %s;
 """
 
+
+def build_structured_search(
+    q=None,
+    organism=None,
+    library_strategy=None,
+    platform=None,
+    country=None,
+    center=None,
+    year_from=None,
+    year_to=None,
+    source=None,
+    cursor_rank=None,
+    cursor_acc=None,
+):
+    """Build SQL + params for structured search across GEO, SRA, ArrayExpress, ENA.
+
+    Returns (sql_string, params_dict) using %(name)s named parameters.
+    """
+    params = {}
+    cte_parts = []
+
+    include_geo = source in (None, "all", "geo")
+    include_sra = source in (None, "all", "sra")
+    include_ae = source in (None, "all", "arrayexpress")
+    include_ena = source in (None, "all", "ena")
+
+    # Skip sources that cannot satisfy required filters
+    if library_strategy:
+        include_geo = False
+    if platform:
+        include_geo = False
+        include_ae = False
+    if country:
+        include_ae = False
+
+    # Populate shared params
+    if q:
+        params["q"] = q
+    if organism:
+        params["organism"] = organism
+    if library_strategy:
+        params["library_strategy"] = library_strategy
+    if platform:
+        params["platform"] = platform
+    if country:
+        params["country"] = country
+    if center:
+        params["center"] = center
+    if year_from is not None:
+        params["year_from"] = year_from
+    if year_to is not None:
+        params["year_to"] = year_to
+
+    # --- GEO ---
+    if include_geo:
+        w = []
+        if q:
+            w.append("g.tsv @@ plainto_tsquery('english', %(q)s)")
+        if organism:
+            w.append("g.organisms @> ARRAY[%(organism)s]")
+        if country:
+            w.append(
+                "EXISTS (SELECT 1 FROM geo_contributors gc"
+                " WHERE gc.accession = g.accession"
+                " AND gc.address_country = %(country)s)"
+            )
+        if center:
+            w.append(
+                "EXISTS (SELECT 1 FROM geo_contributors gc2"
+                " WHERE gc2.accession = g.accession"
+                " AND gc2.organization ILIKE '%%' || %(center)s || '%%')"
+            )
+        if year_from is not None:
+            w.append("g.published_at >= make_date(%(year_from)s, 1, 1)")
+        if year_to is not None:
+            w.append("g.published_at <= make_date(%(year_to)s, 12, 31)")
+
+        rank = (
+            "ts_rank(g.tsv, plainto_tsquery('english', %(q)s))"
+            if q
+            else "COALESCE(EXTRACT(EPOCH FROM g.published_at), 0)"
+        )
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        cte_parts.append(
+            f"SELECT g.accession, g.title, g.summary,"
+            f" g.updated_at, g.organisms,"
+            f" {rank} AS rank, 'geo'::text AS source,"
+            f" g.accession AS dedup_key"
+            f" FROM geo_series g{where}"
+        )
+
+    # --- SRA ---
+    if include_sra:
+        w = []
+        if q:
+            w.append("s.tsv @@ plainto_tsquery('english', %(q)s)")
+        if organism:
+            w.append("s.organisms @> ARRAY[%(organism)s]")
+        if library_strategy or platform:
+            ec = ["e.study = s.accession"]
+            if library_strategy:
+                ec.append("e.library_strategy = %(library_strategy)s")
+            if platform:
+                ec.append("e.platform = %(platform)s")
+            w.append(
+                "EXISTS (SELECT 1 FROM sra_experiments e"
+                " WHERE " + " AND ".join(ec) + ")"
+            )
+        if country:
+            w.append("s.countries @> ARRAY[%(country)s]")
+        if center:
+            w.append(
+                "EXISTS (SELECT 1 FROM sra_submissions sub"
+                " WHERE sub.accession = s.submission"
+                " AND sub.center_name ILIKE '%%' || %(center)s || '%%')"
+            )
+        if year_from is not None:
+            w.append("s.published_at >= make_date(%(year_from)s, 1, 1)")
+        if year_to is not None:
+            w.append("s.published_at <= make_date(%(year_to)s, 12, 31)")
+
+        rank = (
+            "ts_rank(s.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
+            if q
+            else "COALESCE(EXTRACT(EPOCH FROM s.published_at), 0)"
+        )
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        cte_parts.append(
+            f"SELECT s.accession, s.title, s.abstract AS summary,"
+            f" s.updated_at, s.organisms,"
+            f" {rank} AS rank, 'sra'::text AS source,"
+            f" COALESCE(s.alias, s.accession) AS dedup_key"
+            f" FROM sra_studies s{where}"
+        )
+
+    # --- ArrayExpress ---
+    if include_ae:
+        w = []
+        if q:
+            w.append("ae.tsv @@ plainto_tsquery('english', %(q)s)")
+        if organism:
+            w.append("ae.organisms @> ARRAY[%(organism)s]")
+        if library_strategy:
+            w.append("ae.technology = %(library_strategy)s")
+        if center:
+            w.append("ae.organizations::text ILIKE '%%' || %(center)s || '%%'")
+        if year_from is not None:
+            w.append("ae.release_date >= make_date(%(year_from)s, 1, 1)")
+        if year_to is not None:
+            w.append("ae.release_date <= make_date(%(year_to)s, 12, 31)")
+
+        rank = (
+            "ts_rank(ae.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
+            if q
+            else "COALESCE(EXTRACT(EPOCH FROM ae.release_date), 0)"
+        )
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        cte_parts.append(
+            f"SELECT ae.accession, ae.title, ae.description AS summary,"
+            f" ae.release_date AS updated_at, ae.organisms,"
+            f" {rank} AS rank, 'arrayexpress'::text AS source,"
+            f" ae.accession AS dedup_key"
+            f" FROM arrayexpress_experiments ae{where}"
+        )
+
+    # --- ENA ---
+    if include_ena:
+        w = []
+        ena_tsv = (
+            "to_tsvector('english',"
+            " coalesce(es.study_title, '') || ' ' ||"
+            " coalesce(es.study_description, ''))"
+        )
+        if q:
+            w.append(f"{ena_tsv} @@ plainto_tsquery('english', %(q)s)")
+        if organism:
+            w.append("es.scientific_name = %(organism)s")
+        if library_strategy or platform or country:
+            ec = ["ee.study_accession = es.study_accession"]
+            if library_strategy:
+                ec.append("ee.library_strategy = %(library_strategy)s")
+            if platform:
+                ec.append("ee.instrument_platform = %(platform)s")
+            if country:
+                ec.append("ee.country = %(country)s")
+            w.append(
+                "EXISTS (SELECT 1 FROM ena_experiments ee"
+                " WHERE " + " AND ".join(ec) + ")"
+            )
+        if center:
+            w.append("es.center_name ILIKE '%%' || %(center)s || '%%'")
+        ena_date = "NULLIF(es.first_public, '')::date"
+        if year_from is not None:
+            w.append(f"{ena_date} >= make_date(%(year_from)s, 1, 1)")
+        if year_to is not None:
+            w.append(f"{ena_date} <= make_date(%(year_to)s, 12, 31)")
+
+        rank = (
+            f"ts_rank({ena_tsv}," f" plainto_tsquery('english', %(q)s)) * 0.7"
+            if q
+            else f"COALESCE(EXTRACT(EPOCH FROM {ena_date}), 0)"
+        )
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        cte_parts.append(
+            f"SELECT es.study_accession AS accession,"
+            f" es.study_title AS title,"
+            f" es.study_description AS summary,"
+            f" {ena_date} AS updated_at,"
+            f" CASE WHEN es.scientific_name IS NOT NULL"
+            f" THEN ARRAY[es.scientific_name] END AS organisms,"
+            f" {rank} AS rank, 'ena'::text AS source,"
+            f" es.study_accession AS dedup_key"
+            f" FROM ena_studies es{where}"
+        )
+
+    if not cte_parts:
+        return (
+            "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
+            " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL::float8 AS rank, NULL AS source,"
+            " 0::bigint AS total_count WHERE FALSE",
+            {},
+        )
+
+    all_matches = "\n    UNION ALL\n    ".join(cte_parts)
+
+    if cursor_rank is not None and cursor_acc is not None:
+        params["cursor_rank"] = cursor_rank
+        params["cursor_acc"] = cursor_acc
+        cursor_where = (
+            "WHERE (rank, accession) < "
+            "(%(cursor_rank)s::float8, %(cursor_acc)s::text)"
+        )
+    else:
+        cursor_where = ""
+
+    sql = f"""\
+WITH all_matches AS (
+    {all_matches}
+),
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY dedup_key, rank DESC
+),
+counted AS (
+    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+),
+paged AS (
+    SELECT *
+    FROM counted
+    {cursor_where}
+)
+SELECT
+    accession, title, summary, updated_at, organisms, rank, source, total_count
+FROM paged
+ORDER BY rank DESC, accession DESC
+LIMIT 20;"""
+
+    return sql, params
+
+
+RELATED_SQL = """\
+WITH forward_geo AS (
+    SELECT target_accession AS accession,
+           link_type,
+           'cross_ref_geo' AS source
+    FROM cross_ref_geo
+    WHERE geo_accession = %(acc)s
+),
+forward_ae AS (
+    SELECT target_accession AS accession,
+           link_type,
+           'cross_ref_ae' AS source
+    FROM cross_ref_ae
+    WHERE ae_accession = %(acc)s
+),
+reverse_geo AS (
+    SELECT geo_accession AS accession,
+           link_type || ' (reverse)' AS link_type,
+           'cross_ref_geo' AS source
+    FROM cross_ref_geo
+    WHERE target_accession = %(acc)s
+),
+reverse_ae AS (
+    SELECT ae_accession AS accession,
+           link_type || ' (reverse)' AS link_type,
+           'cross_ref_ae' AS source
+    FROM cross_ref_ae
+    WHERE target_accession = %(acc)s
+),
+forward_ena AS (
+    SELECT target_accession AS accession,
+           link_type,
+           'cross_ref_ena' AS source
+    FROM cross_ref_ena
+    WHERE ena_accession = %(acc)s
+),
+reverse_ena AS (
+    SELECT ena_accession AS accession,
+           link_type || ' (reverse)' AS link_type,
+           'cross_ref_ena' AS source
+    FROM cross_ref_ena
+    WHERE target_accession = %(acc)s
+),
+sra_alias AS (
+    SELECT alias AS accession,
+           'SRA alias' AS link_type,
+           'sra_studies' AS source
+    FROM sra_studies
+    WHERE accession = %(acc)s
+      AND alias LIKE 'GSE%%'
+),
+sra_reverse AS (
+    SELECT accession,
+           'SRA study' AS link_type,
+           'sra_studies' AS source
+    FROM sra_studies
+    WHERE alias = %(acc)s
+),
+egeod_to_gse AS (
+    SELECT 'GSE' || substring(%(acc)s FROM 'E-GEOD-(\\d+)') AS accession,
+           'E-GEOD naming' AS link_type,
+           'naming_convention' AS source
+    WHERE %(acc)s LIKE 'E-GEOD-%%'
+      AND EXISTS (
+          SELECT 1 FROM geo_series
+          WHERE accession = 'GSE' || substring(%(acc)s FROM 'E-GEOD-(\\d+)')
+      )
+),
+gse_to_egeod AS (
+    SELECT 'E-GEOD-' || substring(%(acc)s FROM 'GSE(\\d+)') AS accession,
+           'E-GEOD naming' AS link_type,
+           'naming_convention' AS source
+    WHERE %(acc)s LIKE 'GSE%%'
+      AND EXISTS (
+          SELECT 1 FROM arrayexpress_experiments
+          WHERE accession = 'E-GEOD-' || substring(%(acc)s FROM 'GSE(\\d+)')
+      )
+)
+SELECT accession, link_type, source FROM forward_geo
+UNION ALL
+SELECT accession, link_type, source FROM forward_ae
+UNION ALL
+SELECT accession, link_type, source FROM forward_ena
+UNION ALL
+SELECT accession, link_type, source FROM reverse_geo
+UNION ALL
+SELECT accession, link_type, source FROM reverse_ae
+UNION ALL
+SELECT accession, link_type, source FROM reverse_ena
+UNION ALL
+SELECT accession, link_type, source FROM sra_alias
+UNION ALL
+SELECT accession, link_type, source FROM sra_reverse
+UNION ALL
+SELECT accession, link_type, source FROM egeod_to_gse
+UNION ALL
+SELECT accession, link_type, source FROM gse_to_egeod;
+"""
+
+
 BULK_PROJECT_METADATA_SQL = """
 WITH input AS (
     SELECT accession, MIN(ord)::int AS ord
