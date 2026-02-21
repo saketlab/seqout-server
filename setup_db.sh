@@ -147,12 +147,114 @@ CREATE INDEX IF NOT EXISTS sra_experiments_accession_upper_idx ON sra_experiment
 -- Index for SRX to SRP lookups (join on study column)
 CREATE INDEX IF NOT EXISTS sra_experiments_study_idx ON sra_experiments (study);
 
+-- ENA Studies (created here so structured search queries don't error if no data transferred yet)
+CREATE TABLE IF NOT EXISTS ena_studies (
+    study_accession             TEXT PRIMARY KEY,
+    secondary_study_accession   TEXT,
+    secondary_study_alias       TEXT,
+    secondary_study_center_name TEXT,
+    study_alias                 TEXT,
+    study_title                 TEXT,
+    study_description           TEXT,
+    study_name                  TEXT,
+    center_name                 TEXT,
+    broker_name                 TEXT,
+    project_name                TEXT,
+    tax_id                      INTEGER,
+    tax_lineage                 TEXT,
+    tax_division                TEXT,
+    scientific_name             TEXT,
+    strain                      TEXT,
+    breed                       TEXT,
+    cultivar                    TEXT,
+    isolate                     TEXT,
+    first_public                DATE,
+    last_updated                DATE,
+    geo_accession               TEXT,
+    keywords                    TEXT,
+    tag                         TEXT,
+    submission_tool             TEXT,
+    parent_study_accession      TEXT,
+    description                 TEXT,
+    status                      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ena_experiments (
+    run_accession               TEXT PRIMARY KEY,
+    experiment_accession        TEXT NOT NULL,
+    sample_accession            TEXT,
+    study_accession             TEXT NOT NULL,
+    experiment_title            TEXT,
+    library_strategy            TEXT,
+    library_source              TEXT,
+    library_selection           TEXT,
+    library_layout              TEXT,
+    library_name                TEXT,
+    instrument_platform         TEXT,
+    instrument_model            TEXT,
+    scientific_name             TEXT,
+    tax_id                      INTEGER,
+    center_name                 TEXT,
+    first_public                DATE,
+    last_updated                DATE,
+    sample_title                TEXT,
+    sample_alias                TEXT,
+    sample_description          TEXT,
+    country                     TEXT,
+    host                        TEXT,
+    tissue_type                 TEXT,
+    cell_type                   TEXT,
+    disease                     TEXT,
+    dev_stage                   TEXT,
+    base_count                  INTEGER,
+    read_count                  INTEGER
+);
+
 -- Indexes for structured search filters
 CREATE INDEX IF NOT EXISTS idx_sra_exp_library_strategy ON sra_experiments (library_strategy);
 CREATE INDEX IF NOT EXISTS idx_sra_exp_platform ON sra_experiments (platform);
 CREATE INDEX IF NOT EXISTS idx_geo_series_organisms ON geo_series USING GIN (organisms);
 CREATE INDEX IF NOT EXISTS idx_sra_studies_organisms ON sra_studies USING GIN (organisms);
 CREATE INDEX IF NOT EXISTS idx_geo_contributors_country ON geo_contributors (address_country);
+
+-- ENA indexes
+CREATE INDEX IF NOT EXISTS idx_ena_studies_scientific_name ON ena_studies (scientific_name);
+CREATE INDEX IF NOT EXISTS idx_ena_studies_first_public ON ena_studies (first_public);
+CREATE INDEX IF NOT EXISTS idx_ena_studies_geo_accession ON ena_studies (geo_accession);
+CREATE INDEX IF NOT EXISTS idx_ena_studies_center_name ON ena_studies (center_name);
+CREATE INDEX IF NOT EXISTS idx_ena_exp_study ON ena_experiments (study_accession);
+CREATE INDEX IF NOT EXISTS idx_ena_exp_strategy ON ena_experiments (library_strategy);
+CREATE INDEX IF NOT EXISTS idx_ena_exp_platform ON ena_experiments (instrument_platform);
+CREATE INDEX IF NOT EXISTS idx_ena_exp_country ON ena_experiments (country);
+
+-- Date-based indexes for year range filters
+CREATE INDEX IF NOT EXISTS idx_geo_series_published_at ON geo_series (published_at);
+CREATE INDEX IF NOT EXISTS idx_sra_studies_published_at ON sra_studies (published_at);
+
+-- SRA submissions center_name for center filter
+CREATE INDEX IF NOT EXISTS idx_sra_submissions_center ON sra_submissions (center_name);
+
+-- Cross-reference tables (populated by setup_cross_refs.sh, created here to prevent errors)
+CREATE TABLE IF NOT EXISTS cross_ref_geo (
+    geo_accession    TEXT NOT NULL,
+    target_accession TEXT NOT NULL,
+    link_type        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cross_ref_ae (
+    ae_accession     TEXT NOT NULL,
+    target_accession TEXT NOT NULL,
+    link_type        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cross_ref_ena (
+    ena_accession    TEXT NOT NULL,
+    target_accession TEXT NOT NULL,
+    link_type        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cross_ref_pubmed (
+    accession  TEXT NOT NULL,
+    pubmed_id  TEXT NOT NULL,
+    source     TEXT NOT NULL
+);
 
 EOF
 
