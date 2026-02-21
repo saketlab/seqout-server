@@ -37,6 +37,7 @@ from queries import (
     PROJECT_AE_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
+    RELATED_SQL,
     SAMPLE_SQL,
     SRA_QUERY_ACCESSIONS_SQL,
     SEARCH_SQL,
@@ -44,6 +45,7 @@ from queries import (
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
+    build_structured_search,
 )
 
 load_dotenv()
@@ -568,9 +570,7 @@ def search_geo(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc)
-                )
+                cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
                 rows = cur.fetchall()
     except Exception as e:
         logger.exception("Database error in search_geo")
@@ -1355,6 +1355,125 @@ def get_prj_info(
         raise HTTPException(500, "Internal server error")
 
 
+@api_app.get(
+    "/search/structured",
+    summary="Structured search with filters",
+    description=(
+        "Search across GEO, SRA, ArrayExpress, and ENA with structured filters "
+        "(organism, library_strategy, platform, country, center, year range) "
+        "optionally combined with full-text search. At least one of q or a filter "
+        "parameter is required. Use cursors (rank + accession) for pagination. "
+        "Returns {results: object[], total: int, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}."
+    ),
+    operation_id="search_structured",
+)
+@limiter.limit("100/minute")
+def search_structured(
+    request: Request,
+    q: str | None = Query(None, max_length=500),
+    organism: str | None = Query(None),
+    library_strategy: str | None = Query(None),
+    platform: str | None = Query(None),
+    country: str | None = Query(None),
+    center: str | None = Query(None),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
+    source: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|all)$"),
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
+):
+    if not any(
+        [q, organism, library_strategy, platform, country, center, year_from, year_to]
+    ):
+        raise HTTPException(
+            400,
+            "At least one of q, organism, library_strategy, platform, "
+            "country, center, year_from, or year_to is required",
+        )
+
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(400, "year_from must be <= year_to")
+
+    sql, params = build_structured_search(
+        q=q,
+        organism=organism,
+        library_strategy=library_strategy,
+        platform=platform,
+        country=country,
+        center=center,
+        year_from=year_from,
+        year_to=year_to,
+        source=source,
+        cursor_rank=cursor_rank,
+        cursor_acc=cursor_acc,
+    )
+
+    start = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in search_structured")
+        raise HTTPException(500, "Internal server error")
+
+    took_ms = (time.perf_counter() - start) * 1000
+    total = rows[0]["total_count"] if rows else 0
+
+    return {
+        "results": rows,
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": (
+            None
+            if not rows
+            else {
+                "rank": rows[-1]["rank"],
+                "accession": rows[-1]["accession"],
+            }
+        ),
+    }
+
+
+@api_app.get(
+    "/project/{accession}/related",
+    summary="Find related projects across archives",
+    description=(
+        "Discover related studies across GEO, SRA, ArrayExpress and ENA by following "
+        "cross-reference links, SRA aliases, and E-GEOD naming conventions. "
+        "Returns {accession: string, related: [{accession, link_type, source}]}."
+    ),
+    operation_id="get_related_projects",
+)
+@limiter.limit("100/minute")
+def get_related_projects(
+    request: Request,
+    accession: str = Path(...),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(RELATED_SQL, {"acc": accession})
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_related_projects")
+        raise HTTPException(500, "Internal server error")
+
+    # Deduplicate by accession (keep first occurrence)
+    seen = set()
+    unique = []
+    for row in rows:
+        acc = row["accession"]
+        if acc and acc not in seen:
+            seen.add(acc)
+            unique.append(row)
+
+    return {"accession": accession, "related": unique}
+
+
 MCP_INSTRUCTIONS = """\
 You are connected to pysraweb, a genomics study search engine covering
 NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
@@ -1405,25 +1524,51 @@ ArrayExpress:  Experiment (E-MTAB-NNN, E-GEOD-NNN, etc.) → Samples (with ENA l
 BioProject:  PRJNA/PRJEB/PRJDA can link to GEO or SRA
 
 Many GEO series have a linked SRA study (the SRA study's `alias` field = GSE accession).
+E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GSE50760).
 
 ## Recommended workflow
 
-1. **Search** — call `search_all` with the user's query.
+1. **Search** — call `search_all` for simple keyword searches.
    The `source` field tells you: 'geo', 'sra', or 'arrayexpress'.
    Only pass `db="geo"|"sra"|"arrayexpress"` if user explicitly restricts.
 
-2. **Drill into a result** — call `get_project` with the accession.
+2. **Structured search** — call `search_structured` when the user wants to filter by
+   organism, library strategy (e.g. RNA-Seq, ChIP-Seq), platform (e.g. ILLUMINA),
+   country, institution/center, or date range. Searches across GEO, SRA, ArrayExpress,
+   and ENA. Filters can be combined with a keyword query (`q`). At least one filter or
+   `q` is required.
+   - `organism`: exact species name, e.g. "Homo sapiens", "Mus musculus"
+   - `library_strategy`: SRA/ENA library strategy, e.g. "RNA-Seq", "ChIP-Seq", "WGS"
+     (also matches ArrayExpress `technology` field)
+   - `platform`: sequencing platform, e.g. "ILLUMINA", "OXFORD_NANOPORE"
+     (SRA and ENA only; GEO and ArrayExpress are excluded when this filter is active)
+   - `country`: country name, e.g. "United States", "United Kingdom"
+     (GEO via contributors, SRA via geocoded countries, ENA via experiment metadata;
+     ArrayExpress is excluded — no structured country data)
+   - `center`: institution name (partial match), e.g. "Broad Institute"
+   - `year_from`/`year_to`: publication year range
+   - `source`: restrict to "geo", "sra", "arrayexpress", "ena", or "all"
+   Use `search_all` for simple keyword searches; use `search_structured` when specific
+   metadata filters are needed.
+
+3. **Drill into a result** — call `get_project` with the accession.
    Returns full metadata for GSE, SRP, or E-XXXX.
 
-3. **Explore samples/experiments**:
+4. **Explore samples/experiments**:
    - SRA study → `get_study_experiments`, then `get_sample` for individual samples
    - GEO series → `get_geo_series_samples`
    - ArrayExpress experiment → `get_ae_experiment_samples`
 
-4. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
+5. **Cross-archive discovery** — call `get_related_projects` with any accession (GSE, SRP,
+   E-XXXX, PRJNA) to discover the same study across all archives. Shows cross-reference
+   links (SRA, BioProject, ENA, GEO), naming convention links (E-GEOD ↔ GSE), and
+   SRA alias connections. Use this when the user asks "is this study also in SRA/GEO?"
+   or wants to find all versions of a dataset.
+
+6. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
    to their parent study/series.
 
-5. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
+7. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
 ## Context rules
 
