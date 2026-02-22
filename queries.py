@@ -970,23 +970,22 @@ def build_structured_search(
             )
         if center:
             w.append("es.center_name ILIKE '%%' || %(center)s || '%%'")
-        ena_date = "NULLIF(es.first_public, '')::date"
         if year_from is not None:
-            w.append(f"{ena_date} >= make_date(%(year_from)s, 1, 1)")
+            w.append("es.first_public >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
-            w.append(f"{ena_date} <= make_date(%(year_to)s, 12, 31)")
+            w.append("es.first_public <= make_date(%(year_to)s, 12, 31)")
 
         rank = (
             f"ts_rank({ena_tsv}," f" plainto_tsquery('english', %(q)s)) * 0.7"
             if q
-            else f"COALESCE(EXTRACT(EPOCH FROM {ena_date}), 0)"
+            else "COALESCE(EXTRACT(EPOCH FROM es.first_public), 0)"
         )
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT es.study_accession AS accession,"
             f" es.study_title AS title,"
             f" es.study_description AS summary,"
-            f" {ena_date} AS updated_at,"
+            f" es.first_public AS updated_at,"
             f" CASE WHEN es.scientific_name IS NOT NULL"
             f" THEN ARRAY[es.scientific_name] END AS organisms,"
             f" {rank} AS rank, 'ena'::text AS source,"
@@ -1119,6 +1118,43 @@ gse_to_egeod AS (
           SELECT 1 FROM arrayexpress_experiments
           WHERE accession = 'E-GEOD-' || substring(%(acc)s FROM 'GSE(\\d+)')
       )
+),
+pubmed_siblings AS (
+    SELECT DISTINCT p2.accession,
+           'PubMed:' || p1.pubmed_id AS link_type,
+           'pubmed' AS source
+    FROM cross_ref_pubmed p1
+    JOIN cross_ref_pubmed p2
+      ON p1.pubmed_id = p2.pubmed_id
+    WHERE p1.accession = %(acc)s
+      AND p2.accession != %(acc)s
+),
+ena_two_hop AS (
+    SELECT DISTINCT cf2.target_accession AS accession,
+           cf2.link_type,
+           'cross_ref_ena_2hop' AS source
+    FROM cross_ref_ena cf1
+    JOIN cross_ref_ena cf2 ON cf1.ena_accession = cf2.ena_accession
+    WHERE cf1.target_accession = %(acc)s
+      AND cf2.target_accession != %(acc)s
+),
+geo_two_hop AS (
+    SELECT DISTINCT cf2.target_accession AS accession,
+           cf2.link_type,
+           'cross_ref_geo_2hop' AS source
+    FROM cross_ref_geo cf1
+    JOIN cross_ref_geo cf2 ON cf1.geo_accession = cf2.geo_accession
+    WHERE cf1.target_accession = %(acc)s
+      AND cf2.target_accession != %(acc)s
+),
+ae_two_hop AS (
+    SELECT DISTINCT cf2.target_accession AS accession,
+           cf2.link_type,
+           'cross_ref_ae_2hop' AS source
+    FROM cross_ref_ae cf1
+    JOIN cross_ref_ae cf2 ON cf1.ae_accession = cf2.ae_accession
+    WHERE cf1.target_accession = %(acc)s
+      AND cf2.target_accession != %(acc)s
 )
 SELECT accession, link_type, source FROM forward_geo
 UNION ALL
@@ -1138,7 +1174,15 @@ SELECT accession, link_type, source FROM sra_reverse
 UNION ALL
 SELECT accession, link_type, source FROM egeod_to_gse
 UNION ALL
-SELECT accession, link_type, source FROM gse_to_egeod;
+SELECT accession, link_type, source FROM gse_to_egeod
+UNION ALL
+SELECT accession, link_type, source FROM pubmed_siblings
+UNION ALL
+SELECT accession, link_type, source FROM ena_two_hop
+UNION ALL
+SELECT accession, link_type, source FROM geo_two_hop
+UNION ALL
+SELECT accession, link_type, source FROM ae_two_hop;
 """
 
 
