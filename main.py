@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -8,7 +9,11 @@ import struct
 import threading
 import time
 import zipfile
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
+import geoip2.database
+import geoip2.errors
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
@@ -19,6 +24,8 @@ from psycopg_pool import ConnectionPool
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+from user_agents import parse as parse_ua
 
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
@@ -134,6 +141,142 @@ limiter = Limiter(key_func=get_remote_address)
 api_app = FastAPI()
 api_app.state.limiter = limiter
 
+# ---------
+# Analytics
+# ---------
+
+_geoip_reader = None
+_geoip_lock = threading.Lock()
+_GEOIP_DB_PATH = os.environ.get("GEOIP_DB_PATH", "/usr/share/GeoIP/GeoLite2-City.mmdb")
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _get_daily_salt() -> str:
+    return f"pysradb-{date.today().isoformat()}"
+
+
+def hash_ip(ip: str) -> str:
+    salted = f"{ip}:{_get_daily_salt()}"
+    return hashlib.sha256(salted.encode()).hexdigest()[:16]
+
+
+def get_location_from_ip(ip: str) -> tuple[str | None, str | None]:
+    """Return (country, city) from IP using GeoLite2-City database."""
+    global _geoip_reader
+    with _geoip_lock:
+        if _geoip_reader is None:
+            try:
+                _geoip_reader = geoip2.database.Reader(_GEOIP_DB_PATH)
+            except Exception:
+                logger.debug("GeoIP database not found at %s", _GEOIP_DB_PATH)
+                return None, None
+    try:
+        resp = _geoip_reader.city(ip)
+        return resp.country.name, resp.city.name
+    except (geoip2.errors.AddressNotFoundError, ValueError):
+        return None, None
+    except Exception:
+        return None, None
+
+
+def log_request(
+    request: Request,
+    status_code: int,
+    response_ms: float,
+    search_query: str | None,
+) -> None:
+    try:
+        client_ip = request.client.host if request.client else ""
+        ip_hashed = hash_ip(client_ip) if client_ip else None
+        country, city = get_location_from_ip(client_ip) if client_ip else (None, None)
+
+        now_ist = datetime.now(_IST)
+
+        ua_string = request.headers.get("user-agent", "")
+        ua = parse_ua(ua_string)
+        browser = ua.browser.family if ua.browser.family != "Other" else None
+        browser_version = ua.browser.version_string or None
+        os_name = ua.os.family if ua.os.family != "Other" else None
+        os_version = ua.os.version_string or None
+
+        if ua.is_mobile:
+            device_type = "mobile"
+        elif ua.is_tablet:
+            device_type = "tablet"
+        elif ua.is_bot:
+            device_type = "bot"
+        elif ua.is_pc:
+            device_type = "desktop"
+        else:
+            device_type = "other"
+
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO request_log
+                        (ts, method, path, query_string, search_query,
+                         status_code, response_ms, ip_address, ip_hash,
+                         country, city,
+                         user_agent_raw, browser, browser_version,
+                         os, os_version, device_type,
+                         accept_language, referer)
+                    VALUES
+                        (%s, %s, %s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s,
+                         %s, %s)
+                    """,
+                    (
+                        now_ist,
+                        request.method,
+                        request.url.path,
+                        str(request.url.query) or None,
+                        search_query,
+                        status_code,
+                        round(response_ms, 2),
+                        client_ip or None,
+                        ip_hashed,
+                        country,
+                        city,
+                        ua_string[:512] if ua_string else None,
+                        browser,
+                        browser_version,
+                        os_name,
+                        os_version,
+                        device_type,
+                        (request.headers.get("accept-language") or "")[:255] or None,
+                        (request.headers.get("referer") or "")[:512] or None,
+                    ),
+                )
+    except Exception:
+        logger.debug("Failed to log request", exc_info=True)
+
+
+class AnalyticsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        response_ms = (time.perf_counter() - start) * 1000
+
+        # Extract search query from 'q' param if present
+        search_query = request.query_params.get("q")
+
+        # Invoke a daemon thread so we never slow down the response
+        t = threading.Thread(
+            target=log_request,
+            args=(request, response.status_code, response_ms, search_query),
+            daemon=True,
+        )
+        t.start()
+
+        return response
+
+
+# Middleware is registered on combined_app (below) so it covers
+# both REST and MCP routes.
 
 @api_app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -1641,5 +1784,6 @@ combined_app = FastAPI(
 )
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+combined_app.add_middleware(AnalyticsMiddleware)
 
 app = combined_app
