@@ -262,6 +262,23 @@ CREATE TABLE IF NOT EXISTS cross_ref_pubmed (
     source     TEXT NOT NULL
 );
 
+-- PubMed metadata (populated by backfill_pubmed_metadata.py + transfers/pubmed_metadata.py)
+CREATE TABLE IF NOT EXISTS pubmed_metadata (
+    pmid                       TEXT PRIMARY KEY,
+    title                      TEXT,
+    journal                    TEXT,
+    doi                        TEXT,
+    pub_date                   TEXT,
+    authors                    TEXT,
+    issn                       TEXT,
+    citation_count             INTEGER,
+    journal_h_index            INTEGER,
+    journal_i10_index          INTEGER,
+    journal_2yr_mean_citedness REAL,
+    journal_cited_by_count     INTEGER,
+    journal_works_count        INTEGER
+);
+
 -- Analytics: privacy-respecting request log
 CREATE TABLE IF NOT EXISTS request_log (
     id              BIGSERIAL PRIMARY KEY,
