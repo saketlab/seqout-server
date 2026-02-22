@@ -1,5 +1,11 @@
 """SQL queries for pysradb-server"""
 
+STUDY_PUBLICATIONS_BATCH_SQL = """
+SELECT accession, publications
+FROM study_publications
+WHERE accession = ANY(%s);
+"""
+
 GEO_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q

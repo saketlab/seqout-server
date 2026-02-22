@@ -53,6 +53,7 @@ from queries import (
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
+    STUDY_PUBLICATIONS_BATCH_SQL,
     build_structured_search,
 )
 
@@ -296,6 +297,33 @@ def classify_accession(acc: str) -> str | None:
     if STUDY_PATTERN.match(acc):
         return "sra"
     return None
+
+
+def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
+    """Batch-lookup publications from study_publications and merge into result rows.
+
+    Adds the full `publications` JSONB array plus top-level convenience fields
+    from the primary (most-cited) publication: pmid, publication_title,
+    journal, doi, citation_count.
+    """
+    if not rows:
+        return rows
+    accessions = [r["accession"] for r in rows if r.get("accession")]
+    if not accessions:
+        return rows
+    cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (accessions,))
+    pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
+    for row in rows:
+        pubs = pub_map.get(row["accession"])
+        row["publications"] = pubs
+        if pubs and len(pubs) > 0:
+            primary = pubs[0]
+            row["pmid"] = primary.get("pmid")
+            row["publication_title"] = primary.get("title")
+            row["journal"] = primary.get("journal")
+            row["doi"] = primary.get("doi")
+            row["citation_count"] = primary.get("citation_count")
+    return rows
 
 
 def _transform_ae_sample_to_geo(sample: dict) -> dict:
@@ -717,6 +745,7 @@ def search_geo(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
                 rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
     except Exception as e:
         logger.exception("Database error in search_geo")
         raise HTTPException(500, "Internal server error")
@@ -769,6 +798,7 @@ def search_sra(
                     (q, cursor_rank, cursor_rank, cursor_acc),
                 )
                 rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
     except Exception as e:
         logger.exception("Database error in search_sra")
         raise HTTPException(500, "Internal server error")
@@ -828,6 +858,7 @@ def search(
                         (q, cursor_rank, cursor_rank, cursor_acc),
                     )
                     rows = cur.fetchall()
+                    _enrich_with_publications(rows, cur)
         except Exception as e:
             logger.exception("Database error in search_arrayexpress")
             raise HTTPException(500, "Internal server error")
@@ -864,6 +895,7 @@ def search(
                     ),
                 )
                 rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
     except Exception as e:
         logger.exception("Database error in search")
         raise HTTPException(500, "Internal server error")
@@ -913,6 +945,8 @@ def get_project(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, (accession,))
                 row = cur.fetchone()
+                if row:
+                    _enrich_with_publications([row], cur)
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
@@ -1594,6 +1628,7 @@ def search_structured(
                 cur.execute("SET LOCAL statement_timeout = '30s'")
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
     except Exception as e:
         err_msg = str(e).lower()
         if "canceling statement" in err_msg or "timeout" in err_msg:
