@@ -107,7 +107,7 @@ all_matches AS (
     -- ArrayExpress full-text search
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
            ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,
-           accession AS dedup_key
+           COALESCE(alias, accession) AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
 ),
@@ -392,7 +392,7 @@ all_matches AS (
     -- ArrayExpress exact accession match (priority 11)
     SELECT accession,
            100.0::float8 AS rank, 'arrayexpress'::text AS source, 11 AS priority,
-           accession AS dedup_key
+           COALESCE(alias, accession) AS dedup_key
     FROM arrayexpress_experiments
     WHERE UPPER(accession) = UPPER(%s)
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
@@ -403,7 +403,7 @@ all_matches AS (
     -- ArrayExpress ENA experiment/run match (priority 12)
     SELECT DISTINCT e.accession,
            100.0::float8 AS rank, 'arrayexpress'::text AS source, 12 AS priority,
-           e.accession AS dedup_key
+           COALESCE(e.alias, e.accession) AS dedup_key
     FROM arrayexpress_samples s
     JOIN arrayexpress_experiments e ON e.accession = s.experiment_accession
     WHERE (UPPER(s.ena_experiment) = UPPER(%s) OR UPPER(s.ena_run) = UPPER(%s))
@@ -415,7 +415,7 @@ all_matches AS (
     -- ArrayExpress organization name match (priority 13)
     SELECT DISTINCT e.accession,
            50.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
-           e.accession AS dedup_key
+           COALESCE(e.alias, e.accession) AS dedup_key
     FROM arrayexpress_experiments e
     CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
     WHERE org->>'name' ILIKE '%%' || %s || '%%'
@@ -427,7 +427,7 @@ all_matches AS (
     -- ArrayExpress full-text search (priority 14)
     SELECT accession,
            ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source, 14 AS priority,
-           accession AS dedup_key
+           COALESCE(alias, accession) AS dedup_key
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM release_date) >= %s::int)
@@ -940,7 +940,7 @@ def build_structured_search(
             f"SELECT ae.accession, ae.title, ae.description AS summary,"
             f" ae.release_date AS updated_at, ae.organisms,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
-            f" ae.accession AS dedup_key"
+            f" COALESCE(ae.alias, ae.accession) AS dedup_key"
             f" FROM arrayexpress_experiments ae{where}"
         )
 
