@@ -212,6 +212,7 @@ def log_request(
 
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                cur.execute("SET timezone = 'Asia/Kolkata'")
                 cur.execute(
                     """
                     INSERT INTO request_log
