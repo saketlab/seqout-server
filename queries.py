@@ -1047,6 +1047,123 @@ LIMIT 20;"""
     return sql, params
 
 
+def build_sorted_search_sql(
+    q, sortby, order="desc", db=None, cursor_sort=None, cursor_acc=None
+):
+    """Build search SQL sorted by citations, journal, or year.
+
+    Returns (sql_string, params_dict) using %(name)s named parameters.
+    """
+    params = {"q": q}
+    cte_parts = []
+
+    if db in (None, "geo"):
+        cte_parts.append(
+            "SELECT accession, title, summary, updated_at, organisms,"
+            " ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,"
+            " accession AS dedup_key"
+            " FROM geo_series, q"
+            " WHERE tsv @@ q.q"
+        )
+
+    if db in (None, "sra"):
+        cte_parts.append(
+            "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,"
+            " s.organisms,"
+            " ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,"
+            " COALESCE(s.alias, s.accession) AS dedup_key"
+            " FROM sra_studies s, q"
+            " WHERE s.tsv @@ q.q"
+        )
+
+    if db in (None, "arrayexpress"):
+        cte_parts.append(
+            "SELECT accession, title, description AS summary,"
+            " release_date AS updated_at, organisms,"
+            " ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,"
+            " COALESCE(alias, accession) AS dedup_key"
+            " FROM arrayexpress_experiments, q"
+            " WHERE tsv @@ q.q"
+        )
+
+    if not cte_parts:
+        return (
+            "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
+            " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL::float8 AS rank, NULL AS source,"
+            " NULL AS sort_val, 0::bigint AS total_count WHERE FALSE",
+            {},
+        )
+
+    all_matches = "\n    UNION ALL\n    ".join(cte_parts)
+
+    # Sort expression and optional join
+    if sortby == "citations":
+        sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
+        join_clause = (
+            "\n    LEFT JOIN study_publications sp" " ON sp.accession = d.accession"
+        )
+        cursor_cast = "::int"
+    elif sortby == "journal":
+        sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
+        join_clause = (
+            "\n    LEFT JOIN study_publications sp" " ON sp.accession = d.accession"
+        )
+        cursor_cast = ""
+    else:  # year
+        sort_expr = "COALESCE(d.updated_at::date, '1970-01-01'::date)"
+        join_clause = ""
+        cursor_cast = "::date"
+
+    direction = "DESC" if order == "desc" else "ASC"
+    comp = "<" if order == "desc" else ">"
+
+    if cursor_sort is not None and cursor_acc is not None:
+        params["cursor_sort"] = cursor_sort
+        params["cursor_acc"] = cursor_acc
+        cursor_where = (
+            f"WHERE (sort_val, accession) {comp} "
+            f"(%(cursor_sort)s{cursor_cast}, %(cursor_acc)s)"
+        )
+    else:
+        cursor_where = ""
+
+    sql = f"""\
+WITH q AS (
+    SELECT plainto_tsquery('english', %(q)s) AS q
+),
+all_matches AS (
+    {all_matches}
+),
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, title, summary, updated_at, organisms, rank, source
+    FROM all_matches
+    ORDER BY dedup_key, rank DESC
+),
+sorted AS (
+    SELECT d.*,
+           {sort_expr} AS sort_val
+    FROM deduped d{join_clause}
+),
+counted AS (
+    SELECT *, COUNT(*) OVER () AS total_count FROM sorted
+),
+paged AS (
+    SELECT *
+    FROM counted
+    {cursor_where}
+)
+SELECT
+    accession, title, summary, updated_at, organisms, rank, source,
+    sort_val, total_count
+FROM paged
+ORDER BY sort_val {direction} NULLS LAST, accession {direction}
+LIMIT 20;"""
+
+    return sql, params
+
+
 RELATED_SQL = """\
 WITH forward_geo AS (
     SELECT target_accession AS accession,

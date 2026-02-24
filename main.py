@@ -59,6 +59,7 @@ from queries import (
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
+    build_sorted_search_sql,
     build_structured_search,
 )
 
@@ -876,12 +877,11 @@ def search_sra(
     description=(
         "Unified search across GEO, SRA, and ArrayExpress. "
         "Optionally restrict by db=geo|sra|arrayexpress. "
-        "Use cursors (rank + accession) for pagination. "
-        "Results objects: {accession: string, title: string, summary: string | null, "
-        "updated_at: string | null, organisms: string[] | null, rank: float, "
-        "source: 'geo' | 'sra' | 'arrayexpress'}. "
+        "Optionally sort by sortby=citations|journal|year with order=desc(default)|asc. "
+        "For default relevance sort, use cursor_rank + cursor_acc for pagination. "
+        "For custom sortby, use cursor_sort + cursor_acc for pagination. "
         "Returns {results: object[], total: int, took_ms: float, "
-        "next_cursor: {rank: float, accession: string} | null}."
+        "next_cursor: {rank, accession} or {sort_value, accession} | null}."
     ),
     operation_id="search_all",
 )
@@ -891,8 +891,49 @@ def search(
     q: str = Query(..., min_length=1, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
+    cursor_sort: str | None = Query(None),
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress)$"),
+    sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
+    if sortby:
+        sql, params = build_sorted_search_sql(
+            q=q,
+            sortby=sortby,
+            order=order,
+            db=db,
+            cursor_sort=cursor_sort,
+            cursor_acc=cursor_acc,
+        )
+        start = time.perf_counter()
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                    _enrich_with_publications(rows, cur)
+        except Exception:
+            logger.exception("Database error in search (sorted)")
+            raise HTTPException(500, "Internal server error")
+
+        took_ms = (time.perf_counter() - start) * 1000
+        total = rows[0]["total_count"] if rows else 0
+
+        return {
+            "results": rows,
+            "total": total,
+            "took_ms": round(took_ms, 2),
+            "next_cursor": (
+                None
+                if not rows
+                else {
+                    "sort_value": rows[-1].get("sort_val"),
+                    "accession": rows[-1]["accession"],
+                }
+            ),
+        }
+
+    # Default rank-based search
     if db == "geo":
         return search_geo(request, q, cursor_rank, cursor_acc)
     elif db == "sra":
@@ -1861,6 +1902,14 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 1. **Search** — call `search_all` for simple keyword searches.
    The `source` field tells you: 'geo', 'sra', or 'arrayexpress'.
    Only pass `db="geo"|"sra"|"arrayexpress"` if user explicitly restricts.
+   - **Sorting**: pass `sortby` to re-order results:
+     - `sortby=citations`: sort by citation count of the primary publication.
+     - `sortby=journal`: sort by journal name of the primary publication.
+     - `sortby=year`: sort by study date (updated_at).
+     - `order=desc` (default) or `order=asc`.
+   - When `sortby` is used, pagination cursors change: `next_cursor` returns
+     `{sort_value, accession}` instead of `{rank, accession}`. Pass these back
+     as `cursor_sort` + `cursor_acc` (not `cursor_rank`).
 
 2. **Structured search** — call `search_structured` when the user wants to filter by
    organism, library strategy (e.g. RNA-Seq, ChIP-Seq), platform (e.g. ILLUMINA),
@@ -1898,10 +1947,13 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 6. **Citations & publications** — call `get_project_cite` with any accession to get
    publication metadata and BibTeX citations. Returns title, authors, journal, DOI,
    pub_date, citation_count, and formatted BibTeX for each linked paper.
-   - Default (`type=original`): returns the original/earliest publication (smallest PMID).
+   - `type=original` (default): returns the original/earliest publication (smallest PMID).
    - `type=all`: returns all linked publications sorted by PMID ascending.
+   - `format=json` (default): returns structured JSON with all fields.
+   - `format=bibtex`: returns raw plain-text BibTeX, ready to copy-paste into a .bib file.
    Use this when the user asks for citations, references, BibTeX, or paper details
-   for a study. Note: search results and `get_project` also include top-level
+   for a study. When the user wants copy-pasteable BibTeX, use `format=bibtex`.
+   Note: search results and `get_project` also include top-level
    publication fields (pmid, publication_title, journal, doi, authors, citation_count)
    from the primary (most-cited) publication.
 
