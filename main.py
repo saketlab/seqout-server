@@ -17,7 +17,12 @@ import geoip2.errors
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastmcp import FastMCP
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -1755,6 +1760,7 @@ def get_project_cite(
     request: Request,
     accession: str = Path(...),
     type: str = Query("original", pattern="^(original|all)$"),
+    format: str = Query("json", pattern="^(json|bibtex)$"),
 ):
     accession = accession.upper()
     try:
@@ -1790,6 +1796,10 @@ def get_project_cite(
                 "bibtex": _pub_to_bibtex(pub, accession),
             }
         )
+
+    if format == "bibtex":
+        bibtex_text = "\n\n".join(c["bibtex"] for c in citations)
+        return PlainTextResponse(bibtex_text, media_type="text/plain")
 
     return {"accession": accession, "citations": citations}
 
