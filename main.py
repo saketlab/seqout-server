@@ -280,6 +280,7 @@ class AnalyticsMiddleware(BaseHTTPMiddleware):
 # Middleware is registered on combined_app (below) so it covers
 # both REST and MCP routes.
 
+
 @api_app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
@@ -322,8 +323,51 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["publication_title"] = primary.get("title")
             row["journal"] = primary.get("journal")
             row["doi"] = primary.get("doi")
+            row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
     return rows
+
+
+def _pub_to_bibtex(pub: dict, accession: str) -> str:
+    """Convert a publication dict from study_publications JSONB into a BibTeX @article string."""
+    pmid = pub.get("pmid") or "unknown"
+    fields = []
+
+    if pub.get("title"):
+        fields.append(f"  title   = {{{pub['title']}}}")
+
+    authors = pub.get("authors")
+    if authors:
+        fields.append(
+            f"  author  = {{{' and '.join(a.strip() for a in authors.split(','))}}}"
+        )
+
+    if pub.get("journal"):
+        fields.append(f"  journal = {{{pub['journal']}}}")
+
+    pub_date = pub.get("pub_date") or ""
+    year = ""
+    if pub_date:
+        year = pub_date.strip().split()[0] if pub_date.strip() else ""
+        if year.isdigit():
+            fields.append(f"  year    = {{{year}}}")
+        else:
+            year = ""
+
+    if pub.get("doi"):
+        fields.append(f"  doi     = {{{pub['doi']}}}")
+
+    fields.append(f"  pmid    = {{{pmid}}}")
+
+    cite_key = f"PMID{pmid}"
+    if authors:
+        first_author = authors.split(",")[0].strip()
+        last_name = first_author.split()[-1] if first_author else ""
+        if last_name:
+            cite_key = f"{last_name}{year}"
+
+    body = ",\n".join(fields)
+    return f"@article{{{cite_key},\n{body},\n}}"
 
 
 def _transform_ae_sample_to_geo(sample: dict) -> dict:
@@ -1696,6 +1740,60 @@ def get_project_xref(
     return {"accession": accession, "xref": unique}
 
 
+@api_app.get(
+    "/project/{accession}/cite",
+    summary="Get BibTeX citation for a project",
+    description=(
+        "Return BibTeX citation(s) for a project accession. "
+        "By default returns the original publication (smallest PMID). "
+        "Use type=all to get BibTeX for every linked publication."
+    ),
+    operation_id="get_project_cite",
+)
+@limiter.limit("100/minute")
+def get_project_cite(
+    request: Request,
+    accession: str = Path(...),
+    type: str = Query("original", pattern="^(original|all)$"),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, ([accession],))
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_project_cite")
+        raise HTTPException(500, "Internal server error")
+
+    if not row or not row.get("publications"):
+        raise HTTPException(404, f"No publications found for {accession}")
+
+    pubs = row["publications"]
+    # Sort by PMID ascending (smallest = earliest/original)
+    pubs_sorted = sorted(pubs, key=lambda p: int(p.get("pmid") or 0))
+
+    if type == "original":
+        pubs_sorted = pubs_sorted[:1]
+
+    citations = []
+    for pub in pubs_sorted:
+        citations.append(
+            {
+                "pmid": pub.get("pmid"),
+                "title": pub.get("title"),
+                "authors": pub.get("authors"),
+                "journal": pub.get("journal"),
+                "doi": pub.get("doi"),
+                "pub_date": pub.get("pub_date"),
+                "citation_count": pub.get("citation_count"),
+                "bibtex": _pub_to_bibtex(pub, accession),
+            }
+        )
+
+    return {"accession": accession, "citations": citations}
+
+
 MCP_INSTRUCTIONS = """\
 You are connected to pysraweb, a genomics study search engine covering
 NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
@@ -1787,10 +1885,20 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    SRA alias connections. Use this when the user asks "is this study also in SRA/GEO?"
    or wants to find all versions of a dataset.
 
-6. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
+6. **Citations & publications** — call `get_project_cite` with any accession to get
+   publication metadata and BibTeX citations. Returns title, authors, journal, DOI,
+   pub_date, citation_count, and formatted BibTeX for each linked paper.
+   - Default (`type=original`): returns the original/earliest publication (smallest PMID).
+   - `type=all`: returns all linked publications sorted by PMID ascending.
+   Use this when the user asks for citations, references, BibTeX, or paper details
+   for a study. Note: search results and `get_project` also include top-level
+   publication fields (pmid, publication_title, journal, doi, authors, citation_count)
+   from the primary (most-cited) publication.
+
+7. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
    to their parent study/series.
 
-7. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
+8. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
 ## Context rules
 
