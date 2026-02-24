@@ -12,7 +12,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
-    SELECT accession, title, summary, updated_at, organisms,
+    SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
            ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority
     FROM geo_series, q
     WHERE tsv @@ q.q
@@ -26,7 +26,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -39,7 +39,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 6)
-    SELECT accession, title, abstract AS summary, updated_at, organisms,
+    SELECT accession, title, abstract AS summary, updated_at, organisms, countries,
            ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 6 AS priority
     FROM sra_studies, q
     WHERE tsv @@ q.q
@@ -53,7 +53,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -66,7 +66,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 4)
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
            ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 4 AS priority
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.q
@@ -80,7 +80,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -93,7 +93,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- GEO full-text search (includes contributors/departments/organizations in geo_series.tsv)
-    SELECT accession, title, summary, updated_at, organisms,
+    SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
            ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,
            accession AS dedup_key
     FROM geo_series, q
@@ -102,7 +102,7 @@ all_matches AS (
     UNION ALL
 
     -- SRA full-text search (lower rank multiplier)
-    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,
+        SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms, s.countries,
            ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,
            COALESCE(s.alias, s.accession) AS dedup_key
     FROM sra_studies s, q
@@ -111,7 +111,7 @@ all_matches AS (
     UNION ALL
 
     -- ArrayExpress full-text search
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms,
+    SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
            ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,
            COALESCE(alias, accession) AS dedup_key
     FROM arrayexpress_experiments, q
@@ -119,7 +119,7 @@ all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, rank, source
+        accession, title, summary, updated_at, organisms, countries, rank, source
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
@@ -132,7 +132,7 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;
@@ -870,7 +870,7 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT g.accession, g.title, g.summary,"
-            f" g.updated_at, g.organisms,"
+            f" g.updated_at, g.organisms, g.countries_iso AS countries,"
             f" {rank} AS rank, 'geo'::text AS source,"
             f" g.accession AS dedup_key"
             f" FROM geo_series g{where}"
@@ -914,7 +914,7 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT s.accession, s.title, s.abstract AS summary,"
-            f" s.updated_at, s.organisms,"
+            f" s.updated_at, s.organisms, s.countries,"
             f" {rank} AS rank, 'sra'::text AS source,"
             f" COALESCE(s.alias, s.accession) AS dedup_key"
             f" FROM sra_studies s{where}"
@@ -944,7 +944,7 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT ae.accession, ae.title, ae.description AS summary,"
-            f" ae.release_date AS updated_at, ae.organisms,"
+            f" ae.release_date AS updated_at, ae.organisms, ae.countries,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
             f" COALESCE(ae.alias, ae.accession) AS dedup_key"
             f" FROM arrayexpress_experiments ae{where}"
@@ -982,7 +982,7 @@ def build_structured_search(
             w.append("es.first_public <= make_date(%(year_to)s, 12, 31)")
 
         rank = (
-            f"ts_rank({ena_tsv}," f" plainto_tsquery('english', %(q)s)) * 0.7"
+            f"ts_rank({ena_tsv}, plainto_tsquery('english', %(q)s)) * 0.7"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM es.first_public), 0)"
         )
@@ -994,6 +994,7 @@ def build_structured_search(
             f" es.first_public AS updated_at,"
             f" CASE WHEN es.scientific_name IS NOT NULL"
             f" THEN ARRAY[es.scientific_name] END AS organisms,"
+            f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
             f" es.study_accession AS dedup_key"
             f" FROM ena_studies es{where}"
@@ -1003,6 +1004,7 @@ def build_structured_search(
         return (
             "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
             " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL::text[] AS countries,"
             " NULL::float8 AS rank, NULL AS source,"
             " 0::bigint AS total_count WHERE FALSE",
             {},
@@ -1014,8 +1016,7 @@ def build_structured_search(
         params["cursor_rank"] = cursor_rank
         params["cursor_acc"] = cursor_acc
         cursor_where = (
-            "WHERE (rank, accession) < "
-            "(%(cursor_rank)s::float8, %(cursor_acc)s::text)"
+            "WHERE (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text)"
         )
     else:
         cursor_where = ""
@@ -1026,7 +1027,7 @@ WITH all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, rank, source
+        accession, title, summary, updated_at, organisms, countries, rank, source
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
@@ -1039,7 +1040,7 @@ paged AS (
     {cursor_where}
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source, total_count
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count
 FROM paged
 ORDER BY rank DESC, accession DESC
 LIMIT 20;"""
@@ -1059,7 +1060,7 @@ def build_sorted_search_sql(
 
     if db in (None, "geo"):
         cte_parts.append(
-            "SELECT accession, title, summary, updated_at, organisms,"
+            "SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,"
             " ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,"
             " accession AS dedup_key"
             " FROM geo_series, q"
@@ -1069,7 +1070,7 @@ def build_sorted_search_sql(
     if db in (None, "sra"):
         cte_parts.append(
             "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,"
-            " s.organisms,"
+            " s.organisms, s.countries,"
             " ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,"
             " COALESCE(s.alias, s.accession) AS dedup_key"
             " FROM sra_studies s, q"
@@ -1079,7 +1080,7 @@ def build_sorted_search_sql(
     if db in (None, "arrayexpress"):
         cte_parts.append(
             "SELECT accession, title, description AS summary,"
-            " release_date AS updated_at, organisms,"
+            " release_date AS updated_at, organisms, countries,"
             " ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,"
             " COALESCE(alias, accession) AS dedup_key"
             " FROM arrayexpress_experiments, q"
@@ -1090,6 +1091,7 @@ def build_sorted_search_sql(
         return (
             "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
             " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL::text[] AS countries,"
             " NULL::float8 AS rank, NULL AS source,"
             " NULL AS sort_val, 0::bigint AS total_count WHERE FALSE",
             {},
@@ -1101,13 +1103,13 @@ def build_sorted_search_sql(
     if sortby == "citations":
         sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
         join_clause = (
-            "\n    LEFT JOIN study_publications sp" " ON sp.accession = d.accession"
+            "\n    LEFT JOIN study_publications sp ON sp.accession = d.accession"
         )
         cursor_cast = "::int"
     elif sortby == "journal":
         sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
         join_clause = (
-            "\n    LEFT JOIN study_publications sp" " ON sp.accession = d.accession"
+            "\n    LEFT JOIN study_publications sp ON sp.accession = d.accession"
         )
         cursor_cast = ""
     else:  # year
@@ -1137,7 +1139,7 @@ all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, rank, source
+        accession, title, summary, updated_at, organisms, countries, rank, source
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
@@ -1155,7 +1157,7 @@ paged AS (
     {cursor_where}
 )
 SELECT
-    accession, title, summary, updated_at, organisms, rank, source,
+    accession, title, summary, updated_at, organisms, countries, rank, source,
     sort_val, total_count
 FROM paged
 ORDER BY sort_val {direction} NULLS LAST, accession {direction}
