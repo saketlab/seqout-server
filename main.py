@@ -1876,7 +1876,7 @@ All of these are client-side operations on data you already have. Use `title`,
 
 ### Paginate-and-filter pattern
 
-Each search returns up to 20 results, a `total` count, and a `next_cursor`.
+Each search returns up to 200 results, a `total` count, and a `next_cursor`.
 When the user asks to filter and the current page has few or no matches:
 
 1. Check `total` — if it's much larger than results seen so far, more pages exist.

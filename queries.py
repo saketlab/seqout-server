@@ -29,7 +29,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-LIMIT 20;
+LIMIT 200;
 """
 
 
@@ -56,7 +56,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-LIMIT 20;
+LIMIT 200;
 """
 
 
@@ -83,7 +83,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-LIMIT 20;
+LIMIT 200;
 """
 
 
@@ -135,7 +135,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-LIMIT 20;
+LIMIT 200;
 """
 
 
@@ -1043,7 +1043,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-LIMIT 20;"""
+LIMIT 200;"""
 
     return sql, params
 
@@ -1162,7 +1162,7 @@ SELECT
     sort_val, total_count
 FROM paged
 ORDER BY sort_val {direction} NULLS LAST, accession {direction}
-LIMIT 20;"""
+LIMIT 200;"""
 
     return sql, params
 
