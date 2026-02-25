@@ -674,7 +674,7 @@ SELECT
     NULL::real[] AS coords_2d,
     NULL::real[] AS coords_3d,
     NULL::jsonb AS neighbors,
-    NULL AS alias,
+    ae.alias,
     ae.publication_title,
     ae.publication_authors,
     ae.publication_doi,
