@@ -96,7 +96,7 @@ logger = logging.getLogger(__name__)
 MAX_QUERY_DOWNLOAD = 100
 COMBINED_BIN_ROWS_SQL = """
 WITH combined AS (
-    SELECT accession, coords_2d, countries
+    SELECT accession, coords_2d, countries_iso AS countries
     FROM geo_series
     WHERE coords_2d IS NOT NULL
     UNION ALL
