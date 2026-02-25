@@ -1062,7 +1062,7 @@ def build_sorted_search_sql(
         cte_parts.append(
             "SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,"
             " ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,"
-            " accession AS dedup_key"
+            " accession AS dedup_key, instrument_models, library_strategies"
             " FROM geo_series, q"
             " WHERE tsv @@ q.q"
         )
@@ -1072,7 +1072,7 @@ def build_sorted_search_sql(
             "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,"
             " s.organisms, s.countries,"
             " ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,"
-            " COALESCE(s.alias, s.accession) AS dedup_key"
+            " COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
             " FROM sra_studies s, q"
             " WHERE s.tsv @@ q.q"
         )
@@ -1082,7 +1082,7 @@ def build_sorted_search_sql(
             "SELECT accession, title, description AS summary,"
             " release_date AS updated_at, organisms, countries,"
             " ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,"
-            " COALESCE(alias, accession) AS dedup_key"
+            " COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM arrayexpress_experiments, q"
             " WHERE tsv @@ q.q"
         )
@@ -1093,6 +1093,7 @@ def build_sorted_search_sql(
             " NULL AS updated_at, NULL::text[] AS organisms,"
             " NULL::text[] AS countries,"
             " NULL::float8 AS rank, NULL AS source,"
+            " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies,"
             " NULL AS sort_val, 0::bigint AS total_count WHERE FALSE",
             {},
         )
@@ -1139,7 +1140,7 @@ all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, countries, rank, source
+        accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
@@ -1157,7 +1158,7 @@ paged AS (
     {cursor_where}
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source,
+    accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies,
     sort_val, total_count
 FROM paged
 ORDER BY sort_val {direction} NULLS LAST, accession {direction}
