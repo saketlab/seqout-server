@@ -456,7 +456,7 @@ LIMIT %s;
 PROJECT_GEO_SQL = """
 SELECT
     accession,
-    alias,
+    alias_all AS alias,
     title,
     summary,
     overall_design,
