@@ -1362,7 +1362,6 @@ def bulk_project_metadata(request: Request, payload: dict):
     ),
     operation_id="bulk_project_samples_metadata",
 )
-@limiter.limit("20/minute")
 def bulk_project_samples_metadata(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
