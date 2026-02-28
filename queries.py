@@ -1356,3 +1356,76 @@ FROM input i
 JOIN matched m ON m.accession = i.accession
 ORDER BY i.ord;
 """
+
+
+# Resolve study_accession(s) used in sra_run_download_links for a given
+# SRP/ERP/DRP accession.  
+_RESOLVE_DL_STUDY = """
+WITH candidates AS (
+    SELECT %s::text AS acc
+    UNION
+    SELECT bioproject_id FROM sra_studies
+    WHERE accession = %s AND bioproject_id IS NOT NULL
+)
+"""
+
+STUDY_RUNS_SUMMARY_SQL = (
+    _RESOLVE_DL_STUDY
+    + """
+SELECT
+    COUNT(*) AS total_runs,
+    COUNT(*) FILTER (WHERE library_layout = 'PAIRED') AS paired_runs,
+    COUNT(*) FILTER (WHERE library_layout = 'SINGLE') AS single_runs,
+    COALESCE(SUM(
+        CASE WHEN fastq_bytes IS NOT NULL AND fastq_bytes != ''
+             THEN (
+                 SELECT SUM(v::bigint)
+                 FROM unnest(string_to_array(fastq_bytes, ';')) AS v
+                 WHERE v ~ '^[0-9]+$'
+             )
+             ELSE 0
+        END
+    ), 0) AS total_fastq_bytes
+FROM sra_run_download_links
+WHERE study_accession IN (SELECT acc FROM candidates);
+"""
+)
+
+STUDY_RUNS_SQL = (
+    _RESOLVE_DL_STUDY
+    + """
+SELECT
+    run_accession,
+    experiment_accession,
+    library_layout,
+    fastq_ftp,
+    fastq_bytes,
+    fastq_md5,
+    sra_ftp,
+    sra_bytes,
+    sra_md5
+FROM sra_run_download_links
+WHERE study_accession IN (SELECT acc FROM candidates)
+ORDER BY experiment_accession, run_accession;
+"""
+)
+
+STUDY_RUNS_PREVIEW_SQL = (
+    _RESOLVE_DL_STUDY
+    + """
+SELECT
+    run_accession,
+    experiment_accession,
+    library_layout,
+    fastq_ftp,
+    fastq_bytes,
+    fastq_md5,
+    sra_ftp,
+    sra_bytes,
+    sra_md5
+FROM sra_run_download_links
+WHERE study_accession IN (SELECT acc FROM candidates)
+ORDER BY experiment_accession, run_accession
+LIMIT 500;
+"""
+)

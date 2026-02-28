@@ -59,6 +59,9 @@ from queries import (
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
+    STUDY_RUNS_PREVIEW_SQL,
+    STUDY_RUNS_SQL,
+    STUDY_RUNS_SUMMARY_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -1106,6 +1109,160 @@ def get_study_experiments(
     except Exception as e:
         logger.exception("Database error in get_study_experiments")
         raise HTTPException(500, "Internal server error")
+
+
+def _split_fastq_fields(row: dict, study: str) -> list[dict]:
+    """Expand a single run row into one dict per FASTQ file.
+
+    Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields;
+    this splits them into individual file entries with directory paths.
+    """
+    ftp = row.get("fastq_ftp") or ""
+    bytes_ = row.get("fastq_bytes") or ""
+    md5s = row.get("fastq_md5") or ""
+    urls = [u.strip() for u in ftp.split(";") if u.strip()]
+    sizes = [s.strip() for s in bytes_.split(";") if s.strip()]
+    checksums = [m.strip() for m in md5s.split(";") if m.strip()]
+
+    run = row["run_accession"]
+    exp = row.get("experiment_accession") or "unknown"
+    dir_path = f"{study}/{exp}/{run}"
+
+    if not urls:
+        # Fall back to SRA format if no FASTQ links
+        sra_ftp = row.get("sra_ftp") or ""
+        if sra_ftp:
+            filename = sra_ftp.rsplit("/", 1)[-1] if "/" in sra_ftp else run
+            return [
+                {
+                    "run_accession": run,
+                    "experiment_accession": exp,
+                    "library_layout": row.get("library_layout") or "",
+                    "fastq_url": (
+                        f"ftp://{sra_ftp}"
+                        if not sra_ftp.startswith("ftp://")
+                        else sra_ftp
+                    ),
+                    "fastq_bytes": row.get("sra_bytes") or "",
+                    "fastq_md5": row.get("sra_md5") or "",
+                    "filename": filename,
+                    "directory_path": dir_path,
+                }
+            ]
+        return []
+
+    results = []
+    for i, url in enumerate(urls):
+        filename = url.rsplit("/", 1)[-1] if "/" in url else url
+        results.append(
+            {
+                "run_accession": run,
+                "experiment_accession": exp,
+                "library_layout": row.get("library_layout") or "",
+                "fastq_url": f"ftp://{url}" if not url.startswith("ftp://") else url,
+                "fastq_bytes": sizes[i] if i < len(sizes) else "",
+                "fastq_md5": checksums[i] if i < len(checksums) else "",
+                "filename": filename,
+                "directory_path": dir_path,
+            }
+        )
+    return results
+
+
+@api_app.get(
+    "/project/{study}/runs",
+    summary="List download links for a study",
+    description=(
+        "Return FASTQ/SRA download links for all runs in an SRA study. "
+        "Returns a preview (up to 500 runs) plus summary statistics."
+    ),
+    operation_id="get_study_runs",
+)
+@limiter.limit("100/minute")
+def get_study_runs(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    study = study.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                summary = cur.fetchone()
+                if not summary or summary["total_runs"] == 0:
+                    return {
+                        "total_runs": 0,
+                        "paired_runs": 0,
+                        "single_runs": 0,
+                        "total_fastq_bytes": 0,
+                        "runs": [],
+                    }
+
+                cur.execute(STUDY_RUNS_PREVIEW_SQL, (study, study))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_study_runs")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "total_runs": summary["total_runs"],
+        "paired_runs": summary["paired_runs"],
+        "single_runs": summary["single_runs"],
+        "total_fastq_bytes": summary["total_fastq_bytes"],
+        "runs": rows,
+    }
+
+
+@api_app.get(
+    "/project/{study}/runs/download",
+    summary="Download run links as TSV",
+    description=(
+        "Stream a TSV file containing all FASTQ download links for a study, "
+        "with one row per file. Paired-end runs are split into separate rows. "
+        "Includes a directory_path column for organizing files as STUDY/EXPERIMENT/RUN/."
+    ),
+    operation_id="download_study_runs_tsv",
+)
+@limiter.limit("20/minute")
+def download_study_runs_tsv(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    study = study.upper()
+
+    def generate():
+        header = "run_accession\texperiment_accession\tlibrary_layout\tfastq_url\tfastq_bytes\tfastq_md5\tfilename\tdirectory_path\n"
+        yield header
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(STUDY_RUNS_SQL, (study, study))
+                    while True:
+                        rows = cur.fetchmany(500)
+                        if not rows:
+                            break
+                        for row in rows:
+                            for entry in _split_fastq_fields(row, study):
+                                yield (
+                                    f"{entry['run_accession']}\t"
+                                    f"{entry['experiment_accession']}\t"
+                                    f"{entry['library_layout']}\t"
+                                    f"{entry['fastq_url']}\t"
+                                    f"{entry['fastq_bytes']}\t"
+                                    f"{entry['fastq_md5']}\t"
+                                    f"{entry['filename']}\t"
+                                    f"{entry['directory_path']}\n"
+                                )
+        except Exception:
+            logger.exception("Error streaming runs TSV for %s", study)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/tab-separated-values",
+        headers={
+            "Content-Disposition": f'attachment; filename="{study}_download_links.tsv"'
+        },
+    )
 
 
 @api_app.get(
