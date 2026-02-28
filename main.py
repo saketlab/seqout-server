@@ -30,7 +30,6 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
 from user_agents import parse as parse_ua
 
 from queries import (
@@ -2165,11 +2164,5 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-combined_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 app = combined_app
