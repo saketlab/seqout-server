@@ -30,6 +30,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from user_agents import parse as parse_ua
 
 from queries import (
@@ -150,6 +151,7 @@ pool = ConnectionPool(
 limiter = Limiter(key_func=get_remote_address)
 api_app = FastAPI()
 api_app.state.limiter = limiter
+
 
 # ---------
 # Analytics
@@ -2094,13 +2096,26 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    - GEO series → `get_geo_series_samples`
    - ArrayExpress experiment → `get_ae_experiment_samples`
 
-5. **Cross-reference lookup** — call `get_project_xref` with any accession (GSE, SRP,
+5. **FASTQ download links** — call `get_study_runs` with an SRA study accession
+   (SRP/ERP/DRP) to get FASTQ download URLs for all runs. Returns summary statistics
+   (total_runs, paired_runs, single_runs, total_fastq_bytes) and a list of runs with
+   fields: run_accession, experiment_accession, library_layout, fastq_ftp,
+   fastq_bytes, fastq_md5. Use this when the user asks how to download raw data,
+   FASTQs, or sequencing files for a study.
+   - FASTQ URLs are EBI FTP paths (prefix with `https://` to make downloadable links).
+   - Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields (R1;R2).
+   - For a wget/curl one-liner, point users to the TSV download endpoint:
+     `curl -sS "https://pysraweb.saketlab.org/api/project/{study}/runs/download" | tail -n +2 | cut -f4 | xargs -P4 -I{} wget -q -x -nH --cut-dirs=6 "{}"`
+   - Or direct them to the web UI at `https://pysraweb.saketlab.org/p/{study}` which
+     has an interactive download section with per-file links and batch download scripts.
+
+6. **Cross-reference lookup** — call `get_project_xref` with any accession (GSE, SRP,
    E-XXXX, PRJNA) to discover cross-references across all archives. Shows cross-reference
    links (SRA, BioProject, ENA, GEO), naming convention links (E-GEOD ↔ GSE), and
    SRA alias connections. Use this when the user asks "is this study also in SRA/GEO?"
    or wants to find all versions of a dataset.
 
-6. **Citations & publications** — call `get_project_cite` with any accession to get
+7. **Citations & publications** — call `get_project_cite` with any accession to get
    publication metadata and BibTeX citations. Returns title, authors, journal, DOI,
    pub_date, citation_count, and formatted BibTeX for each linked paper.
    - `type=original` (default): returns the original/earliest publication (smallest PMID).
@@ -2113,10 +2128,10 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    publication fields (pmid, publication_title, journal, doi, authors, citation_count)
    from the primary (most-cited) publication.
 
-7. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
+8. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
    to their parent study/series.
 
-8. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
+9. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
 ## Context rules
 
@@ -2128,6 +2143,9 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 
 - `bulk_metadata`, `download_by_query`, `bulk_project_metadata` return binary/bulk data
   useless for LLMs. Tell users to use the REST API or web interface directly.
+- `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
+  structured JSON with download links. Point users to the TSV endpoint URL if they
+  want a wget/curl one-liner.
 - `health_check` is only for connectivity checks.
 - `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
 """
@@ -2147,5 +2165,11 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
+combined_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app = combined_app
