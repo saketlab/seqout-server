@@ -1819,9 +1819,10 @@ def get_prj_info(
     summary="Structured search with filters",
     description=(
         "Search across GEO, SRA, ArrayExpress, and ENA with structured filters "
-        "(organism, library_strategy, platform, country, center, year range) "
-        "optionally combined with full-text search. At least one of q or a filter "
-        "parameter is required. Use cursors (rank + accession) for pagination. "
+        "(organism, library_strategy, platform, country, center, year range, "
+        "journal, instrument_model) optionally combined with full-text search. "
+        "At least one of q or a filter parameter is required. "
+        "Use cursors (rank + accession) for pagination. "
         "Returns {results: object[], total: int, took_ms: float, "
         "next_cursor: {rank: float, accession: string} | null}."
     ),
@@ -1841,14 +1842,28 @@ def search_structured(
     source: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|all)$"),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
+    journal: str | None = Query(None),
+    instrument_model: str | None = Query(None),
 ):
     if not any(
-        [q, organism, library_strategy, platform, country, center, year_from, year_to]
+        [
+            q,
+            organism,
+            library_strategy,
+            platform,
+            country,
+            center,
+            year_from,
+            year_to,
+            journal,
+            instrument_model,
+        ]
     ):
         raise HTTPException(
             400,
             "At least one of q, organism, library_strategy, platform, "
-            "country, center, year_from, or year_to is required",
+            "country, center, year_from, year_to, journal, or "
+            "instrument_model is required",
         )
 
     if year_from is not None and year_to is not None and year_from > year_to:
@@ -1866,6 +1881,8 @@ def search_structured(
         source=source,
         cursor_rank=cursor_rank,
         cursor_acc=cursor_acc,
+        journal=journal,
+        instrument_model=instrument_model,
     )
 
     start = time.perf_counter()
@@ -2070,9 +2087,9 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 
 2. **Structured search** — call `search_structured` when the user wants to filter by
    organism, library strategy (e.g. RNA-Seq, ChIP-Seq), platform (e.g. ILLUMINA),
-   country, institution/center, or date range. Searches across GEO, SRA, ArrayExpress,
-   and ENA. Filters can be combined with a keyword query (`q`). At least one filter or
-   `q` is required.
+   country, institution/center, date range, journal, or instrument model. Searches
+   across GEO, SRA, ArrayExpress, and ENA. Filters can be combined with a keyword
+   query (`q`). At least one filter or `q` is required.
    - `organism`: exact species name, e.g. "Homo sapiens", "Mus musculus"
    - `library_strategy`: SRA/ENA library strategy, e.g. "RNA-Seq", "ChIP-Seq", "WGS"
      (also matches ArrayExpress `technology` field)
@@ -2083,6 +2100,10 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
      ArrayExpress is excluded — no structured country data)
    - `center`: institution name (partial match), e.g. "Broad Institute"
    - `year_from`/`year_to`: publication year range
+   - `journal`: exact journal name, e.g. "Nature", "Cell"
+     (filters by the primary publication's journal across all sources)
+   - `instrument_model`: exact instrument model, e.g. "Illumina HiSeq 2500"
+     (GEO and SRA only; ArrayExpress and ENA are excluded when this filter is active)
    - `source`: restrict to "geo", "sra", "arrayexpress", "ena", or "all"
    Use `search_all` for simple keyword searches; use `search_structured` when specific
    metadata filters are needed.

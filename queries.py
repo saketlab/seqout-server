@@ -798,6 +798,8 @@ def build_structured_search(
     source=None,
     cursor_rank=None,
     cursor_acc=None,
+    journal=None,
+    instrument_model=None,
 ):
     """Build SQL + params for structured search across GEO, SRA, ArrayExpress, ENA.
 
@@ -819,6 +821,9 @@ def build_structured_search(
         include_ae = False
     if country:
         include_ae = False
+    if instrument_model:
+        include_ae = False
+        include_ena = False
 
     # Populate shared params
     if q:
@@ -837,6 +842,10 @@ def build_structured_search(
         params["year_from"] = year_from
     if year_to is not None:
         params["year_to"] = year_to
+    if journal:
+        params["journal"] = journal
+    if instrument_model:
+        params["instrument_model"] = instrument_model
 
     # --- GEO ---
     if include_geo:
@@ -861,6 +870,14 @@ def build_structured_search(
             w.append("g.published_at >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("g.published_at <= make_date(%(year_to)s, 12, 31)")
+        if journal:
+            w.append(
+                "EXISTS (SELECT 1 FROM study_publications sp"
+                " WHERE sp.accession = g.accession"
+                " AND sp.publications->0->>'journal' = %(journal)s)"
+            )
+        if instrument_model:
+            w.append("g.instrument_models @> ARRAY[%(instrument_model)s]")
 
         rank = (
             "ts_rank(g.tsv, plainto_tsquery('english', %(q)s))"
@@ -905,6 +922,14 @@ def build_structured_search(
             w.append("s.published_at >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("s.published_at <= make_date(%(year_to)s, 12, 31)")
+        if journal:
+            w.append(
+                "EXISTS (SELECT 1 FROM study_publications sp"
+                " WHERE sp.accession = s.accession"
+                " AND sp.publications->0->>'journal' = %(journal)s)"
+            )
+        if instrument_model:
+            w.append("s.instrument_models @> ARRAY[%(instrument_model)s]")
 
         rank = (
             "ts_rank(s.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -935,6 +960,12 @@ def build_structured_search(
             w.append("ae.release_date >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("ae.release_date <= make_date(%(year_to)s, 12, 31)")
+        if journal:
+            w.append(
+                "EXISTS (SELECT 1 FROM study_publications sp"
+                " WHERE sp.accession = ae.accession"
+                " AND sp.publications->0->>'journal' = %(journal)s)"
+            )
 
         rank = (
             "ts_rank(ae.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -980,6 +1011,12 @@ def build_structured_search(
             w.append("es.first_public >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("es.first_public <= make_date(%(year_to)s, 12, 31)")
+        if journal:
+            w.append(
+                "EXISTS (SELECT 1 FROM study_publications sp"
+                " WHERE sp.accession = es.study_accession"
+                " AND sp.publications->0->>'journal' = %(journal)s)"
+            )
 
         rank = (
             f"ts_rank({ena_tsv}, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -1359,7 +1396,7 @@ ORDER BY i.ord;
 
 
 # Resolve study_accession(s) used in sra_run_download_links for a given
-# SRP/ERP/DRP accession.  
+# SRP/ERP/DRP accession.
 _RESOLVE_DL_STUDY = """
 WITH candidates AS (
     SELECT %s::text AS acc
