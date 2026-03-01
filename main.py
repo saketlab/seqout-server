@@ -30,6 +30,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from user_agents import parse as parse_ua
 
 from queries import (
@@ -62,6 +63,14 @@ from queries import (
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
+    GROWTH_PROJECTS_GEO_SQL,
+    GROWTH_PROJECTS_SRA_SQL,
+    GROWTH_PROJECTS_AE_SQL,
+    GROWTH_PROJECTS_ENA_SQL,
+    GROWTH_EXPERIMENTS_GEO_SQL,
+    GROWTH_EXPERIMENTS_SRA_SQL,
+    GROWTH_EXPERIMENTS_AE_SQL,
+    GROWTH_EXPERIMENTS_ENA_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -138,6 +147,8 @@ _bin_cache_lock = threading.Lock()
 _bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"ready": False, "rows": []}
+_growth_cache_lock = threading.Lock()
+_growth_cache = {"ready": False, "data": {}}
 
 
 pool = ConnectionPool(
@@ -701,6 +712,44 @@ def _get_clusters_rows() -> list[dict]:
         return rows
 
 
+def _build_growth_data() -> dict:
+    """Run all 8 growth queries in one connection and return nested dict."""
+    queries = {
+        "projects": {
+            "geo": GROWTH_PROJECTS_GEO_SQL,
+            "sra": GROWTH_PROJECTS_SRA_SQL,
+            "arrayexpress": GROWTH_PROJECTS_AE_SQL,
+            "ena": GROWTH_PROJECTS_ENA_SQL,
+        },
+        "experiments": {
+            "geo": GROWTH_EXPERIMENTS_GEO_SQL,
+            "sra": GROWTH_EXPERIMENTS_SRA_SQL,
+            "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
+            "ena": GROWTH_EXPERIMENTS_ENA_SQL,
+        },
+    }
+    data = {}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            for mode, dbs in queries.items():
+                data[mode] = {}
+                for db_name, sql in dbs.items():
+                    cur.execute(sql)
+                    data[mode][db_name] = cur.fetchall()
+    return data
+
+
+def _get_growth_data() -> dict:
+    with _growth_cache_lock:
+        if _growth_cache["ready"]:
+            return _growth_cache["data"]
+
+        data = _build_growth_data()
+        _growth_cache["ready"] = True
+        _growth_cache["data"] = data
+        return data
+
+
 @api_app.get(
     "/",
     summary="Health check",
@@ -770,6 +819,52 @@ def get_clusters(request: Request):
         raise HTTPException(500, "Internal server error")
 
     return rows
+
+
+@api_app.get(
+    "/stats/growth",
+    summary="Database growth over time",
+    description=(
+        "Return monthly counts of projects or experiments per database (GEO, SRA, "
+        "ArrayExpress, ENA) for plotting growth timeline charts. "
+        "Counts are per-month (not cumulative). "
+        "Returns {mode: string, series: {geo?: [{month, count}], sra?: [...], "
+        "arrayexpress?: [...], ena?: [...]}, took_ms: float}."
+    ),
+    operation_id="get_growth_stats",
+)
+@limiter.limit("20/minute")
+def get_growth_stats(
+    request: Request,
+    mode: str = Query(
+        ...,
+        pattern="^(projects|experiments)$",
+        description="Count projects (studies/series) or experiments (samples/experiments)",
+    ),
+    db: str | None = Query(
+        None,
+        pattern="^(geo|sra|arrayexpress|ena)$",
+        description="Filter to a single database",
+    ),
+):
+    t0 = time.perf_counter()
+    try:
+        all_data = _get_growth_data()
+    except Exception:
+        logger.exception("Database error in get_growth_stats")
+        raise HTTPException(500, "Internal server error")
+
+    mode_data = all_data.get(mode, {})
+    if db:
+        series = {db: mode_data.get(db, [])}
+    else:
+        series = mode_data
+
+    return {
+        "mode": mode,
+        "series": series,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
 
 
 @api_app.get(
@@ -2185,5 +2280,11 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
+combined_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app = combined_app

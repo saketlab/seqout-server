@@ -233,9 +233,12 @@ CREATE INDEX IF NOT EXISTS idx_ena_exp_strategy ON ena_experiments (library_stra
 CREATE INDEX IF NOT EXISTS idx_ena_exp_platform ON ena_experiments (instrument_platform);
 CREATE INDEX IF NOT EXISTS idx_ena_exp_country ON ena_experiments (country);
 
--- Date-based indexes for year range filters
+-- Date-based indexes for year range filters and growth stats
 CREATE INDEX IF NOT EXISTS idx_geo_series_published_at ON geo_series (published_at);
 CREATE INDEX IF NOT EXISTS idx_sra_studies_published_at ON sra_studies (published_at);
+CREATE INDEX IF NOT EXISTS idx_ae_experiments_release_date ON arrayexpress_experiments (release_date);
+CREATE INDEX IF NOT EXISTS idx_geo_samples_published_at ON geo_samples (published_at);
+CREATE INDEX IF NOT EXISTS idx_ena_experiments_first_public ON ena_experiments (first_public);
 
 -- SRA submissions center_name for center filter
 CREATE INDEX IF NOT EXISTS idx_sra_submissions_center ON sra_submissions (center_name);
