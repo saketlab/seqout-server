@@ -2248,6 +2248,24 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 
 9. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
+10. **Quick metadata** — call `get_project_metadata` with any accession (GSE, SRP, E-XXXX)
+    to get just the title and description without full project details. Faster than
+    `get_project` when you only need a quick summary.
+
+11. **Species common name** — call `get_common_name_by_scientific_name` with a scientific
+    name (e.g. "Homo sapiens") to get its common name (e.g. "human"). Useful when
+    displaying organism info in a friendly format.
+
+12. **Database growth stats** — call `get_growth_stats` with `mode=projects` or
+    `mode=experiments` to get monthly counts per database (GEO, SRA, ArrayExpress, ENA).
+    Optionally filter by `db` (e.g. `db=geo`). Returns per-month (non-cumulative) counts.
+    Use this when the user asks about database size, growth trends, or historical data
+    volume.
+
+13. **Bulk project+samples metadata** — call `bulk_project_samples_metadata` with a list
+    of project accessions (GSE, SRP, ERP, DRP) to get project title/description plus
+    flattened sample rows. Useful for comparing sample-level metadata across studies.
+
 ## Context rules
 
 - **Stay focused** on current search results unless user explicitly requests new search.
@@ -2261,6 +2279,10 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 - `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
   structured JSON with download links. Point users to the TSV endpoint URL if they
   want a wget/curl one-liner.
+- `get_points_bin`, `get_accessions_bin`, `get_clusters` return binary/JSON data for
+  the 2D map visualization — not useful for conversational LLM interactions.
+- `get_geo_series_neighbors_coords` returns raw neighbor/3D coordinate data for the
+  similarity graph — not useful for conversational use.
 - `health_check` is only for connectivity checks.
 - `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
 """
