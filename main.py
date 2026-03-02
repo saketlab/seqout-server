@@ -71,6 +71,9 @@ from queries import (
     GROWTH_EXPERIMENTS_SRA_SQL,
     GROWTH_EXPERIMENTS_AE_SQL,
     GROWTH_EXPERIMENTS_ENA_SQL,
+    GROWTH_BASES_ENA_SQL,
+    GROWTH_BYTES_SRA_FASTQ_SQL,
+    GROWTH_BYTES_SRA_SRA_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -148,7 +151,7 @@ _bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"ready": False, "rows": []}
 _growth_cache_lock = threading.Lock()
-_growth_cache = {"ready": False, "data": {}}
+_growth_cache = {"ready": False, "data": {}, "built_at": 0.0}
 
 
 pool = ConnectionPool(
@@ -713,7 +716,7 @@ def _get_clusters_rows() -> list[dict]:
 
 
 def _build_growth_data() -> dict:
-    """Run all 8 growth queries in one connection and return nested dict."""
+    """Run all growth queries in one connection and return nested dict."""
     queries = {
         "projects": {
             "geo": GROWTH_PROJECTS_GEO_SQL,
@@ -727,6 +730,11 @@ def _build_growth_data() -> dict:
             "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
             "ena": GROWTH_EXPERIMENTS_ENA_SQL,
         },
+        "bases": {
+            "ena": GROWTH_BASES_ENA_SQL,
+            "sra_fastq_bytes": GROWTH_BYTES_SRA_FASTQ_SQL,
+            "sra_sra_bytes": GROWTH_BYTES_SRA_SRA_SQL,
+        },
     }
     data = {}
     with pool.connection() as conn:
@@ -739,14 +747,22 @@ def _build_growth_data() -> dict:
     return data
 
 
+_GROWTH_CACHE_TTL = 7 * 24 * 3600  # 7 days in seconds
+
+
 def _get_growth_data() -> dict:
     with _growth_cache_lock:
-        if _growth_cache["ready"]:
+        now = time.time()
+        if (
+            _growth_cache["ready"]
+            and (now - _growth_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
             return _growth_cache["data"]
 
         data = _build_growth_data()
         _growth_cache["ready"] = True
         _growth_cache["data"] = data
+        _growth_cache["built_at"] = now
         return data
 
 
@@ -825,11 +841,11 @@ def get_clusters(request: Request):
     "/stats/growth",
     summary="Database growth over time",
     description=(
-        "Return monthly counts of projects or experiments per database (GEO, SRA, "
-        "ArrayExpress, ENA) for plotting growth timeline charts. "
+        "Return monthly counts of projects, experiments, or data volume per database. "
+        "modes: projects (studies/series count), experiments (samples count), "
+        "bases (nucleotide bases for ENA, FASTQ/SRA bytes for SRA). "
         "Counts are per-month (not cumulative). "
-        "Returns {mode: string, series: {geo?: [{month, count}], sra?: [...], "
-        "arrayexpress?: [...], ena?: [...]}, took_ms: float}."
+        "Returns {mode, series: {db: [{month, count}]}, took_ms}."
     ),
     operation_id="get_growth_stats",
 )
@@ -838,13 +854,13 @@ def get_growth_stats(
     request: Request,
     mode: str = Query(
         ...,
-        pattern="^(projects|experiments)$",
-        description="Count projects (studies/series) or experiments (samples/experiments)",
+        pattern="^(projects|experiments|bases)$",
+        description="Count projects, experiments, or data volume (bases/bytes)",
     ),
     db: str | None = Query(
         None,
-        pattern="^(geo|sra|arrayexpress|ena)$",
-        description="Filter to a single database",
+        pattern="^(geo|sra|arrayexpress|ena|sra_fastq_bytes|sra_sra_bytes)$",
+        description="Filter to a single series",
     ),
 ):
     t0 = time.perf_counter()
@@ -1241,6 +1257,22 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
                     ),
                     "fastq_bytes": row.get("sra_bytes") or "",
                     "fastq_md5": row.get("sra_md5") or "",
+                    "filename": filename,
+                    "directory_path": dir_path,
+                }
+            ]
+        # Fall back to NCBI URL (already full HTTPS/S3 URLs)
+        ncbi_url = row.get("ncbi_sra_url") or row.get("ncbi_sra_url_aws") or ""
+        if ncbi_url:
+            filename = ncbi_url.rsplit("/", 1)[-1] if "/" in ncbi_url else run
+            return [
+                {
+                    "run_accession": run,
+                    "experiment_accession": exp,
+                    "library_layout": row.get("library_layout") or "",
+                    "fastq_url": ncbi_url,
+                    "fastq_bytes": "",
+                    "fastq_md5": "",
                     "filename": filename,
                     "directory_path": dir_path,
                 }

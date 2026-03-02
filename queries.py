@@ -1440,7 +1440,9 @@ SELECT
     fastq_md5,
     sra_ftp,
     sra_bytes,
-    sra_md5
+    sra_md5,
+    ncbi_sra_url,
+    ncbi_sra_url_aws
 FROM sra_run_download_links
 WHERE study_accession IN (SELECT acc FROM candidates)
 ORDER BY experiment_accession, run_accession;
@@ -1459,7 +1461,9 @@ SELECT
     fastq_md5,
     sra_ftp,
     sra_bytes,
-    sra_md5
+    sra_md5,
+    ncbi_sra_url,
+    ncbi_sra_url_aws
 FROM sra_run_download_links
 WHERE study_accession IN (SELECT acc FROM candidates)
 ORDER BY experiment_accession, run_accession
@@ -1546,5 +1550,50 @@ SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
 FROM ena_experiments
 WHERE first_public IS NOT NULL
 GROUP BY DATE_TRUNC('month', first_public)
+ORDER BY month;
+"""
+
+# -- Bases / bytes mode (data volume per month) --
+
+GROWTH_BASES_ENA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
+       SUM(base_count::bigint) AS count
+FROM ena_experiments
+WHERE first_public IS NOT NULL
+  AND base_count IS NOT NULL
+GROUP BY DATE_TRUNC('month', first_public)
+ORDER BY month;
+"""
+
+GROWTH_BYTES_SRA_FASTQ_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', s.published_at), 'YYYY-MM') AS month,
+       SUM(
+           split_part(dl.fastq_bytes, ';', 1)::bigint +
+           COALESCE(NULLIF(split_part(dl.fastq_bytes, ';', 2), '')::bigint, 0) +
+           COALESCE(NULLIF(split_part(dl.fastq_bytes, ';', 3), '')::bigint, 0)
+       ) AS count
+FROM sra_run_download_links dl
+JOIN sra_studies s ON s.accession = dl.study_accession
+WHERE dl.fastq_bytes IS NOT NULL
+  AND dl.fastq_bytes <> ''
+  AND s.published_at IS NOT NULL
+GROUP BY DATE_TRUNC('month', s.published_at)
+ORDER BY month;
+"""
+
+GROWTH_BYTES_SRA_SRA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', s.published_at), 'YYYY-MM') AS month,
+       SUM(
+           CASE
+               WHEN dl.sra_bytes NOT LIKE '%;%' THEN dl.sra_bytes::bigint
+               ELSE (SELECT SUM(x::bigint) FROM unnest(string_to_array(dl.sra_bytes, ';')) x)
+           END
+       ) AS count
+FROM sra_run_download_links dl
+JOIN sra_studies s ON s.accession = dl.study_accession
+WHERE dl.sra_bytes IS NOT NULL
+  AND dl.sra_bytes <> ''
+  AND s.published_at IS NOT NULL
+GROUP BY DATE_TRUNC('month', s.published_at)
 ORDER BY month;
 """
