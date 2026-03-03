@@ -32,6 +32,8 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from user_agents import parse as parse_ua
 
+# from starlette.middleware.cors import CORSMiddleware
+
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -1582,6 +1584,8 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
 
     Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields;
     this splits them into individual file entries with directory paths.
+    Each entry includes separate columns for SRA Lite, SRA (normalized),
+    S3/AWS, and GCS URLs alongside the FASTQ URL.
     """
     ftp = row.get("fastq_ftp") or ""
     bytes_ = row.get("fastq_bytes") or ""
@@ -1594,72 +1598,78 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     exp = row.get("experiment_accession") or "unknown"
     dir_path = f"{study}/{exp}/{run}"
 
-    if not urls:
-        # Fall back to SRA format if no FASTQ links
+    # Cloud / SRA URLs
+    sra_lite_url = row.get("ncbi_sra_lite_url") or ""
+    sra_lite_bytes = row.get("ncbi_sra_lite_bytes") or ""
+    sra_url = row.get("ncbi_sra_normalized_url") or ""
+    sra_bytes = row.get("ncbi_sra_normalized_bytes") or ""
+    s3_url = row.get("ncbi_sra_lite_s3_url") or ""
+    gs_url = row.get("ncbi_sra_lite_gs_url") or ""
+
+    sra_md5 = row.get("sra_md5") or ""
+
+    common = {
+        "run_accession": run,
+        "experiment_accession": exp,
+        "library_layout": row.get("library_layout") or "",
+        "sra_lite_url": sra_lite_url,
+        "sra_lite_bytes": sra_lite_bytes,
+        "sra_url": sra_url,
+        "sra_bytes": sra_bytes,
+        "sra_md5": sra_md5,
+        "s3_url": s3_url,
+        "gs_url": gs_url,
+        "directory_path": dir_path,
+    }
+
+    if urls:
+        results = []
+        for i, url in enumerate(urls):
+            filename = url.rsplit("/", 1)[-1] if "/" in url else url
+            results.append(
+                {
+                    **common,
+                    "fastq_url": (
+                        f"ftp://{url}" if not url.startswith("ftp://") else url
+                    ),
+                    "fastq_bytes": sizes[i] if i < len(sizes) else "",
+                    "fastq_md5": checksums[i] if i < len(checksums) else "",
+                    "filename": filename,
+                }
+            )
+        return results
+
+    # No FASTQ FTP so emit one row
+    # with empty FASTQ columns but cloud URLs
+    best_url = (
+        sra_url
+        or sra_lite_url
+        or row.get("ncbi_sra_url")
+        or row.get("ncbi_sra_url_aws")
+        or ""
+    )
+    if not best_url:
         sra_ftp = row.get("sra_ftp") or ""
         if sra_ftp:
-            filename = sra_ftp.rsplit("/", 1)[-1] if "/" in sra_ftp else run
-            return [
-                {
-                    "run_accession": run,
-                    "experiment_accession": exp,
-                    "library_layout": row.get("library_layout") or "",
-                    "fastq_url": (
-                        f"ftp://{sra_ftp}"
-                        if not sra_ftp.startswith("ftp://")
-                        else sra_ftp
-                    ),
-                    "fastq_bytes": row.get("sra_bytes") or "",
-                    "fastq_md5": row.get("sra_md5") or "",
-                    "filename": filename,
-                    "directory_path": dir_path,
-                }
-            ]
-        # Fall back to NCBI URL: prefer SRA Normalized (full), then SRA Lite
-        ncbi_url = (
-            row.get("ncbi_sra_normalized_url")
-            or row.get("ncbi_sra_lite_url")
-            or row.get("ncbi_sra_url")
-            or row.get("ncbi_sra_url_aws")
-            or ""
-        )
-        ncbi_bytes = ""
-        if row.get("ncbi_sra_normalized_url"):
-            ncbi_bytes = row.get("ncbi_sra_normalized_bytes") or ""
-        elif row.get("ncbi_sra_lite_url"):
-            ncbi_bytes = row.get("ncbi_sra_lite_bytes") or ""
-        if ncbi_url:
-            filename = ncbi_url.rsplit("/", 1)[-1] if "/" in ncbi_url else run
-            return [
-                {
-                    "run_accession": run,
-                    "experiment_accession": exp,
-                    "library_layout": row.get("library_layout") or "",
-                    "fastq_url": ncbi_url,
-                    "fastq_bytes": ncbi_bytes,
-                    "fastq_md5": "",
-                    "filename": filename,
-                    "directory_path": dir_path,
-                }
-            ]
+            best_url = (
+                f"ftp://{sra_ftp}" if not sra_ftp.startswith("ftp://") else sra_ftp
+            )
+            common["sra_url"] = best_url
+            common["sra_bytes"] = row.get("sra_bytes") or ""
+    if not best_url and not s3_url:
         return []
 
-    results = []
-    for i, url in enumerate(urls):
-        filename = url.rsplit("/", 1)[-1] if "/" in url else url
-        results.append(
-            {
-                "run_accession": run,
-                "experiment_accession": exp,
-                "library_layout": row.get("library_layout") or "",
-                "fastq_url": f"ftp://{url}" if not url.startswith("ftp://") else url,
-                "fastq_bytes": sizes[i] if i < len(sizes) else "",
-                "fastq_md5": checksums[i] if i < len(checksums) else "",
-                "filename": filename,
-                "directory_path": dir_path,
-            }
-        )
-    return results
+    filename = best_url.rsplit("/", 1)[-1] if "/" in best_url else run
+
+    return [
+        {
+            **common,
+            "fastq_url": "",
+            "fastq_bytes": "",
+            "fastq_md5": "",
+            "filename": filename,
+        }
+    ]
 
 
 @api_app.get(
@@ -1724,7 +1734,14 @@ def download_study_runs_tsv(
     study = study.upper()
 
     def generate():
-        header = "run_accession\texperiment_accession\tlibrary_layout\tfastq_url\tfastq_bytes\tfastq_md5\tfilename\tdirectory_path\n"
+        header = (
+            "run_accession\texperiment_accession\tlibrary_layout\t"
+            "fastq_url\tfastq_bytes\tfastq_md5\t"
+            "sra_lite_url\tsra_lite_bytes\t"
+            "sra_url\tsra_bytes\t"
+            "s3_url\tgs_url\t"
+            "filename\tdirectory_path\n"
+        )
         yield header
         try:
             with pool.connection() as conn:
@@ -1743,6 +1760,12 @@ def download_study_runs_tsv(
                                     f"{entry['fastq_url']}\t"
                                     f"{entry['fastq_bytes']}\t"
                                     f"{entry['fastq_md5']}\t"
+                                    f"{entry['sra_lite_url']}\t"
+                                    f"{entry['sra_lite_bytes']}\t"
+                                    f"{entry['sra_url']}\t"
+                                    f"{entry['sra_bytes']}\t"
+                                    f"{entry['s3_url']}\t"
+                                    f"{entry['gs_url']}\t"
                                     f"{entry['filename']}\t"
                                     f"{entry['directory_path']}\n"
                                 )
@@ -1756,6 +1779,119 @@ def download_study_runs_tsv(
             "Content-Disposition": f'attachment; filename="{study}_download_links.tsv"'
         },
     )
+
+
+_DOWNLOAD_MODES = {
+    "fastq": {
+        "label": "FASTQ files",
+        "url_key": "fastq_url",
+        "md5_key": "fastq_md5",
+        "cmd": 'wget -q --show-progress -O "{dirpath}/{filename}" "{url}"',
+    },
+    "sra": {
+        "label": "SRA format",
+        "url_key": "sra_url",
+        "md5_key": "sra_md5",
+        "cmd": 'wget -q --show-progress -O "{dirpath}/{filename}" "{url}"',
+    },
+    "sra_lite": {
+        "label": "SRA Lite",
+        "url_key": "sra_lite_url",
+        "md5_key": "sra_md5",
+        "cmd": 'wget -q --show-progress -O "{dirpath}/{filename}" "{url}"',
+    },
+    "s3": {
+        "label": "AWS S3",
+        "url_key": "s3_url",
+        "md5_key": "sra_md5",
+        "cmd": 'aws s3 cp "{url}" "{dirpath}/{filename}"',
+    },
+    "gcs": {
+        "label": "Google Cloud",
+        "url_key": "gs_url",
+        "md5_key": "sra_md5",
+        "cmd": 'gsutil cp "{url}" "{dirpath}/{filename}"',
+    },
+}
+
+_DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
+
+
+@api_app.get(
+    "/project/{study}/download/{mode}",
+    summary="Download script for a study",
+    description=(
+        "Return a bash script to download all runs in a study using the "
+        "specified source: fastq (EBI FASTQ via wget), sra (SRA normalized "
+        "via wget), sra_lite (SRA Lite via wget), s3 (AWS S3 via aws cli), "
+        "or gcs (Google Cloud via gsutil)."
+    ),
+    operation_id="download_study_script",
+)
+@limiter.limit("20/minute")
+def download_study_script(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+    mode: str = Path(..., pattern=_DOWNLOAD_MODE_REGEX),
+):
+    study = study.upper()
+    cfg = _DOWNLOAD_MODES.get(mode)
+    if not cfg:
+        raise HTTPException(400, f"Invalid mode: {mode}")
+
+    url_key = cfg["url_key"]
+    md5_key = cfg["md5_key"]
+    cmd_tpl = cfg["cmd"]
+    label = cfg["label"]
+
+    # Collect all entries first so we can 404 if none have URLs for this mode
+    lines: list[str] = []
+    checksums: list[tuple[str, str]] = []  # (md5, filepath)
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_RUNS_SQL, (study, study))
+                while True:
+                    batch = cur.fetchmany(500)
+                    if not batch:
+                        break
+                    for row in batch:
+                        for entry in _split_fastq_fields(row, study):
+                            url = entry.get(url_key) or ""
+                            if not url:
+                                continue
+                            dirpath = entry["directory_path"]
+                            filename = entry["filename"]
+                            lines.append(
+                                f'mkdir -p "{dirpath}" && {cmd_tpl.format(url=url, dirpath=dirpath, filename=filename)}'
+                            )
+                            md5 = entry.get(md5_key) or ""
+                            if md5:
+                                checksums.append((md5, f"{dirpath}/{filename}"))
+    except Exception:
+        logger.exception("Error generating download script for %s", study)
+        raise HTTPException(500, "Internal error generating download script")
+
+    if not lines:
+        raise HTTPException(
+            404,
+            f"No {label} URLs available for {study}",
+        )
+
+    script = (
+        f"#!/usr/bin/env bash\n# Download {label} for {study}\n\nset -euo pipefail\n\n"
+    )
+    script += "\n".join(lines) + "\n"
+    script += f'\necho "Done — {len(lines)} files saved under ./{study}/"\n'
+    if checksums:
+        script += "\n# Verify checksums\n"
+        script += "echo 'Verifying MD5 checksums...'\n"
+        script += "md5sum -c <<'MD5SUMS'\n"
+        for md5, path in checksums:
+            script += f"{md5}  {path}\n"
+        script += "MD5SUMS\n"
+
+    return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
 
 @api_app.get(
@@ -2664,13 +2800,20 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    (SRP/ERP/DRP) to get FASTQ download URLs for all runs. Returns summary statistics
    (total_runs, paired_runs, single_runs, total_fastq_bytes) and a list of runs with
    fields: run_accession, experiment_accession, library_layout, fastq_ftp,
-   fastq_bytes, fastq_md5. Use this when the user asks how to download raw data,
-   FASTQs, or sequencing files for a study.
+   fastq_bytes, fastq_md5, plus cloud URLs (ncbi_sra_lite_url, ncbi_sra_normalized_url,
+   ncbi_sra_lite_s3_url, ncbi_sra_lite_gs_url). Use this when the user asks how to
+   download raw data, FASTQs, or sequencing files for a study.
    - FASTQ URLs are EBI FTP paths (prefix with `https://` to make downloadable links).
    - Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields (R1;R2).
-   - For a wget/curl one-liner, point users to the TSV download endpoint:
-     `curl -sS "https://pysraweb.saketlab.org/api/project/{study}/runs/download" | tail -n +2 | cut -f4 | xargs -P4 -I{} wget -q -x -nH --cut-dirs=6 "{}"`
-   - Or direct them to the web UI at `https://pysraweb.saketlab.org/p/{study}` which
+   - **Download scripts** — call `download_study_script` with a study accession and a
+     mode to get a ready-to-run bash script. Available modes:
+     - `fastq` — wget commands for EBI FASTQ files (default, recommended)
+     - `sra` — wget commands for SRA normalized format (full quality)
+     - `sra_lite` — wget commands for SRA Lite format (smaller, lossy quality scores)
+     - `s3` — aws s3 cp commands using s3:// URIs
+     - `gcs` — gsutil cp commands using gs:// URIs
+     Example: `https://seqout.org/api/project/SRP123456/download/fastq`
+   - Or direct them to the web UI at `https://seqout.org/p/{study}` which
      has an interactive download section with per-file links and batch download scripts.
 
 6. **Cross-reference lookup** — call `get_project_xref` with any accession (GSE, SRP,
@@ -2744,8 +2887,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 - `bulk_metadata`, `download_by_query`, `bulk_project_metadata` return binary/bulk data
   useless for LLMs. Tell users to use the REST API or web interface directly.
 - `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
-  structured JSON with download links. Point users to the TSV endpoint URL if they
-  want a wget/curl one-liner.
+  structured JSON with download links, or `download_study_script` to get a ready-to-run
+  bash script for any download mode (fastq, sra, sra_lite, s3, gcs).
 - `get_points_bin`, `get_accessions_bin`, `get_clusters` return binary/JSON data for
   the 2D map visualization — not useful for conversational LLM interactions.
 - `get_geo_series_neighbors_coords` returns raw neighbor/3D coordinate data for the
@@ -2771,5 +2914,11 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
+# combined_app.add_middleware(
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_methods=["*"],
+#    allow_headers=["*"],
+# )
 
 app = combined_app
