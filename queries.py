@@ -1442,7 +1442,13 @@ SELECT
     sra_bytes,
     sra_md5,
     ncbi_sra_url,
-    ncbi_sra_url_aws
+    ncbi_sra_url_aws,
+    ncbi_sra_normalized_url,
+    ncbi_sra_normalized_bytes,
+    ncbi_sra_lite_url,
+    ncbi_sra_lite_bytes,
+    ncbi_sra_lite_s3_url,
+    ncbi_sra_lite_gs_url
 FROM sra_run_download_links
 WHERE study_accession IN (SELECT acc FROM candidates)
 ORDER BY experiment_accession, run_accession;
@@ -1463,7 +1469,13 @@ SELECT
     sra_bytes,
     sra_md5,
     ncbi_sra_url,
-    ncbi_sra_url_aws
+    ncbi_sra_url_aws,
+    ncbi_sra_normalized_url,
+    ncbi_sra_normalized_bytes,
+    ncbi_sra_lite_url,
+    ncbi_sra_lite_bytes,
+    ncbi_sra_lite_s3_url,
+    ncbi_sra_lite_gs_url
 FROM sra_run_download_links
 WHERE study_accession IN (SELECT acc FROM candidates)
 ORDER BY experiment_accession, run_accession
@@ -1596,4 +1608,83 @@ WHERE dl.sra_bytes IS NOT NULL
   AND s.published_at IS NOT NULL
 GROUP BY DATE_TRUNC('month', s.published_at)
 ORDER BY month;
+"""
+
+# ---------------------------------------------------------------------------
+# Organism growth: monthly sample/experiment counts filtered by organism
+# ---------------------------------------------------------------------------
+
+GROWTH_ORGANISM_SQL = """
+SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, count
+FROM organism_growth_monthly
+WHERE organism = %s
+ORDER BY db, month;
+"""
+
+# ---------------------------------------------------------------------------
+# List all distinct organisms across databases
+# ---------------------------------------------------------------------------
+
+LIST_ORGANISMS_SQL = """
+SELECT DISTINCT organism
+FROM organism_growth_monthly
+WHERE organism IS NOT NULL AND organism != ''
+ORDER BY organism;
+"""
+
+LIST_ORGANISMS_WITH_COMMON_NAMES_SQL = """
+SELECT DISTINCT ogm.organism AS scientific_name,
+       cn.common_name
+FROM organism_growth_monthly ogm
+LEFT JOIN common_names cn ON LOWER(cn.scientific_name) = LOWER(ogm.organism)
+WHERE ogm.organism IS NOT NULL AND ogm.organism != ''
+ORDER BY ogm.organism;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Organism experiment totals: total experiments per organism per database
+# ---------------------------------------------------------------------------
+
+ORGANISM_TOTALS_SQL = """
+SELECT o.organism, o.db, o.count, cn.common_name
+FROM (
+    SELECT organism, db, SUM(count) AS count
+    FROM organism_growth_monthly
+    GROUP BY organism, db
+) o
+LEFT JOIN common_names cn ON cn.scientific_name = o.organism
+ORDER BY o.organism, o.db;
+"""
+
+ORGANISM_TOTALS_YEAR_SQL = """
+SELECT o.organism, o.db, o.count, cn.common_name
+FROM (
+    SELECT organism, db, SUM(count) AS count
+    FROM organism_growth_monthly
+    WHERE month >= make_date(%s, 1, 1) AND month <= make_date(%s, 12, 31)
+    GROUP BY organism, db
+) o
+LEFT JOIN common_names cn ON cn.scientific_name = o.organism
+ORDER BY o.organism, o.db;
+"""
+
+ORGANISM_SEARCH_SQL = """
+WITH candidates AS (
+    SELECT DISTINCT organism
+    FROM organism_growth_monthly
+    WHERE organism ILIKE %s
+    UNION
+    SELECT scientific_name AS organism
+    FROM common_names
+    WHERE common_name ILIKE %s
+      AND scientific_name IN (SELECT DISTINCT organism FROM organism_growth_monthly)
+)
+SELECT c.organism, SUM(ogm.count) AS total, cn.common_name
+FROM candidates c
+JOIN organism_growth_monthly ogm ON ogm.organism = c.organism
+LEFT JOIN common_names cn ON cn.scientific_name = c.organism
+GROUP BY c.organism, cn.common_name
+ORDER BY total DESC
+LIMIT %s;
 """

@@ -314,7 +314,54 @@ CREATE INDEX IF NOT EXISTS idx_request_log_country     ON request_log (country);
 CREATE INDEX IF NOT EXISTS idx_request_log_city        ON request_log (city);
 CREATE INDEX IF NOT EXISTS idx_request_log_device_type ON request_log (device_type);
 
+-- Materialized view: pre-aggregated organism counts by month and database
+CREATE MATERIALIZED VIEW IF NOT EXISTS organism_growth_monthly AS
+  SELECT 'geo'::text AS db,
+         UNNEST(g.organisms) AS organism,
+         DATE_TRUNC('month', s.published_at) AS month,
+         COUNT(*) AS count
+  FROM geo_samples s
+  JOIN geo_series g ON s.accession = ANY(g.samples_ref)
+  WHERE s.published_at IS NOT NULL AND g.organisms IS NOT NULL
+  GROUP BY UNNEST(g.organisms), DATE_TRUNC('month', s.published_at)
+
+  UNION ALL
+
+  SELECT 'sra'::text, UNNEST(st.organisms),
+         DATE_TRUNC('month', st.published_at), COUNT(*)
+  FROM sra_experiments e
+  JOIN sra_studies st ON st.accession = e.study
+  WHERE st.published_at IS NOT NULL AND st.organisms IS NOT NULL
+  GROUP BY UNNEST(st.organisms), DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'arrayexpress'::text, s.organism,
+         DATE_TRUNC('month', ex.release_date), COUNT(*)
+  FROM arrayexpress_samples s
+  JOIN arrayexpress_experiments ex ON ex.accession = s.experiment_accession
+  WHERE ex.release_date IS NOT NULL AND s.organism IS NOT NULL AND s.organism != ''
+  GROUP BY s.organism, DATE_TRUNC('month', ex.release_date)
+
+  UNION ALL
+
+  SELECT 'ena'::text, es.scientific_name,
+         DATE_TRUNC('month', e.first_public), COUNT(*)
+  FROM ena_experiments e
+  JOIN ena_studies es ON es.study_accession = e.study_accession
+  WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
+  GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ogm_organism_db_month
+  ON organism_growth_monthly(organism, db, month);
+CREATE INDEX IF NOT EXISTS idx_ogm_organism
+  ON organism_growth_monthly(organism);
+
 EOF
+
+echo ""
+echo "Refreshing materialized views..."
+PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "REFRESH MATERIALIZED VIEW CONCURRENTLY organism_growth_monthly;"
 
 echo ""
 echo "=== Setup Complete ==="

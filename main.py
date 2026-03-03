@@ -73,6 +73,12 @@ from queries import (
     GROWTH_BASES_ENA_SQL,
     GROWTH_BYTES_SRA_FASTQ_SQL,
     GROWTH_BYTES_SRA_SRA_SQL,
+    GROWTH_ORGANISM_SQL,
+    LIST_ORGANISMS_SQL,
+    LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
+    ORGANISM_SEARCH_SQL,
+    ORGANISM_TOTALS_SQL,
+    ORGANISM_TOTALS_YEAR_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -151,6 +157,13 @@ _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"ready": False, "rows": []}
 _growth_cache_lock = threading.Lock()
 _growth_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_MAX_ORGANISM_CACHE_ENTRIES = 500
+_organism_growth_cache_lock = threading.Lock()
+_organism_growth_cache: dict[str, dict] = {}  # key -> {data, built_at}
+_organisms_list_cache_lock = threading.Lock()
+_organisms_list_cache: dict[str, dict] = {}  # "plain"/"common" -> {data, built_at}
+_organism_totals_cache_lock = threading.Lock()
+_organism_totals_cache: dict[str, dict] = {}  # cache_key -> {data, built_at}
 
 
 pool = ConnectionPool(
@@ -883,6 +896,346 @@ def get_growth_stats(
 
 
 @api_app.get(
+    "/stats/organism-growth",
+    summary="Organism growth over time",
+    description=(
+        "Return monthly and cumulative experiment/sample counts for a given organism "
+        "across GEO, SRA, ArrayExpress, and ENA databases. "
+        "The organism parameter should be a scientific name (e.g. 'Homo sapiens'). "
+        "mode=absolute returns raw counts; mode=percentage returns the organism's share "
+        "of total experiments per month per database. "
+        "Returns {organism, mode, series: {db: [{month, count, cumulative}]}, took_ms}."
+    ),
+    operation_id="get_organism_growth",
+)
+@limiter.limit("20/minute")
+def get_organism_growth(
+    request: Request,
+    organism: str = Query(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Scientific name of the organism (e.g. 'Homo sapiens')",
+    ),
+    mode: str = Query(
+        "absolute",
+        pattern="^(absolute|percentage)$",
+        description="absolute counts or percentage of total experiments",
+    ),
+    db: str | None = Query(
+        None,
+        pattern="^(geo|sra|arrayexpress|ena)$",
+        description="Filter to a single database",
+    ),
+):
+    t0 = time.perf_counter()
+    cache_key = organism.lower()
+
+    # Always fetch/cache the absolute organism data first
+    with _organism_growth_cache_lock:
+        now = time.time()
+        cached = _organism_growth_cache.get(cache_key)
+        if cached and (now - cached["built_at"]) < _GROWTH_CACHE_TTL:
+            all_series = cached["data"]
+        else:
+            all_series = None
+
+    if all_series is None:
+        try:
+            all_series = {"geo": [], "sra": [], "arrayexpress": [], "ena": []}
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(GROWTH_ORGANISM_SQL, (organism,))
+                    for row in cur.fetchall():
+                        all_series.setdefault(row["db"], []).append(
+                            {"month": row["month"], "count": row["count"]}
+                        )
+            for db_rows in all_series.values():
+                cumulative = 0
+                for row in db_rows:
+                    cumulative += row["count"]
+                    row["cumulative"] = cumulative
+        except Exception:
+            logger.exception("Database error in get_organism_growth")
+            raise HTTPException(500, "Internal server error")
+
+        with _organism_growth_cache_lock:
+            now = time.time()
+            # Evict expired entries and cap size
+            expired = [
+                k
+                for k, v in _organism_growth_cache.items()
+                if now - v["built_at"] >= _GROWTH_CACHE_TTL
+            ]
+            for k in expired:
+                del _organism_growth_cache[k]
+            if len(_organism_growth_cache) >= _MAX_ORGANISM_CACHE_ENTRIES:
+                oldest = min(
+                    _organism_growth_cache,
+                    key=lambda k: _organism_growth_cache[k]["built_at"],
+                )
+                del _organism_growth_cache[oldest]
+            _organism_growth_cache[cache_key] = {
+                "data": all_series,
+                "built_at": now,
+            }
+
+    # For percentage mode, compute organism / total * 100 per month per db
+    if mode == "percentage":
+        try:
+            growth_data = _get_growth_data()
+        except Exception:
+            logger.exception("Database error fetching total growth for percentage")
+            raise HTTPException(500, "Internal server error")
+        total_exp = growth_data.get("experiments", {})
+
+        result_series = {}
+        dbs = [db] if db else ["geo", "sra", "arrayexpress", "ena"]
+        for db_name in dbs:
+            org_rows = all_series.get(db_name, [])
+            # Build lookup: month -> total count
+            total_lookup = {r["month"]: r["count"] for r in total_exp.get(db_name, [])}
+            pct_rows = []
+            cum_org = 0
+            cum_total = 0
+            for row in org_rows:
+                total = total_lookup.get(row["month"], 0)
+                pct = round(row["count"] / total * 100, 4) if total > 0 else 0.0
+                cum_org += row["count"]
+                cum_total += total
+                cum_pct = round(cum_org / cum_total * 100, 4) if cum_total > 0 else 0.0
+                pct_rows.append(
+                    {
+                        "month": row["month"],
+                        "count": pct,
+                        "cumulative": cum_pct,
+                    }
+                )
+            result_series[db_name] = pct_rows
+        series = result_series
+    else:
+        if db:
+            series = {db: all_series.get(db, [])}
+        else:
+            series = all_series
+
+    return {
+        "organism": organism,
+        "mode": mode,
+        "series": series,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/stats/organism-totals",
+    summary="Total experiments per organism",
+    description=(
+        "Return total experiment/sample counts per organism across GEO, SRA, "
+        "ArrayExpress, and ENA. Optionally filter by publication year range. "
+        "Returns {organisms: [{organism, geo, sra, arrayexpress, ena, total}], "
+        "year_from, year_to, total_organisms, took_ms}."
+    ),
+    operation_id="get_organism_totals",
+)
+@limiter.limit("20/minute")
+def get_organism_totals(
+    request: Request,
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
+    limit: int | None = Query(
+        None, ge=1, le=10000, description="Max organisms to return"
+    ),
+):
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(400, "year_from must be <= year_to")
+
+    t0 = time.perf_counter()
+    cache_key = f"{year_from}:{year_to}"
+
+    with _organism_totals_cache_lock:
+        now = time.time()
+        cached = _organism_totals_cache.get(cache_key)
+        if cached and (now - cached["built_at"]) < _GROWTH_CACHE_TTL:
+            data = cached["data"][:limit] if limit else cached["data"]
+            return {
+                "organisms": data,
+                "year_from": year_from,
+                "year_to": year_to,
+                "total_organisms": len(data),
+                "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+            }
+
+    if year_from is not None or year_to is not None:
+        sql = ORGANISM_TOTALS_YEAR_SQL
+        params = (year_from or 1900, year_to or 2100)
+    else:
+        sql = ORGANISM_TOTALS_SQL
+        params = ()
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_organism_totals")
+        raise HTTPException(500, "Internal server error")
+
+    # Pivot rows into {organism -> {geo, sra, arrayexpress, ena, total, common_name}}
+    org_map: dict[str, dict] = {}
+    for row in rows:
+        name = row["organism"]
+        if name not in org_map:
+            org_map[name] = {
+                "organism": name,
+                "common_name": row.get("common_name"),
+                "geo": 0,
+                "sra": 0,
+                "arrayexpress": 0,
+                "ena": 0,
+                "total": 0,
+            }
+        org_map[name][row["db"]] = row["count"]
+        org_map[name]["total"] += row["count"]
+
+    organisms = sorted(org_map.values(), key=lambda x: x["total"], reverse=True)
+
+    with _organism_totals_cache_lock:
+        # Evict stale entries (>24h)
+        now = time.time()
+        stale = [
+            k for k, v in _organism_totals_cache.items() if now - v["built_at"] > 86400
+        ]
+        for k in stale:
+            del _organism_totals_cache[k]
+        if len(_organism_totals_cache) >= _MAX_ORGANISM_CACHE_ENTRIES:
+            oldest = min(
+                _organism_totals_cache,
+                key=lambda k: _organism_totals_cache[k]["built_at"],
+            )
+            del _organism_totals_cache[oldest]
+        _organism_totals_cache[cache_key] = {
+            "data": organisms,
+            "built_at": now,
+        }
+
+    data = organisms[:limit] if limit else organisms
+    return {
+        "organisms": data,
+        "year_from": year_from,
+        "year_to": year_to,
+        "total_organisms": len(data),
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/stats/organism-search",
+    summary="Search organisms by name",
+    description=(
+        "Search for organisms by partial name match (case-insensitive). "
+        "Returns up to `limit` organisms sorted by total experiment count. "
+        "Use this for typeahead/autocomplete in organism selectors."
+    ),
+    operation_id="search_organisms",
+)
+@limiter.limit("100/minute")
+def search_organisms(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200, description="Search term"),
+    limit: int = Query(20, ge=1, le=100, description="Max results"),
+):
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(ORGANISM_SEARCH_SQL, (f"%{q}%", f"%{q}%", limit))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in search_organisms")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "organisms": [
+            {
+                "organism": r["organism"],
+                "total": r["total"],
+                "common_name": r.get("common_name"),
+            }
+            for r in rows
+        ],
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/organisms",
+    summary="List all organisms",
+    description=(
+        "Return all distinct organism names (scientific names) found across "
+        "GEO, SRA, ArrayExpress, and ENA databases. "
+        "Set common_names=true to include common name mappings. "
+        "Returns {organisms: [...], total: int, took_ms: float}."
+    ),
+    operation_id="list_organisms",
+)
+@limiter.limit("20/minute")
+def list_organisms(
+    request: Request,
+    common_names: bool = Query(
+        False,
+        description="Include common name for each organism",
+    ),
+):
+    t0 = time.perf_counter()
+    variant = "common" if common_names else "plain"
+
+    with _organisms_list_cache_lock:
+        now = time.time()
+        cached = _organisms_list_cache.get(variant)
+        if cached and (now - cached["built_at"]) < _GROWTH_CACHE_TTL:
+            return {
+                "organisms": cached["data"],
+                "total": len(cached["data"]),
+                "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+            }
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if common_names:
+                    cur.execute(LIST_ORGANISMS_WITH_COMMON_NAMES_SQL)
+                    rows = cur.fetchall()
+                    organisms = [
+                        {
+                            "scientific_name": r["scientific_name"],
+                            "common_name": r["common_name"],
+                        }
+                        for r in rows
+                    ]
+                else:
+                    cur.execute(LIST_ORGANISMS_SQL)
+                    rows = cur.fetchall()
+                    organisms = [r["organism"] for r in rows]
+    except Exception:
+        logger.exception("Database error in list_organisms")
+        raise HTTPException(500, "Internal server error")
+
+    with _organisms_list_cache_lock:
+        _organisms_list_cache[variant] = {
+            "data": organisms,
+            "built_at": time.time(),
+        }
+
+    return {
+        "organisms": organisms,
+        "total": len(organisms),
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
     "/search/geo",
     summary="Search GEO",
     description=(
@@ -1260,8 +1613,19 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
                     "directory_path": dir_path,
                 }
             ]
-        # Fall back to NCBI URL (already full HTTPS/S3 URLs)
-        ncbi_url = row.get("ncbi_sra_url") or row.get("ncbi_sra_url_aws") or ""
+        # Fall back to NCBI URL: prefer SRA Normalized (full), then SRA Lite
+        ncbi_url = (
+            row.get("ncbi_sra_normalized_url")
+            or row.get("ncbi_sra_lite_url")
+            or row.get("ncbi_sra_url")
+            or row.get("ncbi_sra_url_aws")
+            or ""
+        )
+        ncbi_bytes = ""
+        if row.get("ncbi_sra_normalized_url"):
+            ncbi_bytes = row.get("ncbi_sra_normalized_bytes") or ""
+        elif row.get("ncbi_sra_lite_url"):
+            ncbi_bytes = row.get("ncbi_sra_lite_bytes") or ""
         if ncbi_url:
             filename = ncbi_url.rsplit("/", 1)[-1] if "/" in ncbi_url else run
             return [
@@ -1270,7 +1634,7 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
                     "experiment_accession": exp,
                     "library_layout": row.get("library_layout") or "",
                     "fastq_url": ncbi_url,
-                    "fastq_bytes": "",
+                    "fastq_bytes": ncbi_bytes,
                     "fastq_md5": "",
                     "filename": filename,
                     "directory_path": dir_path,
@@ -2287,15 +2651,33 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     name (e.g. "Homo sapiens") to get its common name (e.g. "human"). Useful when
     displaying organism info in a friendly format.
 
-12. **Database growth stats** — call `get_growth_stats` with `mode=projects` or
-    `mode=experiments` to get monthly counts per database (GEO, SRA, ArrayExpress, ENA).
-    Optionally filter by `db` (e.g. `db=geo`). Returns per-month (non-cumulative) counts.
-    Use this when the user asks about database size, growth trends, or historical data
-    volume.
+12. **Database growth stats** — call `get_growth_stats` with `mode=projects`,
+    `mode=experiments`, or `mode=bases` (data volume in bytes) to get monthly counts
+    per database (GEO, SRA, ArrayExpress, ENA). Optionally filter by `db` (e.g.
+    `db=geo`). Returns per-month (non-cumulative) counts. Use this when the user asks
+    about database size, growth trends, or historical data volume.
 
 13. **Bulk project+samples metadata** — call `bulk_project_samples_metadata` with a list
     of project accessions (GSE, SRP, ERP, DRP) to get project title/description plus
     flattened sample rows. Useful for comparing sample-level metadata across studies.
+
+14. **Organism growth stats** — call `get_organism_growth` with an organism scientific
+    name (e.g. "Homo sapiens") to get monthly experiment counts across GEO, SRA,
+    ArrayExpress, and ENA. Use `mode=absolute` for raw counts or `mode=percentage`
+    for the organism's share of total experiments per month. Optionally filter to a
+    single database with `db=geo|sra|arrayexpress|ena`. Returns per-db series with
+    monthly count and cumulative total. Use this when the user asks about trends,
+    growth, or historical data for a specific organism.
+
+15. **Organism totals** — call `get_organism_totals` to get total experiment counts
+    per organism across all databases. Optionally filter by `year_from`/`year_to`
+    and limit results with `limit`. Returns organisms sorted by total count
+    (descending) with per-database breakdown (geo, sra, arrayexpress, ena) and
+    common names. Use this when the user asks which organisms have the most data.
+
+16. **Organism search** — call `search_organisms` with a partial name query (`q`)
+    to find organisms by scientific or common name. Returns up to `limit` results
+    sorted by total experiment count. Use this for organism name lookup/autocomplete.
 
 ## Context rules
 
@@ -2316,6 +2698,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
   similarity graph — not useful for conversational use.
 - `health_check` is only for connectivity checks.
 - `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
+- `list_organisms` returns all ~283K organisms — use `search_organisms` or
+  `get_organism_totals` (with `limit`) instead for conversational use.
 """
 
 mcp = FastMCP.from_fastapi(
