@@ -1697,16 +1697,9 @@ SELECT
     (SELECT COUNT(*) FROM ena_studies) AS ena;
 """
 
-SITEMAP_ACCESSIONS_SQL = """
-SELECT accession FROM (
-    SELECT series_accession AS accession FROM geo_series
-    UNION ALL
-    SELECT study_accession AS accession FROM sra_studies
-    UNION ALL
-    SELECT accession AS accession FROM arrayexpress_experiments
-    UNION ALL
-    SELECT study_accession AS accession FROM ena_studies
-) AS all_accessions
-ORDER BY accession
-LIMIT %s OFFSET %s;
-"""
+SITEMAP_ACCESSIONS_SQL = {
+    "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
+    "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",
+    "arrayexpress": "SELECT accession FROM arrayexpress_experiments ORDER BY accession LIMIT %s OFFSET %s;",
+    "ena": "SELECT study_accession AS accession FROM ena_studies ORDER BY study_accession LIMIT %s OFFSET %s;",
+}

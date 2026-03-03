@@ -2539,19 +2539,23 @@ def sitemap_counts(request: Request):
 @api_app.get(
     "/sitemap/accessions",
     summary="Paginated sitemap accessions",
-    description="Return a paginated list of all accessions for sitemap generation.",
+    description="Return a paginated list of accessions from a single source for sitemap generation.",
     operation_id="sitemap_accessions",
 )
 def sitemap_accessions(
     request: Request,
+    source: str = Query(..., pattern="^(geo|sra|arrayexpress|ena)$"),
     page: int = Query(0, ge=0),
     limit: int = Query(50000, ge=1, le=50000),
 ):
     offset = page * limit
+    sql = SITEMAP_ACCESSIONS_SQL.get(source)
+    if sql is None:
+        raise HTTPException(400, f"Unknown source: {source}")
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SITEMAP_ACCESSIONS_SQL, (limit, offset))
+                cur.execute(sql, (limit, offset))
                 rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in sitemap_accessions")
