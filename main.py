@@ -79,6 +79,8 @@ from queries import (
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
     ORGANISM_TOTALS_YEAR_SQL,
+    SITEMAP_ACCESSIONS_SQL,
+    SITEMAP_COUNTS_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -2507,6 +2509,54 @@ def get_project_cite(
         return PlainTextResponse(bibtex_text, media_type="text/plain")
 
     return {"accession": accession, "citations": citations}
+
+
+@api_app.get(
+    "/sitemap/counts",
+    summary="Sitemap accession counts",
+    description="Return total accession counts per source for sitemap generation.",
+    operation_id="sitemap_counts",
+)
+def sitemap_counts(request: Request):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SITEMAP_COUNTS_SQL)
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in sitemap_counts")
+        raise HTTPException(500, "Internal server error")
+    total = row["geo"] + row["sra"] + row["arrayexpress"] + row["ena"]
+    return {
+        "geo": row["geo"],
+        "sra": row["sra"],
+        "arrayexpress": row["arrayexpress"],
+        "ena": row["ena"],
+        "total": total,
+    }
+
+
+@api_app.get(
+    "/sitemap/accessions",
+    summary="Paginated sitemap accessions",
+    description="Return a paginated list of all accessions for sitemap generation.",
+    operation_id="sitemap_accessions",
+)
+def sitemap_accessions(
+    request: Request,
+    page: int = Query(0, ge=0),
+    limit: int = Query(50000, ge=1, le=50000),
+):
+    offset = page * limit
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SITEMAP_ACCESSIONS_SQL, (limit, offset))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in sitemap_accessions")
+        raise HTTPException(500, "Internal server error")
+    return {"accessions": [r["accession"] for r in rows], "page": page, "limit": limit}
 
 
 MCP_INSTRUCTIONS = """\

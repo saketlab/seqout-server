@@ -1688,3 +1688,25 @@ GROUP BY c.organism, cn.common_name
 ORDER BY total DESC
 LIMIT %s;
 """
+
+SITEMAP_COUNTS_SQL = """
+SELECT
+    (SELECT COUNT(*) FROM geo_series) AS geo,
+    (SELECT COUNT(*) FROM sra_studies) AS sra,
+    (SELECT COUNT(*) FROM arrayexpress_experiments) AS arrayexpress,
+    (SELECT COUNT(*) FROM ena_studies) AS ena;
+"""
+
+SITEMAP_ACCESSIONS_SQL = """
+SELECT accession FROM (
+    SELECT series_accession AS accession FROM geo_series
+    UNION ALL
+    SELECT study_accession AS accession FROM sra_studies
+    UNION ALL
+    SELECT accession AS accession FROM arrayexpress_experiments
+    UNION ALL
+    SELECT study_accession AS accession FROM ena_studies
+) AS all_accessions
+ORDER BY accession
+LIMIT %s OFFSET %s;
+"""
