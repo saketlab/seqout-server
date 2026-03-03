@@ -2544,7 +2544,7 @@ def sitemap_counts(request: Request):
 )
 def sitemap_accessions(
     request: Request,
-    source: str = Query(..., pattern="^(geo|sra|arrayexpress|ena)$"),
+    source: str = Query(..., pattern=f"^({'|'.join(SITEMAP_ACCESSIONS_SQL)})$"),
     page: int = Query(0, ge=0),
     limit: int = Query(50000, ge=1, le=50000),
 ):
