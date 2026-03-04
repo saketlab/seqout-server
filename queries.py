@@ -1787,6 +1787,116 @@ ORDER BY total DESC
 LIMIT %s;
 """
 
+# ---------------------------------------------------------------------------
+# Global contributions: aggregated lat/lng from unified_metadata
+# ---------------------------------------------------------------------------
+
+_GLOBAL_CONTRIBUTIONS_TEMPLATE = """
+WITH location_agg AS (
+    SELECT
+        ROUND(latitude::numeric, 2) AS lat,
+        ROUND(longitude::numeric, 2) AS lng,
+        COUNT(*) AS n_projects,
+        COALESCE(SUM(n_experiments), 0)::bigint AS n_experiments,
+        COALESCE(SUM(n_samples), 0)::bigint AS n_samples,
+        COUNT(*) FILTER (WHERE source = 'geo') AS n_geo,
+        COUNT(*) FILTER (WHERE source = 'sra') AS n_sra,
+        COUNT(*) FILTER (WHERE source = 'arrayexpress') AS n_ae,
+        COUNT(*) FILTER (WHERE source = 'ena') AS n_ena,
+        MODE() WITHIN GROUP (ORDER BY country) AS country,
+        MODE() WITHIN GROUP (ORDER BY city) AS city
+    FROM unified_metadata
+    WHERE __WHERE__
+    GROUP BY 1, 2
+),
+organism_ranked AS (
+    SELECT
+        ROUND(latitude::numeric, 2) AS lat,
+        ROUND(longitude::numeric, 2) AS lng,
+        dominant_scientific_name AS organism,
+        COUNT(*) AS cnt,
+        ROW_NUMBER() OVER (
+            PARTITION BY ROUND(latitude::numeric, 2), ROUND(longitude::numeric, 2)
+            ORDER BY COUNT(*) DESC
+        ) AS rn
+    FROM unified_metadata
+    WHERE __WHERE__
+        AND dominant_scientific_name IS NOT NULL
+    GROUP BY 1, 2, dominant_scientific_name
+),
+organism_top5 AS (
+    SELECT lat, lng,
+        jsonb_agg(jsonb_build_object('name', organism, 'count', cnt) ORDER BY cnt DESC) AS top_organisms
+    FROM organism_ranked
+    WHERE rn <= 5
+    GROUP BY lat, lng
+)
+SELECT
+    a.lat, a.lng, a.n_projects, a.n_experiments, a.n_samples,
+    a.n_geo, a.n_sra, a.n_ae, a.n_ena,
+    a.country, a.city,
+    COALESCE(o.top_organisms, '[]'::jsonb) AS top_organisms
+FROM location_agg a
+LEFT JOIN organism_top5 o ON a.lat = o.lat AND a.lng = o.lng
+ORDER BY a.n_projects DESC;
+"""
+
+
+def build_global_contributions_sql(
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    assay_l2: str | None = None,
+) -> tuple[str, list]:
+    """Build the global contributions SQL with optional filters.
+
+    Filter values go into the params list (safe from injection).
+    """
+    conditions = ["latitude IS NOT NULL", "longitude IS NOT NULL"]
+    params: list = []
+    if organism:
+        conditions.append("dominant_scientific_name = %s")
+        params.append(organism)
+    if assay_l1:
+        conditions.append("dominant_assay_l1 = %s")
+        params.append(assay_l1)
+    if assay_l2:
+        conditions.append("dominant_assay_l2 = %s")
+        params.append(assay_l2)
+    where = " AND ".join(conditions)
+    sql = _GLOBAL_CONTRIBUTIONS_TEMPLATE.replace("__WHERE__", where)
+    return sql, params
+
+
+GLOBAL_CONTRIBUTIONS_FILTERS_SQL = """
+WITH organism_opts AS (
+    SELECT dominant_scientific_name AS value, COUNT(*) AS count
+    FROM unified_metadata
+    WHERE dominant_scientific_name IS NOT NULL
+      AND latitude IS NOT NULL AND longitude IS NOT NULL
+    GROUP BY 1 ORDER BY count DESC
+    LIMIT 200
+),
+assay_l1_opts AS (
+    SELECT dominant_assay_l1 AS value, COUNT(*) AS count
+    FROM unified_metadata
+    WHERE dominant_assay_l1 IS NOT NULL
+      AND latitude IS NOT NULL AND longitude IS NOT NULL
+    GROUP BY 1 ORDER BY count DESC
+),
+assay_l2_opts AS (
+    SELECT dominant_assay_l2 AS value, COUNT(*) AS count
+    FROM unified_metadata
+    WHERE dominant_assay_l2 IS NOT NULL
+      AND latitude IS NOT NULL AND longitude IS NOT NULL
+    GROUP BY 1 ORDER BY count DESC
+)
+SELECT 'organism' AS kind, value, count FROM organism_opts
+UNION ALL
+SELECT 'assay_l1' AS kind, value, count FROM assay_l1_opts
+UNION ALL
+SELECT 'assay_l2' AS kind, value, count FROM assay_l2_opts;
+"""
+
 SITEMAP_COUNTS_SQL = """
 SELECT
     (SELECT COUNT(*) FROM geo_series) AS geo,

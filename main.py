@@ -83,6 +83,8 @@ from queries import (
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
     ORGANISM_TOTALS_YEAR_SQL,
+    GLOBAL_CONTRIBUTIONS_FILTERS_SQL,
+    build_global_contributions_sql,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
     build_sorted_search_sql,
@@ -170,6 +172,8 @@ _organisms_list_cache_lock = threading.Lock()
 _organisms_list_cache: dict[str, dict] = {}  # "plain"/"common" -> {data, built_at}
 _organism_totals_cache_lock = threading.Lock()
 _organism_totals_cache: dict[str, dict] = {}  # cache_key -> {data, built_at}
+_global_contributions_cache_lock = threading.Lock()
+_global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
 
 
 pool = ConnectionPool(
@@ -1171,6 +1175,141 @@ def search_organisms(
             }
             for r in rows
         ],
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+def _query_global_contributions(
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    assay_l2: str | None = None,
+) -> list[dict]:
+    """Aggregate unified_metadata by rounded lat/lng with optional filters."""
+    sql, params = build_global_contributions_sql(organism, assay_l1, assay_l2)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+def _get_global_contributions_cached() -> list[dict]:
+    """Return unfiltered contributions from cache (7-day TTL)."""
+    with _global_contributions_cache_lock:
+        now = time.time()
+        if (
+            _global_contributions_cache["ready"]
+            and (now - _global_contributions_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _global_contributions_cache["data"]
+
+        data = _query_global_contributions()
+        _global_contributions_cache["ready"] = True
+        _global_contributions_cache["data"] = data
+        _global_contributions_cache["built_at"] = now
+        return data
+
+
+_global_contributions_filters_cache_lock = threading.Lock()
+_global_contributions_filters_cache: dict = {
+    "ready": False,
+    "data": {},
+    "built_at": 0.0,
+}
+
+
+def _get_global_contributions_filters() -> dict:
+    """Return cached filter options (organisms, assay_l1, assay_l2)."""
+    with _global_contributions_filters_cache_lock:
+        now = time.time()
+        if (
+            _global_contributions_filters_cache["ready"]
+            and (now - _global_contributions_filters_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _global_contributions_filters_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(GLOBAL_CONTRIBUTIONS_FILTERS_SQL)
+            rows = cur.fetchall()
+
+    filters: dict[str, list] = {"organisms": [], "assay_l1": [], "assay_l2": []}
+    for r in rows:
+        kind = r["kind"]
+        entry = {"value": r["value"], "count": r["count"]}
+        if kind == "organism":
+            filters["organisms"].append(entry)
+        elif kind == "assay_l1":
+            filters["assay_l1"].append(entry)
+        elif kind == "assay_l2":
+            filters["assay_l2"].append(entry)
+
+    with _global_contributions_filters_cache_lock:
+        _global_contributions_filters_cache["ready"] = True
+        _global_contributions_filters_cache["data"] = filters
+        _global_contributions_filters_cache["built_at"] = time.time()
+
+    return filters
+
+
+@api_app.get(
+    "/stats/global-contributions",
+    summary="Geographic contributions across all databases",
+    description=(
+        "Return aggregated project/experiment/sample counts per geographic location "
+        "(latitude/longitude rounded to 2 decimal places) from the unified_metadata table. "
+        "Includes source breakdown (GEO/SRA/ArrayExpress/ENA), city, country, and top 5 organisms "
+        "per location. Unfiltered results are cached for 7 days; filtered requests run fresh."
+    ),
+    operation_id="get_global_contributions",
+)
+@limiter.limit("20/minute")
+def get_global_contributions(
+    request: Request,
+    organism: str | None = Query(
+        None, description="Filter by dominant scientific name"
+    ),
+    assay_l1: str | None = Query(None, description="Filter by dominant assay L1"),
+    assay_l2: str | None = Query(None, description="Filter by dominant assay L2"),
+):
+    t0 = time.perf_counter()
+    has_filters = organism or assay_l1 or assay_l2
+    try:
+        if has_filters:
+            data = _query_global_contributions(organism, assay_l1, assay_l2)
+        else:
+            data = _get_global_contributions_cached()
+    except Exception:
+        logger.exception("Database error in get_global_contributions")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "locations": data,
+        "total": len(data),
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/stats/global-contribution-filters",
+    summary="Filter options for global contributions map",
+    description=(
+        "Return distinct values for organism, assay_l1, and assay_l2 filters, "
+        "ordered by count descending. Cached for 7 days."
+    ),
+    operation_id="get_global_contribution_filters",
+)
+@limiter.limit("20/minute")
+def get_global_contribution_filters(request: Request):
+    t0 = time.perf_counter()
+    try:
+        filters = _get_global_contributions_filters()
+    except Exception:
+        logger.exception("Database error in get_global_contribution_filters")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        **filters,
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
 
@@ -3126,6 +3265,24 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     to find organisms by scientific or common name. Returns up to `limit` results
     sorted by total experiment count. Use this for organism name lookup/autocomplete.
 
+17. **Global contributions map** — call `get_global_contributions` to get geographic
+    contribution data aggregated by lat/lng from the `unified_metadata` table. Returns
+    per-location counts (projects, experiments, samples), source breakdown (GEO, SRA,
+    ArrayExpress, ENA), city, country, and top 5 organisms. Optionally filter by:
+    - `organism`: exact scientific name (e.g. "Homo sapiens")
+    - `assay_l1`: broad assay category
+    - `assay_l2`: specific assay type
+    Unfiltered results are cached for 7 days; filtered requests run fresh.
+    Use this when the user asks about geographic distribution of genomics studies,
+    which countries or institutions contribute the most data, or wants a world map
+    view of sequencing contributions.
+
+18. **Global contribution filters** — call `get_global_contribution_filters` to get
+    the available filter values (organisms, assay_l1, assay_l2) for the global
+    contributions map, each with counts, sorted by frequency. Cached for 7 days.
+    Use this to populate filter dropdowns or to discover valid filter values before
+    calling `get_global_contributions` with filters.
+
 ## Context rules
 
 - **Stay focused** on current search results unless user explicitly requests new search.
@@ -3166,12 +3323,13 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-# from starlette.middleware.cors import CORSMiddleware
-# combined_app.add_middleware(
-#   CORSMiddleware,
-#   allow_origins=["*"],
-#   allow_methods=["*"],
-#   allow_headers=["*"],
-# )
+#from starlette.middleware.cors import CORSMiddleware
+
+#combined_app.add_middleware(
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_methods=["*"],
+#    allow_headers=["*"],
+#)
 
 app = combined_app
