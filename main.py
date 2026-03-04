@@ -32,7 +32,6 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from user_agents import parse as parse_ua
 
-# from starlette.middleware.cors import CORSMiddleware
 
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
@@ -53,6 +52,7 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     RELATED_SQL,
+    BATCH_SAMPLES_SQL,
     SAMPLE_SQL,
     SRA_QUERY_ACCESSIONS_SQL,
     SEARCH_SQL,
@@ -1781,6 +1781,208 @@ def download_study_runs_tsv(
     )
 
 
+@api_app.get(
+    "/project/{study}/metadata/download",
+    summary="Download merged metadata as CSV",
+    description=(
+        "Return a CSV file merging experiment metadata, sample attributes, "
+        "and run download links for an SRA study. One row per run."
+    ),
+    operation_id="download_study_metadata_csv",
+)
+@limiter.limit("20/minute")
+def download_study_metadata_csv(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    study = study.upper()
+
+    # Fetch experiments and samples eagerly (bounded by experiment count),
+    # then stream runs to avoid buffering the full TSV in memory.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Fetch experiments and build lookup in a single pass
+                cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
+                experiments = cur.fetchall()
+                if not experiments:
+                    raise HTTPException(404, f"No experiments found for {study}")
+
+                exp_map: dict[str, dict] = {}
+                sample_accs: list[str] = []
+                for exp in experiments:
+                    # samples is TEXT[] — psycopg3 returns a Python list
+                    samples_list = exp.get("samples") or []
+                    sample_acc = samples_list[0] if samples_list else ""
+                    exp["_sample_acc"] = sample_acc
+                    exp_map[exp["accession"]] = exp
+                    if sample_acc:
+                        sample_accs.append(sample_acc)
+
+                # 2. Batch-fetch samples
+                sample_map: dict[str, dict] = {}
+                if sample_accs:
+                    cur.execute(BATCH_SAMPLES_SQL, (sample_accs,))
+                    for s in cur.fetchall():
+                        sample_map[s["accession"]] = s
+
+                # 3. Collect dynamic attribute keys (order-preserving)
+                all_attr_keys: list[str] = []
+                seen_keys: set[str] = set()
+                for s in sample_map.values():
+                    attrs_raw = s.get("attributes_json")
+                    if isinstance(attrs_raw, str):
+                        try:
+                            attrs_raw = json.loads(attrs_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            attrs_raw = None
+                        s["attributes_json"] = attrs_raw
+                    if isinstance(attrs_raw, list):
+                        for attr in attrs_raw:
+                            key = attr.get("tag") or attr.get("key") or ""
+                            if key and key not in seen_keys:
+                                seen_keys.add(key)
+                                all_attr_keys.append(key)
+
+                # 4. Verify runs exist before streaming
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                summary = cur.fetchone()
+                if not summary or summary["total_runs"] == 0:
+                    raise HTTPException(404, f"No runs found for {study}")
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Error fetching metadata for %s", study)
+        raise HTTPException(500, "Internal error generating metadata TSV")
+
+    # Pre-compute per-sample attribute dicts (already parsed above)
+    sample_attrs: dict[str, dict[str, str]] = {}
+    for acc, s in sample_map.items():
+        attrs_raw = s.get("attributes_json")
+        if isinstance(attrs_raw, list):
+            sample_attrs[acc] = {
+                f"sample_attribute:{attr.get('tag') or attr.get('key') or ''}": attr.get(
+                    "value"
+                )
+                or ""
+                for attr in attrs_raw
+                if attr.get("tag") or attr.get("key")
+            }
+
+    # Define columns
+    exp_cols = [
+        "experiment_accession",
+        "experiment_title",
+        "design_description",
+        "library_layout",
+        "library_name",
+        "library_selection",
+        "library_source",
+        "library_strategy",
+        "platform",
+        "instrument_model",
+    ]
+    sample_cols = [
+        "sample_accession",
+        "sample_alias",
+        "sample_description",
+        "sample_title",
+        "scientific_name",
+        "taxon_id",
+    ]
+    attr_cols = [f"sample_attribute:{k}" for k in all_attr_keys]
+    run_cols = [
+        "run_accession",
+        "fastq_ftp",
+        "fastq_bytes",
+        "fastq_md5",
+        "sra_ftp",
+        "sra_bytes",
+        "ncbi_sra_url",
+        "ncbi_sra_normalized_url",
+        "ncbi_sra_normalized_bytes",
+        "ncbi_sra_lite_url",
+        "ncbi_sra_lite_bytes",
+        "ncbi_sra_lite_s3_url",
+        "ncbi_sra_lite_gs_url",
+    ]
+    fieldnames = ["study_accession"] + run_cols + exp_cols + sample_cols + attr_cols
+
+    def _run_to_row(run: dict) -> dict:
+        exp_acc = run.get("experiment_accession") or ""
+        exp = exp_map.get(exp_acc, {})
+        s_acc = exp.get("_sample_acc", "")
+        sample = sample_map.get(s_acc, {})
+        return {
+            "study_accession": study,
+            "run_accession": run.get("run_accession") or "",
+            "fastq_ftp": run.get("fastq_ftp") or "",
+            "fastq_bytes": run.get("fastq_bytes") or "",
+            "fastq_md5": run.get("fastq_md5") or "",
+            "sra_ftp": run.get("sra_ftp") or "",
+            "sra_bytes": run.get("sra_bytes") or "",
+            "ncbi_sra_url": run.get("ncbi_sra_url") or "",
+            "ncbi_sra_normalized_url": run.get("ncbi_sra_normalized_url") or "",
+            "ncbi_sra_normalized_bytes": run.get("ncbi_sra_normalized_bytes") or "",
+            "ncbi_sra_lite_url": run.get("ncbi_sra_lite_url") or "",
+            "ncbi_sra_lite_bytes": run.get("ncbi_sra_lite_bytes") or "",
+            "ncbi_sra_lite_s3_url": run.get("ncbi_sra_lite_s3_url") or "",
+            "ncbi_sra_lite_gs_url": run.get("ncbi_sra_lite_gs_url") or "",
+            "experiment_accession": exp_acc,
+            "experiment_title": exp.get("title") or "",
+            "design_description": exp.get("design_description") or "",
+            "library_layout": exp.get("library_layout")
+            or run.get("library_layout")
+            or "",
+            "library_name": exp.get("library_name") or "",
+            "library_selection": exp.get("library_selection") or "",
+            "library_source": exp.get("library_source") or "",
+            "library_strategy": exp.get("library_strategy") or "",
+            "platform": exp.get("platform") or "",
+            "instrument_model": exp.get("instrument_model") or "",
+            "sample_accession": s_acc,
+            "sample_alias": sample.get("alias") or "",
+            "sample_description": sample.get("description") or "",
+            "sample_title": sample.get("title") or "",
+            "scientific_name": sample.get("scientific_name") or "",
+            "taxon_id": sample.get("taxon_id") or "",
+            **sample_attrs.get(s_acc, {}),
+        }
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        yield buf.getvalue()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(STUDY_RUNS_SQL, (study, study))
+                    while True:
+                        rows = cur.fetchmany(500)
+                        if not rows:
+                            break
+                        buf = io.StringIO()
+                        writer = csv.DictWriter(
+                            buf,
+                            fieldnames=fieldnames,
+                            extrasaction="ignore",
+                        )
+                        for run in rows:
+                            writer.writerow(_run_to_row(run))
+                        yield buf.getvalue()
+        except Exception:
+            logger.exception("Error streaming metadata CSV for %s", study)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{study}_metadata.csv"'},
+    )
+
+
 _DOWNLOAD_MODES = {
     "fastq": {
         "label": "FASTQ files",
@@ -1879,7 +2081,13 @@ def download_study_script(
         )
 
     script = (
-        f"#!/usr/bin/env bash\n# Download {label} for {study}\n\nset -euo pipefail\n\n"
+        f"#!/usr/bin/env bash\n"
+        f"# Download {label} for {study}\n"
+        f"# Generated by seqout.org\n\n"
+        f"set -euo pipefail\n\n"
+        f"# Download metadata\n"
+        f'curl -sS "https://seqout.org/api/project/{study}/metadata/download"'
+        f' -o "{study}/metadata.csv" --create-dirs\n\n'
     )
     script += "\n".join(lines) + "\n"
     script += f'\necho "Done — {len(lines)} files saved under ./{study}/"\n'
@@ -2813,6 +3021,11 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
      - `s3` — aws s3 cp commands using s3:// URIs
      - `gcs` — gsutil cp commands using gs:// URIs
      Example: `https://seqout.org/api/project/SRP123456/download/fastq`
+   - **Merged metadata CSV** — call `download_study_metadata_csv` with a study accession
+     to get a CSV merging experiment metadata, sample attributes (as dynamic columns),
+     and run download links. One row per run. Useful when users need a complete metadata
+     table for a study.
+     Example: `https://seqout.org/api/project/SRP123456/metadata/download`
    - Or direct them to the web UI at `https://seqout.org/p/{study}` which
      has an interactive download section with per-file links and batch download scripts.
 
@@ -2889,6 +3102,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 - `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
   structured JSON with download links, or `download_study_script` to get a ready-to-run
   bash script for any download mode (fastq, sra, sra_lite, s3, gcs).
+- `download_study_metadata_csv` streams a merged metadata CSV — not useful for LLMs.
+  Use `get_study_experiments` + `get_sample` for structured metadata access.
 - `get_points_bin`, `get_accessions_bin`, `get_clusters` return binary/JSON data for
   the 2D map visualization — not useful for conversational LLM interactions.
 - `get_geo_series_neighbors_coords` returns raw neighbor/3D coordinate data for the
@@ -2914,11 +3129,12 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
+# from starlette.middleware.cors import CORSMiddleware
 # combined_app.add_middleware(
-#    CORSMiddleware,
-#    allow_origins=["*"],
-#    allow_methods=["*"],
-#    allow_headers=["*"],
+#   CORSMiddleware,
+#   allow_origins=["*"],
+#   allow_methods=["*"],
+#   allow_headers=["*"],
 # )
 
 app = combined_app

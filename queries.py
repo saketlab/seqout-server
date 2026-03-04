@@ -564,6 +564,20 @@ FROM sra_samples
 WHERE accession = %s;
 """
 
+BATCH_SAMPLES_SQL = """
+SELECT
+    accession,
+    alias,
+    description,
+    title,
+    scientific_name,
+    taxon_id,
+    external_id,
+    attributes_json
+FROM sra_samples
+WHERE accession = ANY(%s);
+"""
+
 COMMON_NAME_BY_SCIENTIFIC_NAME_SQL = """
 SELECT
     tax_id,
