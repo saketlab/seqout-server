@@ -619,6 +619,29 @@ SELECT
 FROM sra_experiments
 WHERE study = %s;
 """
+
+ENA_STUDY_EXPERIMENTS_SQL = """
+SELECT DISTINCT ON (e.experiment_accession)
+    e.experiment_accession AS accession,
+    e.experiment_title AS title,
+    NULL::text AS design_description,
+    e.library_layout,
+    e.library_name,
+    e.library_selection,
+    e.library_source,
+    e.library_strategy,
+    CASE
+        WHEN e.sample_accession IS NOT NULL THEN ARRAY[e.sample_accession]::text[]
+        ELSE ARRAY[]::text[]
+    END AS samples,
+    e.instrument_platform AS platform,
+    e.instrument_model,
+    NULL::text AS submission
+FROM ena_experiments e
+WHERE UPPER(e.study_accession) = UPPER(%s)
+ORDER BY e.experiment_accession, e.run_accession NULLS LAST;
+"""
+
 SAMPLE_SQL = """
 SELECT
     accession,
@@ -633,6 +656,45 @@ SELECT
     links
 FROM sra_samples
 WHERE accession = %s;
+"""
+
+ENA_SAMPLE_SQL = """
+SELECT
+    s.sample_accession AS accession,
+    s.sample_alias AS alias,
+    s.sample_description AS description,
+    s.sample_title AS title,
+    s.scientific_name,
+    s.tax_id AS taxon_id,
+    s.secondary_sample_accession AS external_id,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object('tag', kv.key, 'value', kv.value)
+                ORDER BY kv.key
+            )
+            FROM jsonb_each_text(
+                jsonb_strip_nulls(
+                    to_jsonb(s) - ARRAY[
+                        'sample_accession',
+                        'secondary_sample_accession',
+                        'sample_alias',
+                        'sample_title',
+                        'sample_description',
+                        'tax_id',
+                        'scientific_name',
+                        'study_accession'
+                    ]::text[]
+                )
+            ) AS kv
+        ),
+        '[]'::jsonb
+    ) AS attributes_json,
+    s.submission_accession AS submission,
+    NULL::jsonb AS links
+FROM ena_samples s
+WHERE UPPER(s.sample_accession) = UPPER(%s)
+LIMIT 1;
 """
 
 BATCH_SAMPLES_SQL = """

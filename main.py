@@ -41,6 +41,8 @@ from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
     COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
+    ENA_SAMPLE_SQL,
+    ENA_STUDY_EXPERIMENTS_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SERIES_NEIGHBORS_COORDS_SQL,
@@ -115,6 +117,8 @@ EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
 PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|PRJ[A-Z]+|[Ee]-[A-Za-z]{{4}}-)\d+$"
+STUDY_EXPERIMENTS_REGEX = rf"^({_STUDY_PREFIX}|PRJ[A-Z]+)\d+$"
+SAMPLE_OR_ENA_REGEX = rf"^({_SAMPLE_PREFIX}|SAM[A-Z]+)\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
 AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
 
@@ -467,10 +471,29 @@ def rows_to_csv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
+def _is_ena_study(study: str) -> bool:
+    return study.upper().startswith("PRJ")
+
+
+def _fetch_study_experiments(cur, study: str) -> list[dict]:
+    sql = ENA_STUDY_EXPERIMENTS_SQL if _is_ena_study(study) else STUDY_EXPERIMENTS_SQL
+    cur.execute(sql, (study,))
+    return cur.fetchall()
+
+
+def _fetch_sample(cur, accession: str) -> dict | None:
+    cur.execute(SAMPLE_SQL, (accession,))
+    sample = cur.fetchone()
+    if sample:
+        return sample
+
+    cur.execute(ENA_SAMPLE_SQL, (accession,))
+    return cur.fetchone()
+
+
 def flatten_sra_study(cur, study: str) -> list[dict]:
     # 1. Fetch experiments (like /project/{study}/experiments endpoint)
-    cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
-    experiments = cur.fetchall()
+    experiments = _fetch_study_experiments(cur, study)
     if not experiments:
         return []
 
@@ -486,8 +509,7 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
     # Fetch all samples and parse attributes_json
     samples_map = {}
     for sample_acc in unique_sample_accs:
-        cur.execute(SAMPLE_SQL, (sample_acc,))
-        sample = cur.fetchone()
+        sample = _fetch_sample(cur, sample_acc)
         if sample:
             # Parse attributes_json if it's a string (like frontend does)
             attrs = sample.get("attributes_json")
@@ -504,6 +526,12 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
         attrs = sample.get("attributes_json")
         if attrs and isinstance(attrs, dict):
             attribute_keys.update(attrs.keys())
+        elif attrs and isinstance(attrs, list):
+            for attr in attrs:
+                if isinstance(attr, dict):
+                    key = attr.get("tag") or attr.get("key")
+                    if key:
+                        attribute_keys.add(key)
 
     attribute_keys = sorted(attribute_keys)
 
@@ -535,9 +563,18 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
 
         # Add attribute columns matching frontend's attrRow
         attrs = sample.get("attributes_json") if sample else None
+        attrs_map = None
+        if isinstance(attrs, list):
+            attrs_map = {
+                (attr.get("tag") or attr.get("key")): attr.get("value")
+                for attr in attrs
+                if isinstance(attr, dict) and (attr.get("tag") or attr.get("key"))
+            }
         for key in attribute_keys:
             if isinstance(attrs, dict):
                 row[key] = attrs.get(key, "-")
+            elif isinstance(attrs_map, dict):
+                row[key] = attrs_map.get(key, "-")
             else:
                 row[key] = "-"
 
@@ -1737,19 +1774,22 @@ def get_project_metadata(
 @api_app.get(
     "/project/{study}/experiments",
     summary="List study experiments",
-    description="List all experiments for an SRA study accession (SRP/DRP/ERP).",
+    description=(
+        "List all experiments for a study accession (SRP/DRP/ERP/PRJ*). "
+        "For ENA (PRJ*), returns one row per experiment_accession (first run only)."
+    ),
     operation_id="get_study_experiments",
 )
 @limiter.limit("100/minute")
 def get_study_experiments(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
+    study = study.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
-                return cur.fetchall()
+                return _fetch_study_experiments(cur, study)
     except Exception as e:
         logger.exception("Database error in get_study_experiments")
         raise HTTPException(500, "Internal server error")
@@ -1979,8 +2019,7 @@ def download_study_metadata_csv(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # 1. Fetch experiments and build lookup in a single pass
-                cur.execute(STUDY_EXPERIMENTS_SQL, (study,))
-                experiments = cur.fetchall()
+                experiments = _fetch_study_experiments(cur, study)
                 if not experiments:
                     raise HTTPException(404, f"No experiments found for {study}")
 
@@ -1998,9 +2037,15 @@ def download_study_metadata_csv(
                 # 2. Batch-fetch samples
                 sample_map: dict[str, dict] = {}
                 if sample_accs:
-                    cur.execute(BATCH_SAMPLES_SQL, (sample_accs,))
-                    for s in cur.fetchall():
-                        sample_map[s["accession"]] = s
+                    if _is_ena_study(study):
+                        for sample_acc in sample_accs:
+                            s = _fetch_sample(cur, sample_acc)
+                            if s:
+                                sample_map[s["accession"]] = s
+                    else:
+                        cur.execute(BATCH_SAMPLES_SQL, (sample_accs,))
+                        for s in cur.fetchall():
+                            sample_map[s["accession"]] = s
 
                 # 3. Collect dynamic attribute keys (order-preserving)
                 all_attr_keys: list[str] = []
@@ -2281,19 +2326,19 @@ def download_study_script(
 @api_app.get(
     "/sample/{accession}",
     summary="Get sample",
-    description="Return an SRA sample (SRS/DRS/ERS) by accession.",
+    description="Return an SRA/ENA sample (SRS/DRS/ERS/SAM*) by accession.",
     operation_id="get_sample",
 )
 @limiter.limit("100/minute")
 def get_sample(
     request: Request,
-    accession: str = Path(..., pattern=SAMPLE_REGEX),
+    accession: str = Path(..., pattern=SAMPLE_OR_ENA_REGEX),
 ):
+    accession = accession.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SAMPLE_SQL, (accession,))
-                return cur.fetchone()
+                return _fetch_sample(cur, accession)
     except Exception as e:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
