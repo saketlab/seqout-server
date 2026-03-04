@@ -578,6 +578,30 @@ LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
 WHERE s.accession = %s;
 """
 
+PROJECT_ENA_SQL = """
+SELECT
+    es.study_accession AS accession,
+    NULL::text AS alias,
+    es.study_title AS title,
+    es.study_description AS summary,
+    NULL::text AS overall_design,
+    NULL::text[] AS organisms,
+    NULL::text[] AS pubmed_id,
+    NULL::text[] AS samples_ref,
+    NULL::text AS series_type,
+    NULL::jsonb AS relation,
+    NULL::text[] AS supplementary_data,
+    NULL::date AS published_at,
+    es.last_updated AS updated_at,
+    NULL::real[] AS coords_2d,
+    NULL::real[] AS coords_3d,
+    NULL::jsonb AS neighbors,
+    NULL::jsonb AS center
+FROM ena_studies es
+WHERE UPPER(es.study_accession) = UPPER(%s)
+LIMIT 1;
+"""
+
 STUDY_EXPERIMENTS_SQL = """
 SELECT
     accession,

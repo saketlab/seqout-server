@@ -50,6 +50,7 @@ from queries import (
     PRJ_TO_SRA_STUDY_SQL,
     PRJNA_TO_GEO_SERIES_SQL,
     PROJECT_AE_SQL,
+    PROJECT_ENA_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     RELATED_SQL,
@@ -111,7 +112,7 @@ SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
 EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
-PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$"
+PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|PRJ[A-Z]+|[Ee]-[A-Za-z]{{4}}-)\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
 AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
 
@@ -1515,7 +1516,8 @@ def search(
     "/project/{accession}",
     summary="Get project",
     description=(
-        "Return a GEO series (GSE) or SRA study (SRP/DRP/ERP) record by accession."
+        "Return a GEO series (GSE), SRA study (SRP/DRP/ERP), ENA project (PRJ*), "
+        "or ArrayExpress project (E-*) record by accession."
     ),
     operation_id="get_project",
 )
@@ -1525,18 +1527,21 @@ def get_project(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     accession = accession.upper()
+    params = (accession,)
 
     if accession.startswith("E-"):
         sql = PROJECT_AE_SQL
     elif accession.startswith("G"):
         sql = PROJECT_GEO_SQL
+    elif accession.startswith("PRJ"):
+        sql = PROJECT_ENA_SQL
     else:
         sql = PROJECT_SRA_SQL
 
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql, (accession,))
+                cur.execute(sql, params)
                 row = cur.fetchone()
                 if row:
                     _enrich_with_publications([row], cur)
