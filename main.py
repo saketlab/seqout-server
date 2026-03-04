@@ -37,6 +37,7 @@ from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
     AE_SEARCH_SQL,
+    ENA_SEARCH_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
     COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
@@ -1346,8 +1347,8 @@ def search_sra(
     "/search",
     summary="Search all databases",
     description=(
-        "Unified search across GEO, SRA, and ArrayExpress. "
-        "Optionally restrict by db=geo|sra|arrayexpress. "
+        "Unified search across GEO, SRA, ArrayExpress, and ENA. "
+        "Optionally restrict by db=geo|sra|arrayexpress|ena. "
         "Optionally sort by sortby=citations|journal|year with order=desc(default)|asc. "
         "For default relevance sort, use cursor_rank + cursor_acc for pagination. "
         "For custom sortby, use cursor_sort + cursor_acc for pagination. "
@@ -1363,7 +1364,7 @@ def search(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
     cursor_sort: str | None = Query(None),
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
@@ -1422,6 +1423,37 @@ def search(
                     _enrich_with_publications(rows, cur)
         except Exception as e:
             logger.exception("Database error in search_arrayexpress")
+            raise HTTPException(500, "Internal server error")
+
+        took_ms = (time.perf_counter() - start) * 1000
+        total = rows[0]["total_count"] if rows else 0
+
+        return {
+            "results": rows,
+            "total": total,
+            "took_ms": round(took_ms, 2),
+            "next_cursor": (
+                None
+                if not rows
+                else {
+                    "rank": rows[-1]["rank"],
+                    "accession": rows[-1]["accession"],
+                }
+            ),
+        }
+    elif db == "ena":
+        start = time.perf_counter()
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        ENA_SEARCH_SQL,
+                        (q, cursor_rank, cursor_rank, cursor_acc),
+                    )
+                    rows = cur.fetchall()
+                    _enrich_with_publications(rows, cur)
+        except Exception:
+            logger.exception("Database error in search_ena")
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000

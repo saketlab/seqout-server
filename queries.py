@@ -87,6 +87,40 @@ LIMIT 200;
 """
 
 
+ENA_SEARCH_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS q
+),
+all_matches AS (
+    -- Full-text search match (priority 4)
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[] AS organisms,
+           NULL::text[] AS countries,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source, 4 AS priority,
+           NULL::text[] AS instrument_models,
+           NULL::text[] AS library_strategies
+    FROM ena_studies_search, q
+    WHERE tsv @@ q.q
+),
+counted AS (
+    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
+),
+paged AS (
+    SELECT *
+    FROM counted
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+)
+SELECT
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+FROM paged
+ORDER BY rank DESC, accession DESC
+LIMIT 200;
+"""
+
+
 SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
@@ -115,6 +149,19 @@ all_matches AS (
            ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,
            COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.q
+
+    UNION ALL
+
+    -- ENA full-text search
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[] AS organisms, NULL::text[] AS countries,
+           ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source,
+           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+    FROM ena_studies_search, q
     WHERE tsv @@ q.q
 ),
 deduped AS (
@@ -1135,6 +1182,19 @@ def build_sorted_search_sql(
             " ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,"
             " COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM arrayexpress_experiments, q"
+            " WHERE tsv @@ q.q"
+        )
+
+    if db in (None, "ena"):
+        cte_parts.append(
+            "SELECT accession,"
+            " COALESCE(study_title, study_name, project_name, accession) AS title,"
+            " study_description AS summary,"
+            " COALESCE(last_updated, first_public) AS updated_at,"
+            " NULL::text[] AS organisms, NULL::text[] AS countries,"
+            " ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source,"
+            " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            " FROM ena_studies_search, q"
             " WHERE tsv @@ q.q"
         )
 
