@@ -852,7 +852,11 @@ def get_points_bin(request: Request):
         logger.exception("Database error in get_points_bin")
         raise HTTPException(500, "Internal server error")
 
-    return Response(content=points_bytes, media_type="application/octet-stream")
+    return Response(
+        content=points_bytes,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
 
 
 @api_app.get(
@@ -873,7 +877,11 @@ def get_accessions_bin(request: Request):
         logger.exception("Database error in get_accessions_bin")
         raise HTTPException(500, "Internal server error")
 
-    return Response(content=accessions_bytes, media_type="application/octet-stream")
+    return Response(
+        content=accessions_bytes,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
 
 
 @api_app.get(
@@ -893,7 +901,10 @@ def get_clusters(request: Request):
         logger.exception("Database error in get_clusters")
         raise HTTPException(500, "Internal server error")
 
-    return rows
+    return JSONResponse(
+        content=rows,
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
 
 
 @api_app.get(
@@ -2901,7 +2912,32 @@ def search_structured(
     cursor_acc: str | None = Query(None),
     journal: str | None = Query(None),
     instrument_model: str | None = Query(None),
+    geo_country: str | None = Query(None),
+    geo_country_code: str | None = Query(None),
+    geo_country_code_iso2: str | None = Query(None),
+    geo_city: str | None = Query(None),
+    geo_state: str | None = Query(None),
+    geo_district: str | None = Query(None),
+    geo_postcode: str | None = Query(None),
+    geo_lat: float | None = Query(None, ge=-90, le=90),
+    geo_lng: float | None = Query(None, ge=-180, le=180),
+    geo_radius_km: float | None = Query(None, ge=0.1, le=20000),
 ):
+    has_geo_filter = any(
+        v is not None
+        for v in (
+            geo_country,
+            geo_country_code,
+            geo_country_code_iso2,
+            geo_city,
+            geo_state,
+            geo_district,
+            geo_postcode,
+            geo_lat,
+            geo_lng,
+        )
+    )
+
     if not any(
         [
             q,
@@ -2914,17 +2950,26 @@ def search_structured(
             year_to,
             journal,
             instrument_model,
+            has_geo_filter,
         ]
     ):
         raise HTTPException(
             400,
             "At least one of q, organism, library_strategy, platform, "
-            "country, center, year_from, year_to, journal, or "
-            "instrument_model is required",
+            "country, center, year_from, year_to, journal, "
+            "instrument_model, or a geo_* filter is required",
         )
 
     if year_from is not None and year_to is not None and year_from > year_to:
         raise HTTPException(400, "year_from must be <= year_to")
+
+    if (geo_lat is None) != (geo_lng is None):
+        raise HTTPException(
+            400, "geo_lat and geo_lng must both be provided or both omitted"
+        )
+
+    if geo_radius_km is not None and geo_lat is None:
+        raise HTTPException(400, "geo_radius_km requires geo_lat and geo_lng")
 
     sql, params = build_structured_search(
         q=q,
@@ -2940,6 +2985,16 @@ def search_structured(
         cursor_acc=cursor_acc,
         journal=journal,
         instrument_model=instrument_model,
+        geo_country=geo_country,
+        geo_country_code=geo_country_code,
+        geo_country_code_iso2=geo_country_code_iso2,
+        geo_city=geo_city,
+        geo_state=geo_state,
+        geo_district=geo_district,
+        geo_postcode=geo_postcode,
+        geo_lat=geo_lat,
+        geo_lng=geo_lng,
+        geo_radius_km=geo_radius_km,
     )
 
     start = time.perf_counter()
