@@ -89,6 +89,8 @@ from queries import (
     build_global_contributions_sql,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
+    ENRICHED_SAMPLES_SQL,
+    ENRICHED_STUDY_SQL,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -3193,6 +3195,48 @@ def sitemap_accessions(
     return {"accessions": [r["accession"] for r in rows], "page": page, "limit": limit}
 
 
+# ── Enriched Metadata ────────────────────────────────────────────────────────
+
+
+@api_app.get(
+    "/project/{accession}/enriched",
+    summary="Get LLM-enriched sample metadata",
+    description=(
+        "Return structured metadata extracted by LLM from sample descriptions: "
+        "age, sex, ethnicity, phenotype, cell_type, tissue, strain, disease, "
+        "assay, cell_line, treatment. Includes study title and sample count."
+    ),
+    operation_id="get_project_enriched",
+)
+@limiter.limit("100/minute")
+def get_project_enriched(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(ENRICHED_STUDY_SQL, (accession,))
+                study = cur.fetchone()
+                if not study:
+                    raise HTTPException(404, f"No enriched metadata for {accession}")
+                cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
+                samples = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_project_enriched")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "accession": study["accession"],
+        "title": study["title"],
+        "n_samples": study["n_samples"],
+        "samples": samples,
+    }
+
+
 MCP_INSTRUCTIONS = """\
 You are connected to pysraweb, a genomics study search engine covering
 NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
@@ -3433,13 +3477,13 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-#from starlette.middleware.cors import CORSMiddleware
+# from starlette.middleware.cors import CORSMiddleware
 
-#combined_app.add_middleware(
+# combined_app.add_middleware(
 #    CORSMiddleware,
 #    allow_origins=["*"],
 #    allow_methods=["*"],
 #    allow_headers=["*"],
-#)
+# )
 
 app = combined_app

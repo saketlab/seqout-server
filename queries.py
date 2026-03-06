@@ -2081,6 +2081,21 @@ SELECT
     (SELECT COUNT(*) FROM ena_studies) AS ena;
 """
 
+ENRICHED_SAMPLES_SQL = """
+SELECT es.sample, es.age, es.sex, es.ethnicity, es.phenotype,
+       es.cell_type, es.tissue, es.strain, es.disease, es.assay,
+       es.cell_line, es.treatment
+FROM enriched_samples es
+WHERE es.study_accession = %s
+ORDER BY es.sample;
+"""
+
+ENRICHED_STUDY_SQL = """
+SELECT st.accession, st.title, st.n_samples
+FROM enriched_studies st
+WHERE st.accession = %s;
+"""
+
 SITEMAP_ACCESSIONS_SQL = {
     "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
     "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",
