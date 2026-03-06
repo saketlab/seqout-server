@@ -931,29 +931,35 @@ LIMIT %s;
 """
 
 
-def _build_geo_exists(accession_expr, params, **geo):
-    """Return an EXISTS clause filtering via unified_metadata, or empty string."""
+def _build_geo_cte(params, assay_l1=None, assay_l2=None, **geo):
+    """Return a CTE string for geo_accessions from unified_metadata, or None."""
     conditions = []
+    if assay_l1:
+        conditions.append("dominant_assay_l1 = %(assay_l1)s")
+        params["assay_l1"] = assay_l1
+    if assay_l2:
+        conditions.append("dominant_assay_l2 = %(assay_l2)s")
+        params["assay_l2"] = assay_l2
     if geo.get("geo_country"):
-        conditions.append("um.country ILIKE %(geo_country)s")
+        conditions.append("country ILIKE %(geo_country)s")
         params["geo_country"] = geo["geo_country"]
     if geo.get("geo_country_code"):
-        conditions.append("um.country_code ILIKE %(geo_country_code)s")
+        conditions.append("country_code ILIKE %(geo_country_code)s")
         params["geo_country_code"] = geo["geo_country_code"]
     if geo.get("geo_country_code_iso2"):
-        conditions.append("um.country_code_iso2 ILIKE %(geo_country_code_iso2)s")
+        conditions.append("country_code_iso2 ILIKE %(geo_country_code_iso2)s")
         params["geo_country_code_iso2"] = geo["geo_country_code_iso2"]
     if geo.get("geo_city"):
-        conditions.append("um.city ILIKE %(geo_city)s")
+        conditions.append("city ILIKE %(geo_city)s")
         params["geo_city"] = geo["geo_city"]
     if geo.get("geo_state"):
-        conditions.append("um.state ILIKE %(geo_state)s")
+        conditions.append("state ILIKE %(geo_state)s")
         params["geo_state"] = geo["geo_state"]
     if geo.get("geo_district"):
-        conditions.append("um.district ILIKE %(geo_district)s")
+        conditions.append("district ILIKE %(geo_district)s")
         params["geo_district"] = geo["geo_district"]
     if geo.get("geo_postcode"):
-        conditions.append("um.postcode = %(geo_postcode)s")
+        conditions.append("postcode = %(geo_postcode)s")
         params["geo_postcode"] = geo["geo_postcode"]
     if geo.get("geo_lat") is not None and geo.get("geo_lng") is not None:
         params["geo_lat"] = geo["geo_lat"]
@@ -961,22 +967,23 @@ def _build_geo_exists(accession_expr, params, **geo):
         if geo.get("geo_radius_km"):
             params["geo_radius_km"] = geo["geo_radius_km"]
             conditions.append(
-                "(6371 * acos(LEAST(1.0, cos(radians(%(geo_lat)s)) * cos(radians(um.latitude))"
-                " * cos(radians(um.longitude) - radians(%(geo_lng)s))"
-                " + sin(radians(%(geo_lat)s)) * sin(radians(um.latitude))))) <= %(geo_radius_km)s"
+                "(6371 * acos(LEAST(1.0, cos(radians(%(geo_lat)s)) * cos(radians(latitude))"
+                " * cos(radians(longitude) - radians(%(geo_lng)s))"
+                " + sin(radians(%(geo_lat)s)) * sin(radians(latitude))))) <= %(geo_radius_km)s"
             )
         else:
             conditions.append(
-                "ROUND(um.latitude::numeric, 2) = ROUND(%(geo_lat)s::numeric, 2)"
-                " AND ROUND(um.longitude::numeric, 2) = ROUND(%(geo_lng)s::numeric, 2)"
+                "ROUND(latitude::numeric, 2) = ROUND(%(geo_lat)s::numeric, 2)"
+                " AND ROUND(longitude::numeric, 2) = ROUND(%(geo_lng)s::numeric, 2)"
             )
     if not conditions:
         return None
     where = " AND ".join(conditions)
     return (
-        f"EXISTS (SELECT 1 FROM unified_metadata um"
-        f" WHERE um.canonical_accession = {accession_expr}"
-        f" AND {where})"
+        f"geo_accessions AS ("
+        f"SELECT DISTINCT canonical_accession, source"
+        f" FROM unified_metadata"
+        f" WHERE {where})"
     )
 
 
@@ -1004,6 +1011,8 @@ def build_structured_search(
     geo_lat=None,
     geo_lng=None,
     geo_radius_km=None,
+    assay_l1=None,
+    assay_l2=None,
 ):
     """Build SQL + params for structured search across GEO, SRA, ArrayExpress, ENA.
 
@@ -1051,7 +1060,7 @@ def build_structured_search(
     if instrument_model:
         params["instrument_model"] = instrument_model
 
-    # Geo filter kwargs (passed to _build_geo_exists for each source CTE)
+    # Geo filter kwargs
     geo_kwargs = dict(
         geo_country=geo_country,
         geo_country_code=geo_country_code,
@@ -1065,10 +1074,22 @@ def build_structured_search(
         geo_radius_km=geo_radius_km,
     )
     has_geo_filter = any(v is not None for v in geo_kwargs.values())
+    has_um_filter = has_geo_filter or assay_l1 or assay_l2
+
+    # When unified_metadata filters are active, use it as the driving table:
+    # build a geo_accessions CTE and INNER JOIN each source table to it.
+    geo_cte = None
+    if has_um_filter:
+        geo_cte = _build_geo_cte(
+            params, assay_l1=assay_l1, assay_l2=assay_l2, **geo_kwargs
+        )
 
     # --- GEO ---
     if include_geo:
         w = []
+        joins = ""
+        if geo_cte:
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = g.accession AND ga.source = 'geo'"
         if q:
             w.append("g.tsv @@ plainto_tsquery('english', %(q)s)")
         if organism:
@@ -1097,10 +1118,6 @@ def build_structured_search(
             )
         if instrument_model:
             w.append("g.instrument_models @> ARRAY[%(instrument_model)s]")
-        if has_geo_filter:
-            geo_clause = _build_geo_exists("g.accession", params, **geo_kwargs)
-            if geo_clause:
-                w.append(geo_clause)
 
         rank = (
             "ts_rank(g.tsv, plainto_tsquery('english', %(q)s))"
@@ -1113,12 +1130,15 @@ def build_structured_search(
             f" g.updated_at, g.organisms, g.countries_iso AS countries,"
             f" {rank} AS rank, 'geo'::text AS source,"
             f" g.accession AS dedup_key, g.instrument_models, g.library_strategies"
-            f" FROM geo_series g{where}"
+            f" FROM geo_series g{joins}{where}"
         )
 
     # --- SRA ---
     if include_sra:
         w = []
+        joins = ""
+        if geo_cte:
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = s.accession AND ga.source = 'sra'"
         if q:
             w.append("s.tsv @@ plainto_tsquery('english', %(q)s)")
         if organism:
@@ -1153,10 +1173,6 @@ def build_structured_search(
             )
         if instrument_model:
             w.append("s.instrument_models @> ARRAY[%(instrument_model)s]")
-        if has_geo_filter:
-            geo_clause = _build_geo_exists("s.accession", params, **geo_kwargs)
-            if geo_clause:
-                w.append(geo_clause)
 
         rank = (
             "ts_rank(s.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -1169,12 +1185,15 @@ def build_structured_search(
             f" s.updated_at, s.organisms, s.countries,"
             f" {rank} AS rank, 'sra'::text AS source,"
             f" COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
-            f" FROM sra_studies s{where}"
+            f" FROM sra_studies s{joins}{where}"
         )
 
     # --- ArrayExpress ---
     if include_ae:
         w = []
+        joins = ""
+        if geo_cte:
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = ae.accession AND ga.source = 'arrayexpress'"
         if q:
             w.append("ae.tsv @@ plainto_tsquery('english', %(q)s)")
         if organism:
@@ -1193,10 +1212,6 @@ def build_structured_search(
                 " WHERE sp.accession = ae.accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
-        if has_geo_filter:
-            geo_clause = _build_geo_exists("ae.accession", params, **geo_kwargs)
-            if geo_clause:
-                w.append(geo_clause)
 
         rank = (
             "ts_rank(ae.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -1209,12 +1224,15 @@ def build_structured_search(
             f" ae.release_date AS updated_at, ae.organisms, ae.countries,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
             f" COALESCE(ae.alias, ae.accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
-            f" FROM arrayexpress_experiments ae{where}"
+            f" FROM arrayexpress_experiments ae{joins}{where}"
         )
 
     # --- ENA ---
     if include_ena:
         w = []
+        joins = ""
+        if geo_cte:
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = es.study_accession AND ga.source = 'ena'"
         ena_tsv = (
             "to_tsvector('english',"
             " coalesce(es.study_title, '') || ' ' ||"
@@ -1248,14 +1266,6 @@ def build_structured_search(
                 " WHERE sp.accession = es.study_accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
-        if has_geo_filter:
-            geo_clause = _build_geo_exists(
-                "es.study_accession",
-                params,
-                **geo_kwargs,
-            )
-            if geo_clause:
-                w.append(geo_clause)
 
         rank = (
             f"ts_rank({ena_tsv}, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -1273,7 +1283,7 @@ def build_structured_search(
             f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
             f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
-            f" FROM ena_studies es{where}"
+            f" FROM ena_studies es{joins}{where}"
         )
 
     if not cte_parts:
@@ -1297,8 +1307,11 @@ def build_structured_search(
     else:
         cursor_where = ""
 
+    # Prepend geo_accessions CTE when geo filters are active
+    geo_cte_prefix = f"{geo_cte},\n" if geo_cte else ""
+
     sql = f"""\
-WITH all_matches AS (
+WITH {geo_cte_prefix}all_matches AS (
     {all_matches}
 ),
 deduped AS (
@@ -1958,7 +1971,11 @@ WITH location_agg AS (
         COUNT(*) FILTER (WHERE source = 'arrayexpress') AS n_ae,
         COUNT(*) FILTER (WHERE source = 'ena') AS n_ena,
         MODE() WITHIN GROUP (ORDER BY country) AS country,
-        MODE() WITHIN GROUP (ORDER BY city) AS city
+        MODE() WITHIN GROUP (ORDER BY city) AS city,
+        MODE() WITHIN GROUP (ORDER BY state) AS state,
+        MODE() WITHIN GROUP (ORDER BY place_name) AS place_name,
+        MODE() WITHIN GROUP (ORDER BY short_label) AS short_label,
+        MODE() WITHIN GROUP (ORDER BY center_name) AS center_name
     FROM unified_metadata
     WHERE latitude IS NOT NULL AND longitude IS NOT NULL
       AND __WHERE__
@@ -1990,7 +2007,7 @@ organism_top5 AS (
 SELECT
     a.lat, a.lng, a.n_projects, a.n_experiments, a.n_samples,
     a.n_geo, a.n_sra, a.n_ae, a.n_ena,
-    a.country, a.city,
+    a.country, a.city, a.state, a.place_name, a.short_label, a.center_name,
     COALESCE(o.top_organisms, '[]'::jsonb) AS top_organisms
 FROM location_agg a
 LEFT JOIN organism_top5 o ON a.lat = o.lat AND a.lng = o.lng

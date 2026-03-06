@@ -2922,6 +2922,12 @@ def search_structured(
     geo_lat: float | None = Query(None, ge=-90, le=90),
     geo_lng: float | None = Query(None, ge=-180, le=180),
     geo_radius_km: float | None = Query(None, ge=0.1, le=20000),
+    assay_l1: str | None = Query(
+        None, description="Filter by dominant assay L1 (from unified_metadata)"
+    ),
+    assay_l2: str | None = Query(
+        None, description="Filter by dominant assay L2 (from unified_metadata)"
+    ),
 ):
     has_geo_filter = any(
         v is not None
@@ -2951,13 +2957,15 @@ def search_structured(
             journal,
             instrument_model,
             has_geo_filter,
+            assay_l1,
+            assay_l2,
         ]
     ):
         raise HTTPException(
             400,
             "At least one of q, organism, library_strategy, platform, "
             "country, center, year_from, year_to, journal, "
-            "instrument_model, or a geo_* filter is required",
+            "instrument_model, assay_l1, assay_l2, or a geo_* filter is required",
         )
 
     if year_from is not None and year_to is not None and year_from > year_to:
@@ -2995,6 +3003,8 @@ def search_structured(
         geo_lat=geo_lat,
         geo_lng=geo_lng,
         geo_radius_km=geo_radius_km,
+        assay_l1=assay_l1,
+        assay_l2=assay_l2,
     )
 
     start = time.perf_counter()
