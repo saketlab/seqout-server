@@ -3507,13 +3507,13 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-from starlette.middleware.cors import CORSMiddleware
+#from starlette.middleware.cors import CORSMiddleware
 
-combined_app.add_middleware(
-   CORSMiddleware,
-   allow_origins=["*"],
-   allow_methods=["*"],
-   allow_headers=["*"],
-)
+#combined_app.add_middleware(
+#   CORSMiddleware,
+#   allow_origins=["*"],
+#   allow_methods=["*"],
+#   allow_headers=["*"],
+#)
 
 app = combined_app
