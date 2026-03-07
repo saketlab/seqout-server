@@ -1958,7 +1958,38 @@ LIMIT %s;
 # Global contributions: aggregated lat/lng from unified_metadata
 # ---------------------------------------------------------------------------
 
-_GLOBAL_CONTRIBUTIONS_TEMPLATE = """
+_GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS = ["place_type", "address_type"]
+_global_contributions_available_cols: set[str] = set()
+
+
+def _build_global_contributions_template(available_cols: set[str]) -> str:
+    """Build the template, omitting MODE()/SELECT for columns not in PG."""
+    mode_lines = [
+        "MODE() WITHIN GROUP (ORDER BY country) AS country",
+        "MODE() WITHIN GROUP (ORDER BY city) AS city",
+        "MODE() WITHIN GROUP (ORDER BY state) AS state",
+        "MODE() WITHIN GROUP (ORDER BY place_name) AS place_name",
+    ]
+    select_cols = [
+        "a.country",
+        "a.city",
+        "a.state",
+        "a.place_name",
+    ]
+    for col in _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS:
+        if col in available_cols:
+            mode_lines.append(f"MODE() WITHIN GROUP (ORDER BY {col}) AS {col}")
+            select_cols.append(f"a.{col}")
+        else:
+            select_cols.append(f"NULL AS {col}")
+    mode_lines.append("MODE() WITHIN GROUP (ORDER BY short_label) AS short_label")
+    mode_lines.append("MODE() WITHIN GROUP (ORDER BY center_name) AS center_name")
+    select_cols.extend(["a.short_label", "a.center_name"])
+
+    mode_block = ",\n        ".join(mode_lines)
+    select_block = ", ".join(select_cols)
+
+    return f"""
 WITH location_agg AS (
     SELECT
         ROUND(latitude::numeric, 2) AS lat,
@@ -1970,12 +2001,7 @@ WITH location_agg AS (
         COUNT(*) FILTER (WHERE source = 'sra') AS n_sra,
         COUNT(*) FILTER (WHERE source = 'arrayexpress') AS n_ae,
         COUNT(*) FILTER (WHERE source = 'ena') AS n_ena,
-        MODE() WITHIN GROUP (ORDER BY country) AS country,
-        MODE() WITHIN GROUP (ORDER BY city) AS city,
-        MODE() WITHIN GROUP (ORDER BY state) AS state,
-        MODE() WITHIN GROUP (ORDER BY place_name) AS place_name,
-        MODE() WITHIN GROUP (ORDER BY short_label) AS short_label,
-        MODE() WITHIN GROUP (ORDER BY center_name) AS center_name
+        {mode_block}
     FROM unified_metadata
     WHERE latitude IS NOT NULL AND longitude IS NOT NULL
       AND __WHERE__
@@ -2007,7 +2033,7 @@ organism_top5 AS (
 SELECT
     a.lat, a.lng, a.n_projects, a.n_experiments, a.n_samples,
     a.n_geo, a.n_sra, a.n_ae, a.n_ena,
-    a.country, a.city, a.state, a.place_name, a.short_label, a.center_name,
+    {select_block},
     COALESCE(o.top_organisms, '[]'::jsonb) AS top_organisms
 FROM location_agg a
 LEFT JOIN organism_top5 o ON a.lat = o.lat AND a.lng = o.lng
@@ -2015,10 +2041,17 @@ ORDER BY a.n_projects DESC;
 """
 
 
+_GLOBAL_CONTRIBUTIONS_TEMPLATE = _build_global_contributions_template(
+    {"place_type", "address_type"}
+)
+
+
 def build_global_contributions_sql(
     organism: str | None = None,
     assay_l1: str | None = None,
     assay_l2: str | None = None,
+    place_type: str | None = None,
+    address_type: str | None = None,
 ) -> tuple[str, list]:
     """Build the global contributions SQL with optional filters.
 
@@ -2037,41 +2070,80 @@ def build_global_contributions_sql(
     if assay_l2:
         conditions.append("dominant_assay_l2 = %s")
         params.append(assay_l2)
+    if place_type and "place_type" in _global_contributions_available_cols:
+        conditions.append("place_type = %s")
+        params.append(place_type)
+    if address_type and "address_type" in _global_contributions_available_cols:
+        conditions.append("address_type = %s")
+        params.append(address_type)
     where = " AND ".join(conditions)
     sql = _GLOBAL_CONTRIBUTIONS_TEMPLATE.replace("__WHERE__", where)
     # __WHERE__ appears in 2 CTEs, so each param placeholder is duplicated
     return sql, params * 2
 
 
-GLOBAL_CONTRIBUTIONS_FILTERS_SQL = """
-WITH organism_opts AS (
-    SELECT dominant_scientific_name AS value, COUNT(*) AS count
-    FROM unified_metadata
-    WHERE dominant_scientific_name IS NOT NULL
-      AND latitude IS NOT NULL AND longitude IS NOT NULL
-    GROUP BY 1 ORDER BY count DESC
-    LIMIT 200
-),
-assay_l1_opts AS (
-    SELECT dominant_assay_l1 AS value, COUNT(*) AS count
-    FROM unified_metadata
-    WHERE dominant_assay_l1 IS NOT NULL
-      AND latitude IS NOT NULL AND longitude IS NOT NULL
-    GROUP BY 1 ORDER BY count DESC
-),
-assay_l2_opts AS (
-    SELECT dominant_assay_l2 AS value, COUNT(*) AS count
-    FROM unified_metadata
-    WHERE dominant_assay_l2 IS NOT NULL
-      AND latitude IS NOT NULL AND longitude IS NOT NULL
-    GROUP BY 1 ORDER BY count DESC
+def init_global_contributions_schema(pg_conn):
+    """Probe unified_metadata for optional columns and rebuild template."""
+    global _GLOBAL_CONTRIBUTIONS_TEMPLATE, _global_contributions_available_cols
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'unified_metadata' AND column_name = ANY(%s)",
+            (_GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS,),
+        )
+        _global_contributions_available_cols = {r[0] for r in cur.fetchall()}
+    _GLOBAL_CONTRIBUTIONS_TEMPLATE = _build_global_contributions_template(
+        _global_contributions_available_cols
+    )
+
+
+def _build_global_contributions_filters_sql(available_cols: set[str]) -> str:
+    ctes = [
+        ("organism_opts", "dominant_scientific_name", "organism", "LIMIT 200"),
+        ("assay_l1_opts", "dominant_assay_l1", "assay_l1", ""),
+        ("assay_l2_opts", "dominant_assay_l2", "assay_l2", ""),
+    ]
+    for col in _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS:
+        if col in available_cols:
+            ctes.append((f"{col}_opts", col, col, ""))
+
+    cte_parts = []
+    select_parts = []
+    for cte_name, col, kind, limit in ctes:
+        cte_parts.append(
+            f"{cte_name} AS (\n"
+            f"    SELECT {col} AS value, COUNT(*) AS count\n"
+            f"    FROM unified_metadata\n"
+            f"    WHERE {col} IS NOT NULL\n"
+            f"      AND latitude IS NOT NULL AND longitude IS NOT NULL\n"
+            f"    GROUP BY 1 ORDER BY count DESC\n"
+            f"    {limit}\n"
+            f")"
+        )
+        select_parts.append(f"SELECT '{kind}' AS kind, value, count FROM {cte_name}")
+
+    return (
+        "WITH "
+        + ",\n".join(cte_parts)
+        + "\n"
+        + "\nUNION ALL\n".join(select_parts)
+        + ";"
+    )
+
+
+GLOBAL_CONTRIBUTIONS_FILTERS_SQL = _build_global_contributions_filters_sql(
+    {"place_type", "address_type"}
 )
-SELECT 'organism' AS kind, value, count FROM organism_opts
-UNION ALL
-SELECT 'assay_l1' AS kind, value, count FROM assay_l1_opts
-UNION ALL
-SELECT 'assay_l2' AS kind, value, count FROM assay_l2_opts;
-"""
+
+
+def init_global_contributions_filters_sql() -> str:
+    """Rebuild filters SQL using detected available columns. Returns new SQL."""
+    global GLOBAL_CONTRIBUTIONS_FILTERS_SQL
+    GLOBAL_CONTRIBUTIONS_FILTERS_SQL = _build_global_contributions_filters_sql(
+        _global_contributions_available_cols
+    )
+    return GLOBAL_CONTRIBUTIONS_FILTERS_SQL
+
 
 SITEMAP_COUNTS_SQL = """
 SELECT
@@ -2081,10 +2153,59 @@ SELECT
     (SELECT COUNT(*) FROM ena_studies) AS ena;
 """
 
+_ENRICHED_SAMPLES_BASE_COLS = [
+    "sample",
+    "age",
+    "sex",
+    "ethnicity",
+    "phenotype",
+    "cell_type",
+    "tissue",
+    "strain",
+    "disease",
+    "assay",
+    "cell_line",
+    "treatment",
+]
+_ENRICHED_SAMPLES_NEW_COLS = [
+    "development_stage",
+    "sample_type",
+    "genetic_modification",
+]
+
+
+def build_enriched_samples_sql(pg_conn) -> str:
+    """Build ENRICHED_SAMPLES_SQL, including new columns only if they exist in PG."""
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'enriched_samples' AND column_name = ANY(%s)",
+            (_ENRICHED_SAMPLES_NEW_COLS,),
+        )
+        existing_new = {r[0] for r in cur.fetchall()}
+
+    cols = list(_ENRICHED_SAMPLES_BASE_COLS)
+    for c in _ENRICHED_SAMPLES_NEW_COLS:
+        if c in existing_new:
+            cols.append(c)
+        else:
+            cols.append(f"NULL AS {c}")
+
+    col_str = ", ".join(f"es.{c}" if " " not in c else c for c in cols)
+    return f"""
+SELECT {col_str}
+FROM enriched_samples es
+WHERE es.study_accession = %s
+ORDER BY es.sample;
+"""
+
+
+# Default (base columns only + NULL placeholders) — overridden at startup by build_enriched_samples_sql()
 ENRICHED_SAMPLES_SQL = """
 SELECT es.sample, es.age, es.sex, es.ethnicity, es.phenotype,
        es.cell_type, es.tissue, es.strain, es.disease, es.assay,
-       es.cell_line, es.treatment
+       es.cell_line, es.treatment,
+       NULL AS development_stage, NULL AS sample_type, NULL AS genetic_modification
 FROM enriched_samples es
 WHERE es.study_accession = %s
 ORDER BY es.sample;

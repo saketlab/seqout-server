@@ -91,6 +91,9 @@ from queries import (
     SITEMAP_COUNTS_SQL,
     ENRICHED_SAMPLES_SQL,
     ENRICHED_STUDY_SQL,
+    build_enriched_samples_sql,
+    init_global_contributions_schema,
+    init_global_contributions_filters_sql,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -188,6 +191,11 @@ pool = ConnectionPool(
     max_size=10,
     kwargs={"autocommit": True},
 )
+
+with pool.connection() as _conn:
+    ENRICHED_SAMPLES_SQL = build_enriched_samples_sql(_conn)
+    init_global_contributions_schema(_conn)
+    GLOBAL_CONTRIBUTIONS_FILTERS_SQL = init_global_contributions_filters_sql()
 
 limiter = Limiter(key_func=get_remote_address)
 api_app = FastAPI()
@@ -1233,9 +1241,13 @@ def _query_global_contributions(
     organism: str | None = None,
     assay_l1: str | None = None,
     assay_l2: str | None = None,
+    place_type: str | None = None,
+    address_type: str | None = None,
 ) -> list[dict]:
     """Aggregate unified_metadata by rounded lat/lng with optional filters."""
-    sql, params = build_global_contributions_sql(organism, assay_l1, assay_l2)
+    sql, params = build_global_contributions_sql(
+        organism, assay_l1, assay_l2, place_type, address_type
+    )
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
@@ -1283,7 +1295,13 @@ def _get_global_contributions_filters() -> dict:
             cur.execute(GLOBAL_CONTRIBUTIONS_FILTERS_SQL)
             rows = cur.fetchall()
 
-    filters: dict[str, list] = {"organisms": [], "assay_l1": [], "assay_l2": []}
+    filters: dict[str, list] = {
+        "organisms": [],
+        "assay_l1": [],
+        "assay_l2": [],
+        "place_type": [],
+        "address_type": [],
+    }
     for r in rows:
         kind = r["kind"]
         entry = {"value": r["value"], "count": r["count"]}
@@ -1293,6 +1311,10 @@ def _get_global_contributions_filters() -> dict:
             filters["assay_l1"].append(entry)
         elif kind == "assay_l2":
             filters["assay_l2"].append(entry)
+        elif kind == "place_type":
+            filters["place_type"].append(entry)
+        elif kind == "address_type":
+            filters["address_type"].append(entry)
 
     with _global_contributions_filters_cache_lock:
         _global_contributions_filters_cache["ready"] = True
@@ -1321,12 +1343,20 @@ def get_global_contributions(
     ),
     assay_l1: str | None = Query(None, description="Filter by dominant assay L1"),
     assay_l2: str | None = Query(None, description="Filter by dominant assay L2"),
+    place_type: str | None = Query(
+        None, description="Filter by place type (e.g. university, hospital)"
+    ),
+    address_type: str | None = Query(
+        None, description="Filter by address type (e.g. building, amenity)"
+    ),
 ):
     t0 = time.perf_counter()
-    has_filters = organism or assay_l1 or assay_l2
+    has_filters = organism or assay_l1 or assay_l2 or place_type or address_type
     try:
         if has_filters:
-            data = _query_global_contributions(organism, assay_l1, assay_l2)
+            data = _query_global_contributions(
+                organism, assay_l1, assay_l2, place_type, address_type
+            )
         else:
             data = _get_global_contributions_cached()
     except Exception:
@@ -3477,13 +3507,13 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-# from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware
 
-# combined_app.add_middleware(
-#    CORSMiddleware,
-#    allow_origins=["*"],
-#    allow_methods=["*"],
-#    allow_headers=["*"],
-# )
+combined_app.add_middleware(
+   CORSMiddleware,
+   allow_origins=["*"],
+   allow_methods=["*"],
+   allow_headers=["*"],
+)
 
 app = combined_app
