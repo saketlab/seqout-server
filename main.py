@@ -1325,23 +1325,27 @@ def _get_global_contributions_filters() -> dict:
     return filters
 
 
-def _get_country_scoped_filters(country: str) -> dict:
-    """Return filter options scoped to a specific country (not cached)."""
-    sql, params = build_country_filters_sql(country)
+def _get_country_scoped_filters(country: str, organism: str | None = None) -> dict:
+    """Return filter options scoped to a specific country (and optionally organism)."""
+    sql, params = build_country_filters_sql(country, organism=organism)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
 
-    filters: dict[str, list] = {
+    filters: dict[str, object] = {
         "organisms": [],
         "assay_l1": [],
         "assay_l2": [],
         "place_type": [],
         "address_type": [],
+        "total": 0,
     }
     for r in rows:
         kind = r["kind"]
+        if kind == "total":
+            filters["total"] = r["count"]
+            continue
         entry = {"value": r["value"], "count": r["count"]}
         if kind == "organism":
             filters["organisms"].append(entry)
@@ -1419,11 +1423,15 @@ def get_global_contribution_filters(
     country: str | None = Query(
         None, description="Scope filter counts to this country"
     ),
+    organism: str | None = Query(
+        None,
+        description="Scope assay counts to this organism (requires country)",
+    ),
 ):
     t0 = time.perf_counter()
     try:
         if country:
-            filters = _get_country_scoped_filters(country)
+            filters = _get_country_scoped_filters(country, organism=organism)
         else:
             filters = _get_global_contributions_filters()
     except Exception:
@@ -3606,8 +3614,12 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 18. **Global contribution filters** — call `get_global_contribution_filters` to get
     the available filter values (organisms, assay_l1, assay_l2) for the global
     contributions map, each with counts, sorted by frequency. Cached for 7 days.
-    Use this to populate filter dropdowns or to discover valid filter values before
-    calling `get_global_contributions` with filters.
+    Optionally pass `country` to scope counts to a specific country, and `organism`
+    to further scope assay counts to a specific organism within that country (organism
+    list always reflects the full country, never self-filtered). When `country` is
+    provided, the response includes a `total` field with the exact project count for
+    that scope. Use this to populate filter dropdowns or to discover valid filter
+    values before calling `get_global_contributions` with filters.
 
 19. **Enriched metadata** — call `get_project_enriched` with a project accession to get
     LLM-extracted structured sample metadata: age, sex, ethnicity, phenotype, cell_type,
