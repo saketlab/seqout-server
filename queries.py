@@ -1966,12 +1966,14 @@ def _build_global_contributions_template(available_cols: set[str]) -> str:
     """Build the template, omitting MODE()/SELECT for columns not in PG."""
     mode_lines = [
         "MODE() WITHIN GROUP (ORDER BY country) AS country",
+        "MODE() WITHIN GROUP (ORDER BY country_code) AS country_code",
         "MODE() WITHIN GROUP (ORDER BY city) AS city",
         "MODE() WITHIN GROUP (ORDER BY state) AS state",
         "MODE() WITHIN GROUP (ORDER BY place_name) AS place_name",
     ]
     select_cols = [
         "a.country",
+        "a.country_code",
         "a.city",
         "a.state",
         "a.place_name",
