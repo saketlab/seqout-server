@@ -94,6 +94,7 @@ from queries import (
     build_enriched_samples_sql,
     init_global_contributions_schema,
     init_global_contributions_filters_sql,
+    build_country_filters_sql,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -1324,6 +1325,38 @@ def _get_global_contributions_filters() -> dict:
     return filters
 
 
+def _get_country_scoped_filters(country: str) -> dict:
+    """Return filter options scoped to a specific country (not cached)."""
+    sql, params = build_country_filters_sql(country)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    filters: dict[str, list] = {
+        "organisms": [],
+        "assay_l1": [],
+        "assay_l2": [],
+        "place_type": [],
+        "address_type": [],
+    }
+    for r in rows:
+        kind = r["kind"]
+        entry = {"value": r["value"], "count": r["count"]}
+        if kind == "organism":
+            filters["organisms"].append(entry)
+        elif kind == "assay_l1":
+            filters["assay_l1"].append(entry)
+        elif kind == "assay_l2":
+            filters["assay_l2"].append(entry)
+        elif kind == "place_type":
+            filters["place_type"].append(entry)
+        elif kind == "address_type":
+            filters["address_type"].append(entry)
+
+    return filters
+
+
 @api_app.get(
     "/stats/global-contributions",
     summary="Geographic contributions across all databases",
@@ -1375,15 +1408,24 @@ def get_global_contributions(
     summary="Filter options for global contributions map",
     description=(
         "Return distinct values for organism, assay_l1, and assay_l2 filters, "
-        "ordered by count descending. Cached for 7 days."
+        "ordered by count descending. When country is provided, counts are scoped "
+        "to that country (not cached). Without country, results are cached for 7 days."
     ),
     operation_id="get_global_contribution_filters",
 )
 @limiter.limit("20/minute")
-def get_global_contribution_filters(request: Request):
+def get_global_contribution_filters(
+    request: Request,
+    country: str | None = Query(
+        None, description="Scope filter counts to this country"
+    ),
+):
     t0 = time.perf_counter()
     try:
-        filters = _get_global_contributions_filters()
+        if country:
+            filters = _get_country_scoped_filters(country)
+        else:
+            filters = _get_global_contributions_filters()
     except Exception:
         logger.exception("Database error in get_global_contribution_filters")
         raise HTTPException(500, "Internal server error")
@@ -3617,10 +3659,10 @@ combined_app.add_middleware(AnalyticsMiddleware)
 # from starlette.middleware.cors import CORSMiddleware
 
 # combined_app.add_middleware(
-#   CORSMiddleware,
-#   allow_origins=["*"],
-#   allow_methods=["*"],
-#   allow_headers=["*"],
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_methods=["*"],
+#    allow_headers=["*"],
 # )
 
 app = combined_app

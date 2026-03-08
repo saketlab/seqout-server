@@ -2147,6 +2147,50 @@ def init_global_contributions_filters_sql() -> str:
     return GLOBAL_CONTRIBUTIONS_FILTERS_SQL
 
 
+def build_country_filters_sql(
+    country: str,
+) -> tuple[str, list]:
+    """Build filters SQL scoped to a specific country. Returns (sql, params)."""
+    cols = _global_contributions_available_cols or {"place_type", "address_type"}
+
+    ctes_cfg = [
+        ("organism_opts", "dominant_scientific_name", "organism", "LIMIT 200"),
+        ("assay_l1_opts", "dominant_assay_l1", "assay_l1", ""),
+        ("assay_l2_opts", "dominant_assay_l2", "assay_l2", ""),
+    ]
+    for col in _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS:
+        if col in cols:
+            ctes_cfg.append((f"{col}_opts", col, col, ""))
+
+    # Each CTE gets its own %s placeholder for the country param
+    params: list[str] = []
+    cte_parts = []
+    select_parts = []
+    for cte_name, col, kind, limit in ctes_cfg:
+        cte_parts.append(
+            f"{cte_name} AS (\n"
+            f"    SELECT {col} AS value, COUNT(*) AS count\n"
+            f"    FROM unified_metadata\n"
+            f"    WHERE {col} IS NOT NULL\n"
+            f"      AND latitude IS NOT NULL AND longitude IS NOT NULL\n"
+            f"      AND country = %s\n"
+            f"    GROUP BY 1 ORDER BY count DESC\n"
+            f"    {limit}\n"
+            f")"
+        )
+        params.append(country)
+        select_parts.append(f"SELECT '{kind}' AS kind, value, count FROM {cte_name}")
+
+    sql = (
+        "WITH "
+        + ",\n".join(cte_parts)
+        + "\n"
+        + "\nUNION ALL\n".join(select_parts)
+        + ";"
+    )
+    return sql, params
+
+
 SITEMAP_COUNTS_SQL = """
 SELECT
     (SELECT COUNT(*) FROM geo_series) AS geo,
