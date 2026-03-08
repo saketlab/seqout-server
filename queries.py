@@ -2228,6 +2228,35 @@ SELECT
     (SELECT COUNT(*) FROM ena_studies) AS ena;
 """
 
+
+def build_country_accessions_sql(
+    country: str,
+    organism: str | None = None,
+    assay_l2: str | None = None,
+) -> tuple[str, list]:
+    """Return accessions for a country with optional organism/assay filters."""
+    conditions = [
+        "latitude IS NOT NULL",
+        "longitude IS NOT NULL",
+        "country = %s",
+    ]
+    params: list = [country]
+    if organism:
+        conditions.append("dominant_scientific_name = %s")
+        params.append(organism)
+    if assay_l2:
+        conditions.append("dominant_assay_l2 = %s")
+        params.append(assay_l2)
+    where = " AND ".join(conditions)
+    sql = (
+        f"SELECT DISTINCT canonical_accession"
+        f" FROM unified_metadata"
+        f" WHERE {where}"
+        f" ORDER BY canonical_accession;"
+    )
+    return sql, params
+
+
 _ENRICHED_SAMPLES_BASE_COLS = [
     "sample",
     "age",

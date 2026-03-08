@@ -95,6 +95,7 @@ from queries import (
     init_global_contributions_schema,
     init_global_contributions_filters_sql,
     build_country_filters_sql,
+    build_country_accessions_sql,
     build_sorted_search_sql,
     build_structured_search,
 )
@@ -1442,6 +1443,38 @@ def get_global_contribution_filters(
         **filters,
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
+
+
+@api_app.get(
+    "/stats/global-contributions/accessions",
+    summary="Project accessions for a country",
+    description=(
+        "Return distinct project accessions from unified_metadata for a given country, "
+        "optionally filtered by organism and assay. Returns a plain newline-separated "
+        "text list of accessions."
+    ),
+    operation_id="get_country_accessions",
+    response_class=PlainTextResponse,
+)
+@limiter.limit("10/minute")
+def get_country_accessions(
+    request: Request,
+    country: str = Query(..., description="Country name"),
+    organism: str | None = Query(None, description="Filter by organism"),
+    assay_l2: str | None = Query(None, description="Filter by assay type"),
+):
+    sql, params = build_country_accessions_sql(
+        country, organism=organism, assay_l2=assay_l2
+    )
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_accessions")
+        raise HTTPException(500, "Internal server error")
+    return "\n".join(r[0] for r in rows if r[0])
 
 
 @api_app.get(
@@ -3621,7 +3654,13 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     that scope. Use this to populate filter dropdowns or to discover valid filter
     values before calling `get_global_contributions` with filters.
 
-19. **Enriched metadata** — call `get_project_enriched` with a project accession to get
+19. **Country accessions** — call `get_country_accessions` with a required `country`
+    name to get all distinct project accessions from that country. Optionally filter
+    by `organism` (scientific name) and `assay_l2` (assay type). Returns a plain-text
+    newline-separated list of accession strings. Use this when the user wants to list
+    or export all project accessions for a country.
+
+20. **Enriched metadata** — call `get_project_enriched` with a project accession to get
     LLM-extracted structured sample metadata: age, sex, ethnicity, phenotype, cell_type,
     tissue, strain, disease, assay, cell_line, treatment, development_stage, sample_type,
     genetic_modification. Returns 404 if no enriched data exists for the project.
@@ -3668,13 +3707,13 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-# from starlette.middleware.cors import CORSMiddleware
+#from starlette.middleware.cors import CORSMiddleware
 
-# combined_app.add_middleware(
+#combined_app.add_middleware(
 #    CORSMiddleware,
 #    allow_origins=["*"],
 #    allow_methods=["*"],
 #    allow_headers=["*"],
-# )
+#)
 
 app = combined_app
