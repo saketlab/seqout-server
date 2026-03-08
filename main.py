@@ -3480,6 +3480,12 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
      and run download links. One row per run. Useful when users need a complete metadata
      table for a study.
      Example: `https://seqout.org/api/project/SRP123456/metadata/download`
+   - **Supplementary file download** — call `download_supplementary_script` with a
+     GEO (GSE) or ArrayExpress (E-MTAB) accession to get a bash script that downloads
+     all supplementary / processed data files using curl.
+     Example: `https://seqout.org/api/project/GSE119945/supplementary/download`
+     FTP URLs are automatically converted to HTTPS. Only works for GEO and ArrayExpress
+     accessions (SRA studies use `download_study_script` instead).
    - Or direct them to the web UI at `https://seqout.org/p/{study}` which
      has an interactive download section with per-file links and batch download scripts.
 
@@ -3560,6 +3566,13 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     contributions map, each with counts, sorted by frequency. Cached for 7 days.
     Use this to populate filter dropdowns or to discover valid filter values before
     calling `get_global_contributions` with filters.
+
+19. **Enriched metadata** — call `get_project_enriched` with a project accession to get
+    LLM-extracted structured sample metadata: age, sex, ethnicity, phenotype, cell_type,
+    tissue, strain, disease, assay, cell_line, treatment, development_stage, sample_type,
+    genetic_modification. Returns 404 if no enriched data exists for the project.
+    Use this when the user asks for structured/parsed sample attributes beyond what the
+    raw metadata provides.
 
 ## Context rules
 
