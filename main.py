@@ -3419,6 +3419,7 @@ def sitemap_accessions(
 def get_project_enriched(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
+    human_readable_age: bool = Query(True, description="Convert age from hours to human-readable format"),
 ):
     accession = accession.upper()
     try:
@@ -3436,12 +3437,59 @@ def get_project_enriched(
         logger.exception("Database error in get_project_enriched")
         raise HTTPException(500, "Internal server error")
 
+    if human_readable_age:
+        for s in samples:
+            s["age"] = _age_hours_to_human(s.get("age"))
+
     return {
         "accession": study["accession"],
         "title": study["title"],
         "n_samples": study["n_samples"],
         "samples": samples,
     }
+
+
+def _age_hours_to_human(value: str | None) -> str | None:
+    """Convert age in hours (float string) to a human-friendly string.
+
+    Examples: 8760.0 -> "1 year", 720.0 -> "30 days", 48.0 -> "2 days",
+              0.5 -> "0.5 hours", 168.0 -> "1 week"
+    """
+    if not value:
+        return value
+    try:
+        hours = float(value)
+    except (ValueError, TypeError):
+        return value  # not a number, return as-is (e.g. already formatted)
+
+    if hours < 0:
+        return value
+
+    # < 1 day: show hours
+    if hours < 24:
+        h = round(hours, 1)
+        return f"{h:g} hour{'s' if h != 1 else ''}"
+
+    days = hours / 24
+
+    # < 14 days: show days
+    if days < 14:
+        d = round(days, 1)
+        return f"{d:g} day{'s' if d != 1 else ''}"
+
+    # < 60 days: show weeks
+    if days < 60:
+        weeks = round(days / 7, 1)
+        return f"{weeks:g} week{'s' if weeks != 1 else ''}"
+
+    # < 730 days (~2 years): show months
+    if days < 730:
+        months = round(days / 30, 1)
+        return f"{months:g} month{'s' if months != 1 else ''}"
+
+    # >= 2 years: show years
+    years = round(days / 365, 1)
+    return f"{years:g} year{'s' if years != 1 else ''}"
 
 
 MCP_INSTRUCTIONS = """\
