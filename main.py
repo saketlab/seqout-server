@@ -98,6 +98,12 @@ from queries import (
     build_country_accessions_sql,
     build_sorted_search_sql,
     build_structured_search,
+    SRA_EXPERIMENT_SQL,
+    ENA_EXPERIMENT_SQL,
+    GEO_SAMPLE_SQL,
+    EXPERIMENT_RUNS_SQL,
+    ENA_SAMPLE_TO_EXPERIMENT_SQL,
+    SRA_SAMPLE_TO_EXPERIMENT_SQL,
 )
 
 load_dotenv()
@@ -2562,6 +2568,331 @@ def get_sample(
     except Exception as e:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
+
+
+SAMPLE_DETAIL_REGEX = (
+    rf"^({_EXPERIMENT_PREFIX}|{_SAMPLE_PREFIX}|GSM|SAM[A-Z]+)\d+$"
+)
+
+
+def _resolve_sample_detail(cur, accession: str) -> dict:
+    """Resolve any sample/experiment accession to full detail.
+
+    Returns a dict with:
+      - project: full parent project metadata
+      - sample_type: 'geo_sample' | 'sra_experiment' | 'sra_sample'
+      - sample: the sample/experiment record
+      - experiment: experiment metadata (for SRA types)
+      - runs: run download links (for SRA types)
+    """
+    acc = accession.upper()
+
+    # --- GSM sample ---
+    if GEO_SAMPLE_PATTERN.match(acc):
+        # Fetch GEO sample
+        cur.execute(GEO_SAMPLE_SQL, (acc,))
+        geo_sample = cur.fetchone()
+        if not geo_sample:
+            raise HTTPException(404, f"Sample not found: {acc}")
+
+        # Find parent series
+        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        series_row = cur.fetchone()
+        if not series_row:
+            raise HTTPException(404, f"No parent series found for {acc}")
+
+        series_acc = series_row["accession"]
+        cur.execute(PROJECT_GEO_SQL, (series_acc,))
+        project = cur.fetchone()
+        if project:
+            _enrich_with_publications([project], cur)
+
+        result = {
+            "sample_type": "geo_sample",
+            "project": project,
+            "project_accession": series_acc,
+            "sample": geo_sample,
+            "experiment": None,
+            "runs": None,
+        }
+        return result
+
+    # --- SRX/DRX/ERX experiment ---
+    if EXPERIMENT_PATTERN.match(acc):
+        # Fetch experiment
+        cur.execute(SRA_EXPERIMENT_SQL, (acc,))
+        experiment = cur.fetchone()
+        if not experiment:
+            cur.execute(ENA_EXPERIMENT_SQL, (acc,))
+            experiment = cur.fetchone()
+        if not experiment:
+            raise HTTPException(404, f"Experiment not found: {acc}")
+
+        study_acc = experiment.get("study")
+        if not study_acc:
+            raise HTTPException(404, f"No parent study found for {acc}")
+
+        # Fetch parent project
+        if study_acc.startswith("PRJ"):
+            cur.execute(PROJECT_ENA_SQL, (study_acc,))
+        else:
+            cur.execute(PROJECT_SRA_SQL, (study_acc,))
+        project = cur.fetchone()
+        if project:
+            _enrich_with_publications([project], cur)
+
+        # Fetch associated sample
+        sample = None
+        samples_list = experiment.get("samples") or []
+        if samples_list:
+            sample = _fetch_sample(cur, samples_list[0])
+
+        # Fetch runs for this experiment
+        cur.execute(EXPERIMENT_RUNS_SQL, (acc,))
+        runs = cur.fetchall()
+
+        result = {
+            "sample_type": "sra_experiment",
+            "project": project,
+            "project_accession": study_acc,
+            "sample": sample,
+            "experiment": experiment,
+            "runs": runs,
+        }
+        return result
+
+    # --- SRS/DRS/ERS/SAM* sample ---
+    sample = _fetch_sample(cur, acc)
+    if not sample:
+        raise HTTPException(404, f"Sample not found: {acc}")
+
+    # Find the experiment that references this sample
+    cur.execute(SRA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
+    exp_row = cur.fetchone()
+    experiment = None
+    runs = []
+
+    if exp_row:
+        exp_acc = exp_row["accession"]
+        cur.execute(SRA_EXPERIMENT_SQL, (exp_acc,))
+        experiment = cur.fetchone()
+        cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
+        runs = cur.fetchall()
+    else:
+        # Try ENA
+        cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
+        exp_row = cur.fetchone()
+        if exp_row:
+            exp_acc = exp_row["experiment_accession"]
+            cur.execute(ENA_EXPERIMENT_SQL, (exp_acc,))
+            experiment = cur.fetchone()
+            cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
+            runs = cur.fetchall()
+
+    # Find parent study
+    study_acc = None
+    if experiment:
+        study_acc = experiment.get("study")
+    else:
+        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        study_row = cur.fetchone()
+        if study_row:
+            study_acc = study_row["accession"]
+
+    project = None
+    if study_acc:
+        if study_acc.startswith("PRJ"):
+            cur.execute(PROJECT_ENA_SQL, (study_acc,))
+        else:
+            cur.execute(PROJECT_SRA_SQL, (study_acc,))
+        project = cur.fetchone()
+        if project:
+            _enrich_with_publications([project], cur)
+
+    result = {
+        "sample_type": "sra_sample",
+        "project": project,
+        "project_accession": study_acc,
+        "sample": sample,
+        "experiment": experiment,
+        "runs": runs,
+    }
+    return result
+
+
+@api_app.get(
+    "/sample-detail/{accession}",
+    summary="Get sample detail",
+    description=(
+        "Return full metadata for a sample or experiment accession "
+        "(GSM, SRX/DRX/ERX, SRS/DRS/ERS, SAM*). Includes parent project metadata, "
+        "sample attributes, experiment info, and run download links."
+    ),
+    operation_id="get_sample_detail",
+)
+@limiter.limit("100/minute")
+def get_sample_detail(
+    request: Request,
+    accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                return _resolve_sample_detail(cur, accession)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_sample_detail")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/sample-detail/{accession}/download",
+    summary="Download sample metadata as CSV",
+    description=(
+        "Return a CSV file with metadata for a single sample or experiment accession. "
+        "Includes experiment info, sample attributes, and run download links."
+    ),
+    operation_id="download_sample_detail_csv",
+)
+@limiter.limit("20/minute")
+def download_sample_detail_csv(
+    request: Request,
+    accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                detail = _resolve_sample_detail(cur, accession)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in download_sample_detail_csv")
+        raise HTTPException(500, "Internal server error")
+
+    sample_type = detail["sample_type"]
+    sample = detail.get("sample") or {}
+    experiment = detail.get("experiment") or {}
+    runs = detail.get("runs") or []
+    project_accession = detail.get("project_accession") or ""
+
+    if sample_type == "geo_sample":
+        # For GEO samples, flatten channel info into a CSV
+        channels = sample.get("channels") or []
+        rows = []
+        for ch in channels:
+            row = {
+                "sample_accession": sample.get("accession", ""),
+                "sample_title": sample.get("title", ""),
+                "sample_description": sample.get("description", ""),
+                "sample_type": sample.get("sample_type", ""),
+                "platform": sample.get("platform_ref", ""),
+                "series_accession": project_accession,
+            }
+            if isinstance(ch, dict):
+                org = ch.get("Organism") or {}
+                row["organism"] = org.get("#text", "") if isinstance(org, dict) else str(org)
+                row["source"] = ch.get("Source", "")
+                row["molecule"] = ch.get("Molecule", "")
+                row["label"] = ch.get("Label", "")
+                for char in (ch.get("Characteristics") or []):
+                    if isinstance(char, dict):
+                        tag = char.get("@tag", "")
+                        text = char.get("#text", "")
+                        if tag:
+                            row[f"characteristic:{tag}"] = text
+            rows.append(row)
+
+        if not rows:
+            rows = [{
+                "sample_accession": sample.get("accession", ""),
+                "sample_title": sample.get("title", ""),
+                "sample_description": sample.get("description", ""),
+                "series_accession": project_accession,
+            }]
+
+        csv_text = rows_to_csv(rows)
+        return StreamingResponse(
+            iter([csv_text]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{accession}_metadata.csv"'
+            },
+        )
+
+    # SRA experiment or sample
+    # Parse sample attributes
+    attrs_raw = sample.get("attributes_json")
+    if isinstance(attrs_raw, str):
+        try:
+            attrs_raw = json.loads(attrs_raw)
+        except (json.JSONDecodeError, TypeError):
+            attrs_raw = None
+        sample["attributes_json"] = attrs_raw
+
+    attr_dict = {}
+    if isinstance(attrs_raw, list):
+        for attr in attrs_raw:
+            key = attr.get("tag") or attr.get("key") or ""
+            val = attr.get("value") or ""
+            if key:
+                attr_dict[f"sample_attribute:{key}"] = val
+    elif isinstance(attrs_raw, dict):
+        for key, val in attrs_raw.items():
+            attr_dict[f"sample_attribute:{key}"] = val
+
+    if runs:
+        # One row per run
+        rows = []
+        for run in runs:
+            row = {
+                "study_accession": project_accession,
+                "experiment_accession": experiment.get("accession", ""),
+                "sample_accession": sample.get("accession", ""),
+                "sample_alias": sample.get("alias", ""),
+                "sample_title": sample.get("title", ""),
+                "scientific_name": sample.get("scientific_name", ""),
+                "taxon_id": sample.get("taxon_id", ""),
+                "library_layout": experiment.get("library_layout") or run.get("library_layout", ""),
+                "library_strategy": experiment.get("library_strategy", ""),
+                "library_source": experiment.get("library_source", ""),
+                "library_selection": experiment.get("library_selection", ""),
+                "platform": experiment.get("platform", ""),
+                "instrument_model": experiment.get("instrument_model", ""),
+                "run_accession": run.get("run_accession", ""),
+                "fastq_ftp": run.get("fastq_ftp", ""),
+                "fastq_bytes": run.get("fastq_bytes", ""),
+                "fastq_md5": run.get("fastq_md5", ""),
+                "sra_ftp": run.get("sra_ftp", ""),
+                "sra_bytes": run.get("sra_bytes", ""),
+                **attr_dict,
+            }
+            rows.append(row)
+    else:
+        rows = [{
+            "study_accession": project_accession,
+            "experiment_accession": experiment.get("accession", ""),
+            "sample_accession": sample.get("accession", ""),
+            "sample_alias": sample.get("alias", ""),
+            "sample_title": sample.get("title", ""),
+            "scientific_name": sample.get("scientific_name", ""),
+            "taxon_id": sample.get("taxon_id", ""),
+            "library_strategy": experiment.get("library_strategy", ""),
+            "platform": experiment.get("platform", ""),
+            "instrument_model": experiment.get("instrument_model", ""),
+            **attr_dict,
+        }]
+
+    csv_text = rows_to_csv(rows)
+    return StreamingResponse(
+        iter([csv_text]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{accession}_metadata.csv"'
+        },
+    )
 
 
 @api_app.get(

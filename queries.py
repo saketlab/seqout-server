@@ -780,6 +780,113 @@ WHERE bioproject_id = %s
 LIMIT 1;
 """
 
+# ---------------------------------------------------------------------------
+# Sample detail queries
+# ---------------------------------------------------------------------------
+
+# Get a single SRA experiment by accession (SRX/DRX/ERX)
+SRA_EXPERIMENT_SQL = """
+SELECT
+    accession,
+    title,
+    design_description,
+    library_layout,
+    library_name,
+    library_selection,
+    library_source,
+    library_strategy,
+    samples,
+    platform,
+    instrument_model,
+    submission,
+    study
+FROM sra_experiments
+WHERE UPPER(accession) = UPPER(%s)
+LIMIT 1;
+"""
+
+# Get a single ENA experiment by accession
+ENA_EXPERIMENT_SQL = """
+SELECT DISTINCT ON (e.experiment_accession)
+    e.experiment_accession AS accession,
+    e.experiment_title AS title,
+    NULL::text AS design_description,
+    e.library_layout,
+    e.library_name,
+    e.library_selection,
+    e.library_source,
+    e.library_strategy,
+    CASE
+        WHEN e.sample_accession IS NOT NULL THEN ARRAY[e.sample_accession]::text[]
+        ELSE ARRAY[]::text[]
+    END AS samples,
+    e.instrument_platform AS platform,
+    e.instrument_model,
+    NULL::text AS submission,
+    e.study_accession AS study
+FROM ena_experiments e
+WHERE UPPER(e.experiment_accession) = UPPER(%s)
+ORDER BY e.experiment_accession, e.run_accession NULLS LAST
+LIMIT 1;
+"""
+
+# Get a single GEO sample by accession (GSM)
+GEO_SAMPLE_SQL = """
+SELECT s.*
+FROM geo_samples s
+WHERE UPPER(s.accession) = UPPER(%s)
+LIMIT 1;
+"""
+
+# Get runs for a specific experiment accession
+EXPERIMENT_RUNS_SQL = """
+SELECT
+    run_accession,
+    experiment_accession,
+    library_layout,
+    fastq_ftp,
+    fastq_bytes,
+    fastq_md5,
+    sra_ftp,
+    sra_bytes,
+    sra_md5,
+    ncbi_sra_url,
+    ncbi_sra_url_aws,
+    ncbi_sra_normalized_url,
+    ncbi_sra_normalized_bytes,
+    ncbi_sra_lite_url,
+    ncbi_sra_lite_bytes,
+    ncbi_sra_lite_s3_url,
+    ncbi_sra_lite_gs_url
+FROM sra_run_download_links
+WHERE UPPER(experiment_accession) = UPPER(%s)
+ORDER BY run_accession;
+"""
+
+# Get ENA experiment accession from sample accession
+ENA_SAMPLE_TO_EXPERIMENT_SQL = """
+SELECT DISTINCT experiment_accession
+FROM ena_experiments
+WHERE UPPER(sample_accession) = UPPER(%s)
+LIMIT 1;
+"""
+
+# Get SRA experiment accession from sample accession
+SRA_SAMPLE_TO_EXPERIMENT_SQL = """
+SELECT accession
+FROM sra_experiments
+WHERE samples @> ARRAY[UPPER(%s)]
+LIMIT 1;
+"""
+
+# Get ENA study accession from experiment accession
+ENA_EXPERIMENT_TO_STUDY_SQL = """
+SELECT DISTINCT study_accession AS study
+FROM ena_experiments
+WHERE UPPER(experiment_accession) = UPPER(%s)
+LIMIT 1;
+"""
+
 PROJECT_AE_SQL = """
 SELECT
     ae.accession,
