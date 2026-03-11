@@ -3336,6 +3336,7 @@ def get_project_from_accession(
 
     Returns the project accession that contains the given sample or experiment.
     """
+    accession = accession.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:

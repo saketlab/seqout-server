@@ -740,27 +740,30 @@ SELECT accession FROM geo_series WHERE bioproject_id = %s;
 """
 
 # Get SRA study accession from sample accession
+# Caller must pass accession already uppercased
 SRA_SAMPLE_TO_STUDY_SQL = """
 SELECT DISTINCT s.accession
 FROM sra_experiments e
 JOIN sra_studies s ON s.accession = e.study
-WHERE e.samples @> ARRAY[UPPER(%s)]
+WHERE e.samples @> ARRAY[%s]
 LIMIT 1;
 """
 
 # Get GEO series accession from GSM sample accession
+# Caller must pass accession already uppercased
 GEO_SAMPLE_TO_SERIES_SQL = """
 SELECT accession
 FROM geo_series
-WHERE samples_ref @> ARRAY[UPPER(%s)]
+WHERE samples_ref @> ARRAY[%s]
 LIMIT 1;
 """
 
 # Get SRA study accession from experiment accession
+# Caller must pass accession already uppercased
 SRA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT study
 FROM sra_experiments
-WHERE accession = UPPER(%s)
+WHERE accession = %s
 LIMIT 1;
 """
 
@@ -785,6 +788,7 @@ LIMIT 1;
 # ---------------------------------------------------------------------------
 
 # Get a single SRA experiment by accession (SRX/DRX/ERX)
+# Caller must pass accession already uppercased
 SRA_EXPERIMENT_SQL = """
 SELECT
     accession,
@@ -801,11 +805,12 @@ SELECT
     submission,
     study
 FROM sra_experiments
-WHERE UPPER(accession) = UPPER(%s)
+WHERE accession = %s
 LIMIT 1;
 """
 
 # Get a single ENA experiment by accession
+# Caller must pass accession already uppercased
 ENA_EXPERIMENT_SQL = """
 SELECT DISTINCT ON (e.experiment_accession)
     e.experiment_accession AS accession,
@@ -825,20 +830,22 @@ SELECT DISTINCT ON (e.experiment_accession)
     NULL::text AS submission,
     e.study_accession AS study
 FROM ena_experiments e
-WHERE UPPER(e.experiment_accession) = UPPER(%s)
+WHERE e.experiment_accession = %s
 ORDER BY e.experiment_accession, e.run_accession NULLS LAST
 LIMIT 1;
 """
 
 # Get a single GEO sample by accession (GSM)
+# Caller must pass accession already uppercased
 GEO_SAMPLE_SQL = """
 SELECT s.*
 FROM geo_samples s
-WHERE UPPER(s.accession) = UPPER(%s)
+WHERE s.accession = %s
 LIMIT 1;
 """
 
 # Get runs for a specific experiment accession
+# Caller must pass accession already uppercased
 EXPERIMENT_RUNS_SQL = """
 SELECT
     run_accession,
@@ -859,31 +866,34 @@ SELECT
     ncbi_sra_lite_s3_url,
     ncbi_sra_lite_gs_url
 FROM sra_run_download_links
-WHERE UPPER(experiment_accession) = UPPER(%s)
+WHERE experiment_accession = %s
 ORDER BY run_accession;
 """
 
 # Get ENA experiment accession from sample accession
+# Caller must pass accession already uppercased
 ENA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT DISTINCT experiment_accession
 FROM ena_experiments
-WHERE UPPER(sample_accession) = UPPER(%s)
+WHERE sample_accession = %s
 LIMIT 1;
 """
 
 # Get SRA experiment accession from sample accession
+# Caller must pass accession already uppercased
 SRA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT accession
 FROM sra_experiments
-WHERE samples @> ARRAY[UPPER(%s)]
+WHERE samples @> ARRAY[%s]
 LIMIT 1;
 """
 
 # Get ENA study accession from experiment accession
+# Caller must pass accession already uppercased
 ENA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT DISTINCT study_accession AS study
 FROM ena_experiments
-WHERE UPPER(experiment_accession) = UPPER(%s)
+WHERE experiment_accession = %s
 LIMIT 1;
 """
 
