@@ -30,6 +30,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from user_agents import parse as parse_ua
 
 
@@ -64,6 +65,7 @@ from queries import (
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
     STUDY_EXPERIMENTS_SQL,
+    SUBMITTER_BATCH_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
@@ -373,7 +375,10 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
 
     Adds the full `publications` JSONB array plus top-level convenience fields
     from the primary (most-cited) publication: pmid, publication_title,
-    journal, doi, citation_count.
+    journal, doi, citation_count, authors.
+
+    For studies without publication authors, falls back to the submitter/center
+    name so every result card can show attribution.
     """
     if not rows:
         return rows
@@ -382,6 +387,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         return rows
     cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (accessions,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
+    no_author_accessions = []
     for row in rows:
         pubs = pub_map.get(row["accession"])
         row["publications"] = pubs
@@ -393,6 +399,15 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["doi"] = primary.get("doi")
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
+        if not row.get("authors"):
+            no_author_accessions.append(row["accession"])
+    # Fallback: use submitter/center name for studies without publication authors
+    if no_author_accessions:
+        cur.execute(SUBMITTER_BATCH_SQL, {"acc": no_author_accessions})
+        sub_map = {r["accession"]: r["submitter"] for r in cur.fetchall()}
+        for row in rows:
+            if not row.get("authors") and row["accession"] in sub_map:
+                row["authors"] = sub_map[row["accession"]]
     return rows
 
 
@@ -2570,9 +2585,7 @@ def get_sample(
         raise HTTPException(500, "Internal server error")
 
 
-SAMPLE_DETAIL_REGEX = (
-    rf"^({_EXPERIMENT_PREFIX}|{_SAMPLE_PREFIX}|GSM|SAM[A-Z]+)\d+$"
-)
+SAMPLE_DETAIL_REGEX = rf"^({_EXPERIMENT_PREFIX}|{_SAMPLE_PREFIX}|GSM|SAM[A-Z]+)\d+$"
 
 
 def _resolve_sample_detail(cur, accession: str) -> dict:
@@ -2793,11 +2806,13 @@ def download_sample_detail_csv(
             }
             if isinstance(ch, dict):
                 org = ch.get("Organism") or {}
-                row["organism"] = org.get("#text", "") if isinstance(org, dict) else str(org)
+                row["organism"] = (
+                    org.get("#text", "") if isinstance(org, dict) else str(org)
+                )
                 row["source"] = ch.get("Source", "")
                 row["molecule"] = ch.get("Molecule", "")
                 row["label"] = ch.get("Label", "")
-                for char in (ch.get("Characteristics") or []):
+                for char in ch.get("Characteristics") or []:
                     if isinstance(char, dict):
                         tag = char.get("@tag", "")
                         text = char.get("#text", "")
@@ -2806,12 +2821,14 @@ def download_sample_detail_csv(
             rows.append(row)
 
         if not rows:
-            rows = [{
-                "sample_accession": sample.get("accession", ""),
-                "sample_title": sample.get("title", ""),
-                "sample_description": sample.get("description", ""),
-                "series_accession": project_accession,
-            }]
+            rows = [
+                {
+                    "sample_accession": sample.get("accession", ""),
+                    "sample_title": sample.get("title", ""),
+                    "sample_description": sample.get("description", ""),
+                    "series_accession": project_accession,
+                }
+            ]
 
         csv_text = rows_to_csv(rows)
         return StreamingResponse(
@@ -2855,7 +2872,8 @@ def download_sample_detail_csv(
                 "sample_title": sample.get("title", ""),
                 "scientific_name": sample.get("scientific_name", ""),
                 "taxon_id": sample.get("taxon_id", ""),
-                "library_layout": experiment.get("library_layout") or run.get("library_layout", ""),
+                "library_layout": experiment.get("library_layout")
+                or run.get("library_layout", ""),
                 "library_strategy": experiment.get("library_strategy", ""),
                 "library_source": experiment.get("library_source", ""),
                 "library_selection": experiment.get("library_selection", ""),
@@ -2871,19 +2889,21 @@ def download_sample_detail_csv(
             }
             rows.append(row)
     else:
-        rows = [{
-            "study_accession": project_accession,
-            "experiment_accession": experiment.get("accession", ""),
-            "sample_accession": sample.get("accession", ""),
-            "sample_alias": sample.get("alias", ""),
-            "sample_title": sample.get("title", ""),
-            "scientific_name": sample.get("scientific_name", ""),
-            "taxon_id": sample.get("taxon_id", ""),
-            "library_strategy": experiment.get("library_strategy", ""),
-            "platform": experiment.get("platform", ""),
-            "instrument_model": experiment.get("instrument_model", ""),
-            **attr_dict,
-        }]
+        rows = [
+            {
+                "study_accession": project_accession,
+                "experiment_accession": experiment.get("accession", ""),
+                "sample_accession": sample.get("accession", ""),
+                "sample_alias": sample.get("alias", ""),
+                "sample_title": sample.get("title", ""),
+                "scientific_name": sample.get("scientific_name", ""),
+                "taxon_id": sample.get("taxon_id", ""),
+                "library_strategy": experiment.get("library_strategy", ""),
+                "platform": experiment.get("platform", ""),
+                "instrument_model": experiment.get("instrument_model", ""),
+                **attr_dict,
+            }
+        ]
 
     csv_text = rows_to_csv(rows)
     return StreamingResponse(
@@ -3751,7 +3771,9 @@ def sitemap_accessions(
 def get_project_enriched(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
-    human_readable_age: bool = Query(True, description="Convert age from hours to human-readable format"),
+    human_readable_age: bool = Query(
+        True, description="Convert age from hours to human-readable format"
+    ),
 ):
     accession = accession.upper()
     try:
@@ -4087,8 +4109,6 @@ combined_app = FastAPI(
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
-#from starlette.middleware.cors import CORSMiddleware
-
 #combined_app.add_middleware(
 #    CORSMiddleware,
 #    allow_origins=["*"],
