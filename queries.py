@@ -7,7 +7,7 @@ WHERE accession = ANY(%s);
 """
 
 SUBMITTER_BATCH_SQL = """
-SELECT canonical_accession AS accession, center_name AS submitter, country_code_iso2 AS country_code
+SELECT canonical_accession AS accession, center_name AS submitter, country_code
 FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
