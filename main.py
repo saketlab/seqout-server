@@ -371,14 +371,14 @@ def classify_accession(acc: str) -> str | None:
 
 
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
-    """Batch-lookup publications from study_publications and merge into result rows.
+    """Batch-lookup publications and center names, merge into result rows.
 
     Adds the full `publications` JSONB array plus top-level convenience fields
     from the primary (most-cited) publication: pmid, publication_title,
     journal, doi, citation_count, authors.
 
-    For studies without publication authors, falls back to the submitter/center
-    name so every result card can show attribution.
+    Always sets `center_name` from unified_metadata.
+    For studies without publication authors, falls back to center_name.
     """
     if not rows:
         return rows
@@ -387,7 +387,8 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         return rows
     cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (accessions,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
-    no_author_accessions = []
+    cur.execute(SUBMITTER_BATCH_SQL, {"acc": accessions})
+    sub_map = {r["accession"]: r["submitter"] for r in cur.fetchall()}
     for row in rows:
         pubs = pub_map.get(row["accession"])
         row["publications"] = pubs
@@ -399,15 +400,9 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["doi"] = primary.get("doi")
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
-        if not row.get("authors"):
-            no_author_accessions.append(row["accession"])
-    # Fallback: use submitter/center name for studies without publication authors
-    if no_author_accessions:
-        cur.execute(SUBMITTER_BATCH_SQL, {"acc": no_author_accessions})
-        sub_map = {r["accession"]: r["submitter"] for r in cur.fetchall()}
-        for row in rows:
-            if not row.get("authors") and row["accession"] in sub_map:
-                row["authors"] = sub_map[row["accession"]]
+        row["center_name"] = sub_map.get(row["accession"])
+        if not row.get("authors") and row.get("center_name"):
+            row["authors"] = row["center_name"]
     return rows
 
 

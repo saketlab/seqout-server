@@ -6,33 +6,11 @@ FROM study_publications
 WHERE accession = ANY(%s);
 """
 
-# Batch-fetch submitter/center names for accessions that lack publication authors.
-# Returns the first contributor organization (GEO), center_name (SRA via submission),
-# center_name (ENA), or contact_name (ArrayExpress).
 SUBMITTER_BATCH_SQL = """
-SELECT accession, submitter FROM (
-    SELECT g.accession,
-           (SELECT c.organization FROM geo_contributors c WHERE c.accession = g.accession LIMIT 1) AS submitter
-    FROM geo_series g
-    WHERE g.accession = ANY(%(acc)s)
-  UNION ALL
-    SELECT s.accession,
-           sub.center_name AS submitter
-    FROM sra_studies s
-    LEFT JOIN sra_submissions sub ON sub.accession = s.submission
-    WHERE s.accession = ANY(%(acc)s)
-  UNION ALL
-    SELECT es.study_accession AS accession,
-           es.center_name AS submitter
-    FROM ena_studies es
-    WHERE es.study_accession = ANY(%(acc)s)
-  UNION ALL
-    SELECT ae.accession,
-           ae.contact_name AS submitter
-    FROM arrayexpress_experiments ae
-    WHERE ae.accession = ANY(%(acc)s)
-) sub
-WHERE submitter IS NOT NULL AND submitter != '';
+SELECT canonical_accession AS accession, center_name AS submitter
+FROM unified_metadata
+WHERE canonical_accession = ANY(%(acc)s)
+  AND center_name IS NOT NULL AND center_name != '';
 """
 
 GEO_SEARCH_SQL = """
