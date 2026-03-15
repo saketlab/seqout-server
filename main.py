@@ -388,7 +388,12 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (accessions,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
     cur.execute(SUBMITTER_BATCH_SQL, {"acc": accessions})
-    sub_map = {r["accession"]: r["submitter"] for r in cur.fetchall()}
+    sub_map = {}
+    for r in cur.fetchall():
+        sub_map[r["accession"]] = {
+            "submitter": r["submitter"],
+            "country_code": r["country_code"],
+        }
     for row in rows:
         pubs = pub_map.get(row["accession"])
         row["publications"] = pubs
@@ -400,7 +405,9 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["doi"] = primary.get("doi")
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
-        row["center_name"] = sub_map.get(row["accession"])
+        meta = sub_map.get(row["accession"], {})
+        row["center_name"] = meta.get("submitter")
+        row["country_code"] = meta.get("country_code")
         if not row.get("authors") and row.get("center_name"):
             row["authors"] = row["center_name"]
     return rows
