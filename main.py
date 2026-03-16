@@ -197,8 +197,9 @@ _global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
 
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
-    min_size=1,
-    max_size=10,
+    min_size=4,
+    max_size=20,
+    timeout=10,
     kwargs={"autocommit": True},
 )
 
@@ -4104,9 +4105,11 @@ mcp = FastMCP.from_fastapi(
 mcp_app = mcp.http_app(path="/mcp")
 
 combined_app = FastAPI(
-    title="pysradb-server",
+    title="seqout API",
+    description="Programmatic access to 1M+ GEO, SRA, ENA & ArrayExpress sequencing projects.",
     routes=[*mcp_app.routes, *api_app.routes],
     lifespan=mcp_app.lifespan,
+    root_path="/api",
 )
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
