@@ -2444,6 +2444,31 @@ FROM enriched_studies st
 WHERE st.accession = %s;
 """
 
+# ── Ontology-enriched metadata (v3) ─────────────────────────────────────────
+
+ENRICHED_STUDY_V3_SQL = """
+SELECT st.accession, st.title, st.n_samples
+FROM enriched_studies_v3 st
+WHERE st.accession = %s;
+"""
+
+ONTOLOGY_SAMPLES_V3_SQL = """
+SELECT
+    sample, age, sex, ethnicity, phenotype,
+    cell_type, tissue, strain, disease, assay,
+    assay_category, cell_line, treatment,
+    development_stage, sample_type, genetic_modification,
+    organism, taxid, tissue_primary_site, tissue_site_type,
+    disease_ontology_id, disease_ontology_name,
+    tissue_ontology_id, tissue_ontology_name,
+    cell_type_ontology_id, cell_type_ontology_name,
+    assay_ontology_id, assay_ontology_name,
+    development_stage_ontology_id, development_stage_ontology_name
+FROM ontology_samples_v3
+WHERE study_accession = %s
+ORDER BY sample;
+"""
+
 SITEMAP_ACCESSIONS_SQL = {
     "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
     "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",

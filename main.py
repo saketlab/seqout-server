@@ -93,6 +93,8 @@ from queries import (
     SITEMAP_COUNTS_SQL,
     ENRICHED_SAMPLES_SQL,
     ENRICHED_STUDY_SQL,
+    ENRICHED_STUDY_V3_SQL,
+    ONTOLOGY_SAMPLES_V3_SQL,
     build_enriched_samples_sql,
     init_global_contributions_schema,
     init_global_contributions_filters_sql,
@@ -3762,11 +3764,12 @@ def sitemap_accessions(
 
 @api_app.get(
     "/project/{accession}/enriched",
-    summary="Get LLM-enriched sample metadata",
+    summary="Get ontology-enriched sample metadata",
     description=(
-        "Return structured metadata extracted by LLM from sample descriptions: "
-        "age, sex, ethnicity, phenotype, cell_type, tissue, strain, disease, "
-        "assay, cell_line, treatment. Includes study title and sample count."
+        "Return structured metadata extracted by LLM with ontology mappings. "
+        "Fields include tissue, cell_type, disease, assay, development_stage "
+        "each with standardised ontology IDs (UBERON, CL, MONDO, EFO). "
+        "Falls back to legacy enriched_samples if v3 data is unavailable."
     ),
     operation_id="get_project_enriched",
 )
@@ -3782,12 +3785,20 @@ def get_project_enriched(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(ENRICHED_STUDY_SQL, (accession,))
+                cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
                 study = cur.fetchone()
-                if not study:
-                    raise HTTPException(404, f"No enriched metadata for {accession}")
-                cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
-                samples = cur.fetchall()
+                if study:
+                    cur.execute(ONTOLOGY_SAMPLES_V3_SQL, (accession,))
+                    samples = cur.fetchall()
+                    version = "v3"
+                else:
+                    cur.execute(ENRICHED_STUDY_SQL, (accession,))
+                    study = cur.fetchone()
+                    if not study:
+                        raise HTTPException(404, f"No enriched metadata for {accession}")
+                    cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
+                    samples = cur.fetchall()
+                    version = "v1"
     except HTTPException:
         raise
     except Exception:
@@ -3802,6 +3813,7 @@ def get_project_enriched(
         "accession": study["accession"],
         "title": study["title"],
         "n_samples": study["n_samples"],
+        "version": version,
         "samples": samples,
     }
 
@@ -4066,9 +4078,10 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     or export all project accessions for a country.
 
 20. **Enriched metadata** — call `get_project_enriched` with a project accession to get
-    LLM-extracted structured sample metadata: age, sex, ethnicity, phenotype, cell_type,
-    tissue, strain, disease, assay, cell_line, treatment, development_stage, sample_type,
-    genetic_modification. Returns 404 if no enriched data exists for the project.
+    ontology-enriched sample metadata. Returns `version: "v3"` with ontology IDs
+    (MONDO, UBERON, CL, EFO) for disease, tissue, cell_type, assay, development_stage,
+    plus organism/taxid from Cellosaurus. Falls back to `version: "v1"` (legacy) with
+    basic LLM-extracted fields. Returns 404 if no enriched data exists.
     Use this when the user asks for structured/parsed sample attributes beyond what the
     raw metadata provides.
 
