@@ -50,15 +50,15 @@ EXPORT_TABLES = [
 BATCH_SIZE = 50_000
 
 
-def get_columns(conn, table: str) -> list[str] | None:
-    """Get column names for a table/matview, excluding tsvector columns.
+def get_columns_with_types(conn, table: str) -> list[tuple[str, str]] | None:
+    """Get (column_name, type_name) pairs for a table/matview.
 
-    Returns None if the table does not exist.
+    Excludes tsvector columns. Returns None if the table does not exist.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT a.attname
+            SELECT a.attname, t.typname
             FROM pg_attribute a
             JOIN pg_class c ON a.attrelid = c.oid
             JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -72,19 +72,37 @@ def get_columns(conn, table: str) -> list[str] | None:
             """,
             (table,),
         )
-        cols = [row[0] for row in cur.fetchall()]
-        return cols if cols else None
+        rows = cur.fetchall()
+        return rows if rows else None
+
+
+def build_select(columns_with_types: list[tuple[str, str]]) -> tuple[list[str], str]:
+    """Build SELECT clause, casting JSONB/JSONB[] to TEXT to avoid schema mismatches.
+
+    Returns (column_names, select_sql).
+    """
+    names = []
+    exprs = []
+    for col, typ in columns_with_types:
+        names.append(col)
+        # JSONB structs can have inconsistent schemas across rows,
+        # which breaks Parquet's fixed schema. Cast to text.
+        if typ in ("jsonb", "_jsonb"):
+            exprs.append(f'"{col}"::text AS "{col}"')
+        else:
+            exprs.append(f'"{col}"')
+    return names, ", ".join(exprs)
 
 
 def export_table(conn, table: str, output_dir: str) -> None:
     """Export a single table to Parquet using batched server-side cursor."""
-    columns = get_columns(conn, table)
-    if columns is None:
+    columns_with_types = get_columns_with_types(conn, table)
+    if columns_with_types is None:
         print(f"  SKIP {table} (does not exist)")
         return
 
-    col_list = ", ".join(f'"{c}"' for c in columns)
-    query = f'SELECT {col_list} FROM "{table}"'
+    columns, select_sql = build_select(columns_with_types)
+    query = f'SELECT {select_sql} FROM "{table}"'
 
     output_path = os.path.join(output_dir, f"{table}.parquet")
     tmp_path = output_path + ".tmp"
