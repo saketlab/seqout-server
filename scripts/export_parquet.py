@@ -94,6 +94,22 @@ def build_select(columns_with_types: list[tuple[str, str]]) -> tuple[list[str], 
     return names, ", ".join(exprs)
 
 
+def _promote_null_types(schema: pa.Schema) -> pa.Schema:
+    """Replace null-typed fields with string.
+
+    When an entire batch has NULL values for a column, PyArrow infers the
+    type as `null`. Later batches may have actual strings, causing a schema
+    mismatch. Promote all null types to string upfront.
+    """
+    fields = []
+    for field in schema:
+        if pa.types.is_null(field.type):
+            fields.append(pa.field(field.name, pa.string()))
+        else:
+            fields.append(field)
+    return pa.schema(fields)
+
+
 def export_table(conn, table: str, output_dir: str) -> None:
     """Export a single table to Parquet using batched server-side cursor."""
     columns_with_types = get_columns_with_types(conn, table)
@@ -110,6 +126,7 @@ def export_table(conn, table: str, output_dir: str) -> None:
     start = time.time()
     total_rows = 0
     writer = None
+    writer_schema = None
 
     try:
         with conn.cursor(name=f"export_{table}") as cur:
@@ -125,12 +142,15 @@ def export_table(conn, table: str, output_dir: str) -> None:
                 batch_table = pa.table(arrays)
 
                 if writer is None:
+                    writer_schema = _promote_null_types(batch_table.schema)
                     writer = pq.ParquetWriter(
                         tmp_path,
-                        batch_table.schema,
+                        writer_schema,
                         compression="snappy",
                     )
 
+                # Cast batch to writer schema (handles null→string promotion)
+                batch_table = batch_table.cast(writer_schema)
                 writer.write_table(batch_table)
                 total_rows += len(rows)
 
