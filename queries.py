@@ -1872,6 +1872,45 @@ LIMIT 500;
 )
 
 # ---------------------------------------------------------------------------
+# BAM files: original submitted BAM files from ncbi_files JSONB
+# ---------------------------------------------------------------------------
+
+STUDY_BAMS_SQL = (
+    _RESOLVE_DL_STUDY
+    + """
+SELECT
+    dl.run_accession,
+    dl.experiment_accession,
+    f->>'filename'                    AS filename,
+    f->>'url'                         AS url,
+    f->>'size'                        AS size,
+    f->>'md5'                         AS md5,
+    f->>'semantic_name'               AS semantic_name,
+    alt.https_url,
+    alt.s3_url,
+    COUNT(*) OVER()                   AS total_bams,
+    COALESCE(SUM((f->>'size')::bigint) OVER(), 0)::text AS total_bam_bytes
+FROM sra_run_download_links dl,
+     jsonb_array_elements(dl.ncbi_files) AS f,
+     LATERAL (
+         SELECT
+             MAX(a->>'url') FILTER (
+                 WHERE a->>'access_type' = 'anonymous'
+                   AND a->>'url' LIKE 'https://%%'
+             ) AS https_url,
+             MAX(a->>'url') FILTER (
+                 WHERE a->>'url' LIKE 's3://%%'
+             ) AS s3_url
+         FROM jsonb_array_elements(f->'alternatives') AS a
+     ) alt
+WHERE dl.study_accession IN (SELECT acc FROM candidates)
+  AND f->>'supertype' = 'Original'
+  AND f->>'filename' LIKE '%%.bam'
+ORDER BY dl.experiment_accession, dl.run_accession;
+"""
+)
+
+# ---------------------------------------------------------------------------
 # Growth stats: monthly counts per database
 # ---------------------------------------------------------------------------
 

@@ -67,6 +67,7 @@ from queries import (
     STUDY_EXPERIMENTS_SQL,
     SUBMITTER_BATCH_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
+    STUDY_BAMS_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
@@ -2082,6 +2083,105 @@ def get_study_runs(
         "total_fastq_bytes": summary["total_fastq_bytes"],
         "runs": rows,
     }
+
+
+@api_app.get(
+    "/project/{study}/bams",
+    summary="List original BAM files for a study",
+    description=(
+        "Return direct download links for original submitted BAM files in an SRA study. "
+        "BAM files are extracted from the ncbi_files JSONB column where supertype is 'Original'. "
+        "Not all studies have BAM files — returns total_bams=0 when none exist."
+    ),
+    operation_id="get_study_bams",
+)
+@limiter.limit("1000/minute")
+def get_study_bams(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    study = study.upper()
+    empty = {"total_bams": 0, "total_bam_bytes": "0", "bams": []}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_BAMS_SQL, (study, study))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_study_bams")
+        raise HTTPException(500, "Internal server error")
+
+    if not rows:
+        return empty
+
+    total_bams = rows[0]["total_bams"]
+    total_bam_bytes = rows[0]["total_bam_bytes"]
+    for row in rows:
+        del row["total_bams"]
+        del row["total_bam_bytes"]
+
+    return {
+        "total_bams": total_bams,
+        "total_bam_bytes": total_bam_bytes,
+        "bams": rows,
+    }
+
+
+@api_app.get(
+    "/project/{study}/bams/download",
+    summary="Download BAM links as TSV",
+    description=(
+        "Stream a TSV file containing original submitted BAM download links for a study, "
+        "with one row per BAM file."
+    ),
+    operation_id="download_study_bams_tsv",
+)
+@limiter.limit("1000/minute")
+def download_study_bams_tsv(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+):
+    study = study.upper()
+
+    def generate():
+        header = (
+            "run_accession\texperiment_accession\t"
+            "filename\turl\thttps_url\ts3_url\t"
+            "size\tmd5\tsemantic_name\tdirectory_path\n"
+        )
+        yield header
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(STUDY_BAMS_SQL, (study, study))
+                    while True:
+                        rows = cur.fetchmany(500)
+                        if not rows:
+                            break
+                        for row in rows:
+                            dirpath = f"{study}/{row['experiment_accession'] or 'unknown'}/{row['run_accession']}"
+                            yield (
+                                f"{row['run_accession']}\t"
+                                f"{row['experiment_accession'] or ''}\t"
+                                f"{row['filename']}\t"
+                                f"{row['url']}\t"
+                                f"{row['https_url'] or ''}\t"
+                                f"{row['s3_url'] or ''}\t"
+                                f"{row['size'] or ''}\t"
+                                f"{row['md5'] or ''}\t"
+                                f"{row['semantic_name'] or ''}\t"
+                                f"{dirpath}\n"
+                            )
+        except Exception:
+            logger.exception("Error streaming BAMs TSV for %s", study)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/tab-separated-values",
+        headers={
+            "Content-Disposition": f'attachment; filename="{study}_bam_links.tsv"'
+        },
+    )
 
 
 @api_app.get(

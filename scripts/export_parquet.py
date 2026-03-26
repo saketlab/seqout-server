@@ -45,6 +45,7 @@ EXPORT_TABLES = [
     "common_names",
     "organism_growth_monthly",
     "study_publications",
+    "sra_run_download_links",
 ]
 
 BATCH_SIZE = 50_000
@@ -110,8 +111,13 @@ def _promote_null_types(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields)
 
 
-def export_table(conn, table: str, output_dir: str) -> None:
+def export_table(conn, table: str, output_dir: str, skip_existing: bool = False) -> None:
     """Export a single table to Parquet using batched server-side cursor."""
+    output_path = os.path.join(output_dir, f"{table}.parquet")
+    if skip_existing and os.path.exists(output_path):
+        print(f"  SKIP {table} (already exists)")
+        return
+
     columns_with_types = get_columns_with_types(conn, table)
     if columns_with_types is None:
         print(f"  SKIP {table} (does not exist)")
@@ -120,7 +126,6 @@ def export_table(conn, table: str, output_dir: str) -> None:
     columns, select_sql = build_select(columns_with_types)
     query = f'SELECT {select_sql} FROM "{table}"'
 
-    output_path = os.path.join(output_dir, f"{table}.parquet")
     tmp_path = output_path + ".tmp"
 
     start = time.time()
@@ -149,7 +154,6 @@ def export_table(conn, table: str, output_dir: str) -> None:
                         compression="snappy",
                     )
 
-                # Cast batch to writer schema (handles null→string promotion)
                 batch_table = batch_table.cast(writer_schema)
                 writer.write_table(batch_table)
                 total_rows += len(rows)
@@ -187,6 +191,11 @@ def main():
         default=None,
         help="Comma-separated list of tables to export (default: all)",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip tables whose Parquet file already exists",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL")
@@ -204,7 +213,7 @@ def main():
     # Server-side cursors require a transaction (no autocommit)
     with psycopg.connect(database_url) as conn:
         for table in tables:
-            export_table(conn, table, args.output_dir)
+            export_table(conn, table, args.output_dir, skip_existing=args.skip_existing)
 
     print()
     print("Done.")
