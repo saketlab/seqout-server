@@ -3895,7 +3895,9 @@ def get_project_enriched(
                     cur.execute(ENRICHED_STUDY_SQL, (accession,))
                     study = cur.fetchone()
                     if not study:
-                        raise HTTPException(404, f"No enriched metadata for {accession}")
+                        raise HTTPException(
+                            404, f"No enriched metadata for {accession}"
+                        )
                     cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
                     samples = cur.fetchall()
                     version = "v1"

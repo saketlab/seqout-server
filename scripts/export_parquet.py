@@ -111,7 +111,9 @@ def _promote_null_types(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields)
 
 
-def export_table(conn, table: str, output_dir: str, skip_existing: bool = False) -> None:
+def export_table(
+    conn, table: str, output_dir: str, skip_existing: bool = False
+) -> None:
     """Export a single table to Parquet using batched server-side cursor."""
     output_path = os.path.join(output_dir, f"{table}.parquet")
     if skip_existing and os.path.exists(output_path):
