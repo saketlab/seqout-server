@@ -7,7 +7,8 @@ WHERE accession = ANY(%s);
 """
 
 SUBMITTER_BATCH_SQL = """
-SELECT canonical_accession AS accession, center_name AS submitter, country_code
+SELECT canonical_accession AS accession, center_name AS submitter, country_code,
+       is_single_cell, single_cell_modality
 FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
@@ -2437,6 +2438,9 @@ _ENRICHED_SAMPLES_NEW_COLS = [
     "development_stage",
     "sample_type",
     "genetic_modification",
+    "cell_count",
+    "gene_count",
+    "cell_count_estimated",
 ]
 
 
@@ -2478,7 +2482,8 @@ ORDER BY es.sample;
 """
 
 ENRICHED_STUDY_SQL = """
-SELECT st.accession, st.title, st.n_samples
+SELECT st.accession, st.title, st.n_samples,
+       NULL AS single_cell_modality
 FROM enriched_studies st
 WHERE st.accession = %s;
 """
@@ -2486,7 +2491,7 @@ WHERE st.accession = %s;
 # ── Ontology-enriched metadata (v3) ─────────────────────────────────────────
 
 ENRICHED_STUDY_V3_SQL = """
-SELECT st.accession, st.title, st.n_samples
+SELECT st.accession, st.title, st.n_samples, st.single_cell_modality
 FROM enriched_studies_v3 st
 WHERE st.accession = %s;
 """
@@ -2498,6 +2503,7 @@ SELECT
     assay_category, cell_line, treatment,
     development_stage, sample_type, genetic_modification,
     organism, taxid, tissue_primary_site, tissue_site_type,
+    cell_count, gene_count, cell_count_estimated,
     disease_ontology_id, disease_ontology_name,
     tissue_ontology_id, tissue_ontology_name,
     cell_type_ontology_id, cell_type_ontology_name,

@@ -397,6 +397,8 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         sub_map[r["accession"]] = {
             "submitter": r["submitter"],
             "country_code": r["country_code"],
+            "is_single_cell": r["is_single_cell"],
+            "single_cell_modality": r["single_cell_modality"],
         }
     for row in rows:
         pubs = pub_map.get(row["accession"])
@@ -412,6 +414,8 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         meta = sub_map.get(row["accession"], {})
         row["center_name"] = meta.get("submitter")
         row["country_code"] = meta.get("country_code")
+        row["is_single_cell"] = meta.get("is_single_cell")
+        row["single_cell_modality"] = meta.get("single_cell_modality")
         if not row.get("authors") and row.get("center_name"):
             row["authors"] = row["center_name"]
     return rows
@@ -3915,6 +3919,7 @@ def get_project_enriched(
         "accession": study["accession"],
         "title": study["title"],
         "n_samples": study["n_samples"],
+        "single_cell_modality": study.get("single_cell_modality"),
         "version": version,
         "samples": samples,
     }
