@@ -897,13 +897,13 @@ def _ensure_spelling_loaded() -> SymSpell:
         try:
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(
-                        "SELECT normalized, frequency FROM search_vocabulary"
-                    )
+                    cur.execute("SELECT normalized, frequency FROM search_vocabulary")
                     for row in cur:
                         sym.create_dictionary_entry(row["normalized"], row["frequency"])
         except Exception:
-            logger.warning("search_vocabulary table not found; spelling suggestions disabled")
+            logger.warning(
+                "search_vocabulary table not found; spelling suggestions disabled"
+            )
         count = len(sym.words)
         logger.info("Loaded %d terms into SymSpell spelling dictionary", count)
         _spelling_cache["symspell"] = sym
@@ -930,11 +930,13 @@ def _get_suggestions(q: str) -> list[dict]:
             continue
         results = sym.lookup(word, Verbosity.CLOSEST, max_edit_distance=2)
         if results and results[0].term != word:
-            corrections.append({
-                "original": word,
-                "suggested": results[0].term,
-                "distance": results[0].distance,
-            })
+            corrections.append(
+                {
+                    "original": word,
+                    "suggested": results[0].term,
+                    "distance": results[0].distance,
+                }
+            )
             correction_map[i] = results[0].term
         else:
             fallback_indices.append(i)
@@ -954,11 +956,13 @@ def _get_suggestions(q: str) -> list[dict]:
                         )
                         row = cur.fetchone()
                         if row and row["term"].lower() != word:
-                            corrections.append({
-                                "original": word,
-                                "suggested": row["term"],
-                                "distance": None,
-                            })
+                            corrections.append(
+                                {
+                                    "original": word,
+                                    "suggested": row["term"],
+                                    "distance": None,
+                                }
+                            )
                             correction_map[i] = row["term"]
         except Exception:
             logger.debug("pg_trgm fallback failed")
