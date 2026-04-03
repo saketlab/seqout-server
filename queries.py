@@ -2514,6 +2514,19 @@ WHERE study_accession = %s
 ORDER BY sample;
 """
 
+# Fallback when ontology_samples_v3 has no rows yet (e.g. skeleton-only cell-count studies)
+ENRICHED_SAMPLES_V3_SQL = """
+SELECT
+    sample, age, sex, ethnicity, phenotype,
+    cell_type, tissue, strain, disease, assay,
+    assay_category, cell_line, treatment,
+    development_stage, sample_type, genetic_modification,
+    cell_count, gene_count, cell_count_estimated
+FROM enriched_samples_v3
+WHERE study_accession = %s
+ORDER BY sample;
+"""
+
 SITEMAP_ACCESSIONS_SQL = {
     "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
     "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",

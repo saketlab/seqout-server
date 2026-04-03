@@ -31,9 +31,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
+from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
 
+from aliases import QUERY_ALIASES
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -94,6 +96,7 @@ from queries import (
     SITEMAP_COUNTS_SQL,
     ENRICHED_SAMPLES_SQL,
     ENRICHED_STUDY_SQL,
+    ENRICHED_SAMPLES_V3_SQL,
     ENRICHED_STUDY_V3_SQL,
     ONTOLOGY_SAMPLES_V3_SQL,
     build_enriched_samples_sql,
@@ -196,6 +199,8 @@ _organism_totals_cache_lock = threading.Lock()
 _organism_totals_cache: dict[str, dict] = {}  # cache_key -> {data, built_at}
 _global_contributions_cache_lock = threading.Lock()
 _global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
+_spelling_cache_lock = threading.Lock()
+_spelling_cache: dict = {"ready": False, "symspell": None}
 
 
 pool = ConnectionPool(
@@ -866,6 +871,105 @@ def _get_growth_data() -> dict:
         _growth_cache["data"] = data
         _growth_cache["built_at"] = now
         return data
+
+
+def _normalize_query(q: str) -> str:
+    """Replace known assay name variants with canonical FTS forms (word-by-word)."""
+    words = q.split()
+    out = []
+    for w in words:
+        canonical = QUERY_ALIASES.get(w.lower())
+        out.append(canonical if canonical else w)
+    return " ".join(out)
+
+
+_SUGGESTION_THRESHOLD = 5
+
+
+def _ensure_spelling_loaded() -> SymSpell:
+    """Load vocabulary into SymSpell on first call."""
+    if _spelling_cache["ready"]:
+        return _spelling_cache["symspell"]
+    with _spelling_cache_lock:
+        if _spelling_cache["ready"]:
+            return _spelling_cache["symspell"]
+        sym = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SELECT normalized, frequency FROM search_vocabulary"
+                    )
+                    for row in cur:
+                        sym.create_dictionary_entry(row["normalized"], row["frequency"])
+        except Exception:
+            logger.warning("search_vocabulary table not found; spelling suggestions disabled")
+        count = len(sym.words)
+        logger.info("Loaded %d terms into SymSpell spelling dictionary", count)
+        _spelling_cache["symspell"] = sym
+        _spelling_cache["ready"] = True
+        return sym
+
+
+def _get_suggestions(q: str) -> list[dict]:
+    """Return spelling suggestions for a query with few/no FTS results.
+
+    Uses the original (pre-alias-normalized) query so corrections target
+    what the user actually typed, not the canonical form.
+    """
+    sym = _ensure_spelling_loaded()
+    if not sym.words:
+        return []
+    words = q.lower().split()
+    corrections: list[dict] = []
+    correction_map: dict[int, str] = {}  # word index -> suggested term
+
+    fallback_indices: list[int] = []
+    for i, word in enumerate(words):
+        if len(word) < 3 or len(word) > 50:
+            continue
+        results = sym.lookup(word, Verbosity.CLOSEST, max_edit_distance=2)
+        if results and results[0].term != word:
+            corrections.append({
+                "original": word,
+                "suggested": results[0].term,
+                "distance": results[0].distance,
+            })
+            correction_map[i] = results[0].term
+        else:
+            fallback_indices.append(i)
+
+    if fallback_indices:
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    for i in fallback_indices[:5]:
+                        word = words[i]
+                        cur.execute(
+                            "SELECT term, similarity(normalized, %s) AS sml "
+                            "FROM search_vocabulary "
+                            "WHERE normalized %% %s "
+                            "ORDER BY sml DESC, frequency DESC LIMIT 1",
+                            (word, word),
+                        )
+                        row = cur.fetchone()
+                        if row and row["term"].lower() != word:
+                            corrections.append({
+                                "original": word,
+                                "suggested": row["term"],
+                                "distance": None,
+                            })
+                            correction_map[i] = row["term"]
+        except Exception:
+            logger.debug("pg_trgm fallback failed")
+
+    if not corrections:
+        return []
+
+    corrected_words = list(words)
+    for i, suggested in correction_map.items():
+        corrected_words[i] = suggested
+    return [{"corrected_query": " ".join(corrected_words), "corrections": corrections}]
 
 
 @api_app.get(
@@ -1594,6 +1698,10 @@ def search_geo(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    return _search_geo_impl(request, _normalize_query(q), cursor_rank, cursor_acc)
+
+
+def _search_geo_impl(request, q, cursor_rank, cursor_acc):
     start = time.perf_counter()
 
     try:
@@ -1644,6 +1752,10 @@ def search_sra(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    return _search_sra_impl(request, _normalize_query(q), cursor_rank, cursor_acc)
+
+
+def _search_sra_impl(request, q, cursor_rank, cursor_acc):
     start = time.perf_counter()
 
     try:
@@ -1678,6 +1790,30 @@ def search_sra(
 
 
 @api_app.get(
+    "/search/suggest",
+    summary="Spelling suggestions",
+    description=(
+        "Return spelling correction suggestions for a query. "
+        "Useful when a search returns 0 results due to typos."
+    ),
+    operation_id="search_suggest",
+)
+@limiter.limit("100/minute")
+def search_suggest(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=500),
+):
+    start = time.perf_counter()
+    suggestions = _get_suggestions(q)
+    took_ms = (time.perf_counter() - start) * 1000
+    normalized = _normalize_query(q)
+    result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
+    if normalized != q:
+        result["normalized_query"] = normalized
+    return result
+
+
+@api_app.get(
     "/search",
     summary="Search all databases",
     description=(
@@ -1702,6 +1838,9 @@ def search(
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
+    original_q = q
+    q = _normalize_query(q)
+
     if sortby:
         sql, params = build_sorted_search_sql(
             q=q,
@@ -1725,7 +1864,7 @@ def search(
         took_ms = (time.perf_counter() - start) * 1000
         total = rows[0]["total_count"] if rows else 0
 
-        return {
+        result = {
             "results": rows,
             "total": total,
             "took_ms": round(took_ms, 2),
@@ -1738,12 +1877,10 @@ def search(
                 }
             ),
         }
-
-    # Default rank-based search
-    if db == "geo":
-        return search_geo(request, q, cursor_rank, cursor_acc)
+    elif db == "geo":
+        result = _search_geo_impl(request, q, cursor_rank, cursor_acc)
     elif db == "sra":
-        return search_sra(request, q, cursor_rank, cursor_acc)
+        result = _search_sra_impl(request, q, cursor_rank, cursor_acc)
     elif db == "arrayexpress":
         start = time.perf_counter()
         try:
@@ -1762,7 +1899,7 @@ def search(
         took_ms = (time.perf_counter() - start) * 1000
         total = rows[0]["total_count"] if rows else 0
 
-        return {
+        result = {
             "results": rows,
             "total": total,
             "took_ms": round(took_ms, 2),
@@ -1793,7 +1930,44 @@ def search(
         took_ms = (time.perf_counter() - start) * 1000
         total = rows[0]["total_count"] if rows else 0
 
-        return {
+        result = {
+            "results": rows,
+            "total": total,
+            "took_ms": round(took_ms, 2),
+            "next_cursor": (
+                None
+                if not rows
+                else {
+                    "rank": rows[-1]["rank"],
+                    "accession": rows[-1]["accession"],
+                }
+            ),
+        }
+    else:
+        start = time.perf_counter()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        SEARCH_SQL,
+                        (
+                            q,
+                            cursor_rank,
+                            cursor_rank,
+                            cursor_acc,
+                        ),
+                    )
+                    rows = cur.fetchall()
+                    _enrich_with_publications(rows, cur)
+        except Exception as e:
+            logger.exception("Database error in search")
+            raise HTTPException(500, "Internal server error")
+
+        took_ms = (time.perf_counter() - start) * 1000
+        total = rows[0]["total_count"] if rows else 0
+
+        result = {
             "results": rows,
             "total": total,
             "took_ms": round(took_ms, 2),
@@ -1807,42 +1981,12 @@ def search(
             ),
         }
 
-    start = time.perf_counter()
+    if result.get("total", 0) <= _SUGGESTION_THRESHOLD:
+        suggestions = _get_suggestions(original_q)
+        if suggestions:
+            result["suggestions"] = suggestions
 
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    SEARCH_SQL,
-                    (
-                        q,
-                        cursor_rank,
-                        cursor_rank,
-                        cursor_acc,
-                    ),
-                )
-                rows = cur.fetchall()
-                _enrich_with_publications(rows, cur)
-    except Exception as e:
-        logger.exception("Database error in search")
-        raise HTTPException(500, "Internal server error")
-
-    took_ms = (time.perf_counter() - start) * 1000
-    total = rows[0]["total_count"] if rows else 0
-
-    return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {
-                "rank": rows[-1]["rank"],
-                "accession": rows[-1]["accession"],
-            }
-        ),
-    }
+    return result
 
 
 @api_app.get(
@@ -3599,6 +3743,9 @@ def search_structured(
         None, description="Filter by dominant assay L2 (from unified_metadata)"
     ),
 ):
+    if q:
+        q = _normalize_query(q)
+
     has_geo_filter = any(
         v is not None
         for v in (
@@ -3894,6 +4041,9 @@ def get_project_enriched(
                 if study:
                     cur.execute(ONTOLOGY_SAMPLES_V3_SQL, (accession,))
                     samples = cur.fetchall()
+                    if not samples:
+                        cur.execute(ENRICHED_SAMPLES_V3_SQL, (accession,))
+                        samples = cur.fetchall()
                     version = "v3"
                 else:
                     cur.execute(ENRICHED_STUDY_SQL, (accession,))
