@@ -1,4 +1,5 @@
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -176,6 +177,89 @@ SELECT
 FROM eligible
 ORDER BY accession;
 """
+ATLAS_PROJECTS_ROWS_SQL = """
+WITH atlas_base AS (
+    SELECT
+        accession,
+        'geo'::text AS source,
+        'GEO'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        COALESCE(countries_iso, ARRAY[]::text[]) AS raw_country_codes,
+        ARRAY[]::text[] AS raw_country_labels
+    FROM geo_series
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND accession ~ '^[A-Za-z]+\\d+$'
+
+    UNION ALL
+
+    SELECT
+        accession,
+        'sra'::text AS source,
+        'SRA'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        ARRAY[]::text[] AS raw_country_codes,
+        COALESCE(countries, ARRAY[]::text[]) AS raw_country_labels
+    FROM sra_studies
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND accession ~ '^[A-Za-z]+\\d+$'
+),
+country_ranked AS (
+    SELECT
+        canonical_accession AS accession,
+        source,
+        UPPER(NULLIF(BTRIM(country_code), '')) AS country_code,
+        NULLIF(BTRIM(country), '') AS country_label,
+        ROW_NUMBER() OVER (
+            PARTITION BY canonical_accession,
+                         source,
+                         UPPER(NULLIF(BTRIM(country_code), '')),
+                         NULLIF(BTRIM(country), '')
+            ORDER BY canonical_accession
+        ) AS rn
+    FROM unified_metadata
+    WHERE source IN ('geo', 'sra')
+      AND (country IS NOT NULL OR country_code IS NOT NULL)
+),
+country_agg AS (
+    SELECT
+        accession,
+        source,
+        COALESCE(
+            jsonb_agg(
+                jsonb_build_object(
+                    'code', country_code,
+                    'label', country_label
+                )
+                ORDER BY country_label NULLS LAST, country_code NULLS LAST
+            ) FILTER (WHERE country_code IS NOT NULL OR country_label IS NOT NULL),
+            '[]'::jsonb
+        ) AS country_pairs
+    FROM country_ranked
+    WHERE rn = 1
+    GROUP BY accession, source
+)
+SELECT
+    b.accession,
+    b.archive,
+    b.raw_x,
+    b.raw_y,
+    COALESCE(c.country_pairs, '[]'::jsonb) AS country_pairs,
+    b.raw_country_codes,
+    b.raw_country_labels
+FROM atlas_base b
+LEFT JOIN country_agg c
+  ON c.accession = b.accession
+ AND c.source = b.source
+ORDER BY b.accession;
+"""
 CLUSTERS_SQL = """
 SELECT
     title,
@@ -188,6 +272,19 @@ _bin_cache_lock = threading.Lock()
 _bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"ready": False, "rows": []}
+_ATLAS_SCHEMA_VERSION = "v1"
+_ATLAS_EXTENT = 2200.0
+_ATLAS_HALF_EXTENT = _ATLAS_EXTENT / 2
+_ATLAS_CACHE_CONTROL = "public, max-age=2592000, immutable"
+_atlas_cache_lock = threading.Lock()
+_atlas_cache = {
+    "ready": False,
+    "raw": b"",
+    "gzip": b"",
+    "etag_raw": "",
+    "etag_gzip": "",
+    "version": "",
+}
 _growth_cache_lock = threading.Lock()
 _growth_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _MAX_ORGANISM_CACHE_ENTRIES = 500
@@ -767,6 +864,166 @@ def year_params(year_from: int | None, year_to: int | None) -> list:
     return [year_from, year_from, year_to, year_to]
 
 
+def _normalize_to_extent(
+    value: float, min_value: float, max_value: float, half_extent: float
+) -> float:
+    if max_value == min_value:
+        return 0.0
+    scaled = ((value - min_value) / (max_value - min_value)) * (half_extent * 2)
+    return round(scaled - half_extent, 2)
+
+
+def _normalize_country_metadata(
+    country_pairs: list[dict] | None,
+    raw_country_codes: list[str] | None,
+    raw_country_labels: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    normalized_pairs: list[tuple[str, str]] = []
+
+    for pair in country_pairs or []:
+        if not isinstance(pair, dict):
+            continue
+        code = pair.get("code")
+        label = pair.get("label")
+        code = code.strip().upper() if isinstance(code, str) and code.strip() else None
+        label = label.strip() if isinstance(label, str) and label.strip() else None
+        if code or label:
+            normalized_pairs.append((code or label, label or code))
+
+    if not normalized_pairs:
+        for code in raw_country_codes or []:
+            if isinstance(code, str) and code.strip():
+                clean_code = code.strip().upper()
+                normalized_pairs.append((clean_code, clean_code))
+        for label in raw_country_labels or []:
+            if isinstance(label, str) and label.strip():
+                clean_label = label.strip()
+                normalized_pairs.append((clean_label, clean_label))
+
+    seen: set[tuple[str, str]] = set()
+    country_codes: list[str] = []
+    country_labels: list[str] = []
+    for code, label in normalized_pairs:
+        pair = (code, label)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        country_codes.append(code)
+        country_labels.append(label)
+
+    return country_codes, country_labels
+
+
+def _build_atlas_row(
+    accession: str,
+    archive: str,
+    x: float,
+    y: float,
+    country_pairs: list[dict] | None,
+    raw_country_codes: list[str] | None,
+    raw_country_labels: list[str] | None,
+) -> dict:
+    country_codes, country_labels = _normalize_country_metadata(
+        country_pairs, raw_country_codes, raw_country_labels
+    )
+    countries_display = ", ".join(country_labels)
+    countries_text = countries_display or "Unknown"
+    return {
+        "accession": accession,
+        "archive": archive,
+        "country_codes": country_codes,
+        "country_labels": country_labels,
+        "country_count": len(country_labels),
+        "countries_display": countries_display,
+        "atlas_text": (
+            f"Accession: {accession}\n"
+            f"Archive: {archive}\n"
+            f"Countries: {countries_text}"
+        ),
+        "project_link": f"/p/{accession}",
+        "x": x,
+        "y": y,
+    }
+
+
+def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(ATLAS_PROJECTS_ROWS_SQL)
+            rows = cur.fetchall()
+
+    if not rows:
+        raw_bytes = b""
+        gzip_bytes = gzip.compress(raw_bytes, compresslevel=6)
+        raw_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        gzip_hash = hashlib.sha256(gzip_bytes).hexdigest()[:16]
+        return (
+            raw_bytes,
+            gzip_bytes,
+            f'"atlas-{_ATLAS_SCHEMA_VERSION}-{raw_hash}"',
+            f'"atlas-{_ATLAS_SCHEMA_VERSION}-{gzip_hash}"',
+            f"{_ATLAS_SCHEMA_VERSION}-{raw_hash}",
+        )
+
+    min_x = min(row["raw_x"] for row in rows)
+    max_x = max(row["raw_x"] for row in rows)
+    min_y = min(row["raw_y"] for row in rows)
+    max_y = max(row["raw_y"] for row in rows)
+
+    encoded_rows: list[str] = []
+    for row in rows:
+        atlas_row = _build_atlas_row(
+            accession=row["accession"],
+            archive=row["archive"],
+            x=_normalize_to_extent(row["raw_x"], min_x, max_x, _ATLAS_HALF_EXTENT),
+            y=_normalize_to_extent(row["raw_y"], min_y, max_y, _ATLAS_HALF_EXTENT),
+            country_pairs=row.get("country_pairs"),
+            raw_country_codes=row.get("raw_country_codes"),
+            raw_country_labels=row.get("raw_country_labels"),
+        )
+        encoded_rows.append(json.dumps(atlas_row, separators=(",", ":")))
+
+    raw_bytes = ("\n".join(encoded_rows) + "\n").encode("utf-8")
+    gzip_bytes = gzip.compress(raw_bytes, compresslevel=6)
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+    gzip_hash = hashlib.sha256(gzip_bytes).hexdigest()[:16]
+    return (
+        raw_bytes,
+        gzip_bytes,
+        f'"atlas-{_ATLAS_SCHEMA_VERSION}-{raw_hash}"',
+        f'"atlas-{_ATLAS_SCHEMA_VERSION}-{gzip_hash}"',
+        f"{_ATLAS_SCHEMA_VERSION}-{raw_hash}",
+    )
+
+
+def _get_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
+    with _atlas_cache_lock:
+        if _atlas_cache["ready"]:
+            return (
+                _atlas_cache["raw"],
+                _atlas_cache["gzip"],
+                _atlas_cache["etag_raw"],
+                _atlas_cache["etag_gzip"],
+                _atlas_cache["version"],
+            )
+
+        raw_bytes, gzip_bytes, etag_raw, etag_gzip, version = _build_atlas_payloads()
+        _atlas_cache["ready"] = True
+        _atlas_cache["raw"] = raw_bytes
+        _atlas_cache["gzip"] = gzip_bytes
+        _atlas_cache["etag_raw"] = etag_raw
+        _atlas_cache["etag_gzip"] = etag_gzip
+        _atlas_cache["version"] = version
+        return raw_bytes, gzip_bytes, etag_raw, etag_gzip, version
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    if not if_none_match:
+        return False
+    candidates = [value.strip() for value in if_none_match.split(",")]
+    return "*" in candidates or etag in candidates
+
+
 def _build_binary_payloads() -> tuple[bytes, bytes]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1032,6 +1289,46 @@ def get_accessions_bin(request: Request):
         content=accessions_bytes,
         media_type="application/octet-stream",
         headers={"Cache-Control": "public, max-age=2592000"},
+    )
+
+
+@api_app.get(
+    "/atlas/projects.v1.ndjson",
+    summary="Download atlas-ready project dataset",
+    description=(
+        "Return one precomputed atlas row per GEO/SRA project as newline-delimited "
+        "JSON with final archive/country fields, prebuilt atlas text, and "
+        "server-normalized x/y coordinates scaled to the frontend extent."
+    ),
+    operation_id="get_projects_atlas_v1",
+)
+@limiter.limit("20/minute")
+def get_projects_atlas_v1(request: Request):
+    try:
+        raw_bytes, gzip_bytes, etag_raw, etag_gzip, version = _get_atlas_payloads()
+    except Exception:
+        logger.exception("Database error in get_projects_atlas_v1")
+        raise HTTPException(500, "Internal server error")
+
+    accepts_gzip = "gzip" in request.headers.get("accept-encoding", "").lower()
+    content = gzip_bytes if accepts_gzip else raw_bytes
+    etag = etag_gzip if accepts_gzip else etag_raw
+    headers = {
+        "Cache-Control": _ATLAS_CACHE_CONTROL,
+        "ETag": etag,
+        "Vary": "Accept-Encoding",
+        "X-Atlas-Version": version,
+    }
+    if accepts_gzip:
+        headers["Content-Encoding"] = "gzip"
+
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+
+    return Response(
+        content=content,
+        media_type="application/x-ndjson",
+        headers=headers,
     )
 
 
