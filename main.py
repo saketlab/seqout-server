@@ -284,6 +284,8 @@ _atlas_cache = {
     "etag_raw": "",
     "etag_gzip": "",
     "version": "",
+    "labels": b"",
+    "labels_etag": "",
 }
 _growth_cache_lock = threading.Lock()
 _growth_cache = {"ready": False, "data": {}, "built_at": 0.0}
@@ -946,7 +948,44 @@ def _build_atlas_row(
     }
 
 
-def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
+def _build_atlas_labels(
+    min_x: float, max_x: float, min_y: float, max_y: float
+) -> list[dict]:
+    """Normalize cluster centroids into the atlas coordinate space."""
+    clusters = _get_clusters_rows()
+    if not clusters:
+        return []
+    sorted_clusters = sorted(clusters, key=lambda c: c["num_points"], reverse=True)
+    n = len(sorted_clusters)
+    labels: list[dict] = []
+    for rank, cluster in enumerate(sorted_clusters):
+        centroid = cluster["centroid"]
+        if not centroid or len(centroid) < 2:
+            continue
+        pct = rank / n if n > 1 else 0.0
+        if pct < 0.1:
+            level = 0
+        elif pct < 0.35:
+            level = 1
+        else:
+            level = 2
+        labels.append(
+            {
+                "text": cluster["title"],
+                "x": _normalize_to_extent(
+                    float(centroid[0]), min_x, max_x, _ATLAS_HALF_EXTENT
+                ),
+                "y": _normalize_to_extent(
+                    float(centroid[1]), min_y, max_y, _ATLAS_HALF_EXTENT
+                ),
+                "level": level,
+                "priority": cluster["num_points"],
+            }
+        )
+    return labels
+
+
+def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str, list[dict]]:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(ATLAS_PROJECTS_ROWS_SQL)
@@ -963,6 +1002,7 @@ def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
             f'"atlas-{_ATLAS_SCHEMA_VERSION}-{raw_hash}"',
             f'"atlas-{_ATLAS_SCHEMA_VERSION}-{gzip_hash}"',
             f"{_ATLAS_SCHEMA_VERSION}-{raw_hash}",
+            [],
         )
 
     min_x = min(row["raw_x"] for row in rows)
@@ -987,12 +1027,16 @@ def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
     gzip_bytes = gzip.compress(raw_bytes, compresslevel=6)
     raw_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
     gzip_hash = hashlib.sha256(gzip_bytes).hexdigest()[:16]
+
+    labels = _build_atlas_labels(min_x, max_x, min_y, max_y)
+
     return (
         raw_bytes,
         gzip_bytes,
         f'"atlas-{_ATLAS_SCHEMA_VERSION}-{raw_hash}"',
         f'"atlas-{_ATLAS_SCHEMA_VERSION}-{gzip_hash}"',
         f"{_ATLAS_SCHEMA_VERSION}-{raw_hash}",
+        labels,
     )
 
 
@@ -1007,14 +1051,29 @@ def _get_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
                 _atlas_cache["version"],
             )
 
-        raw_bytes, gzip_bytes, etag_raw, etag_gzip, version = _build_atlas_payloads()
+        raw_bytes, gzip_bytes, etag_raw, etag_gzip, version, labels = (
+            _build_atlas_payloads()
+        )
+        labels_json = json.dumps(labels, separators=(",", ":")).encode("utf-8")
+        labels_hash = hashlib.sha256(labels_json).hexdigest()[:16]
+        labels_etag = (
+            f'"atlas-labels-{_ATLAS_SCHEMA_VERSION}-{labels_hash}"'
+        )
         _atlas_cache["ready"] = True
         _atlas_cache["raw"] = raw_bytes
         _atlas_cache["gzip"] = gzip_bytes
         _atlas_cache["etag_raw"] = etag_raw
         _atlas_cache["etag_gzip"] = etag_gzip
         _atlas_cache["version"] = version
+        _atlas_cache["labels"] = labels_json
+        _atlas_cache["labels_etag"] = labels_etag
         return raw_bytes, gzip_bytes, etag_raw, etag_gzip, version
+
+
+def _get_atlas_labels() -> tuple[bytes, str]:
+    _get_atlas_payloads()  # ensure atlas cache (including labels) is populated
+    with _atlas_cache_lock:
+        return _atlas_cache["labels"], _atlas_cache["labels_etag"]
 
 
 def _etag_matches(if_none_match: str | None, etag: str) -> bool:
@@ -1328,6 +1387,39 @@ def get_projects_atlas_v1(request: Request):
     return Response(
         content=content,
         media_type="application/x-ndjson",
+        headers=headers,
+    )
+
+
+@api_app.get(
+    "/atlas/labels.v1.json",
+    summary="Atlas cluster labels",
+    description=(
+        "Return cluster labels normalized into the [-1100, 1100] atlas coordinate "
+        "space used by /atlas/projects.v1.ndjson. Each label has text, x, y, level "
+        "(zoom tier 0-2 derived from cluster rank), and priority (num_points). "
+        "Cached in memory alongside the atlas project payloads."
+    ),
+    operation_id="get_atlas_labels_v1",
+)
+@limiter.limit("20/minute")
+def get_atlas_labels_v1(request: Request):
+    try:
+        labels_json, etag = _get_atlas_labels()
+    except Exception:
+        logger.exception("Database error in get_atlas_labels_v1")
+        raise HTTPException(500, "Internal server error")
+
+    headers = {
+        "Cache-Control": _ATLAS_CACHE_CONTROL,
+        "ETag": etag,
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+
+    return Response(
+        content=labels_json,
+        media_type="application/json",
         headers=headers,
     )
 
