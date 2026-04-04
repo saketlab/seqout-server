@@ -183,6 +183,8 @@ WITH atlas_base AS (
         accession,
         'geo'::text AS source,
         'GEO'::text AS archive,
+        title,
+        LEFT(summary, 200) AS description,
         coords_2d[1]::double precision AS raw_x,
         coords_2d[2]::double precision AS raw_y,
         COALESCE(countries_iso, ARRAY[]::text[]) AS raw_country_codes,
@@ -200,6 +202,8 @@ WITH atlas_base AS (
         accession,
         'sra'::text AS source,
         'SRA'::text AS archive,
+        title,
+        LEFT(abstract, 200) AS description,
         coords_2d[1]::double precision AS raw_x,
         coords_2d[2]::double precision AS raw_y,
         ARRAY[]::text[] AS raw_country_codes,
@@ -249,6 +253,8 @@ country_agg AS (
 SELECT
     b.accession,
     b.archive,
+    b.title,
+    b.description,
     b.raw_x,
     b.raw_y,
     COALESCE(c.country_pairs, '[]'::jsonb) AS country_pairs,
@@ -919,6 +925,8 @@ def _normalize_country_metadata(
 def _build_atlas_row(
     accession: str,
     archive: str,
+    title: str | None,
+    description: str | None,
     x: float,
     y: float,
     country_pairs: list[dict] | None,
@@ -929,19 +937,17 @@ def _build_atlas_row(
         country_pairs, raw_country_codes, raw_country_labels
     )
     countries_display = ", ".join(country_labels)
-    countries_text = countries_display or "Unknown"
+    title_text = title or accession
+    desc_text = description or ""
     return {
         "accession": accession,
         "archive": archive,
+        "title": title_text,
+        "description": desc_text,
         "country_codes": country_codes,
         "country_labels": country_labels,
         "country_count": len(country_labels),
         "countries_display": countries_display,
-        "atlas_text": (
-            f"Accession: {accession}\n"
-            f"Archive: {archive}\n"
-            f"Countries: {countries_text}"
-        ),
         "project_link": f"/p/{accession}",
         "x": x,
         "y": y,
@@ -1015,6 +1021,8 @@ def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str, list[dict]]:
         atlas_row = _build_atlas_row(
             accession=row["accession"],
             archive=row["archive"],
+            title=row.get("title"),
+            description=row.get("description"),
             x=_normalize_to_extent(row["raw_x"], min_x, max_x, _ATLAS_HALF_EXTENT),
             y=_normalize_to_extent(row["raw_y"], min_y, max_y, _ATLAS_HALF_EXTENT),
             country_pairs=row.get("country_pairs"),
