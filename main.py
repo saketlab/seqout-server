@@ -929,7 +929,6 @@ def _build_atlas_row(
         country_pairs, raw_country_codes, raw_country_labels
     )
     countries_display = ", ".join(country_labels)
-    countries_text = countries_display or "Unknown"
     return {
         "accession": accession,
         "archive": archive,
@@ -937,11 +936,6 @@ def _build_atlas_row(
         "country_labels": country_labels,
         "country_count": len(country_labels),
         "countries_display": countries_display,
-        "atlas_text": (
-            f"Accession: {accession}\n"
-            f"Archive: {archive}\n"
-            f"Countries: {countries_text}"
-        ),
         "project_link": f"/p/{accession}",
         "x": x,
         "y": y,
