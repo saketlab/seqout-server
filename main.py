@@ -183,6 +183,8 @@ WITH atlas_base AS (
         accession,
         'geo'::text AS source,
         'GEO'::text AS archive,
+        title,
+        summary AS description,
         coords_2d[1]::double precision AS raw_x,
         coords_2d[2]::double precision AS raw_y,
         COALESCE(countries_iso, ARRAY[]::text[]) AS raw_country_codes,
@@ -200,6 +202,8 @@ WITH atlas_base AS (
         accession,
         'sra'::text AS source,
         'SRA'::text AS archive,
+        title,
+        abstract AS description,
         coords_2d[1]::double precision AS raw_x,
         coords_2d[2]::double precision AS raw_y,
         ARRAY[]::text[] AS raw_country_codes,
@@ -249,6 +253,8 @@ country_agg AS (
 SELECT
     b.accession,
     b.archive,
+    b.title,
+    b.description,
     b.raw_x,
     b.raw_y,
     COALESCE(c.country_pairs, '[]'::jsonb) AS country_pairs,
@@ -919,6 +925,8 @@ def _normalize_country_metadata(
 def _build_atlas_row(
     accession: str,
     archive: str,
+    title: str | None,
+    description: str | None,
     x: float,
     y: float,
     country_pairs: list[dict] | None,
@@ -930,18 +938,26 @@ def _build_atlas_row(
     )
     countries_display = ", ".join(country_labels)
     countries_text = countries_display or "Unknown"
+    title_text = title or accession
+    description_text = description or ""
+    atlas_lines = [
+        f"Title: {title_text}",
+        f"Accession: {accession}",
+        f"Archive: {archive}",
+        f"Countries: {countries_text}",
+    ]
+    if description_text:
+        atlas_lines.append(f"Description: {description_text}")
     return {
         "accession": accession,
         "archive": archive,
+        "title": title_text,
+        "description": description_text,
         "country_codes": country_codes,
         "country_labels": country_labels,
         "country_count": len(country_labels),
         "countries_display": countries_display,
-        "atlas_text": (
-            f"Accession: {accession}\n"
-            f"Archive: {archive}\n"
-            f"Countries: {countries_text}"
-        ),
+        "atlas_text": "\n".join(atlas_lines),
         "project_link": f"/p/{accession}",
         "x": x,
         "y": y,
@@ -1015,6 +1031,8 @@ def _build_atlas_payloads() -> tuple[bytes, bytes, str, str, str, list[dict]]:
         atlas_row = _build_atlas_row(
             accession=row["accession"],
             archive=row["archive"],
+            title=row.get("title"),
+            description=row.get("description"),
             x=_normalize_to_extent(row["raw_x"], min_x, max_x, _ATLAS_HALF_EXTENT),
             y=_normalize_to_extent(row["raw_y"], min_y, max_y, _ATLAS_HALF_EXTENT),
             country_pairs=row.get("country_pairs"),
