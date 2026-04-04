@@ -272,7 +272,7 @@ _bin_cache_lock = threading.Lock()
 _bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"ready": False, "rows": []}
-_ATLAS_SCHEMA_VERSION = "v1"
+_ATLAS_SCHEMA_VERSION = "v2"
 _ATLAS_EXTENT = 2200.0
 _ATLAS_HALF_EXTENT = _ATLAS_EXTENT / 2
 _ATLAS_CACHE_CONTROL = "public, max-age=2592000, immutable"
@@ -1294,6 +1294,37 @@ def _get_suggestions(q: str) -> list[dict]:
 )
 def hello():
     return {"message": "pysradb-server is up and running!", "errors": None}
+
+
+@api_app.post(
+    "/cache/purge",
+    summary="Purge all in-memory caches",
+    description="Reset every server-side cache so the next request rebuilds from the database.",
+    operation_id="purge_cache",
+)
+@limiter.limit("5/minute")
+def purge_cache(request: Request):
+    with _atlas_cache_lock:
+        _atlas_cache["ready"] = False
+    with _bin_cache_lock:
+        _bin_cache["ready"] = False
+    with _clusters_cache_lock:
+        _clusters_cache["ready"] = False
+    with _growth_cache_lock:
+        _growth_cache["ready"] = False
+    with _spelling_cache_lock:
+        _spelling_cache["ready"] = False
+    with _global_contributions_cache_lock:
+        _global_contributions_cache["ready"] = False
+    with _global_contributions_filters_cache_lock:
+        _global_contributions_filters_cache["ready"] = False
+    with _organism_growth_cache_lock:
+        _organism_growth_cache.clear()
+    with _organisms_list_cache_lock:
+        _organisms_list_cache.clear()
+    with _organism_totals_cache_lock:
+        _organism_totals_cache.clear()
+    return {"message": "All caches purged."}
 
 
 @api_app.get(
