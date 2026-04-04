@@ -934,9 +934,6 @@ def _build_atlas_row(
         "archive": archive,
         "country_codes": country_codes,
         "country_labels": country_labels,
-        "country_count": len(country_labels),
-        "countries_display": countries_display,
-        "project_link": f"/p/{accession}",
         "x": x,
         "y": y,
     }
