@@ -323,7 +323,7 @@ with pool.connection() as _conn:
     GLOBAL_CONTRIBUTIONS_FILTERS_SQL = init_global_contributions_filters_sql()
 
 limiter = Limiter(key_func=get_remote_address)
-api_app = FastAPI()
+api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 api_app.state.limiter = limiter
 
 
