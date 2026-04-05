@@ -86,6 +86,13 @@ from queries import (
     GROWTH_BYTES_SRA_FASTQ_SQL,
     GROWTH_BYTES_SRA_SRA_SQL,
     GROWTH_ORGANISM_SQL,
+    GROWTH_PLATFORM_SQL,
+    GROWTH_PLATFORM_INSTRUMENT_SQL,
+    GROWTH_PLATFORM_PROJECTS_SQL,
+    PLATFORM_TOTALS_SQL,
+    PLATFORM_INSTRUMENTS_SQL,
+    PLATFORM_FILTERS_SQL,
+    build_platform_growth_filtered_sql,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
     ORGANISM_SEARCH_SQL,
@@ -1047,9 +1054,7 @@ def _get_atlas_payloads() -> tuple[bytes, bytes, str, str, str]:
         )
         labels_json = json.dumps(labels, separators=(",", ":")).encode("utf-8")
         labels_hash = hashlib.sha256(labels_json).hexdigest()[:16]
-        labels_etag = (
-            f'"atlas-labels-{_ATLAS_SCHEMA_VERSION}-{labels_hash}"'
-        )
+        labels_etag = f'"atlas-labels-{_ATLAS_SCHEMA_VERSION}-{labels_hash}"'
         _atlas_cache["ready"] = True
         _atlas_cache["raw"] = raw_bytes
         _atlas_cache["gzip"] = gzip_bytes
@@ -1321,6 +1326,10 @@ def purge_cache(request: Request):
         _organisms_list_cache.clear()
     with _organism_totals_cache_lock:
         _organism_totals_cache.clear()
+    with _platform_growth_cache_lock:
+        _platform_growth_cache.clear()
+    with _platform_filters_cache_lock:
+        _platform_filters_cache.clear()
     return {"message": "All caches purged."}
 
 
@@ -2089,6 +2098,274 @@ def list_organisms(
     return {
         "organisms": organisms,
         "total": len(organisms),
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+# ---
+# Platform display names
+# ---
+_PLATFORM_DISPLAY_NAMES: dict[str, str] = {}
+_platform_csv = os.path.join(os.path.dirname(__file__), "data", "platforms.csv")
+if os.path.exists(_platform_csv):
+    with open(_platform_csv) as _f:
+        for _row in csv.DictReader(_f):
+            _PLATFORM_DISPLAY_NAMES[_row["platform"]] = _row["display_name"]
+
+
+@api_app.get("/platforms", include_in_schema=False)
+@api_app.get(
+    "/stats/platform-totals",
+    summary="Total experiments per platform",
+    description=(
+        "Return total experiment counts per sequencing platform across databases. "
+        "Also available at /platforms."
+    ),
+    operation_id="get_platform_totals",
+)
+@limiter.limit("20/minute")
+def get_platform_totals(request: Request):
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(PLATFORM_TOTALS_SQL)
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_platform_totals")
+        raise HTTPException(500, "Internal server error")
+
+    platforms = [
+        {
+            "name": r["platform"],  # alias for backwards compat
+            "platform": r["platform"],
+            "display_name": _PLATFORM_DISPLAY_NAMES.get(r["platform"], r["platform"]),
+            "total": r["total"],
+            "geo": r["geo"],
+            "sra": r["sra"],
+            "ena": r["ena"],
+        }
+        for r in rows
+    ]
+    return {
+        "platforms": platforms,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+_platform_growth_cache: dict[str, dict] = {}
+_platform_growth_cache_lock = threading.Lock()
+
+
+@api_app.get(
+    "/stats/platform-growth",
+    summary="Platform growth over time",
+    description=(
+        "Return monthly experiment or project counts for a sequencing platform. "
+        "Optionally filter by instrument_model. "
+        "Returns {platform, mode, series: {db: [{month, count, cumulative}]}, took_ms}."
+    ),
+    operation_id="get_platform_growth",
+)
+@limiter.limit("20/minute")
+def get_platform_growth(
+    request: Request,
+    platform: str = Query(..., description="Platform code, e.g. ILLUMINA"),
+    mode: str = Query("experiments", pattern="^(experiments|projects)$"),
+    instrument_model: str | None = Query(
+        None, description="Drill down to specific instrument"
+    ),
+    organism: str | None = Query(
+        None, description="Filter by organism (dominant_scientific_name)"
+    ),
+    assay: str | None = Query(None, description="Filter by assay (dominant_assay_l2)"),
+    country: str | None = Query(None, description="Filter by country"),
+):
+    has_cross_filter = any([organism, assay, country])
+    cache_key = f"{platform}:{mode}:{instrument_model or ''}:{organism or ''}:{assay or ''}:{country or ''}"
+    with _platform_growth_cache_lock:
+        now = time.time()
+        cached = _platform_growth_cache.get(cache_key)
+        if cached and (now - cached["built_at"]) < _GROWTH_CACHE_TTL:
+            return {
+                "platform": platform,
+                "display_name": _PLATFORM_DISPLAY_NAMES.get(platform, platform),
+                "mode": mode,
+                "instrument_model": instrument_model,
+                "filters": {"organism": organism, "assay": assay, "country": country},
+                "series": cached["series"],
+                "took_ms": 0,
+            }
+
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if has_cross_filter:
+                    # Live query when cross-filters are active
+                    sql, params = build_platform_growth_filtered_sql(
+                        platform,
+                        mode,
+                        instrument_model,
+                        organism,
+                        assay,
+                        country,
+                    )
+                    cur.execute(sql, params)
+                elif mode == "projects":
+                    cur.execute(GROWTH_PLATFORM_PROJECTS_SQL, (platform,))
+                elif instrument_model:
+                    cur.execute(
+                        GROWTH_PLATFORM_INSTRUMENT_SQL, (platform, instrument_model)
+                    )
+                else:
+                    cur.execute(GROWTH_PLATFORM_SQL, (platform,))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_platform_growth")
+        raise HTTPException(500, "Internal server error")
+
+    series: dict[str, list] = {}
+    for r in rows:
+        db_name = r["db"]
+        if db_name not in series:
+            series[db_name] = []
+        series[db_name].append({"month": r["month"], "count": r["count"]})
+
+    for db_name, points in series.items():
+        cumulative = 0
+        for p in points:
+            cumulative += p["count"]
+            p["cumulative"] = cumulative
+
+    with _platform_growth_cache_lock:
+        # Evict stale entries and cap at 500
+        now_ts = time.time()
+        stale = [
+            k
+            for k, v in _platform_growth_cache.items()
+            if now_ts - v["built_at"] >= _GROWTH_CACHE_TTL
+        ]
+        for k in stale:
+            del _platform_growth_cache[k]
+        if len(_platform_growth_cache) >= 500:
+            oldest = min(
+                _platform_growth_cache,
+                key=lambda k: _platform_growth_cache[k]["built_at"],
+            )
+            del _platform_growth_cache[oldest]
+        _platform_growth_cache[cache_key] = {
+            "series": series,
+            "built_at": now_ts,
+        }
+
+    return {
+        "platform": platform,
+        "display_name": _PLATFORM_DISPLAY_NAMES.get(platform, platform),
+        "mode": mode,
+        "instrument_model": instrument_model,
+        "filters": {"organism": organism, "assay": assay, "country": country},
+        "series": series,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/stats/platform-instruments",
+    summary="Instruments for a platform",
+    description="Return instrument models for a platform with experiment counts.",
+    operation_id="get_platform_instruments",
+)
+@limiter.limit("20/minute")
+def get_platform_instruments(
+    request: Request,
+    platform: str = Query(..., description="Platform code, e.g. ILLUMINA"),
+):
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(PLATFORM_INSTRUMENTS_SQL, (platform,))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_platform_instruments")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "platform": platform,
+        "instruments": [
+            {"instrument_model": r["instrument_model"], "total": r["total"]}
+            for r in rows
+        ],
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+_platform_filters_cache: dict[str, dict] = {}
+_platform_filters_cache_lock = threading.Lock()
+
+
+@api_app.get(
+    "/stats/platform-filters",
+    summary="Filter options for a platform",
+    description=(
+        "Return available organisms, assays, and countries for a platform. "
+        "Used to populate filter dropdowns in the sequencing technology stats card."
+    ),
+    operation_id="get_platform_filters",
+)
+@limiter.limit("20/minute")
+def get_platform_filters(
+    request: Request,
+    platform: str = Query(..., description="Platform code, e.g. ILLUMINA"),
+):
+    with _platform_filters_cache_lock:
+        cached = _platform_filters_cache.get(platform)
+        if cached and (time.time() - cached["built_at"]) < _GROWTH_CACHE_TTL:
+            return {
+                "platform": platform,
+                "organisms": cached["organisms"],
+                "assays": cached["assays"],
+                "countries": cached["countries"],
+                "took_ms": 0,
+            }
+
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET LOCAL statement_timeout = '30s'")
+                cur.execute(PLATFORM_FILTERS_SQL, (platform,))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_platform_filters")
+        raise HTTPException(500, "Internal server error")
+
+    organisms = []
+    assays = []
+    countries = []
+    for r in rows:
+        item = {"value": r["value"], "count": r["count"]}
+        if r["filter_type"] == "organism":
+            organisms.append(item)
+        elif r["filter_type"] == "assay":
+            assays.append(item)
+        elif r["filter_type"] == "country":
+            countries.append(item)
+
+    with _platform_filters_cache_lock:
+        _platform_filters_cache[platform] = {
+            "organisms": organisms,
+            "assays": assays,
+            "countries": countries,
+            "built_at": time.time(),
+        }
+
+    return {
+        "platform": platform,
+        "organisms": organisms,
+        "assays": assays,
+        "countries": countries,
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
 
@@ -4157,6 +4434,9 @@ def search_structured(
     assay_l2: str | None = Query(
         None, description="Filter by dominant assay L2 (from unified_metadata)"
     ),
+    multi_platform: bool = Query(
+        False, description="Only studies with 2+ sequencing platforms"
+    ),
 ):
     if q:
         q = _normalize_query(q)
@@ -4191,13 +4471,14 @@ def search_structured(
             has_geo_filter,
             assay_l1,
             assay_l2,
+            multi_platform,
         ]
     ):
         raise HTTPException(
             400,
             "At least one of q, organism, library_strategy, platform, "
             "country, center, year_from, year_to, journal, "
-            "instrument_model, assay_l1, assay_l2, or a geo_* filter is required",
+            "instrument_model, assay_l1, assay_l2, multi_platform, or a geo_* filter is required",
         )
 
     if year_from is not None and year_to is not None and year_from > year_to:
@@ -4237,6 +4518,7 @@ def search_structured(
         geo_radius_km=geo_radius_km,
         assay_l1=assay_l1,
         assay_l2=assay_l2,
+        multi_platform=multi_platform,
     )
 
     start = time.perf_counter()
@@ -4618,7 +4900,11 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
      (filters by the primary publication's journal across all sources)
    - `instrument_model`: exact instrument model, e.g. "Illumina HiSeq 2500"
      (GEO and SRA only; ArrayExpress and ENA are excluded when this filter is active)
+   - `multi_platform`: set to `true` to find only studies with 2+ sequencing platforms
+     (e.g. mixed Illumina + Nanopore). GEO and SRA only.
    - `source`: restrict to "geo", "sra", "arrayexpress", "ena", or "all"
+   Results include a `platforms` array (e.g. `["ILLUMINA", "OXFORD_NANOPORE"]`) showing
+   which sequencing platforms each study used.
    Use `search_all` for simple keyword searches; use `search_structured` when specific
    metadata filters are needed.
 
@@ -4756,6 +5042,28 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
     basic LLM-extracted fields. Returns 404 if no enriched data exists.
     Use this when the user asks for structured/parsed sample attributes beyond what the
     raw metadata provides.
+
+21. **Platform totals** — call `get_platform_totals` to get total experiment counts
+    per sequencing platform (ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT, etc.) with
+    per-database breakdown (geo, sra, ena) and display names. Also available at
+    `/platforms`. Use this when the user asks which sequencing technologies are most
+    used, or wants a breakdown of platforms.
+
+22. **Platform growth** — call `get_platform_growth` with a platform code (e.g.
+    `platform=ILLUMINA`) to get monthly experiment or project counts. Options:
+    - `mode=experiments` (default) or `mode=projects`
+    - `instrument_model`: drill down to specific instrument (e.g. "Illumina NovaSeq 6000")
+    - `organism`, `assay`, `country`: cross-filters using unified_metadata
+    Returns per-db series (geo, sra, ena) with monthly count and cumulative total.
+    Use this when the user asks about growth trends for a specific sequencing technology.
+
+23. **Platform instruments** — call `get_platform_instruments` with a platform code to
+    get all instrument models for that platform with experiment counts. E.g. for
+    OXFORD_NANOPORE returns GridION, MinION, PromethION with their counts.
+
+24. **Platform filters** — call `get_platform_filters` with a platform code to get
+    available organisms, assays (dominant_assay_l2), and countries for that platform.
+    Used to populate filter dropdowns. Each filter value includes a count.
 
 ## Context rules
 

@@ -1137,6 +1137,7 @@ def build_structured_search(
     geo_radius_km=None,
     assay_l1=None,
     assay_l2=None,
+    multi_platform=False,
 ):
     """Build SQL + params for structured search across GEO, SRA, ArrayExpress, ENA.
 
@@ -1159,6 +1160,9 @@ def build_structured_search(
     if country:
         include_ae = False
     if instrument_model:
+        include_ae = False
+        include_ena = False
+    if multi_platform:
         include_ae = False
         include_ena = False
 
@@ -1242,6 +1246,8 @@ def build_structured_search(
             )
         if instrument_model:
             w.append("g.instrument_models @> ARRAY[%(instrument_model)s]")
+        if multi_platform:
+            w.append("array_length(g.platforms, 1) >= 2")
 
         rank = (
             "ts_rank(g.tsv, plainto_tsquery('english', %(q)s))"
@@ -1253,7 +1259,7 @@ def build_structured_search(
             f"SELECT g.accession, g.title, g.summary,"
             f" g.updated_at, g.organisms, g.countries_iso AS countries,"
             f" {rank} AS rank, 'geo'::text AS source,"
-            f" g.accession AS dedup_key, g.instrument_models, g.library_strategies"
+            f" g.accession AS dedup_key, g.instrument_models, g.library_strategies, g.platforms"
             f" FROM geo_series g{joins}{where}"
         )
 
@@ -1297,6 +1303,8 @@ def build_structured_search(
             )
         if instrument_model:
             w.append("s.instrument_models @> ARRAY[%(instrument_model)s]")
+        if multi_platform:
+            w.append("array_length(s.platforms, 1) >= 2")
 
         rank = (
             "ts_rank(s.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
@@ -1308,7 +1316,7 @@ def build_structured_search(
             f"SELECT s.accession, s.title, s.abstract AS summary,"
             f" s.updated_at, s.organisms, s.countries,"
             f" {rank} AS rank, 'sra'::text AS source,"
-            f" COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
+            f" COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies, s.platforms"
             f" FROM sra_studies s{joins}{where}"
         )
 
@@ -1347,7 +1355,7 @@ def build_structured_search(
             f"SELECT ae.accession, ae.title, ae.description AS summary,"
             f" ae.release_date AS updated_at, ae.organisms, ae.countries,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
-            f" COALESCE(ae.alias, ae.accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            f" COALESCE(ae.alias, ae.accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
             f" FROM arrayexpress_experiments ae{joins}{where}"
         )
 
@@ -1406,7 +1414,7 @@ def build_structured_search(
             f" THEN ARRAY[es.scientific_name] END AS organisms,"
             f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
-            f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
             f" FROM ena_studies es{joins}{where}"
         )
 
@@ -2048,6 +2056,145 @@ FROM organism_growth_monthly
 WHERE organism = %s
 ORDER BY db, month;
 """
+
+# ---------------------------------------------------------------------------
+# Platform growth: monthly counts filtered by platform
+# ---------------------------------------------------------------------------
+
+GROWTH_PLATFORM_SQL = """
+SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, SUM(count) AS count
+FROM platform_growth_monthly
+WHERE platform = %s
+GROUP BY month, db
+ORDER BY db, month;
+"""
+
+GROWTH_PLATFORM_INSTRUMENT_SQL = """
+SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, SUM(count) AS count
+FROM platform_growth_monthly
+WHERE platform = %s AND instrument_model = %s
+GROUP BY month, db
+ORDER BY db, month;
+"""
+
+GROWTH_PLATFORM_PROJECTS_SQL = """
+SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, count
+FROM platform_growth_projects_monthly
+WHERE platform = %s
+ORDER BY db, month;
+"""
+
+PLATFORM_TOTALS_SQL = """
+SELECT platform, SUM(count) AS total,
+       SUM(CASE WHEN db = 'geo' THEN count ELSE 0 END) AS geo,
+       SUM(CASE WHEN db = 'sra' THEN count ELSE 0 END) AS sra,
+       SUM(CASE WHEN db = 'ena' THEN count ELSE 0 END) AS ena
+FROM platform_growth_monthly
+GROUP BY platform
+ORDER BY total DESC;
+"""
+
+PLATFORM_INSTRUMENTS_SQL = """
+SELECT instrument_model, SUM(count) AS total
+FROM platform_growth_monthly
+WHERE platform = %s
+  AND instrument_model IS NOT NULL
+  AND instrument_model != ''
+  AND instrument_model != 'unspecified'
+GROUP BY instrument_model
+ORDER BY total DESC;
+"""
+
+PLATFORM_FILTERS_SQL = """
+WITH platform_studies AS MATERIALIZED (
+    SELECT u.dominant_scientific_name, u.dominant_assay_l2, u.country
+    FROM sra_studies s
+    JOIN unified_metadata u ON u.canonical_accession = COALESCE(s.alias, s.accession)
+    WHERE s.platforms @> ARRAY[%s]
+)
+SELECT 'organism' AS filter_type, dominant_scientific_name AS value, COUNT(*) AS count
+FROM platform_studies
+WHERE dominant_scientific_name IS NOT NULL
+GROUP BY dominant_scientific_name
+HAVING COUNT(*) >= 5
+
+UNION ALL
+
+SELECT 'assay', dominant_assay_l2, COUNT(*)
+FROM platform_studies
+WHERE dominant_assay_l2 IS NOT NULL AND dominant_assay_l2 != ''
+GROUP BY dominant_assay_l2
+
+UNION ALL
+
+SELECT 'country', country, COUNT(*)
+FROM platform_studies
+WHERE country IS NOT NULL AND country != ''
+GROUP BY country
+HAVING COUNT(*) >= 5
+
+ORDER BY filter_type, count DESC;
+"""
+
+
+def build_platform_growth_filtered_sql(
+    platform: str,
+    mode: str = "experiments",
+    instrument_model: str | None = None,
+    organism: str | None = None,
+    assay: str | None = None,
+    country: str | None = None,
+) -> tuple[str, list]:
+    """Build live query for platform growth with cross-filters.
+
+    Uses unified_metadata for organism/assay/country matching (same source as
+    the global contributions card). Cross-filtered queries only cover SRA/GEO
+    (sra_experiments + sra_studies). ENA is excluded because unified_metadata
+    does not reliably cover ENA experiments for cross-dimensional filtering.
+    """
+    params: list = []
+    exp_conditions = ["e.platform = %s", "st.published_at IS NOT NULL"]
+    params.append(platform)
+
+    if instrument_model:
+        exp_conditions.append("e.instrument_model = %s")
+        params.append(instrument_model)
+
+    # Join to unified_metadata for cross-filters (COALESCE for single index probe)
+    um_join = ""
+    um_conditions: list[str] = []
+    if organism or assay or country:
+        um_join = " JOIN unified_metadata u ON u.canonical_accession = COALESCE(st.alias, st.accession)"
+        if organism:
+            um_conditions.append("u.dominant_scientific_name = %s")
+            params.append(organism)
+        if assay:
+            um_conditions.append("u.dominant_assay_l2 = %s")
+            params.append(assay)
+        if country:
+            um_conditions.append("u.country = %s")
+            params.append(country)
+
+    where = " AND ".join(exp_conditions + um_conditions)
+
+    if mode == "projects":
+        select = "COUNT(DISTINCT st.accession)"
+    else:
+        select = "COUNT(*)"
+
+    sql = f"""
+    SELECT TO_CHAR(DATE_TRUNC('month', st.published_at), 'YYYY-MM') AS month,
+           CASE WHEN st.alias LIKE 'GSE%%' THEN 'geo' ELSE 'sra' END AS db,
+           {select} AS count
+    FROM sra_experiments e
+    JOIN sra_studies st ON st.accession = e.study
+    {um_join}
+    WHERE {where}
+    GROUP BY month, db
+    ORDER BY db, month
+    """
+    return sql, params
+
 
 # ---------------------------------------------------------------------------
 # List all distinct organisms across databases

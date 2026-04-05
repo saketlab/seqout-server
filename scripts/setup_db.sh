@@ -357,11 +357,90 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ogm_organism_db_month
 CREATE INDEX IF NOT EXISTS idx_ogm_organism
   ON organism_growth_monthly(organism);
 
+-- Materialized view: platform experiment counts by month and database
+CREATE MATERIALIZED VIEW IF NOT EXISTS platform_growth_monthly AS
+  SELECT 'geo'::text AS db,
+         e.platform,
+         e.instrument_model,
+         DATE_TRUNC('month', st.published_at) AS month,
+         COUNT(*) AS count
+  FROM sra_experiments e
+  JOIN sra_studies st ON st.accession = e.study
+  WHERE st.alias LIKE 'GSE%'
+    AND st.published_at IS NOT NULL
+    AND e.platform IS NOT NULL AND e.platform != ''
+  GROUP BY e.platform, e.instrument_model, DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'sra'::text, e.platform, e.instrument_model,
+         DATE_TRUNC('month', st.published_at), COUNT(*)
+  FROM sra_experiments e
+  JOIN sra_studies st ON st.accession = e.study
+  WHERE (st.alias IS NULL OR st.alias NOT LIKE 'GSE%')
+    AND st.published_at IS NOT NULL
+    AND e.platform IS NOT NULL AND e.platform != ''
+  GROUP BY e.platform, e.instrument_model, DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'ena'::text, e.instrument_platform, e.instrument_model,
+         DATE_TRUNC('month', e.first_public), COUNT(*)
+  FROM ena_experiments e
+  WHERE e.first_public IS NOT NULL
+    AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
+  GROUP BY e.instrument_platform, e.instrument_model, DATE_TRUNC('month', e.first_public)
+WITH DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pgm_platform_db_month_model
+  ON platform_growth_monthly(platform, db, month, instrument_model);
+CREATE INDEX IF NOT EXISTS idx_pgm_platform
+  ON platform_growth_monthly(platform);
+
+-- Materialized view: platform project counts by month and database
+CREATE MATERIALIZED VIEW IF NOT EXISTS platform_growth_projects_monthly AS
+  SELECT 'geo'::text AS db,
+         e.platform,
+         DATE_TRUNC('month', st.published_at) AS month,
+         COUNT(DISTINCT st.accession) AS count
+  FROM sra_experiments e
+  JOIN sra_studies st ON st.accession = e.study
+  WHERE st.alias LIKE 'GSE%'
+    AND st.published_at IS NOT NULL
+    AND e.platform IS NOT NULL AND e.platform != ''
+  GROUP BY e.platform, DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'sra'::text, e.platform,
+         DATE_TRUNC('month', st.published_at), COUNT(DISTINCT st.accession)
+  FROM sra_experiments e
+  JOIN sra_studies st ON st.accession = e.study
+  WHERE (st.alias IS NULL OR st.alias NOT LIKE 'GSE%')
+    AND st.published_at IS NOT NULL
+    AND e.platform IS NOT NULL AND e.platform != ''
+  GROUP BY e.platform, DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'ena'::text, e.instrument_platform,
+         DATE_TRUNC('month', e.first_public), COUNT(DISTINCT e.study_accession)
+  FROM ena_experiments e
+  WHERE e.first_public IS NOT NULL
+    AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
+  GROUP BY e.instrument_platform, DATE_TRUNC('month', e.first_public)
+WITH DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pgpm_platform_db_month
+  ON platform_growth_projects_monthly(platform, db, month);
+
 EOF
 
 echo ""
 echo "Refreshing materialized views..."
 PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "REFRESH MATERIALIZED VIEW CONCURRENTLY organism_growth_monthly;"
+PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "REFRESH MATERIALIZED VIEW CONCURRENTLY platform_growth_monthly;" 2>/dev/null || true
+PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "REFRESH MATERIALIZED VIEW CONCURRENTLY platform_growth_projects_monthly;" 2>/dev/null || true
 
 echo ""
 echo "=== Setup Complete ==="
