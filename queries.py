@@ -855,26 +855,28 @@ LIMIT 1;
 # Caller must pass accession already uppercased
 EXPERIMENT_RUNS_SQL = """
 SELECT
-    run_accession,
-    experiment_accession,
-    library_layout,
-    fastq_ftp,
-    fastq_bytes,
-    fastq_md5,
-    sra_ftp,
-    sra_bytes,
-    sra_md5,
-    ncbi_sra_url,
-    ncbi_sra_url_aws,
-    ncbi_sra_normalized_url,
-    ncbi_sra_normalized_bytes,
-    ncbi_sra_lite_url,
-    ncbi_sra_lite_bytes,
-    ncbi_sra_lite_s3_url,
-    ncbi_sra_lite_gs_url
-FROM sra_run_download_links
-WHERE experiment_accession = %s
-ORDER BY run_accession;
+    dl.run_accession,
+    dl.experiment_accession,
+    dl.library_layout,
+    dl.fastq_ftp,
+    dl.fastq_bytes,
+    dl.fastq_md5,
+    dl.sra_ftp,
+    dl.sra_bytes,
+    dl.sra_md5,
+    dl.ncbi_sra_url,
+    dl.ncbi_sra_url_aws,
+    dl.ncbi_sra_normalized_url,
+    dl.ncbi_sra_normalized_bytes,
+    dl.ncbi_sra_lite_url,
+    dl.ncbi_sra_lite_bytes,
+    dl.ncbi_sra_lite_s3_url,
+    dl.ncbi_sra_lite_gs_url,
+    ena.run_alias
+FROM sra_run_download_links dl
+LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+WHERE dl.experiment_accession = %s
+ORDER BY dl.run_accession;
 """
 
 # Get ENA experiment accession from sample accession
@@ -1829,26 +1831,28 @@ STUDY_RUNS_SQL = (
     _RESOLVE_DL_STUDY
     + """
 SELECT
-    run_accession,
-    experiment_accession,
-    library_layout,
-    fastq_ftp,
-    fastq_bytes,
-    fastq_md5,
-    sra_ftp,
-    sra_bytes,
-    sra_md5,
-    ncbi_sra_url,
-    ncbi_sra_url_aws,
-    ncbi_sra_normalized_url,
-    ncbi_sra_normalized_bytes,
-    ncbi_sra_lite_url,
-    ncbi_sra_lite_bytes,
-    ncbi_sra_lite_s3_url,
-    ncbi_sra_lite_gs_url
-FROM sra_run_download_links
-WHERE study_accession IN (SELECT acc FROM candidates)
-ORDER BY experiment_accession, run_accession;
+    dl.run_accession,
+    dl.experiment_accession,
+    dl.library_layout,
+    dl.fastq_ftp,
+    dl.fastq_bytes,
+    dl.fastq_md5,
+    dl.sra_ftp,
+    dl.sra_bytes,
+    dl.sra_md5,
+    dl.ncbi_sra_url,
+    dl.ncbi_sra_url_aws,
+    dl.ncbi_sra_normalized_url,
+    dl.ncbi_sra_normalized_bytes,
+    dl.ncbi_sra_lite_url,
+    dl.ncbi_sra_lite_bytes,
+    dl.ncbi_sra_lite_s3_url,
+    dl.ncbi_sra_lite_gs_url,
+    ena.run_alias
+FROM sra_run_download_links dl
+LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+WHERE dl.study_accession IN (SELECT acc FROM candidates)
+ORDER BY dl.experiment_accession, dl.run_accession;
 """
 )
 
@@ -1856,26 +1860,28 @@ STUDY_RUNS_PREVIEW_SQL = (
     _RESOLVE_DL_STUDY
     + """
 SELECT
-    run_accession,
-    experiment_accession,
-    library_layout,
-    fastq_ftp,
-    fastq_bytes,
-    fastq_md5,
-    sra_ftp,
-    sra_bytes,
-    sra_md5,
-    ncbi_sra_url,
-    ncbi_sra_url_aws,
-    ncbi_sra_normalized_url,
-    ncbi_sra_normalized_bytes,
-    ncbi_sra_lite_url,
-    ncbi_sra_lite_bytes,
-    ncbi_sra_lite_s3_url,
-    ncbi_sra_lite_gs_url
-FROM sra_run_download_links
-WHERE study_accession IN (SELECT acc FROM candidates)
-ORDER BY experiment_accession, run_accession
+    dl.run_accession,
+    dl.experiment_accession,
+    dl.library_layout,
+    dl.fastq_ftp,
+    dl.fastq_bytes,
+    dl.fastq_md5,
+    dl.sra_ftp,
+    dl.sra_bytes,
+    dl.sra_md5,
+    dl.ncbi_sra_url,
+    dl.ncbi_sra_url_aws,
+    dl.ncbi_sra_normalized_url,
+    dl.ncbi_sra_normalized_bytes,
+    dl.ncbi_sra_lite_url,
+    dl.ncbi_sra_lite_bytes,
+    dl.ncbi_sra_lite_s3_url,
+    dl.ncbi_sra_lite_gs_url,
+    ena.run_alias
+FROM sra_run_download_links dl
+LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+WHERE dl.study_accession IN (SELECT acc FROM candidates)
+ORDER BY dl.experiment_accession, dl.run_accession
 LIMIT 500;
 """
 )

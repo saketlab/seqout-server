@@ -2819,6 +2819,7 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
 
     common = {
         "run_accession": run,
+        "run_alias": row.get("run_alias") or "",
         "experiment_accession": exp,
         "library_layout": row.get("library_layout") or "",
         "sra_lite_url": sra_lite_url,
@@ -3043,7 +3044,7 @@ def download_study_runs_tsv(
 
     def generate():
         header = (
-            "run_accession\texperiment_accession\tlibrary_layout\t"
+            "run_accession\trun_alias\texperiment_accession\tlibrary_layout\t"
             "fastq_url\tfastq_bytes\tfastq_md5\t"
             "sra_lite_url\tsra_lite_bytes\t"
             "sra_url\tsra_bytes\t"
@@ -3063,6 +3064,7 @@ def download_study_runs_tsv(
                             for entry in _split_fastq_fields(row, study):
                                 yield (
                                     f"{entry['run_accession']}\t"
+                                    f"{entry['run_alias']}\t"
                                     f"{entry['experiment_accession']}\t"
                                     f"{entry['library_layout']}\t"
                                     f"{entry['fastq_url']}\t"
@@ -3207,6 +3209,7 @@ def download_study_metadata_csv(
     attr_cols = [f"sample_attribute:{k}" for k in all_attr_keys]
     run_cols = [
         "run_accession",
+        "run_alias",
         "fastq_ftp",
         "fastq_bytes",
         "fastq_md5",
@@ -3230,6 +3233,7 @@ def download_study_metadata_csv(
         return {
             "study_accession": study,
             "run_accession": run.get("run_accession") or "",
+            "run_alias": run.get("run_alias") or "",
             "fastq_ftp": run.get("fastq_ftp") or "",
             "fastq_bytes": run.get("fastq_bytes") or "",
             "fastq_md5": run.get("fastq_md5") or "",
@@ -3825,6 +3829,7 @@ def download_sample_detail_csv(
                 "platform": experiment.get("platform", ""),
                 "instrument_model": experiment.get("instrument_model", ""),
                 "run_accession": run.get("run_accession", ""),
+                "run_alias": run.get("run_alias", ""),
                 "fastq_ftp": run.get("fastq_ftp", ""),
                 "fastq_bytes": run.get("fastq_bytes", ""),
                 "fastq_md5": run.get("fastq_md5", ""),
@@ -5108,10 +5113,10 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
 # combined_app.add_middleware(
-#    CORSMiddleware,
-#    allow_origins=["*"],
-#    allow_methods=["*"],
-#    allow_headers=["*"],
+#  CORSMiddleware,
+#  allow_origins=["*"],
+#  allow_methods=["*"],
+#  allow_headers=["*"],
 # )
 
 app = combined_app
