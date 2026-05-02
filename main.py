@@ -5100,7 +5100,7 @@ mcp = FastMCP.from_fastapi(
     name="pysraweb MCP",
     instructions=MCP_INSTRUCTIONS,
 )
-mcp_app = mcp.http_app(path="/mcp")
+mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
 combined_app = FastAPI(
     title="seqout API",
