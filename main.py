@@ -3309,15 +3309,15 @@ def _resume_status_preamble(paths: list[str]) -> str:
     """Bash snippet that counts completed files on disk and echoes remaining %."""
     if not paths:
         return ""
-    quoted = "\n".join(f'  "{p}"' for p in paths)
+    quoted = "\n".join(f"  {_shell_escape(p)}" for p in paths)
     return (
         "# Resume status: count files already complete on disk\n"
         f"expected_files=(\n{quoted}\n)\n"
-        'done=0; for f in "${expected_files[@]}"; do [ -s "$f" ] && done=$((done+1)); done\n'
+        'complete=0; for f in "${expected_files[@]}"; do [ -s "$f" ] && complete=$((complete+1)); done\n'
         "total=${#expected_files[@]}\n"
-        "remaining=$((total - done))\n"
-        "pct=$(( total > 0 ? 100 - done * 100 / total : 0 ))\n"
-        'echo "Resume: $done/$total files already complete; $remaining remaining'
+        "remaining=$((total - complete))\n"
+        "pct=$(( total > 0 ? 100 - complete * 100 / total : 0 ))\n"
+        'echo "Resume: $complete/$total files already complete; $remaining remaining'
         ' (~${pct}% of files left to download)."\n\n'
     )
 
@@ -3403,13 +3403,14 @@ def download_study_script(
                                 continue
                             dirpath = entry["directory_path"]
                             filename = entry["filename"]
+                            path = f"{dirpath}/{filename}"
                             lines.append(
                                 f'mkdir -p "{dirpath}" && {cmd_tpl.format(url=url, dirpath=dirpath, filename=filename)}'
                             )
-                            expected_paths.append(f"{dirpath}/{filename}")
+                            expected_paths.append(path)
                             md5 = entry.get(md5_key) or ""
                             if md5:
-                                checksums.append((md5, f"{dirpath}/{filename}"))
+                                checksums.append((md5, path))
     except Exception:
         logger.exception("Error generating download script for %s", study)
         raise HTTPException(500, "Internal error generating download script")
