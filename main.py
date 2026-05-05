@@ -3300,25 +3300,116 @@ def download_study_metadata_csv(
     )
 
 
-_WGET_RESUME = (
-    "wget -c -q --show-progress --tries=10 --timeout=60 --retry-connrefused"
-)
+_DOWNLOAD_HELPER = r"""# Verify file integrity. 
+_is_complete() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  [ -f "$f.done" ] && [ ! "$f" -nt "$f.done" ] && return 0
+  case "$f" in
+    *.gz) gzip -t "$f" 2>/dev/null ;;
+    *.bam)
+      if command -v samtools >/dev/null 2>&1; then
+        samtools quickcheck "$f" 2>/dev/null
+      else
+        return 0
+      fi
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+_human() { numfmt --to=iec --suffix=B --format='%.1f' "$1" 2>/dev/null || echo "${1}B"; }
+
+_done_count=0
+_total_count=0
+
+download_one() {
+  local url="$1" out="$2" method="${3:-wget}"
+  _done_count=$((_done_count + 1))
+  local prefix="[$_done_count/$_total_count] $out"
+  printf '%s: checking... ' "$prefix" >&2
+  if _is_complete "$out"; then
+    : > "$out.done"
+    echo "valid, skip" >&2
+    return 0
+  fi
+  mkdir -p "${out%/*}"
+  if [ -s "$out" ] && { [ "$method" = "wget" ] || [ "$method" = "curl" ]; }; then
+    echo "partial, resuming" >&2
+    rm -f "$out.done"
+    case "$method" in
+      wget) wget -c -q --show-progress --tries=10 --timeout=60 --retry-connrefused -O "$out" "$url" || true ;;
+      curl) curl -L -C - --retry 10 --retry-delay 5 --retry-all-errors --fail -o "$out" "$url" || true ;;
+    esac
+    if _is_complete "$out"; then
+      : > "$out.done"
+      echo "$prefix: resumed OK" >&2
+      return 0
+    fi
+    echo "$prefix: WARN integrity check failed after resume; redownloading from scratch" >&2
+    rm -f "$out" "$out.done"
+  else
+    echo "missing, downloading" >&2
+    rm -f "$out.done"
+  fi
+  case "$method" in
+    wget)   wget -q --show-progress --tries=10 --timeout=60 --retry-connrefused -O "$out" "$url" ;;
+    curl)   curl -L --retry 10 --retry-delay 5 --retry-all-errors --fail -o "$out" "$url" ;;
+    aws)    aws s3 cp --no-progress "$url" "$out" ;;
+    gsutil) gsutil cp "$url" "$out" ;;
+    *) echo "ERR: unknown download method '$method'" >&2; return 1 ;;
+  esac
+  _is_complete "$out" || { echo "$prefix: ERR corrupted after fresh download (re-run script)" >&2; rm -f "$out" "$out.done"; return 1; }
+  : > "$out.done"
+  echo "$prefix: done" >&2
+}
+
+"""
 
 
-def _resume_status_preamble(paths: list[str]) -> str:
-    """Bash snippet that counts completed files on disk and echoes remaining %."""
+def _coerce_int(v: object) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resume_status_preamble(
+    paths: list[str], sizes: list[int] | None = None
+) -> str:
+    """Bash snippet that estimates resume progress by file count and bytes."""
     if not paths:
         return ""
     quoted = "\n".join(f"  {_shell_escape(p)}" for p in paths)
+    if sizes and len(sizes) == len(paths):
+        sizes_arr = "\n".join(f"  {s}" for s in sizes)
+        return (
+            "# Resume estimate from local file sizes vs known remote sizes.\n"
+            f"expected_files=(\n{quoted}\n)\n"
+            f"expected_sizes=(\n{sizes_arr}\n)\n"
+            "_total_count=${#expected_files[@]}\n"
+            "present=0; local_bytes=0; total_bytes=0\n"
+            'for i in "${!expected_files[@]}"; do\n'
+            '  exp=${expected_sizes[$i]}; total_bytes=$((total_bytes + exp))\n'
+            '  f=${expected_files[$i]}\n'
+            '  if [ -f "$f" ]; then\n'
+            '    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)\n'
+            '    [ "$sz" -gt "$exp" ] && sz=0\n'
+            "    local_bytes=$((local_bytes + sz))\n"
+            '    [ "$sz" -ge "$exp" ] && [ "$exp" -gt 0 ] && present=$((present + 1))\n'
+            "  fi\n"
+            "done\n"
+            "pct=$(( total_bytes > 0 ? local_bytes * 100 / total_bytes : 0 ))\n"
+            'echo "Resume estimate: $present/$_total_count files complete '
+            '($(_human $local_bytes) / $(_human $total_bytes) ≈ ${pct}%)."\n\n'
+        )
     return (
-        "# Resume status: count files already complete on disk\n"
+        "# Resume estimate. \n"
         f"expected_files=(\n{quoted}\n)\n"
-        'complete=0; for f in "${expected_files[@]}"; do [ -s "$f" ] && complete=$((complete+1)); done\n'
-        "total=${#expected_files[@]}\n"
-        "remaining=$((total - complete))\n"
-        "pct=$(( total > 0 ? 100 - complete * 100 / total : 0 ))\n"
-        'echo "Resume: $complete/$total files already complete; $remaining remaining'
-        ' (~${pct}% of files left to download)."\n\n'
+        'present=0; for f in "${expected_files[@]}"; do [ -s "$f" ] && present=$((present+1)); done\n'
+        "_total_count=${#expected_files[@]}\n"
+        'echo "Resume estimate: $present/$_total_count files present on disk'
+        ' (will integrity-check each below)."\n\n'
     )
 
 _DOWNLOAD_MODES = {
@@ -3326,31 +3417,36 @@ _DOWNLOAD_MODES = {
         "label": "FASTQ files",
         "url_key": "fastq_url",
         "md5_key": "fastq_md5",
-        "cmd": _WGET_RESUME + ' -O "{dirpath}/{filename}" "{url}"',
+        "bytes_key": "fastq_bytes",
+        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
     },
     "sra": {
         "label": "SRA format",
         "url_key": "sra_url",
         "md5_key": "sra_md5",
-        "cmd": _WGET_RESUME + ' -O "{dirpath}/{filename}" "{url}"',
+        "bytes_key": "sra_bytes",
+        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
     },
     "sra_lite": {
         "label": "SRA Lite",
         "url_key": "sra_lite_url",
         "md5_key": "sra_md5",
-        "cmd": _WGET_RESUME + ' -O "{dirpath}/{filename}" "{url}"',
+        "bytes_key": "sra_lite_bytes",
+        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
     },
     "s3": {
         "label": "AWS S3",
         "url_key": "s3_url",
         "md5_key": "sra_md5",
-        "cmd": '[ -s "{dirpath}/{filename}" ] || aws s3 cp --no-progress "{url}" "{dirpath}/{filename}"',
+        "bytes_key": "sra_bytes",
+        "cmd": 'download_one "{url}" "{dirpath}/{filename}" aws',
     },
     "gcs": {
         "label": "Google Cloud",
         "url_key": "gs_url",
         "md5_key": "sra_md5",
-        "cmd": '[ -s "{dirpath}/{filename}" ] || gsutil cp "{url}" "{dirpath}/{filename}"',
+        "bytes_key": "sra_bytes",
+        "cmd": 'download_one "{url}" "{dirpath}/{filename}" gsutil',
     },
 }
 
@@ -3381,12 +3477,13 @@ def download_study_script(
 
     url_key = cfg["url_key"]
     md5_key = cfg["md5_key"]
+    bytes_key = cfg.get("bytes_key")
     cmd_tpl = cfg["cmd"]
     label = cfg["label"]
 
-    # Collect all entries first so we can 404 if none have URLs for this mode
     lines: list[str] = []
     expected_paths: list[str] = []
+    expected_sizes: list[int] = []
     checksums: list[tuple[str, str]] = []  # (md5, filepath)
     try:
         with pool.connection() as conn:
@@ -3405,9 +3502,10 @@ def download_study_script(
                             filename = entry["filename"]
                             path = f"{dirpath}/{filename}"
                             lines.append(
-                                f'mkdir -p "{dirpath}" && {cmd_tpl.format(url=url, dirpath=dirpath, filename=filename)}'
+                                cmd_tpl.format(url=url, dirpath=dirpath, filename=filename)
                             )
                             expected_paths.append(path)
+                            expected_sizes.append(_coerce_int(entry.get(bytes_key)) if bytes_key else 0)
                             md5 = entry.get(md5_key) or ""
                             if md5:
                                 checksums.append((md5, path))
@@ -3425,16 +3523,18 @@ def download_study_script(
         f"#!/usr/bin/env bash\n"
         f"# Download {label} for {study}\n"
         f"# Generated by seqout.org\n"
-        f"# Resumable: re-run this script to skip completed files and continue partial transfers.\n\n"
+        f"# Resumable: re-run this script to skip completed files and continue partial transfers.\n"
+        f"# Integrity-checked: corrupted .gz / .bam files are detected and redownloaded automatically.\n\n"
         f"set -euo pipefail\n\n"
-        f"{_resume_status_preamble(expected_paths)}"
+        f"{_DOWNLOAD_HELPER}"
+        f"{_resume_status_preamble(expected_paths, expected_sizes)}"
         f"# Download metadata\n"
         f'curl -sS --retry 10 --retry-delay 5 --retry-all-errors --fail'
         f' "https://seqout.org/api/project/{study}/metadata/download"'
         f' -o "{study}/metadata.csv" --create-dirs\n\n'
     )
     script += "\n".join(lines) + "\n"
-    script += f'\necho "Done — {len(lines)} files saved under ./{study}/"\n'
+    script += f'\necho "Done. {len(lines)} files saved under ./{study}/"\n'
     if checksums:
         script += "\n# Verify checksums\n"
         script += "echo 'Verifying MD5 checksums...'\n"
@@ -3523,13 +3623,7 @@ def download_supplementary_script(
     expected_paths: list[str] = []
     for f in files:
         path = f"{accession}/{f['filename']}"
-        safe_name = _shell_escape(path)
-        safe_url = _shell_escape(f["url"])
-        lines.append(
-            f"mkdir -p {_shell_escape(accession)} && "
-            f"curl -L -C - --retry 10 --retry-delay 5 --retry-all-errors --fail "
-            f"-o {safe_name} {safe_url}"
-        )
+        lines.append(f'download_one "{f["url"]}" "{path}" curl')
         expected_paths.append(path)
 
     script = (
@@ -3537,12 +3631,14 @@ def download_supplementary_script(
         f"# Download supplementary files for {accession}\n"
         f"# {len(files)} file{'s' if len(files) != 1 else ''}\n"
         f"# Generated by seqout.org\n"
-        f"# Resumable: re-run this script to continue any partial/failed transfers.\n\n"
+        f"# Resumable: re-run this script to continue any partial/failed transfers.\n"
+        f"# Integrity-checked: corrupted .gz files are detected and redownloaded automatically.\n\n"
         f"set -euo pipefail\n\n"
+        f"{_DOWNLOAD_HELPER}"
         f"{_resume_status_preamble(expected_paths)}"
     )
     script += "\n".join(lines) + "\n"
-    script += f'\necho "Done — {len(files)} file{"s" if len(files) != 1 else ""} saved under ./{accession}/"\n'
+    script += f'\necho "Done. {len(files)} file{"s" if len(files) != 1 else ""} saved under ./{accession}/"\n'
 
     return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
