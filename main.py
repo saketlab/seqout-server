@@ -3324,17 +3324,23 @@ _done_count=0
 _total_count=0
 
 download_one() {
-  local url="$1" out="$2" method="${3:-wget}"
+  local url="$1" out="$2" method="${3:-wget}" expected="${4:-0}"
   _done_count=$((_done_count + 1))
   local prefix="[$_done_count/$_total_count] $out"
-  printf '%s: checking... ' "$prefix" >&2
-  if _is_complete "$out"; then
+  local sz=0
+  [ -f "$out" ] && sz=$(stat -c %s "$out" 2>/dev/null || echo 0)
+  local sz_msg=""
+  [ "$expected" -gt 0 ] && sz_msg=" ($(_human $sz) / $(_human $expected))"
+  printf '%s: checking%s... ' "$prefix" "$sz_msg" >&2
+
+  if [ "$expected" -gt 0 ] && [ "$sz" -gt "$expected" ]; then
+    echo "oversized, redownloading" >&2
+    rm -f "$out" "$out.done"
+  elif _is_complete "$out"; then
     : > "$out.done"
     echo "valid, skip" >&2
     return 0
-  fi
-  mkdir -p "${out%/*}"
-  if [ -s "$out" ] && { [ "$method" = "wget" ] || [ "$method" = "curl" ]; }; then
+  elif [ "$sz" -gt 0 ] && { [ "$method" = "wget" ] || [ "$method" = "curl" ]; }; then
     echo "partial, resuming" >&2
     rm -f "$out.done"
     case "$method" in
@@ -3352,6 +3358,8 @@ download_one() {
     echo "missing, downloading" >&2
     rm -f "$out.done"
   fi
+
+  mkdir -p "${out%/*}"
   case "$method" in
     wget)   wget -q --show-progress --tries=10 --timeout=60 --retry-connrefused -O "$out" "$url" ;;
     curl)   curl -L --retry 10 --retry-delay 5 --retry-all-errors --fail -o "$out" "$url" ;;
@@ -3413,41 +3421,11 @@ def _resume_status_preamble(
     )
 
 _DOWNLOAD_MODES = {
-    "fastq": {
-        "label": "FASTQ files",
-        "url_key": "fastq_url",
-        "md5_key": "fastq_md5",
-        "bytes_key": "fastq_bytes",
-        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
-    },
-    "sra": {
-        "label": "SRA format",
-        "url_key": "sra_url",
-        "md5_key": "sra_md5",
-        "bytes_key": "sra_bytes",
-        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
-    },
-    "sra_lite": {
-        "label": "SRA Lite",
-        "url_key": "sra_lite_url",
-        "md5_key": "sra_md5",
-        "bytes_key": "sra_lite_bytes",
-        "cmd": 'download_one "{url}" "{dirpath}/{filename}" wget',
-    },
-    "s3": {
-        "label": "AWS S3",
-        "url_key": "s3_url",
-        "md5_key": "sra_md5",
-        "bytes_key": "sra_bytes",
-        "cmd": 'download_one "{url}" "{dirpath}/{filename}" aws',
-    },
-    "gcs": {
-        "label": "Google Cloud",
-        "url_key": "gs_url",
-        "md5_key": "sra_md5",
-        "bytes_key": "sra_bytes",
-        "cmd": 'download_one "{url}" "{dirpath}/{filename}" gsutil',
-    },
+    "fastq":    {"label": "FASTQ files",  "url_key": "fastq_url",    "md5_key": "fastq_md5", "bytes_key": "fastq_bytes",    "method": "wget"},
+    "sra":      {"label": "SRA format",   "url_key": "sra_url",      "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "wget"},
+    "sra_lite": {"label": "SRA Lite",     "url_key": "sra_lite_url", "md5_key": "sra_md5",   "bytes_key": "sra_lite_bytes", "method": "wget"},
+    "s3":       {"label": "AWS S3",       "url_key": "s3_url",       "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "aws"},
+    "gcs":      {"label": "Google Cloud", "url_key": "gs_url",       "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "gsutil"},
 }
 
 _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
@@ -3478,7 +3456,7 @@ def download_study_script(
     url_key = cfg["url_key"]
     md5_key = cfg["md5_key"]
     bytes_key = cfg.get("bytes_key")
-    cmd_tpl = cfg["cmd"]
+    method = cfg["method"]
     label = cfg["label"]
 
     lines: list[str] = []
@@ -3501,11 +3479,12 @@ def download_study_script(
                             dirpath = entry["directory_path"]
                             filename = entry["filename"]
                             path = f"{dirpath}/{filename}"
+                            size = _coerce_int(entry.get(bytes_key)) if bytes_key else 0
                             lines.append(
-                                cmd_tpl.format(url=url, dirpath=dirpath, filename=filename)
+                                f"download_one {_shell_escape(url)} {_shell_escape(path)} {method} {size}"
                             )
                             expected_paths.append(path)
-                            expected_sizes.append(_coerce_int(entry.get(bytes_key)) if bytes_key else 0)
+                            expected_sizes.append(size)
                             md5 = entry.get(md5_key) or ""
                             if md5:
                                 checksums.append((md5, path))
