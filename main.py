@@ -37,6 +37,7 @@ from user_agents import parse as parse_ua
 
 
 from aliases import QUERY_ALIASES
+from expansions import expand_common_names
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -1198,6 +1199,14 @@ def _normalize_query(q: str) -> str:
         canonical = QUERY_ALIASES.get(w.lower())
         out.append(canonical if canonical else w)
     return " ".join(out)
+
+
+def _search_query_variants(conn, q: str) -> list[str]:
+    try:
+        return expand_common_names(conn, q)
+    except Exception:
+        logger.debug("Common/scientific name query expansion failed", exc_info=True)
+        return [q]
 
 
 _SUGGESTION_THRESHOLD = 5
@@ -2403,8 +2412,12 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc):
 
     try:
         with pool.connection() as conn:
+            q_variants = _search_query_variants(conn, q)
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(GEO_SEARCH_SQL, (q, cursor_rank, cursor_rank, cursor_acc))
+                cur.execute(
+                    GEO_SEARCH_SQL,
+                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
+                )
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
     except Exception as e:
@@ -2457,10 +2470,11 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc):
 
     try:
         with pool.connection() as conn:
+            q_variants = _search_query_variants(conn, q)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SRA_SEARCH_SQL,
-                    (q, cursor_rank, cursor_rank, cursor_acc),
+                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
                 )
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
@@ -2540,17 +2554,19 @@ def search(
     q = _normalize_query(q)
 
     if sortby:
-        sql, params = build_sorted_search_sql(
-            q=q,
-            sortby=sortby,
-            order=order,
-            db=db,
-            cursor_sort=cursor_sort,
-            cursor_acc=cursor_acc,
-        )
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
+                q_variants = _search_query_variants(conn, q)
+                sql, params = build_sorted_search_sql(
+                    q=q,
+                    q_variants=q_variants,
+                    sortby=sortby,
+                    order=order,
+                    db=db,
+                    cursor_sort=cursor_sort,
+                    cursor_acc=cursor_acc,
+                )
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(sql, params)
                     rows = cur.fetchall()
@@ -2583,10 +2599,11 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
+                q_variants = _search_query_variants(conn, q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         AE_SEARCH_SQL,
-                        (q, cursor_rank, cursor_rank, cursor_acc),
+                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
                     )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
@@ -2614,10 +2631,11 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
+                q_variants = _search_query_variants(conn, q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         ENA_SEARCH_SQL,
-                        (q, cursor_rank, cursor_rank, cursor_acc),
+                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
                     )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
@@ -2646,11 +2664,13 @@ def search(
 
         try:
             with pool.connection() as conn:
+                q_variants = _search_query_variants(conn, q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         SEARCH_SQL,
                         (
                             q,
+                            q_variants,
                             cursor_rank,
                             cursor_rank,
                             cursor_acc,
@@ -4612,8 +4632,14 @@ def search_structured(
     if geo_radius_km is not None and geo_lat is None:
         raise HTTPException(400, "geo_radius_km requires geo_lat and geo_lng")
 
+    q_variants = None
+    if q:
+        with pool.connection() as conn:
+            q_variants = _search_query_variants(conn, q)
+
     sql, params = build_structured_search(
         q=q,
+        q_variants=q_variants,
         organism=organism,
         library_strategy=library_strategy,
         platform=platform,

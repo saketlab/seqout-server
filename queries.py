@@ -15,14 +15,23 @@ WHERE canonical_accession = ANY(%(acc)s);
 
 GEO_SEARCH_SQL = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source, 4 AS priority, instrument_models, library_strategies
+           ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source, 4 AS priority, instrument_models, library_strategies
     FROM geo_series, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
@@ -42,14 +51,23 @@ LIMIT 200;
 
 SRA_SEARCH_SQL = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     -- Full-text search match (priority 6)
     SELECT accession, title, abstract AS summary, updated_at, organisms, countries,
-           ts_rank(tsv, q.q) AS rank, 'sra'::text AS source, 6 AS priority, instrument_models, library_strategies
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source, 6 AS priority, instrument_models, library_strategies
     FROM sra_studies, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
@@ -69,14 +87,23 @@ LIMIT 200;
 
 AE_SEARCH_SQL = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     -- Full-text search match (priority 4)
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
-           ts_rank(tsv, q.q) AS rank, 'arrayexpress'::text AS source, 4 AS priority, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source, 4 AS priority, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
@@ -96,7 +123,16 @@ LIMIT 200;
 
 ENA_SEARCH_SQL = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     -- Full-text search match (priority 4)
@@ -106,11 +142,11 @@ all_matches AS (
            COALESCE(last_updated, first_public) AS updated_at,
            NULL::text[] AS organisms,
            NULL::text[] AS countries,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source, 4 AS priority,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source, 4 AS priority,
            NULL::text[] AS instrument_models,
            NULL::text[] AS library_strategies
     FROM ena_studies_search, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
@@ -130,33 +166,42 @@ LIMIT 200;
 
 SEARCH_SQL = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS q
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     -- GEO full-text search (includes contributors/departments/organizations in geo_series.tsv)
     SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
-           ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,
+           ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,
            accession AS dedup_key, instrument_models, library_strategies
     FROM geo_series, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 
     UNION ALL
 
     -- SRA full-text search (lower rank multiplier)
         SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms, s.countries,
-           ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,
+           (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,
            COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies
     FROM sra_studies s, q
-    WHERE s.tsv @@ q.q
+    WHERE s.tsv @@ q.match_q
 
     UNION ALL
 
     -- ArrayExpress full-text search
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,
            COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 
     UNION ALL
 
@@ -166,10 +211,10 @@ all_matches AS (
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
            NULL::text[] AS organisms, NULL::text[] AS countries,
-           ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,
            accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM ena_studies_search, q
-    WHERE tsv @@ q.q
+    WHERE tsv @@ q.match_q
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
@@ -1115,6 +1160,7 @@ def _build_geo_cte(params, assay_l1=None, assay_l2=None, **geo):
 
 def build_structured_search(
     q=None,
+    q_variants=None,
     organism=None,
     library_strategy=None,
     platform=None,
@@ -1171,6 +1217,7 @@ def build_structured_search(
     # Populate shared params
     if q:
         params["q"] = q
+        params["q_variants"] = q_variants or [q]
     if organism:
         params["organism"] = organism
     if library_strategy:
@@ -1220,8 +1267,9 @@ def build_structured_search(
         joins = ""
         if geo_cte:
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = g.accession AND ga.source = 'geo'"
+        from_q = ", q" if q else ""
         if q:
-            w.append("g.tsv @@ plainto_tsquery('english', %(q)s)")
+            w.append("g.tsv @@ q.match_q")
         if organism:
             w.append("g.organisms @> ARRAY[%(organism)s]")
         if country:
@@ -1252,7 +1300,7 @@ def build_structured_search(
             w.append("array_length(g.platforms, 1) >= 2")
 
         rank = (
-            "ts_rank(g.tsv, plainto_tsquery('english', %(q)s))"
+            "ts_rank(g.tsv, q.core_q) + ts_rank(g.tsv, q.match_q) * 0.2"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM g.published_at), 0)"
         )
@@ -1262,7 +1310,7 @@ def build_structured_search(
             f" g.updated_at, g.organisms, g.countries_iso AS countries,"
             f" {rank} AS rank, 'geo'::text AS source,"
             f" g.accession AS dedup_key, g.instrument_models, g.library_strategies, g.platforms"
-            f" FROM geo_series g{joins}{where}"
+            f" FROM geo_series g{joins}{from_q}{where}"
         )
 
     # --- SRA ---
@@ -1271,8 +1319,9 @@ def build_structured_search(
         joins = ""
         if geo_cte:
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = s.accession AND ga.source = 'sra'"
+        from_q = ", q" if q else ""
         if q:
-            w.append("s.tsv @@ plainto_tsquery('english', %(q)s)")
+            w.append("s.tsv @@ q.match_q")
         if organism:
             w.append("s.organisms @> ARRAY[%(organism)s]")
         if library_strategy or platform:
@@ -1309,7 +1358,7 @@ def build_structured_search(
             w.append("array_length(s.platforms, 1) >= 2")
 
         rank = (
-            "ts_rank(s.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
+            "(ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM s.published_at), 0)"
         )
@@ -1319,7 +1368,7 @@ def build_structured_search(
             f" s.updated_at, s.organisms, s.countries,"
             f" {rank} AS rank, 'sra'::text AS source,"
             f" COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies, s.platforms"
-            f" FROM sra_studies s{joins}{where}"
+            f" FROM sra_studies s{joins}{from_q}{where}"
         )
 
     # --- ArrayExpress ---
@@ -1328,8 +1377,9 @@ def build_structured_search(
         joins = ""
         if geo_cte:
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = ae.accession AND ga.source = 'arrayexpress'"
+        from_q = ", q" if q else ""
         if q:
-            w.append("ae.tsv @@ plainto_tsquery('english', %(q)s)")
+            w.append("ae.tsv @@ q.match_q")
         if organism:
             w.append("ae.organisms @> ARRAY[%(organism)s]")
         if library_strategy:
@@ -1348,7 +1398,7 @@ def build_structured_search(
             )
 
         rank = (
-            "ts_rank(ae.tsv, plainto_tsquery('english', %(q)s)) * 0.7"
+            "(ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM ae.release_date), 0)"
         )
@@ -1358,7 +1408,7 @@ def build_structured_search(
             f" ae.release_date AS updated_at, ae.organisms, ae.countries,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
             f" COALESCE(ae.alias, ae.accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
-            f" FROM arrayexpress_experiments ae{joins}{where}"
+            f" FROM arrayexpress_experiments ae{joins}{from_q}{where}"
         )
 
     # --- ENA ---
@@ -1367,13 +1417,14 @@ def build_structured_search(
         joins = ""
         if geo_cte:
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = es.study_accession AND ga.source = 'ena'"
+        from_q = ", q" if q else ""
         ena_tsv = (
             "to_tsvector('english',"
             " coalesce(es.study_title, '') || ' ' ||"
             " coalesce(es.study_description, ''))"
         )
         if q:
-            w.append(f"{ena_tsv} @@ plainto_tsquery('english', %(q)s)")
+            w.append(f"{ena_tsv} @@ q.match_q")
         if organism:
             w.append("es.scientific_name = %(organism)s")
         if library_strategy or platform or country:
@@ -1402,7 +1453,7 @@ def build_structured_search(
             )
 
         rank = (
-            f"ts_rank({ena_tsv}, plainto_tsquery('english', %(q)s)) * 0.7"
+            f"(ts_rank({ena_tsv}, q.core_q) + ts_rank({ena_tsv}, q.match_q) * 0.2) * 0.7"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM es.first_public), 0)"
         )
@@ -1417,7 +1468,7 @@ def build_structured_search(
             f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
             f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
-            f" FROM ena_studies es{joins}{where}"
+            f" FROM ena_studies es{joins}{from_q}{where}"
         )
 
     if not cte_parts:
@@ -1441,11 +1492,28 @@ def build_structured_search(
     else:
         cursor_where = ""
 
-    # Prepend geo_accessions CTE when geo filters are active
+    query_cte = ""
+    if q:
+        query_cte = """q AS (
+    SELECT plainto_tsquery('english', %(q)s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%(q_variants)s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
+),
+"""
+
+    # Prepend query and geo_accessions CTEs when active
+    query_cte_prefix = query_cte
     geo_cte_prefix = f"{geo_cte},\n" if geo_cte else ""
 
     sql = f"""\
-WITH {geo_cte_prefix}all_matches AS (
+WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
     {all_matches}
 ),
 deduped AS (
@@ -1472,42 +1540,48 @@ LIMIT 200;"""
 
 
 def build_sorted_search_sql(
-    q, sortby, order="desc", db=None, cursor_sort=None, cursor_acc=None
+    q,
+    sortby,
+    order="desc",
+    db=None,
+    cursor_sort=None,
+    cursor_acc=None,
+    q_variants=None,
 ):
     """Build search SQL sorted by citations, journal, or year.
 
     Returns (sql_string, params_dict) using %(name)s named parameters.
     """
-    params = {"q": q}
+    params = {"q": q, "q_variants": q_variants or [q]}
     cte_parts = []
 
     if db in (None, "geo"):
         cte_parts.append(
             "SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,"
-            " ts_rank(tsv, q.q) AS rank, 'geo'::text AS source,"
+            " ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,"
             " accession AS dedup_key, instrument_models, library_strategies"
             " FROM geo_series, q"
-            " WHERE tsv @@ q.q"
+            " WHERE tsv @@ q.match_q"
         )
 
     if db in (None, "sra"):
         cte_parts.append(
             "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,"
             " s.organisms, s.countries,"
-            " ts_rank(s.tsv, q.q) * 0.7 AS rank, 'sra'::text AS source,"
+            " (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,"
             " COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
             " FROM sra_studies s, q"
-            " WHERE s.tsv @@ q.q"
+            " WHERE s.tsv @@ q.match_q"
         )
 
     if db in (None, "arrayexpress"):
         cte_parts.append(
             "SELECT accession, title, description AS summary,"
             " release_date AS updated_at, organisms, countries,"
-            " ts_rank(tsv, q.q) * 0.7 AS rank, 'arrayexpress'::text AS source,"
+            " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,"
             " COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM arrayexpress_experiments, q"
-            " WHERE tsv @@ q.q"
+            " WHERE tsv @@ q.match_q"
         )
 
     if db in (None, "ena"):
@@ -1517,10 +1591,10 @@ def build_sorted_search_sql(
             " study_description AS summary,"
             " COALESCE(last_updated, first_public) AS updated_at,"
             " NULL::text[] AS organisms, NULL::text[] AS countries,"
-            " ts_rank(tsv, q.q) * 0.7 AS rank, 'ena'::text AS source,"
+            " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,"
             " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM ena_studies_search, q"
-            " WHERE tsv @@ q.q"
+            " WHERE tsv @@ q.match_q"
         )
 
     if not cte_parts:
@@ -1569,7 +1643,16 @@ def build_sorted_search_sql(
 
     sql = f"""\
 WITH q AS (
-    SELECT plainto_tsquery('english', %(q)s) AS q
+    SELECT plainto_tsquery('english', %(q)s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%(q_variants)s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
 ),
 all_matches AS (
     {all_matches}
