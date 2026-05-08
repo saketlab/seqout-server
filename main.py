@@ -35,7 +35,7 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
-from expansions import expand_common_names
+from expansions import expand_common_names, expand_terms
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -1190,11 +1190,22 @@ def _replace_query_hyphens(q: str) -> str:
 
 
 def _search_query_variants(conn, q: str) -> list[str]:
+    variants = [q]
     try:
-        return expand_common_names(conn, q)
+        variants = expand_common_names(conn, q)
     except Exception:
         logger.debug("Common/scientific name query expansion failed", exc_info=True)
-        return [q]
+
+    final_variants = []
+    for v in variants:
+        try:
+            term_variants = expand_terms(conn, v)
+            final_variants.extend(term_variants)
+        except Exception:
+            logger.debug("Term query expansion failed", exc_info=True)
+            final_variants.append(v)
+
+    return list(dict.fromkeys(final_variants))
 
 
 _SUGGESTION_THRESHOLD = 5
