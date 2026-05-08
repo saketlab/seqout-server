@@ -35,25 +35,57 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
-
 from aliases import QUERY_ALIASES
-from expansions import expand_common_names
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
     AE_SEARCH_SQL,
-    ENA_SEARCH_SQL,
+    ALL_QUERY_ACCESSIONS_SQL,
+    BATCH_SAMPLES_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
     COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
+    ENA_EXPERIMENT_SQL,
     ENA_SAMPLE_SQL,
+    ENA_SAMPLE_TO_EXPERIMENT_SQL,
+    ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
-    ALL_QUERY_ACCESSIONS_SQL,
-    GEO_SAMPLE_TO_SERIES_SQL,
-    GEO_SERIES_NEIGHBORS_COORDS_SQL,
+    ENRICHED_SAMPLES_SQL,
+    ENRICHED_SAMPLES_V3_SQL,
+    ENRICHED_STUDY_SQL,
+    ENRICHED_STUDY_V3_SQL,
+    EXPERIMENT_RUNS_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
+    GEO_SAMPLE_SQL,
+    GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SEARCH_SQL,
+    GEO_SERIES_NEIGHBORS_COORDS_SQL,
     GEO_SERIES_SAMPLES_SQL,
+    GLOBAL_CONTRIBUTIONS_FILTERS_SQL,
+    GROWTH_BASES_ENA_SQL,
+    GROWTH_BYTES_SRA_FASTQ_SQL,
+    GROWTH_BYTES_SRA_SRA_SQL,
+    GROWTH_EXPERIMENTS_AE_SQL,
+    GROWTH_EXPERIMENTS_ENA_SQL,
+    GROWTH_EXPERIMENTS_GEO_SQL,
+    GROWTH_EXPERIMENTS_SRA_SQL,
+    GROWTH_ORGANISM_SQL,
+    GROWTH_PLATFORM_INSTRUMENT_SQL,
+    GROWTH_PLATFORM_PROJECTS_SQL,
+    GROWTH_PLATFORM_SQL,
+    GROWTH_PROJECTS_AE_SQL,
+    GROWTH_PROJECTS_ENA_SQL,
+    GROWTH_PROJECTS_GEO_SQL,
+    GROWTH_PROJECTS_SRA_SQL,
+    LIST_ORGANISMS_SQL,
+    LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
+    ONTOLOGY_SAMPLES_V3_SQL,
+    ORGANISM_SEARCH_SQL,
+    ORGANISM_TOTALS_SQL,
+    ORGANISM_TOTALS_YEAR_SQL,
+    PLATFORM_FILTERS_SQL,
+    PLATFORM_INSTRUMENTS_SQL,
+    PLATFORM_TOTALS_SQL,
     PRJ_TO_SRA_STUDY_SQL,
     PRJNA_TO_GEO_SERIES_SQL,
     PROJECT_AE_SQL,
@@ -61,67 +93,35 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     RELATED_SQL,
-    BATCH_SAMPLES_SQL,
     SAMPLE_SQL,
-    SRA_QUERY_ACCESSIONS_SQL,
     SEARCH_SQL,
+    SITEMAP_ACCESSIONS_SQL,
+    SITEMAP_COUNTS_SQL,
+    SRA_EXPERIMENT_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
+    SRA_QUERY_ACCESSIONS_SQL,
+    SRA_SAMPLE_TO_EXPERIMENT_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
-    STUDY_EXPERIMENTS_SQL,
-    SUBMITTER_BATCH_SQL,
-    STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_BAMS_SQL,
+    STUDY_EXPERIMENTS_SQL,
+    STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
-    GROWTH_PROJECTS_GEO_SQL,
-    GROWTH_PROJECTS_SRA_SQL,
-    GROWTH_PROJECTS_AE_SQL,
-    GROWTH_PROJECTS_ENA_SQL,
-    GROWTH_EXPERIMENTS_GEO_SQL,
-    GROWTH_EXPERIMENTS_SRA_SQL,
-    GROWTH_EXPERIMENTS_AE_SQL,
-    GROWTH_EXPERIMENTS_ENA_SQL,
-    GROWTH_BASES_ENA_SQL,
-    GROWTH_BYTES_SRA_FASTQ_SQL,
-    GROWTH_BYTES_SRA_SRA_SQL,
-    GROWTH_ORGANISM_SQL,
-    GROWTH_PLATFORM_SQL,
-    GROWTH_PLATFORM_INSTRUMENT_SQL,
-    GROWTH_PLATFORM_PROJECTS_SQL,
-    PLATFORM_TOTALS_SQL,
-    PLATFORM_INSTRUMENTS_SQL,
-    PLATFORM_FILTERS_SQL,
-    build_platform_growth_filtered_sql,
-    LIST_ORGANISMS_SQL,
-    LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
-    ORGANISM_SEARCH_SQL,
-    ORGANISM_TOTALS_SQL,
-    ORGANISM_TOTALS_YEAR_SQL,
-    GLOBAL_CONTRIBUTIONS_FILTERS_SQL,
-    build_global_contributions_sql,
-    SITEMAP_ACCESSIONS_SQL,
-    SITEMAP_COUNTS_SQL,
-    ENRICHED_SAMPLES_SQL,
-    ENRICHED_STUDY_SQL,
-    ENRICHED_SAMPLES_V3_SQL,
-    ENRICHED_STUDY_V3_SQL,
-    ONTOLOGY_SAMPLES_V3_SQL,
-    build_enriched_samples_sql,
-    init_global_contributions_schema,
-    init_global_contributions_filters_sql,
-    build_country_filters_sql,
+    SUBMITTER_BATCH_SQL,
     build_country_accessions_sql,
+    build_country_filters_sql,
+    build_enriched_samples_sql,
+    build_global_contributions_sql,
+    build_platform_growth_filtered_sql,
     build_sorted_search_sql,
     build_structured_search,
-    SRA_EXPERIMENT_SQL,
-    ENA_EXPERIMENT_SQL,
-    GEO_SAMPLE_SQL,
-    EXPERIMENT_RUNS_SQL,
-    ENA_SAMPLE_TO_EXPERIMENT_SQL,
-    SRA_SAMPLE_TO_EXPERIMENT_SQL,
+    init_global_contributions_filters_sql,
+    init_global_contributions_schema,
 )
+
+from .expansions import expand_common_names
 
 load_dotenv()
 
@@ -3408,9 +3408,7 @@ def _coerce_int(v: object) -> int:
         return 0
 
 
-def _resume_status_preamble(
-    paths: list[str], sizes: list[int] | None = None
-) -> str:
+def _resume_status_preamble(paths: list[str], sizes: list[int] | None = None) -> str:
     """Bash snippet that estimates resume progress by file count and bytes."""
     if not paths:
         return ""
@@ -3424,8 +3422,8 @@ def _resume_status_preamble(
             "_total_count=${#expected_files[@]}\n"
             "present=0; local_bytes=0; total_bytes=0\n"
             'for i in "${!expected_files[@]}"; do\n'
-            '  exp=${expected_sizes[$i]}; total_bytes=$((total_bytes + exp))\n'
-            '  f=${expected_files[$i]}\n'
+            "  exp=${expected_sizes[$i]}; total_bytes=$((total_bytes + exp))\n"
+            "  f=${expected_files[$i]}\n"
             '  if [ -f "$f" ]; then\n'
             '    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)\n'
             '    [ "$sz" -gt "$exp" ] && sz=0\n'
@@ -3446,12 +3444,43 @@ def _resume_status_preamble(
         ' (will integrity-check each below)."\n\n'
     )
 
+
 _DOWNLOAD_MODES = {
-    "fastq":    {"label": "FASTQ files",  "url_key": "fastq_url",    "md5_key": "fastq_md5", "bytes_key": "fastq_bytes",    "method": "wget"},
-    "sra":      {"label": "SRA format",   "url_key": "sra_url",      "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "wget"},
-    "sra_lite": {"label": "SRA Lite",     "url_key": "sra_lite_url", "md5_key": "sra_md5",   "bytes_key": "sra_lite_bytes", "method": "wget"},
-    "s3":       {"label": "AWS S3",       "url_key": "s3_url",       "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "aws"},
-    "gcs":      {"label": "Google Cloud", "url_key": "gs_url",       "md5_key": "sra_md5",   "bytes_key": "sra_bytes",      "method": "gsutil"},
+    "fastq": {
+        "label": "FASTQ files",
+        "url_key": "fastq_url",
+        "md5_key": "fastq_md5",
+        "bytes_key": "fastq_bytes",
+        "method": "wget",
+    },
+    "sra": {
+        "label": "SRA format",
+        "url_key": "sra_url",
+        "md5_key": "sra_md5",
+        "bytes_key": "sra_bytes",
+        "method": "wget",
+    },
+    "sra_lite": {
+        "label": "SRA Lite",
+        "url_key": "sra_lite_url",
+        "md5_key": "sra_md5",
+        "bytes_key": "sra_lite_bytes",
+        "method": "wget",
+    },
+    "s3": {
+        "label": "AWS S3",
+        "url_key": "s3_url",
+        "md5_key": "sra_md5",
+        "bytes_key": "sra_bytes",
+        "method": "aws",
+    },
+    "gcs": {
+        "label": "Google Cloud",
+        "url_key": "gs_url",
+        "md5_key": "sra_md5",
+        "bytes_key": "sra_bytes",
+        "method": "gsutil",
+    },
 }
 
 _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
@@ -3534,7 +3563,7 @@ def download_study_script(
         f"{_DOWNLOAD_HELPER}"
         f"{_resume_status_preamble(expected_paths, expected_sizes)}"
         f"# Download metadata\n"
-        f'curl -sS --retry 10 --retry-delay 5 --retry-all-errors --fail'
+        f"curl -sS --retry 10 --retry-delay 5 --retry-all-errors --fail"
         f' "https://seqout.org/api/project/{study}/metadata/download"'
         f' -o "{study}/metadata.csv" --create-dirs\n\n'
     )
