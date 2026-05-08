@@ -36,6 +36,7 @@ from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
 from aliases import QUERY_ALIASES
+from expansions import expand_common_names
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -120,8 +121,6 @@ from queries import (
     init_global_contributions_filters_sql,
     init_global_contributions_schema,
 )
-
-from .expansions import expand_common_names
 
 load_dotenv()
 
