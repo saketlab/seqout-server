@@ -1185,9 +1185,14 @@ def _get_growth_data() -> dict:
         return data
 
 
+def _replace_query_hyphens(q: str) -> str:
+    """Treat hyphens as word separators in search text."""
+    return q.replace("-", " ")
+
+
 def _normalize_query(q: str) -> str:
-    """Replace known assay name variants with canonical FTS forms (word-by-word)."""
-    words = q.split()
+    """Normalize search text before running FTS queries."""
+    words = _replace_query_hyphens(q).split()
     out = []
     for w in words:
         canonical = QUERY_ALIASES.get(w.lower())
@@ -2496,7 +2501,8 @@ def search_suggest(
     q: str = Query(..., min_length=1, max_length=500),
 ):
     start = time.perf_counter()
-    suggestions = _get_suggestions(q)
+    search_q = _replace_query_hyphens(q)
+    suggestions = _get_suggestions(search_q)
     took_ms = (time.perf_counter() - start) * 1000
     normalized = _normalize_query(q)
     result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
@@ -2530,7 +2536,7 @@ def search(
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
-    original_q = q
+    original_q = _replace_query_hyphens(q)
     q = _normalize_query(q)
 
     if sortby:
