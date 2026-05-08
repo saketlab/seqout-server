@@ -35,7 +35,6 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
-from aliases import QUERY_ALIASES
 from expansions import expand_common_names
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
@@ -1190,16 +1189,6 @@ def _replace_query_hyphens(q: str) -> str:
     return q.replace("-", " ")
 
 
-def _normalize_query(q: str) -> str:
-    """Normalize search text before running FTS queries."""
-    words = _replace_query_hyphens(q).split()
-    out = []
-    for w in words:
-        canonical = QUERY_ALIASES.get(w.lower())
-        out.append(canonical if canonical else w)
-    return " ".join(out)
-
-
 def _search_query_variants(conn, q: str) -> list[str]:
     try:
         return expand_common_names(conn, q)
@@ -1239,13 +1228,12 @@ def _ensure_spelling_loaded() -> SymSpell:
 def _get_suggestions(q: str) -> list[dict]:
     """Return spelling suggestions for a query with few/no FTS results.
 
-    Uses the original (pre-alias-normalized) query so corrections target
-    what the user actually typed, not the canonical form.
+    Uses the original query so corrections target what the user actually typed.
     """
     sym = _ensure_spelling_loaded()
     if not sym.words:
         return []
-    words = q.lower().split()
+    words = q.split()
     corrections: list[dict] = []
     correction_map: dict[int, str] = {}  # word index -> suggested term
 
@@ -1253,8 +1241,9 @@ def _get_suggestions(q: str) -> list[dict]:
     for i, word in enumerate(words):
         if len(word) < 3 or len(word) > 50:
             continue
-        results = sym.lookup(word, Verbosity.CLOSEST, max_edit_distance=2)
-        if results and results[0].term != word:
+        lookup_word = word.lower()
+        results = sym.lookup(lookup_word, Verbosity.CLOSEST, max_edit_distance=2)
+        if results and results[0].term != lookup_word:
             corrections.append(
                 {
                     "original": word,
@@ -1272,15 +1261,16 @@ def _get_suggestions(q: str) -> list[dict]:
                 with conn.cursor(row_factory=dict_row) as cur:
                     for i in fallback_indices[:5]:
                         word = words[i]
+                        lookup_word = word.lower()
                         cur.execute(
                             "SELECT term, similarity(normalized, %s) AS sml "
                             "FROM search_vocabulary "
                             "WHERE normalized %% %s "
                             "ORDER BY sml DESC, frequency DESC LIMIT 1",
-                            (word, word),
+                            (lookup_word, lookup_word),
                         )
                         row = cur.fetchone()
-                        if row and row["term"].lower() != word:
+                        if row and row["term"].lower() != lookup_word:
                             corrections.append(
                                 {
                                     "original": word,
@@ -2403,7 +2393,7 @@ def search_geo(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
-    return _search_geo_impl(request, _normalize_query(q), cursor_rank, cursor_acc)
+    return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_geo_impl(request, q, cursor_rank, cursor_acc):
@@ -2461,7 +2451,7 @@ def search_sra(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
-    return _search_sra_impl(request, _normalize_query(q), cursor_rank, cursor_acc)
+    return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_sra_impl(request, q, cursor_rank, cursor_acc):
@@ -2517,10 +2507,7 @@ def search_suggest(
     search_q = _replace_query_hyphens(q)
     suggestions = _get_suggestions(search_q)
     took_ms = (time.perf_counter() - start) * 1000
-    normalized = _normalize_query(q)
     result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
-    if normalized != q:
-        result["normalized_query"] = normalized
     return result
 
 
@@ -2550,7 +2537,7 @@ def search(
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
     original_q = _replace_query_hyphens(q)
-    q = _normalize_query(q)
+    q = original_q
 
     if sortby:
         start = time.perf_counter()
@@ -4607,7 +4594,7 @@ def search_structured(
     ),
 ):
     if q:
-        q = _normalize_query(q)
+        q = _replace_query_hyphens(q)
 
     has_geo_filter = any(
         v is not None
