@@ -33,7 +33,7 @@ LIMIT %s;
 
 _MAX_COMMON_NAME_ROWS = 100
 _MAX_TERM_EXPANSION_ROWS = 100
-_MAX_QUERY_VARIANTS = 12
+_MAX_QUERY_VARIANTS = 48
 
 
 def _replace_term(query: str, source: str, target: str) -> str | None:
