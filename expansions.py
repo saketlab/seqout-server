@@ -56,6 +56,26 @@ def _dedupe(items: Iterable[str]) -> list[str]:
     return out
 
 
+def _run_expansion_pass(conn, queries: list[str], sql: str, max_rows: int) -> list[str]:
+    new_variants = []
+    for q in queries:
+        with conn.cursor() as cur:
+            cur.execute(sql, (q, q, max_rows))
+            rows = cur.fetchall()
+
+        for row in rows:
+            col1, col2 = row[0], row[1]
+            if col1:
+                variant = _replace_term(q, col1, col2)
+                if variant:
+                    new_variants.append(variant)
+            if col2:
+                variant = _replace_term(q, col2, col1)
+                if variant:
+                    new_variants.append(variant)
+    return new_variants
+
+
 def expand_common_names(conn, query: str) -> list[str]:
     """Return query variants with common/scientific organism names swapped."""
     normalized_query = " ".join(query.split())
@@ -63,22 +83,18 @@ def expand_common_names(conn, query: str) -> list[str]:
         return []
 
     variants = [normalized_query]
-    with conn.cursor() as cur:
-        cur.execute(
-            COMMON_NAME_EXPANSION_SQL,
-            (normalized_query, normalized_query, _MAX_COMMON_NAME_ROWS),
-        )
-        rows = cur.fetchall()
+    
+    pass1_variants = _run_expansion_pass(
+        conn, [normalized_query], COMMON_NAME_EXPANSION_SQL, _MAX_COMMON_NAME_ROWS
+    )
+    pass1_variants = _dedupe(pass1_variants)
+    variants.extend(pass1_variants)
 
-    for scientific_name, common_name in rows:
-        if scientific_name:
-            variant = _replace_term(normalized_query, scientific_name, common_name)
-            if variant:
-                variants.append(variant)
-        if common_name:
-            variant = _replace_term(normalized_query, common_name, scientific_name)
-            if variant:
-                variants.append(variant)
+    if pass1_variants:
+        pass2_variants = _run_expansion_pass(
+            conn, pass1_variants, COMMON_NAME_EXPANSION_SQL, _MAX_COMMON_NAME_ROWS
+        )
+        variants.extend(pass2_variants)
 
     return _dedupe(variants)[:_MAX_QUERY_VARIANTS]
 
@@ -105,22 +121,16 @@ def expand_terms(conn, query: str) -> list[str]:
         variants.append(separated_query)
         queries_to_expand.append(separated_query)
 
-    for q in queries_to_expand:
-        with conn.cursor() as cur:
-            cur.execute(
-                TERM_EXPANSION_SQL,
-                (q, q, _MAX_TERM_EXPANSION_ROWS),
-            )
-            rows = cur.fetchall()
+    pass1_variants = _run_expansion_pass(
+        conn, queries_to_expand, TERM_EXPANSION_SQL, _MAX_TERM_EXPANSION_ROWS
+    )
+    pass1_variants = _dedupe(pass1_variants)
+    variants.extend(pass1_variants)
 
-        for short_form, long_form in rows:
-            if short_form:
-                variant = _replace_term(q, short_form, long_form)
-                if variant:
-                    variants.append(variant)
-            if long_form:
-                variant = _replace_term(q, long_form, short_form)
-                if variant:
-                    variants.append(variant)
+    if pass1_variants:
+        pass2_variants = _run_expansion_pass(
+            conn, pass1_variants, TERM_EXPANSION_SQL, _MAX_TERM_EXPANSION_ROWS
+        )
+        variants.extend(pass2_variants)
 
     return _dedupe(variants)[:_MAX_QUERY_VARIANTS]
