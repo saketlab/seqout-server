@@ -94,6 +94,7 @@ from queries import (
     PROJECT_SRA_SQL,
     RELATED_SQL,
     SAMPLE_SQL,
+    SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
@@ -126,11 +127,16 @@ load_dotenv()
 _STUDY_PREFIX = r"[SED]RP"
 _EXPERIMENT_PREFIX = r"[SED]RX"
 _SAMPLE_PREFIX = r"[SED]RS"
+_RUN_PREFIX = r"[SED]RR"
 
 STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
 SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
 EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
+RUN_PATTERN = re.compile(rf"^({_RUN_PREFIX})\d+$", re.IGNORECASE)
+GEO_SERIES_PATTERN = re.compile(r"^GSE\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
+BIOSAMPLE_PATTERN = re.compile(r"^SAM[A-Z]+\d+$", re.IGNORECASE)
+AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
 PROJECT_PATTERN = re.compile(
     rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
@@ -1187,6 +1193,65 @@ def _get_growth_data() -> dict:
 def _replace_query_hyphens(q: str) -> str:
     """Treat hyphens as word separators in search text."""
     return q.replace("-", " ")
+
+
+_ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (GEO_SERIES_PATTERN, "gse"),
+    (GEO_SAMPLE_PATTERN, "gsm"),
+    (STUDY_PATTERN, "srp"),
+    (EXPERIMENT_PATTERN, "srx"),
+    (SAMPLE_PATTERN, "srs"),
+    (RUN_PATTERN, "srr"),
+    (BIOSAMPLE_PATTERN, "sam"),
+    (AE_PATTERN, "ae"),
+    (PRJ_PATTERN, "prj"),
+)
+
+
+def _classify_accession_query(q: str) -> tuple[str, str] | None:
+    token = q.strip()
+    if not token or any(ch.isspace() for ch in token):
+        return None
+    acc = token.upper()
+    for pattern, kind in _ACCESSION_PATTERNS:
+        if pattern.match(acc):
+            return acc, kind
+    return None
+
+
+def _try_accession_search(
+    q: str, cursor_rank, cursor_acc, db_filter: str | None = None
+) -> dict | None:
+    """Returns an empty result set (not None) when q matches an accession pattern
+    but resolves to nothing. Irrelevant FTS matches are worse than zero results
+    when the user clearly typed an accession.
+    """
+    if cursor_rank is not None or cursor_acc is not None:
+        return None
+    classified = _classify_accession_query(q)
+    if classified is None:
+        return None
+    acc, kind = classified
+    start = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SEARCH_BY_ACCESSION_SQL_BY_KIND[kind], {"acc": acc})
+                rows = cur.fetchall()
+                if rows:
+                    _enrich_with_publications(rows, cur)
+    except Exception:
+        logger.exception("Database error in accession search")
+        raise HTTPException(500, "Internal server error")
+    if db_filter:
+        rows = [r for r in rows if r.get("source") == db_filter]
+    took_ms = (time.perf_counter() - start) * 1000
+    return {
+        "results": rows,
+        "total": len(rows),
+        "took_ms": round(took_ms, 2),
+        "next_cursor": None,
+    }
 
 
 def _search_query_variants(conn, q: str) -> list[str]:
@@ -2404,6 +2469,9 @@ def search_geo(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="geo")
+    if acc_result is not None:
+        return acc_result
     return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
@@ -2462,6 +2530,9 @@ def search_sra(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="sra")
+    if acc_result is not None:
+        return acc_result
     return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
@@ -2547,6 +2618,11 @@ def search(
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
+    if not sortby:
+        acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter=db)
+        if acc_result is not None:
+            return acc_result
+
     original_q = _replace_query_hyphens(q)
     q = original_q
 

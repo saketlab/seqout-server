@@ -238,6 +238,103 @@ LIMIT 200;
 """
 
 
+# Per-kind dispatch (vs. one giant UNION CTE) so each lookup gets its own plan;
+# bind-param values can't be constant-folded across union branches in a prepared
+# statement. Column layout matches SEARCH_SQL so rows flow straight into responses.
+_SRA_FIELDS = (
+    "s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,"
+    " s.countries, 100.0::float8 AS rank, 'sra'::text AS source,"
+    " s.instrument_models, s.library_strategies"
+)
+_GEO_FIELDS = (
+    "g.accession, g.title, g.summary, g.updated_at, g.organisms,"
+    " g.countries_iso AS countries, 100.0::float8 AS rank, 'geo'::text AS source,"
+    " g.instrument_models, g.library_strategies"
+)
+_AE_FIELDS = (
+    "ae.accession, ae.title, ae.description AS summary,"
+    " ae.release_date AS updated_at, ae.organisms, ae.countries,"
+    " 100.0::float8 AS rank, 'arrayexpress'::text AS source,"
+    " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+)
+_ENA_FIELDS = (
+    "es.accession,"
+    " COALESCE(es.study_title, es.study_name, es.project_name, es.accession) AS title,"
+    " es.study_description AS summary,"
+    " COALESCE(es.last_updated, es.first_public) AS updated_at,"
+    " NULL::text[] AS organisms, NULL::text[] AS countries,"
+    " 100.0::float8 AS rank, 'ena'::text AS source,"
+    " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+)
+
+SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
+    "gse": (
+        f"SELECT {_GEO_FIELDS} FROM geo_series g"
+        f" WHERE g.accession = %(acc)s LIMIT 1"
+    ),
+    "gsm": (
+        f"SELECT {_GEO_FIELDS} FROM geo_series g"
+        f" WHERE g.samples_ref @> ARRAY[%(acc)s] LIMIT 1"
+    ),
+    "srp": (
+        f"SELECT {_SRA_FIELDS} FROM sra_studies s"
+        f" WHERE s.accession = %(acc)s LIMIT 1"
+    ),
+    "srx": (
+        f"SELECT {_SRA_FIELDS} FROM sra_experiments e"
+        f" JOIN sra_studies s ON s.accession = e.study"
+        f" WHERE e.accession = %(acc)s LIMIT 1"
+    ),
+    "srs": (
+        f"SELECT DISTINCT ON (s.accession) {_SRA_FIELDS} FROM sra_experiments e"
+        f" JOIN sra_studies s ON s.accession = e.study"
+        f" WHERE e.samples @> ARRAY[%(acc)s]"
+        f" ORDER BY s.accession LIMIT 1"
+    ),
+    "srr": (
+        f"SELECT {_SRA_FIELDS} FROM ena_experiments ee"
+        f" JOIN sra_studies s ON s.accession = ee.study_accession"
+        f" WHERE ee.run_accession = %(acc)s"
+        f" UNION ALL "
+        f"SELECT {_ENA_FIELDS} FROM ena_experiments ee"
+        f" JOIN ena_studies_search es ON es.accession = ee.study_accession"
+        f" WHERE ee.run_accession = %(acc)s"
+        f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
+        f"                   WHERE ss.accession = ee.study_accession)"
+        f" LIMIT 2"
+    ),
+    "sam": (
+        f"(SELECT DISTINCT ON (s.accession) {_SRA_FIELDS} FROM ena_experiments ee"
+        f" JOIN sra_studies s ON s.accession = ee.study_accession"
+        f" WHERE ee.sample_accession = %(acc)s"
+        f" ORDER BY s.accession)"
+        f" UNION ALL "
+        f"(SELECT DISTINCT ON (es.accession) {_ENA_FIELDS} FROM ena_experiments ee"
+        f" JOIN ena_studies_search es ON es.accession = ee.study_accession"
+        f" WHERE ee.sample_accession = %(acc)s"
+        f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
+        f"                   WHERE ss.accession = ee.study_accession)"
+        f" ORDER BY es.accession)"
+        f" LIMIT 2"
+    ),
+    "ae": (
+        f"SELECT {_AE_FIELDS} FROM arrayexpress_experiments ae"
+        f" WHERE UPPER(ae.accession) = %(acc)s LIMIT 1"
+    ),
+    "prj": (
+        f"SELECT {_SRA_FIELDS} FROM sra_studies s"
+        f" WHERE s.bioproject_id = %(acc)s"
+        f" UNION ALL "
+        f"SELECT {_GEO_FIELDS} FROM geo_series g"
+        f" WHERE g.bioproject_id = %(acc)s"
+        f" UNION ALL "
+        f"SELECT {_ENA_FIELDS} FROM ena_studies_search es"
+        f" WHERE es.accession = %(acc)s"
+        f" LIMIT 3"
+    ),
+}
+
+
 GEO_QUERY_ACCESSIONS_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS q
