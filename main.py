@@ -27,6 +27,7 @@ from fastapi.responses import (
 from fastmcp import FastMCP
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from neo4j import GraphDatabase
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -326,6 +327,14 @@ with pool.connection() as _conn:
     ENRICHED_SAMPLES_SQL = build_enriched_samples_sql(_conn)
     init_global_contributions_schema(_conn)
     GLOBAL_CONTRIBUTIONS_FILTERS_SQL = init_global_contributions_filters_sql()
+
+neo4j_driver = GraphDatabase.driver(
+    os.environ.get("NEO4J_URI", "neo4j://localhost:7687"),
+    auth=(
+        os.environ.get("NEO4J_USER", "neo4j"),
+        os.environ.get("NEO4J_PASSWORD", ""),
+    ),
+)
 
 limiter = Limiter(key_func=get_remote_address)
 api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -1264,7 +1273,7 @@ def _search_query_variants(conn, q: str) -> list[str]:
     final_variants = []
     for v in variants:
         try:
-            term_variants = expand_terms(conn, v)
+            term_variants = expand_terms(neo4j_driver, v)
             final_variants.extend(term_variants)
         except Exception:
             logger.debug("Term query expansion failed", exc_info=True)
