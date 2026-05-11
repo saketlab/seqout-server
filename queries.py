@@ -291,21 +291,24 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" WHERE e.samples @> ARRAY[%(acc)s]"
         f" ORDER BY s.accession LIMIT 1"
     ),
+    # ena_experiments.study_accession holds the BioProject ID (PRJ*), not an
+    # SRP/ERP/DRP; the joins below match it against sra_studies.bioproject_id
+    # and ena_studies_search.accession (also PRJ-keyed).
     "srr": (
         f"SELECT {_SRA_FIELDS} FROM ena_experiments ee"
-        f" JOIN sra_studies s ON s.accession = ee.study_accession"
+        f" JOIN sra_studies s ON s.bioproject_id = ee.study_accession"
         f" WHERE ee.run_accession = %(acc)s"
         f" UNION ALL "
         f"SELECT {_ENA_FIELDS} FROM ena_experiments ee"
         f" JOIN ena_studies_search es ON es.accession = ee.study_accession"
         f" WHERE ee.run_accession = %(acc)s"
         f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
-        f"                   WHERE ss.accession = ee.study_accession)"
+        f"                   WHERE ss.bioproject_id = ee.study_accession)"
         f" LIMIT 2"
     ),
     "sam": (
         f"(SELECT DISTINCT ON (s.accession) {_SRA_FIELDS} FROM ena_experiments ee"
-        f" JOIN sra_studies s ON s.accession = ee.study_accession"
+        f" JOIN sra_studies s ON s.bioproject_id = ee.study_accession"
         f" WHERE ee.sample_accession = %(acc)s"
         f" ORDER BY s.accession)"
         f" UNION ALL "
@@ -313,7 +316,7 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" JOIN ena_studies_search es ON es.accession = ee.study_accession"
         f" WHERE ee.sample_accession = %(acc)s"
         f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
-        f"                   WHERE ss.accession = ee.study_accession)"
+        f"                   WHERE ss.bioproject_id = ee.study_accession)"
         f" ORDER BY es.accession)"
         f" LIMIT 2"
     ),
