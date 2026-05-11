@@ -94,6 +94,7 @@ from queries import (
     PROJECT_SRA_SQL,
     RELATED_SQL,
     SAMPLE_SQL,
+    SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
@@ -126,11 +127,16 @@ load_dotenv()
 _STUDY_PREFIX = r"[SED]RP"
 _EXPERIMENT_PREFIX = r"[SED]RX"
 _SAMPLE_PREFIX = r"[SED]RS"
+_RUN_PREFIX = r"[SED]RR"
 
 STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
 SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
 EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
+RUN_PATTERN = re.compile(rf"^({_RUN_PREFIX})\d+$", re.IGNORECASE)
+GEO_SERIES_PATTERN = re.compile(r"^GSE\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
+BIOSAMPLE_PATTERN = re.compile(r"^SAM[A-Z]+\d+$", re.IGNORECASE)
+AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
 PROJECT_PATTERN = re.compile(
     rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
@@ -1187,6 +1193,65 @@ def _get_growth_data() -> dict:
 def _replace_query_hyphens(q: str) -> str:
     """Treat hyphens as word separators in search text."""
     return q.replace("-", " ")
+
+
+_ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (GEO_SERIES_PATTERN, "gse"),
+    (GEO_SAMPLE_PATTERN, "gsm"),
+    (STUDY_PATTERN, "srp"),
+    (EXPERIMENT_PATTERN, "srx"),
+    (SAMPLE_PATTERN, "srs"),
+    (RUN_PATTERN, "srr"),
+    (BIOSAMPLE_PATTERN, "sam"),
+    (AE_PATTERN, "ae"),
+    (PRJ_PATTERN, "prj"),
+)
+
+
+def _classify_accession_query(q: str) -> tuple[str, str] | None:
+    token = q.strip()
+    if not token or any(ch.isspace() for ch in token):
+        return None
+    acc = token.upper()
+    for pattern, kind in _ACCESSION_PATTERNS:
+        if pattern.match(acc):
+            return acc, kind
+    return None
+
+
+def _try_accession_search(
+    q: str, cursor_rank, cursor_acc, db_filter: str | None = None
+) -> dict | None:
+    """Returns an empty result set (not None) when q matches an accession pattern
+    but resolves to nothing. Irrelevant FTS matches are worse than zero results
+    when the user clearly typed an accession.
+    """
+    if cursor_rank is not None or cursor_acc is not None:
+        return None
+    classified = _classify_accession_query(q)
+    if classified is None:
+        return None
+    acc, kind = classified
+    start = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SEARCH_BY_ACCESSION_SQL_BY_KIND[kind], {"acc": acc})
+                rows = cur.fetchall()
+                if rows:
+                    _enrich_with_publications(rows, cur)
+    except Exception:
+        logger.exception("Database error in accession search")
+        raise HTTPException(500, "Internal server error")
+    if db_filter:
+        rows = [r for r in rows if r.get("source") == db_filter]
+    took_ms = (time.perf_counter() - start) * 1000
+    return {
+        "results": rows,
+        "total": len(rows),
+        "took_ms": round(took_ms, 2),
+        "next_cursor": None,
+    }
 
 
 def _search_query_variants(conn, q: str) -> list[str]:
@@ -2404,6 +2469,9 @@ def search_geo(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="geo")
+    if acc_result is not None:
+        return acc_result
     return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
@@ -2462,6 +2530,9 @@ def search_sra(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
 ):
+    acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="sra")
+    if acc_result is not None:
+        return acc_result
     return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
@@ -2547,6 +2618,11 @@ def search(
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
+    if not sortby:
+        acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter=db)
+        if acc_result is not None:
+            return acc_result
+
     original_q = _replace_query_hyphens(q)
     q = original_q
 
@@ -2748,8 +2824,8 @@ def get_project(
     "/project/{accession}/metadata",
     summary="Get project title and description",
     description=(
-        "Return only title and description for a GEO series (GSE) or "
-        "SRA study (SRP/DRP/ERP) accession."
+        "Return only title and description for a GEO series (GSE), SRA study "
+        "(SRP/DRP/ERP), ENA project (PRJ*), or ArrayExpress experiment (E-*) accession."
     ),
     operation_id="get_project_metadata",
 )
@@ -2758,19 +2834,33 @@ def get_project_metadata(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
-    sql = (
-        """
+    accession = accession.upper()
+    if accession.startswith("G"):
+        sql = """
         SELECT accession, title, summary AS description
         FROM geo_series
         WHERE accession = %s;
         """
-        if accession.upper().startswith("G")
-        else """
+    elif accession.startswith("E-"):
+        sql = """
+        SELECT accession, title, description
+        FROM arrayexpress_experiments
+        WHERE accession = %s;
+        """
+    elif accession.startswith("PRJ"):
+        sql = """
+        SELECT study_accession AS accession, study_title AS title,
+               study_description AS description
+        FROM ena_studies
+        WHERE UPPER(study_accession) = UPPER(%s)
+        LIMIT 1;
+        """
+    else:
+        sql = """
         SELECT accession, title, abstract AS description
         FROM sra_studies
         WHERE accession = %s;
         """
-    )
 
     try:
         with pool.connection() as conn:
@@ -3323,6 +3413,73 @@ def download_study_metadata_csv(
     )
 
 
+@api_app.get(
+    "/project/{accession}/metadata/rows",
+    summary="Get project metadata rows as JSON",
+    description=(
+        "Return paginated JSON metadata rows for a project. SRA/ENA studies return "
+        "one row per run with experiment/sample metadata and download links. "
+        "GEO and ArrayExpress projects return flattened sample rows."
+    ),
+    operation_id="get_project_metadata_rows",
+)
+@limiter.limit("1000/minute")
+def get_project_metadata_rows(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if accession.startswith("GSE"):
+                    rows = flatten_geo_series(cur, accession)
+                    source = "geo"
+                elif accession.startswith("E-"):
+                    rows = flatten_ae_experiment(cur, accession)
+                    source = "arrayexpress"
+                else:
+                    exp_map, sample_map, sample_attrs = _prepare_study_metadata(
+                        cur, accession
+                    )
+                    cur.execute(STUDY_RUNS_SQL, (accession, accession))
+                    rows = []
+                    while True:
+                        batch = cur.fetchmany(500)
+                        if not batch:
+                            break
+                        rows.extend(
+                            _study_metadata_row(
+                                accession, run, exp_map, sample_map, sample_attrs
+                            )
+                            for run in batch
+                        )
+                    if not rows and accession.startswith("PRJ"):
+                        rows = flatten_sra_study(cur, accession)
+                    source = "ena" if accession.startswith("PRJ") else "sra"
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_project_metadata_rows")
+        raise HTTPException(500, "Internal server error")
+
+    page = rows[cursor : cursor + limit]
+    next_cursor = cursor + len(page) if cursor + len(page) < len(rows) else None
+    columns = list(page[0].keys()) if page else (list(rows[0].keys()) if rows else [])
+    return {
+        "accession": accession,
+        "source": source,
+        "total_rows": len(rows),
+        "cursor": cursor,
+        "limit": limit,
+        "next_cursor": next_cursor,
+        "columns": columns,
+        "rows": page,
+    }
+
+
 _DOWNLOAD_HELPER = r"""# Verify file integrity. 
 _is_complete() {
   local f="$1"
@@ -3405,6 +3562,106 @@ def _coerce_int(v: object) -> int:
         return 0
 
 
+def _parse_sample_attributes(sample: dict | None) -> dict[str, str]:
+    """Flatten SRA/ENA sample attributes into stable metadata columns."""
+    if not sample:
+        return {}
+    attrs_raw = sample.get("attributes_json")
+    if isinstance(attrs_raw, str):
+        try:
+            attrs_raw = json.loads(attrs_raw)
+        except (json.JSONDecodeError, TypeError):
+            attrs_raw = None
+        sample["attributes_json"] = attrs_raw
+
+    attrs: dict[str, str] = {}
+    if isinstance(attrs_raw, list):
+        for attr in attrs_raw:
+            if not isinstance(attr, dict):
+                continue
+            key = attr.get("tag") or attr.get("key") or ""
+            if key:
+                attrs[f"sample_attribute:{key}"] = attr.get("value") or ""
+    elif isinstance(attrs_raw, dict):
+        for key, val in attrs_raw.items():
+            attrs[f"sample_attribute:{key}"] = val or ""
+    return attrs
+
+
+def _study_metadata_row(
+    study: str,
+    run: dict,
+    exp_map: dict[str, dict],
+    sample_map: dict[str, dict],
+    sample_attrs: dict[str, dict[str, str]],
+) -> dict:
+    exp_acc = run.get("experiment_accession") or ""
+    exp = exp_map.get(exp_acc, {})
+    s_acc = exp.get("_sample_acc", "")
+    sample = sample_map.get(s_acc, {})
+    return {
+        "study_accession": study,
+        "run_accession": run.get("run_accession") or "",
+        "run_alias": run.get("run_alias") or "",
+        "fastq_ftp": run.get("fastq_ftp") or "",
+        "fastq_bytes": run.get("fastq_bytes") or "",
+        "fastq_md5": run.get("fastq_md5") or "",
+        "sra_ftp": run.get("sra_ftp") or "",
+        "sra_bytes": run.get("sra_bytes") or "",
+        "ncbi_sra_url": run.get("ncbi_sra_url") or "",
+        "ncbi_sra_normalized_url": run.get("ncbi_sra_normalized_url") or "",
+        "ncbi_sra_normalized_bytes": run.get("ncbi_sra_normalized_bytes") or "",
+        "ncbi_sra_lite_url": run.get("ncbi_sra_lite_url") or "",
+        "ncbi_sra_lite_bytes": run.get("ncbi_sra_lite_bytes") or "",
+        "ncbi_sra_lite_s3_url": run.get("ncbi_sra_lite_s3_url") or "",
+        "ncbi_sra_lite_gs_url": run.get("ncbi_sra_lite_gs_url") or "",
+        "experiment_accession": exp_acc,
+        "experiment_title": exp.get("title") or "",
+        "design_description": exp.get("design_description") or "",
+        "library_layout": exp.get("library_layout") or run.get("library_layout") or "",
+        "library_name": exp.get("library_name") or "",
+        "library_selection": exp.get("library_selection") or "",
+        "library_source": exp.get("library_source") or "",
+        "library_strategy": exp.get("library_strategy") or "",
+        "platform": exp.get("platform") or "",
+        "instrument_model": exp.get("instrument_model") or "",
+        "sample_accession": s_acc,
+        "sample_alias": sample.get("alias") or "",
+        "sample_description": sample.get("description") or "",
+        "sample_title": sample.get("title") or "",
+        "scientific_name": sample.get("scientific_name") or "",
+        "taxon_id": sample.get("taxon_id") or "",
+        **sample_attrs.get(s_acc, {}),
+    }
+
+
+def _prepare_study_metadata(cur, study: str) -> tuple[dict, dict, dict]:
+    experiments = _fetch_study_experiments(cur, study)
+    if not experiments:
+        raise HTTPException(404, f"No experiments found for {study}")
+
+    exp_map: dict[str, dict] = {}
+    sample_accs: list[str] = []
+    for exp in experiments:
+        samples_list = exp.get("samples") or []
+        sample_acc = samples_list[0] if samples_list else ""
+        exp["_sample_acc"] = sample_acc
+        exp_map[exp["accession"]] = exp
+        if sample_acc:
+            sample_accs.append(sample_acc)
+
+    sample_map: dict[str, dict] = {}
+    for sample_acc in dict.fromkeys(sample_accs):
+        sample = _fetch_sample(cur, sample_acc)
+        if sample:
+            sample_map[sample["accession"]] = sample
+
+    sample_attrs = {
+        acc: _parse_sample_attributes(sample) for acc, sample in sample_map.items()
+    }
+    return exp_map, sample_map, sample_attrs
+
+
 def _resume_status_preamble(paths: list[str], sizes: list[int] | None = None) -> str:
     """Bash snippet that estimates resume progress by file count and bytes."""
     if not paths:
@@ -3481,6 +3738,109 @@ _DOWNLOAD_MODES = {
 }
 
 _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
+
+
+@api_app.get(
+    "/project/{study}/download-manifest",
+    summary="Get structured download manifest for a study",
+    description=(
+        "Return paginated JSON file entries for downloading an SRA study. "
+        "Modes: fastq, sra, sra_lite, s3, or gcs. Each entry includes URL, "
+        "target path, checksum/size when available, and run/experiment metadata."
+    ),
+    operation_id="get_study_download_manifest",
+)
+@limiter.limit("1000/minute")
+def get_study_download_manifest(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_REGEX),
+    mode: str = Query("fastq", pattern=_DOWNLOAD_MODE_REGEX),
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
+):
+    study = study.upper()
+    cfg = _DOWNLOAD_MODES.get(mode)
+    if not cfg:
+        raise HTTPException(400, f"Invalid mode: {mode}")
+
+    url_key = cfg["url_key"]
+    md5_key = cfg["md5_key"]
+    bytes_key = cfg.get("bytes_key")
+    method = cfg["method"]
+    entries: list[dict] = []
+    seen = 0
+    has_more = False
+    summary: dict = {}
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                summary = cur.fetchone() or {}
+                cur.execute(STUDY_RUNS_SQL, (study, study))
+                while True:
+                    batch = cur.fetchmany(500)
+                    if not batch:
+                        break
+                    for row in batch:
+                        for entry in _split_fastq_fields(row, study):
+                            url = entry.get(url_key) or ""
+                            if not url:
+                                continue
+                            if seen < cursor:
+                                seen += 1
+                                continue
+                            if len(entries) >= limit:
+                                has_more = True
+                                break
+
+                            filename = entry["filename"]
+                            path = f"{entry['directory_path']}/{filename}"
+                            bytes_value = entry.get(bytes_key) if bytes_key else ""
+                            checksum = entry.get(md5_key) or ""
+                            entries.append(
+                                {
+                                    "study_accession": study,
+                                    "mode": mode,
+                                    "method": method,
+                                    "run_accession": entry["run_accession"],
+                                    "run_alias": entry.get("run_alias") or "",
+                                    "experiment_accession": entry[
+                                        "experiment_accession"
+                                    ],
+                                    "library_layout": entry.get("library_layout")
+                                    or "",
+                                    "url": url,
+                                    "path": path,
+                                    "filename": filename,
+                                    "bytes": _coerce_int(bytes_value),
+                                    "md5": checksum,
+                                    "directory_path": entry["directory_path"],
+                                    "download_command": _download_command(
+                                        method, url, path
+                                    ),
+                                }
+                            )
+                            seen += 1
+                        if has_more:
+                            break
+                    if has_more:
+                        break
+    except Exception:
+        logger.exception("Database error in get_study_download_manifest")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "study_accession": study,
+        "mode": mode,
+        "method": method,
+        "total_runs": summary.get("total_runs", 0),
+        "total_fastq_bytes": summary.get("total_fastq_bytes", 0),
+        "cursor": cursor,
+        "limit": limit,
+        "next_cursor": cursor + len(entries) if has_more else None,
+        "files": entries,
+    }
 
 
 @api_app.get(
@@ -3607,6 +3967,79 @@ def _extract_supplementary_urls(supplementary_data) -> list[dict]:
 def _shell_escape(s: str) -> str:
     """Escape a string for safe use in single-quoted shell context."""
     return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def _download_command(method: str, url: str, path: str) -> str:
+    if method == "wget":
+        return f"wget -c -O {_shell_escape(path)} {_shell_escape(url)}"
+    if method == "curl":
+        return f"curl -L -C - -o {_shell_escape(path)} {_shell_escape(url)}"
+    if method == "aws":
+        return f"aws s3 cp {_shell_escape(url)} {_shell_escape(path)}"
+    if method == "gsutil":
+        return f"gsutil cp {_shell_escape(url)} {_shell_escape(path)}"
+    return f"{method} {_shell_escape(url)} {_shell_escape(path)}"
+
+
+@api_app.get(
+    "/project/{accession}/supplementary",
+    summary="List supplementary files",
+    description=(
+        "Return structured supplementary / processed data file links for a GEO "
+        "(GSE) or ArrayExpress (E-*) project."
+    ),
+    operation_id="get_supplementary_files",
+)
+@limiter.limit("1000/minute")
+def get_supplementary_files(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    accession = accession.upper()
+    if accession.startswith("E-"):
+        sql = _SUPP_AE_SQL
+        source = "arrayexpress"
+    elif accession.startswith("G"):
+        sql = _SUPP_GEO_SQL
+        source = "geo"
+    else:
+        raise HTTPException(
+            400,
+            "Supplementary files are only available for GEO and ArrayExpress projects",
+        )
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, (accession,))
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Error fetching supplementary data for %s", accession)
+        raise HTTPException(500, "Internal server error")
+
+    if not row:
+        raise HTTPException(404, f"Project {accession} not found")
+
+    files = []
+    for f in _extract_supplementary_urls(row.get("supplementary_data")):
+        path = f"{accession}/{f['filename']}"
+        files.append(
+            {
+                "accession": accession,
+                "source": source,
+                "url": f["url"],
+                "filename": f["filename"],
+                "path": path,
+                "download_command": _download_command("curl", f["url"], path),
+            }
+        )
+
+    return {
+        "accession": accession,
+        "source": source,
+        "total_files": len(files),
+        "files": files,
+    }
 
 
 @api_app.get(
@@ -5042,8 +5475,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 ## Recommended workflow
 
 1. **Search** — call `search_all` for simple keyword searches.
-   The `source` field tells you: 'geo', 'sra', or 'arrayexpress'.
-   Only pass `db="geo"|"sra"|"arrayexpress"` if user explicitly restricts.
+   The `source` field tells you: 'geo', 'sra', 'arrayexpress', or 'ena'.
+   Only pass `db="geo"|"sra"|"arrayexpress"|"ena"` if user explicitly restricts.
    - **Sorting**: pass `sortby` to re-order results:
      - `sortby=citations`: sort by citation count of the primary publication.
      - `sortby=journal`: sort by journal name of the primary publication.
@@ -5097,6 +5530,12 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    download raw data, FASTQs, or sequencing files for a study.
    - FASTQ URLs are EBI FTP paths (prefix with `https://` to make downloadable links).
    - Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields (R1;R2).
+   - **Structured manifest** — call `get_study_download_manifest` for paginated JSON
+     file entries. Use this when the user wants exact download instructions that an
+     agent can inspect or transform. Modes: `fastq`, `sra`, `sra_lite`, `s3`, `gcs`.
+     Each file includes URL, target path, size, MD5 when available, and command.
+   - **Original BAM files** — call `get_study_bams` to list original submitted BAM
+     download links from NCBI file metadata. Not all studies have BAMs.
    - **Download scripts** — call `download_study_script` with a study accession and a
      mode to get a ready-to-run bash script. Available modes:
      - `fastq` — wget commands for EBI FASTQ files (default, recommended)
@@ -5113,6 +5552,7 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    - **Supplementary file download** — call `download_supplementary_script` with a
      GEO (GSE) or ArrayExpress (E-MTAB) accession to get a bash script that downloads
      all supplementary / processed data files using curl.
+     Call `get_supplementary_files` when structured JSON file links are preferred.
      Example: `https://seqout.org/api/project/GSE119945/supplementary/download`
      FTP URLs are automatically converted to HTTPS. Only works for GEO and ArrayExpress
      accessions (SRA studies use `download_study_script` instead).
@@ -5144,8 +5584,8 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 9. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
 10. **Quick metadata** — call `get_project_metadata` with any accession (GSE, SRP, E-XXXX)
-    to get just the title and description without full project details. Faster than
-    `get_project` when you only need a quick summary.
+    or PRJ accession to get just the title and description without full project details.
+    Faster than `get_project` when you only need a quick summary.
 
 11. **Species common name** — call `get_common_name_by_scientific_name` with a scientific
     name (e.g. "Homo sapiens") to get its common name (e.g. "human"). Useful when
@@ -5160,6 +5600,10 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 13. **Bulk project+samples metadata** — call `bulk_project_samples_metadata` with a list
     of project accessions (GSE, SRP, ERP, DRP) to get project title/description plus
     flattened sample rows. Useful for comparing sample-level metadata across studies.
+
+    For a single project, prefer `get_project_metadata_rows`. It returns paginated JSON:
+    SRA/ENA studies are one row per run with experiment/sample metadata and download
+    links; GEO and ArrayExpress are flattened sample rows.
 
 14. **Organism growth stats** — call `get_organism_growth` with an organism scientific
     name (e.g. "Homo sapiens") to get monthly experiment counts across GEO, SRA,
@@ -5243,27 +5687,74 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 - Summarize key fields: title, organisms, summary, sample/experiment count, dates.
 - When comparing studies, fetch both with `get_project` and present side-by-side.
 
-## Tools to avoid
+## Tools not exposed via MCP
 
 - `bulk_metadata`, `download_by_query`, `bulk_project_metadata` return binary/bulk data
-  useless for LLMs. Tell users to use the REST API or web interface directly.
+  and are REST-only. Tell users to use the REST API or web interface directly.
 - `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
   structured JSON with download links, or `download_study_script` to get a ready-to-run
   bash script for any download mode (fastq, sra, sra_lite, s3, gcs).
 - `download_study_metadata_csv` streams a merged metadata CSV — not useful for LLMs.
-  Use `get_study_experiments` + `get_sample` for structured metadata access.
+  Use `get_project_metadata_rows` for structured JSON metadata rows.
 - `get_points_bin`, `get_accessions_bin`, `get_clusters` return binary/JSON data for
   the 2D map visualization — not useful for conversational LLM interactions.
 - `get_geo_series_neighbors_coords` returns raw neighbor/3D coordinate data for the
   similarity graph — not useful for conversational use.
-- `health_check` is only for connectivity checks.
+- `purge_cache` is an admin REST endpoint and must never be called through MCP.
+- `health_check` is only for REST connectivity checks.
 - `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
 - `list_organisms` returns all ~283K organisms — use `search_organisms` or
   `get_organism_totals` (with `limit`) instead for conversational use.
 """
 
+MCP_OPERATION_IDS = {
+    "search_all",
+    "search_suggest",
+    "search_structured",
+    "get_project",
+    "get_project_metadata",
+    "get_project_metadata_rows",
+    "get_study_experiments",
+    "get_study_runs",
+    "get_study_bams",
+    "get_study_download_manifest",
+    "download_study_script",
+    "get_supplementary_files",
+    "download_supplementary_script",
+    "get_sample",
+    "get_sample_detail",
+    "get_geo_series_samples",
+    "get_ae_experiment_samples",
+    "resolve_accession_project",
+    "resolve_prj_project",
+    "get_project_xref",
+    "get_project_cite",
+    "get_common_name_by_scientific_name",
+    "get_growth_stats",
+    "get_organism_growth",
+    "get_organism_totals",
+    "search_organisms",
+    "get_global_contributions",
+    "get_global_contribution_filters",
+    "get_country_accessions",
+    "get_project_enriched",
+    "get_platform_totals",
+    "get_platform_growth",
+    "get_platform_instruments",
+    "get_platform_filters",
+    "bulk_project_samples_metadata",
+}
+
+mcp_api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+mcp_api_app.state.limiter = limiter
+mcp_api_app.router.routes.extend(
+    route
+    for route in api_app.router.routes
+    if getattr(route, "operation_id", None) in MCP_OPERATION_IDS
+)
+
 mcp = FastMCP.from_fastapi(
-    app=api_app,
+    app=mcp_api_app,
     name="pysraweb MCP",
     instructions=MCP_INSTRUCTIONS,
 )
