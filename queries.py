@@ -670,6 +670,20 @@ SELECT
     coords_3d,
     neighbors,
     organisms,
+    (SELECT string_agg(DISTINCT contributor_name, ', ' ORDER BY contributor_name)
+     FROM (
+        SELECT btrim(COALESCE(
+            to_jsonb(c)->>'contributor',
+            to_jsonb(c)->>'contributor_name',
+            to_jsonb(c)->>'contact_name',
+            to_jsonb(c)->>'name',
+            to_jsonb(c)->>'author'
+        )) AS contributor_name
+        FROM geo_contributors c
+        WHERE c.accession = geo_series.accession
+     ) contributors
+     WHERE contributor_name IS NOT NULL AND contributor_name <> ''
+    ) AS geo_contributor_authors,
     (SELECT jsonb_agg(DISTINCT jsonb_build_object(
         'organization', c.organization,
         'department', c.department,

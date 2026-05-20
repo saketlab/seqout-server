@@ -2806,10 +2806,12 @@ def get_project(
     accession = accession.upper()
     params = (accession,)
 
+    is_geo_project = False
     if accession.startswith("E-"):
         sql = PROJECT_AE_SQL
     elif accession.startswith("G"):
         sql = PROJECT_GEO_SQL
+        is_geo_project = True
     elif accession.startswith("PRJ"):
         sql = PROJECT_ENA_SQL
     else:
@@ -2821,7 +2823,10 @@ def get_project(
                 cur.execute(sql, params)
                 row = cur.fetchone()
                 if row:
+                    geo_contributor_authors = row.pop("geo_contributor_authors", None)
                     _enrich_with_publications([row], cur)
+                    if is_geo_project and geo_contributor_authors:
+                        row["authors"] = geo_contributor_authors
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
