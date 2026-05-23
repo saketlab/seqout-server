@@ -317,8 +317,8 @@ _spelling_cache: dict = {"ready": False, "symspell": None}
 
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
-    min_size=4,
-    max_size=20,
+    min_size=2,
+    max_size=8,
     timeout=10,
     kwargs={"autocommit": True},
 )
