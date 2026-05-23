@@ -269,16 +269,14 @@ _ENA_FIELDS = (
 
 SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
     "gse": (
-        f"SELECT {_GEO_FIELDS} FROM geo_series g"
-        f" WHERE g.accession = %(acc)s LIMIT 1"
+        f"SELECT {_GEO_FIELDS} FROM geo_series g WHERE g.accession = %(acc)s LIMIT 1"
     ),
     "gsm": (
         f"SELECT {_GEO_FIELDS} FROM geo_series g"
         f" WHERE g.samples_ref @> ARRAY[%(acc)s] LIMIT 1"
     ),
     "srp": (
-        f"SELECT {_SRA_FIELDS} FROM sra_studies s"
-        f" WHERE s.accession = %(acc)s LIMIT 1"
+        f"SELECT {_SRA_FIELDS} FROM sra_studies s WHERE s.accession = %(acc)s LIMIT 1"
     ),
     "srx": (
         f"SELECT {_SRA_FIELDS} FROM sra_experiments e"
@@ -802,7 +800,7 @@ SELECT DISTINCT ON (e.experiment_accession)
     e.instrument_model,
     NULL::text AS submission
 FROM ena_experiments e
-WHERE UPPER(e.study_accession) = UPPER(%s)
+WHERE e.study_accession = UPPER(%s)
 ORDER BY e.experiment_accession, e.run_accession NULLS LAST;
 """
 
