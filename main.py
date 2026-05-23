@@ -25,9 +25,9 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastmcp import FastMCP
+from neo4j import GraphDatabase
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from neo4j import GraphDatabase
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -2798,7 +2798,7 @@ def search(
     ),
     operation_id="get_project",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_project(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
@@ -2843,7 +2843,7 @@ def get_project(
     ),
     operation_id="get_project_metadata",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_project_metadata(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
@@ -2900,7 +2900,7 @@ def get_project_metadata(
     ),
     operation_id="get_study_experiments",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_study_experiments(
     request: Request,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
@@ -3018,7 +3018,7 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     ),
     operation_id="get_study_runs",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_study_runs(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3063,7 +3063,7 @@ def get_study_runs(
     ),
     operation_id="get_study_bams",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_study_bams(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3104,7 +3104,7 @@ def get_study_bams(
     ),
     operation_id="download_study_bams_tsv",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def download_study_bams_tsv(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3162,7 +3162,7 @@ def download_study_bams_tsv(
     ),
     operation_id="download_study_runs_tsv",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def download_study_runs_tsv(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3227,7 +3227,7 @@ def download_study_runs_tsv(
     ),
     operation_id="download_study_metadata_csv",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def download_study_metadata_csv(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3437,7 +3437,7 @@ def download_study_metadata_csv(
     ),
     operation_id="get_project_metadata_rows",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_project_metadata_rows(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
@@ -3764,7 +3764,7 @@ _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
     ),
     operation_id="get_study_download_manifest",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_study_download_manifest(
     request: Request,
     study: str = Path(..., pattern=STUDY_REGEX),
@@ -3822,8 +3822,7 @@ def get_study_download_manifest(
                                     "experiment_accession": entry[
                                         "experiment_accession"
                                     ],
-                                    "library_layout": entry.get("library_layout")
-                                    or "",
+                                    "library_layout": entry.get("library_layout") or "",
                                     "url": url,
                                     "path": path,
                                     "filename": filename,
@@ -4004,7 +4003,7 @@ def _download_command(method: str, url: str, path: str) -> str:
     ),
     operation_id="get_supplementary_files",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_supplementary_files(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
@@ -4300,7 +4299,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     ),
     operation_id="get_sample_detail",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_sample_detail(
     request: Request,
     accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
@@ -4481,7 +4480,7 @@ def download_sample_detail_csv(
     ),
     operation_id="get_common_name_by_scientific_name",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_common_name_by_scientific_name(
     request: Request,
     scientific_name: str = Query(..., min_length=1, max_length=255),
@@ -4512,7 +4511,7 @@ def get_common_name_by_scientific_name(
     description="List all samples for a GEO series (GSE) or ArrayExpress experiment (E-XXXX-NNN).",
     operation_id="get_geo_series_samples",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_geo_series_samples(
     request: Request,
     accession: str = Path(...),
@@ -4542,7 +4541,7 @@ def get_geo_series_samples(
     description="List all samples for an ArrayExpress experiment accession (E-XXXX-NNN).",
     operation_id="get_ae_experiment_samples",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_ae_experiment_samples(
     request: Request,
     accession: str = Path(..., pattern=AE_REGEX),
@@ -4565,7 +4564,7 @@ def get_ae_experiment_samples(
     description="Return only neighbors and coords_3d for a GEO series accession (GSE).",
     operation_id="get_geo_series_neighbors_coords",
 )
-@limiter.limit("1000/minute")
+@limiter.limit("100/minute")
 def get_geo_series_neighbors_coords(
     request: Request,
     accession: str = Path(..., pattern=GEO_SERIES_REGEX),
@@ -4589,7 +4588,7 @@ def get_geo_series_neighbors_coords(
     ),
     operation_id="bulk_metadata",
 )
-@limiter.limit("100000/minute")
+@limiter.limit("10/minute")
 def bulk_metadata(request: Request, payload: dict):
     accessions = payload.get("accessions", [])
     if not accessions:
