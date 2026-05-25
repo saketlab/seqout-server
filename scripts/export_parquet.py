@@ -16,9 +16,9 @@ import os
 import sys
 import time
 
+import psycopg
 import pyarrow as pa
 import pyarrow.parquet as pq
-import psycopg
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -84,14 +84,17 @@ def build_select(columns_with_types: list[tuple[str, str]]) -> tuple[list[str], 
     """
     names = []
     exprs = []
+
     for col, typ in columns_with_types:
         names.append(col)
-        # JSONB structs can have inconsistent schemas across rows,
-        # which breaks Parquet's fixed schema. Cast to text.
-        if typ in ("jsonb", "_jsonb"):
+
+        if typ == "jsonb":
             exprs.append(f'"{col}"::text AS "{col}"')
+        elif typ.startswith("_"):
+            exprs.append(f'array_to_json("{col}"::anyarray)::text AS "{col}"')
         else:
             exprs.append(f'"{col}"')
+
     return names, ", ".join(exprs)
 
 
