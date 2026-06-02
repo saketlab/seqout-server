@@ -319,7 +319,7 @@ _spelling_cache: dict = {"ready": False, "symspell": None}
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
     min_size=2,
-    max_size=8,
+    max_size=100,
     timeout=10,
     kwargs={"autocommit": True},
 )
@@ -395,7 +395,9 @@ def log_request(
     try:
         client_ip_val = client_ip if client_ip else ""
         ip_hashed = hash_ip(client_ip_val) if client_ip_val else None
-        country, city = get_location_from_ip(client_ip_val) if client_ip_val else (None, None)
+        country, city = (
+            get_location_from_ip(client_ip_val) if client_ip_val else (None, None)
+        )
 
         now_ist = datetime.now(_IST)
 
