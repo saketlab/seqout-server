@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import gzip
 import hashlib
@@ -380,20 +381,25 @@ def get_location_from_ip(ip: str) -> tuple[str | None, str | None]:
 
 
 def log_request(
-    request: Request,
+    method: str,
+    path: str,
+    query_string: str | None,
+    client_ip: str,
+    user_agent: str,
+    accept_language: str,
+    referer: str,
     status_code: int,
     response_ms: float,
     search_query: str | None,
 ) -> None:
     try:
-        client_ip = request.client.host if request.client else ""
-        ip_hashed = hash_ip(client_ip) if client_ip else None
-        country, city = get_location_from_ip(client_ip) if client_ip else (None, None)
+        client_ip_val = client_ip if client_ip else ""
+        ip_hashed = hash_ip(client_ip_val) if client_ip_val else None
+        country, city = get_location_from_ip(client_ip_val) if client_ip_val else (None, None)
 
         now_ist = datetime.now(_IST)
 
-        ua_string = request.headers.get("user-agent", "")
-        ua = parse_ua(ua_string)
+        ua = parse_ua(user_agent)
         browser = ua.browser.family if ua.browser.family != "Other" else None
         browser_version = ua.browser.version_string or None
         os_name = ua.os.family if ua.os.family != "Other" else None
@@ -432,24 +438,24 @@ def log_request(
                     """,
                     (
                         now_ist,
-                        request.method,
-                        request.url.path,
-                        str(request.url.query) or None,
+                        method,
+                        path,
+                        query_string,
                         search_query,
                         status_code,
                         round(response_ms, 2),
-                        client_ip or None,
+                        client_ip_val or None,
                         ip_hashed,
                         country,
                         city,
-                        ua_string[:512] if ua_string else None,
+                        user_agent[:512] if user_agent else None,
                         browser,
                         browser_version,
                         os_name,
                         os_version,
                         device_type,
-                        (request.headers.get("accept-language") or "")[:255] or None,
-                        (request.headers.get("referer") or "")[:512] or None,
+                        accept_language[:255] or None,
+                        referer[:512] or None,
                     ),
                 )
     except Exception:
@@ -462,16 +468,33 @@ class AnalyticsMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response_ms = (time.perf_counter() - start) * 1000
 
-        # Extract search query from 'q' param if present
+        # Extract all needed properties synchronously on the main thread
         search_query = request.query_params.get("q")
+        client_ip = request.client.host if request.client else ""
+        user_agent = request.headers.get("user-agent", "")
+        accept_language = request.headers.get("accept-language", "")
+        referer = request.headers.get("referer", "")
+        method = request.method
+        path = request.url.path
+        query_string = str(request.url.query) or None
 
-        # Invoke a daemon thread so we never slow down the response
-        t = threading.Thread(
-            target=log_request,
-            args=(request, response.status_code, response_ms, search_query),
-            daemon=True,
+        # Schedule the blocking database write and GeoIP lookup to run asynchronously
+        # in asyncio's built-in thread pool executor.
+        asyncio.create_task(
+            asyncio.to_thread(
+                log_request,
+                method,
+                path,
+                query_string,
+                client_ip,
+                user_agent,
+                accept_language,
+                referer,
+                response.status_code,
+                response_ms,
+                search_query,
+            )
         )
-        t.start()
 
         return response
 
