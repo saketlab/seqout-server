@@ -4324,7 +4324,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     ),
     operation_id="get_sample_detail",
 )
-@limiter.limit("100/minute")
+@limiter.limit("10000/minute")  # TODO: Revert this back!
 def get_sample_detail(
     request: Request,
     accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
