@@ -79,6 +79,10 @@ from queries import (
     GROWTH_PROJECTS_ENA_SQL,
     GROWTH_PROJECTS_GEO_SQL,
     GROWTH_PROJECTS_SRA_SQL,
+    LIST_CENTERS_SQL,
+    LIST_INSTRUMENT_MODELS_SQL,
+    LIST_JOURNALS_SQL,
+    LIST_LIBRARY_STRATEGIES_SQL,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
     ONTOLOGY_SAMPLES_V3_SQL,
@@ -94,11 +98,15 @@ from queries import (
     PROJECT_ENA_SQL,
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
+    PUBLICATION_BY_DOI_SQL,
+    PUBLICATION_BY_PMID_SQL,
     RELATED_SQL,
     RUN_DOWNLOAD_SQL,
     SAMPLE_SQL,
+    SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
+    SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
     SRA_EXPERIMENT_SQL,
@@ -107,12 +115,14 @@ from queries import (
     SRA_SAMPLE_TO_EXPERIMENT_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
+    STUDIES_BY_PMID_SQL,
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
+    STUDY_SAMPLES_SRA_SQL,
     SUBMITTER_BATCH_SQL,
     build_country_accessions_sql,
     build_country_filters_sql,
@@ -515,7 +525,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     )
 
 
-def classify_accession(acc: str) -> str | None:
+def _accession_source(acc: str) -> str | None:
     """Classify accession into database source."""
     if acc.startswith("GSE"):
         return "geo"
@@ -2942,6 +2952,40 @@ def get_study_experiments(
         raise HTTPException(500, "Internal server error")
 
 
+@api_app.get(
+    "/project/{study}/samples",
+    summary="List samples for an SRA study",
+    description=(
+        "Return distinct samples referenced by any experiment in an SRA study "
+        "(SRP/DRP/ERP). PRJ accessions are resolved to their SRA study first."
+    ),
+    operation_id="get_study_samples",
+)
+@limiter.limit("1000/minute")
+def get_study_samples(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+):
+    study = study.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if study.startswith("PRJ"):
+                    cur.execute(PRJ_TO_SRA_STUDY_SQL, (study,))
+                    resolved = cur.fetchone()
+                    if not resolved:
+                        raise HTTPException(404, f"No SRA study found for {study}")
+                    study = resolved["accession"]
+                cur.execute(STUDY_SAMPLES_SRA_SQL, (study,))
+                rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_study_samples")
+        raise HTTPException(500, "Internal server error")
+    return {"study_accession": study, "total": len(rows), "samples": rows}
+
+
 def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     """Expand a single run row into one dict per FASTQ file.
 
@@ -3107,6 +3151,64 @@ def get_run(
     if not row:
         raise HTTPException(404, f"No run found for accession {run}")
     return row
+
+
+@api_app.get(
+    "/experiment/{accession}",
+    summary="Get a single SRA/ENA experiment",
+    description=(
+        "Return experiment metadata (library, platform, instrument, parent study, "
+        "linked samples) plus runs for an SRA or ENA experiment accession "
+        "(SRX/ERX/DRX). Use /experiment/{accession}/runs to fetch just the runs."
+    ),
+    operation_id="get_experiment",
+)
+@limiter.limit("1000/minute")
+def get_experiment(
+    request: Request,
+    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SRA_EXPERIMENT_SQL, (accession,))
+                experiment = cur.fetchone()
+                if not experiment:
+                    cur.execute(ENA_EXPERIMENT_SQL, (accession,))
+                    experiment = cur.fetchone()
+                if experiment:
+                    cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
+                    experiment["runs"] = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_experiment")
+        raise HTTPException(500, "Internal server error")
+    if not experiment:
+        raise HTTPException(404, f"No experiment found for accession {accession}")
+    return experiment
+
+
+@api_app.get(
+    "/experiment/{accession}/runs",
+    summary="List runs for an experiment",
+    description="Return run download links and layout for an SRX/ERX/DRX experiment.",
+    operation_id="get_experiment_runs",
+)
+@limiter.limit("1000/minute")
+def get_experiment_runs(
+    request: Request,
+    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
+                runs = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_experiment_runs")
+        raise HTTPException(500, "Internal server error")
+    return {"experiment_accession": accession, "total": len(runs), "runs": runs}
 
 
 @api_app.get(
@@ -4573,7 +4675,7 @@ def get_geo_series_samples(
     accession: str = Path(...),
 ):
     accession = accession.upper()
-    source = classify_accession(accession)
+    source = _accession_source(accession)
     if source not in ["geo", "arrayexpress"]:
         raise HTTPException(400, f"Invalid accession format: {accession}")
 
@@ -4666,7 +4768,7 @@ def bulk_metadata(request: Request, payload: dict):
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     for acc in validated:
-                        source = classify_accession(acc)
+                        source = _accession_source(acc)
 
                         if source == "sra":
                             rows = flatten_sra_study(cur, acc)
@@ -5056,6 +5158,119 @@ def get_prj_info(
         raise HTTPException(500, "Internal server error")
 
 
+_KIND_INFO = {
+    "gse": {"entity": "series", "database": "geo"},
+    "gsm": {"entity": "sample", "database": "geo"},
+    "srp": {"entity": "study", "database": "sra"},
+    "srx": {"entity": "experiment", "database": "sra"},
+    "srs": {"entity": "sample", "database": "sra"},
+    "srr": {"entity": "run", "database": "sra"},
+    "sam": {"entity": "biosample", "database": "biosample"},
+    "ae": {"entity": "experiment", "database": "arrayexpress"},
+    "prj": {"entity": "bioproject", "database": "bioproject"},
+}
+_SED_ARCHIVE = {"S": "ncbi-sra", "E": "ena", "D": "ddbj"}
+
+
+@api_app.get(
+    "/accession/{accession}/classify",
+    summary="Classify an accession by database and entity kind",
+    description=(
+        "Pattern-match an accession and report which database family it belongs to "
+        "and what entity it names (study/series/experiment/sample/run/bioproject). "
+        "Format validation only — does not query the DB. Returns {valid: false} for "
+        "unrecognized strings."
+    ),
+    operation_id="classify_accession",
+)
+@limiter.limit("1000/minute")
+def classify_accession(
+    request: Request,
+    accession: str = Path(..., min_length=2, max_length=64),
+):
+    classified = _classify_accession_query(accession)
+    if classified is None:
+        return {"accession": accession, "valid": False}
+    acc, kind = classified
+    info = _KIND_INFO.get(kind, {})
+    return {
+        "accession": acc,
+        "valid": True,
+        "kind": kind,
+        "entity": info.get("entity"),
+        "database": info.get("database"),
+        "archive": _SED_ARCHIVE.get(acc[0]) or info.get("database"),
+    }
+
+
+@api_app.get(
+    "/search/authors",
+    summary="Search publications and linked studies by author name",
+    description=(
+        "Case-insensitive substring search across publication author lists, ranked "
+        "by citation count. Each result is a publication (PMID, title, journal, DOI, "
+        "authors, citation count) plus its linked dataset accessions across GEO, "
+        "SRA, ArrayExpress, and ENA. Only studies with a linked PubMed publication "
+        "are findable here."
+    ),
+    operation_id="search_by_author",
+)
+@limiter.limit("100/minute")
+def search_by_author(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=100),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    pattern = f"%{q}%"
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SEARCH_AUTHORS_SQL, (pattern, limit))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in search_by_author")
+        raise HTTPException(500, "Internal server error")
+    return {"q": q, "total": len(rows), "results": rows}
+
+
+@api_app.get(
+    "/publication",
+    summary="Find a publication and all linked datasets",
+    description=(
+        "Reverse lookup from a publication (PMID or DOI) to every linked dataset "
+        "accession across GEO, SRA, ArrayExpress, and ENA. Provide either pmid or "
+        "doi as a query parameter."
+    ),
+    operation_id="find_publication",
+)
+@limiter.limit("1000/minute")
+def find_publication(
+    request: Request,
+    pmid: str | None = Query(default=None, pattern=r"^\d+$"),
+    doi: str | None = Query(default=None, min_length=1, max_length=200),
+):
+    if not pmid and not doi:
+        raise HTTPException(400, "Provide either pmid or doi as a query parameter")
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if pmid:
+                    cur.execute(PUBLICATION_BY_PMID_SQL, (pmid,))
+                else:
+                    cur.execute(PUBLICATION_BY_DOI_SQL, (doi,))
+                pub = cur.fetchone()
+                studies = []
+                if pub:
+                    cur.execute(STUDIES_BY_PMID_SQL, (pub["pmid"],))
+                    studies = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in find_publication")
+        raise HTTPException(500, "Internal server error")
+    if not pub:
+        raise HTTPException(404, "Publication not found")
+    return {**pub, "studies": studies, "total_studies": len(studies)}
+
+
 @api_app.get(
     "/search/structured",
     summary="Structured search with filters",
@@ -5105,6 +5320,31 @@ def search_structured(
     multi_platform: bool = Query(
         False, description="Only studies with 2+ sequencing platforms"
     ),
+    published_after: str | None = Query(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Day-granularity lower bound (YYYY-MM-DD)",
+    ),
+    published_before: str | None = Query(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Day-granularity upper bound (YYYY-MM-DD)",
+    ),
+    sample_tissue: str | None = Query(
+        None, description="Filter to studies with samples whose tissue matches (ILIKE)"
+    ),
+    sample_disease: str | None = Query(
+        None, description="Filter to studies with samples whose disease matches (ILIKE)"
+    ),
+    sample_cell_type: str | None = Query(
+        None,
+        description="Filter to studies with samples whose cell_type matches (ILIKE)",
+    ),
+    count_by: str | None = Query(
+        None,
+        pattern="^(year|source|organism|country)$",
+        description="Aggregation mode: return bucket counts instead of rows",
+    ),
 ):
     if q:
         q = _replace_query_hyphens(q)
@@ -5140,13 +5380,20 @@ def search_structured(
             assay_l1,
             assay_l2,
             multi_platform,
+            published_after,
+            published_before,
+            sample_tissue,
+            sample_disease,
+            sample_cell_type,
         ]
     ):
         raise HTTPException(
             400,
             "At least one of q, organism, library_strategy, platform, "
             "country, center, year_from, year_to, journal, "
-            "instrument_model, assay_l1, assay_l2, multi_platform, or a geo_* filter is required",
+            "instrument_model, assay_l1, assay_l2, multi_platform, "
+            "published_after, published_before, sample_tissue, sample_disease, "
+            "sample_cell_type, or a geo_* filter is required",
         )
 
     if year_from is not None and year_to is not None and year_from > year_to:
@@ -5193,6 +5440,12 @@ def search_structured(
         assay_l1=assay_l1,
         assay_l2=assay_l2,
         multi_platform=multi_platform,
+        published_after=published_after,
+        published_before=published_before,
+        sample_tissue=sample_tissue,
+        sample_disease=sample_disease,
+        sample_cell_type=sample_cell_type,
+        count_by=count_by,
     )
 
     start = time.perf_counter()
@@ -5202,7 +5455,8 @@ def search_structured(
                 cur.execute("SET LOCAL statement_timeout = '30s'")
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-                _enrich_with_publications(rows, cur)
+                if not count_by:
+                    _enrich_with_publications(rows, cur)
     except Exception as e:
         err_msg = str(e).lower()
         if "canceling statement" in err_msg or "timeout" in err_msg:
@@ -5216,8 +5470,16 @@ def search_structured(
         raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
-    total = rows[0]["total_count"] if rows else 0
 
+    if count_by:
+        return {
+            "count_by": count_by,
+            "total_buckets": len(rows),
+            "took_ms": round(took_ms, 2),
+            "buckets": rows,
+        }
+
+    total = rows[0]["total_count"] if rows else 0
     return {
         "results": rows,
         "total": total,
@@ -5446,6 +5708,166 @@ def get_project_enriched(
     }
 
 
+@api_app.get(
+    "/project/{accession}/similar",
+    summary="Find similar studies",
+    description=(
+        "Return the nearest studies to a project based on the precomputed 2D "
+        "embedding (geo_series.neighbors / sra_studies.neighbors). Each result "
+        "includes accession, distance, title, organisms, and source. Useful for "
+        "'find studies like X' / 'what else is similar to this dataset'."
+    ),
+    operation_id="get_project_similar",
+)
+@limiter.limit("1000/minute")
+def get_project_similar(
+    request: Request,
+    accession: str = Path(..., pattern=rf"^(GSE|{_STUDY_PREFIX})\d+$"),
+    limit: int = Query(default=10, ge=1, le=100),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SIMILAR_STUDIES_SQL, {"acc": accession, "limit": limit})
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_project_similar")
+        raise HTTPException(500, "Internal server error")
+    if not rows:
+        raise HTTPException(404, f"No precomputed neighbors for {accession}")
+    return {"accession": accession, "total": len(rows), "similar": rows}
+
+
+def _list_filter(sql: str, params: tuple = ()) -> list[dict]:
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+@api_app.get(
+    "/filters/library-strategies",
+    summary="Enumerate library strategies",
+    description=(
+        "Return every library_strategy seen in sra_experiments with a count, "
+        "sorted by frequency. Use to populate filter dropdowns or to discover "
+        "valid values for search_structured(library_strategy=...)."
+    ),
+    operation_id="list_library_strategies",
+)
+@limiter.limit("100/minute")
+def list_library_strategies(request: Request):
+    try:
+        rows = _list_filter(LIST_LIBRARY_STRATEGIES_SQL)
+    except Exception:
+        logger.exception("Database error in list_library_strategies")
+        raise HTTPException(500, "Internal server error")
+    return {"total": len(rows), "values": rows}
+
+
+@api_app.get(
+    "/filters/instrument-models",
+    summary="Enumerate instrument models",
+    description=(
+        "Return every instrument_model seen in sra_experiments with a count, "
+        "sorted by frequency. Use to discover valid values for "
+        "search_structured(instrument_model=...)."
+    ),
+    operation_id="list_instrument_models",
+)
+@limiter.limit("100/minute")
+def list_instrument_models(request: Request):
+    try:
+        rows = _list_filter(LIST_INSTRUMENT_MODELS_SQL)
+    except Exception:
+        logger.exception("Database error in list_instrument_models")
+        raise HTTPException(500, "Internal server error")
+    return {"total": len(rows), "values": rows}
+
+
+@api_app.get(
+    "/filters/journals",
+    summary="Enumerate journals",
+    description=(
+        "Return the top journals appearing in linked publications, sorted by "
+        "frequency. Use to discover valid values for search_structured(journal=...)."
+    ),
+    operation_id="list_journals",
+)
+@limiter.limit("100/minute")
+def list_journals(
+    request: Request,
+    limit: int = Query(default=500, ge=1, le=5000),
+):
+    try:
+        rows = _list_filter(LIST_JOURNALS_SQL, (limit,))
+    except Exception:
+        logger.exception("Database error in list_journals")
+        raise HTTPException(500, "Internal server error")
+    return {"total": len(rows), "values": rows}
+
+
+@api_app.get(
+    "/filters/centers",
+    summary="Enumerate submission centers",
+    description=(
+        "Return the top submission centers from sra_submissions + ena_studies, "
+        "sorted by frequency. Use to discover values for search_structured(center=...)."
+    ),
+    operation_id="list_centers",
+)
+@limiter.limit("100/minute")
+def list_centers(
+    request: Request,
+    limit: int = Query(default=500, ge=1, le=5000),
+):
+    try:
+        rows = _list_filter(LIST_CENTERS_SQL, (limit,))
+    except Exception:
+        logger.exception("Database error in list_centers")
+        raise HTTPException(500, "Internal server error")
+    return {"total": len(rows), "values": rows}
+
+
+@api_app.get(
+    "/sample/{accession}/experiments",
+    summary="List experiments referencing a sample",
+    description=(
+        "Return the SRA/ENA experiment accession(s) that reference a sample "
+        "(SRS/ERS/DRS/SAM*). Inverse of /experiment/{accession}'s samples list."
+    ),
+    operation_id="get_sample_experiments",
+)
+@limiter.limit("1000/minute")
+def get_sample_experiments(
+    request: Request,
+    accession: str = Path(..., pattern=SAMPLE_OR_ENA_REGEX),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SRA_SAMPLE_TO_EXPERIMENT_SQL, (accession,))
+                row = cur.fetchone()
+                source = "sra"
+                if not row:
+                    cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (accession,))
+                    row = cur.fetchone()
+                    source = "ena"
+    except Exception:
+        logger.exception("Database error in get_sample_experiments")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(404, f"No experiment found for sample {accession}")
+    experiment = row.get("accession") or row.get("experiment_accession")
+    return {
+        "sample_accession": accession,
+        "experiment_accession": experiment,
+        "source": source,
+    }
+
+
 def _age_hours_to_human(value: str | None) -> str | None:
     """Convert age in hours (float string) to a human-friendly string.
 
@@ -5546,6 +5968,9 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
 1. **Search** — call `search_all` for simple keyword searches.
    The `source` field tells you: 'geo', 'sra', 'arrayexpress', or 'ena'.
    Only pass `db="geo"|"sra"|"arrayexpress"|"ena"` if user explicitly restricts.
+   - **Spelling correction** — if a query returns 0 results and looks like a typo,
+     call `search_suggest` with the same `q` to get spelling suggestions, then
+     re-issue `search_all` with the corrected term.
    - **Sorting**: pass `sortby` to re-order results:
      - `sortby=citations`: sort by citation count of the primary publication.
      - `sortby=journal`: sort by journal name of the primary publication.
@@ -5577,18 +6002,43 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    - `multi_platform`: set to `true` to find only studies with 2+ sequencing platforms
      (e.g. mixed Illumina + Nanopore). GEO and SRA only.
    - `source`: restrict to "geo", "sra", "arrayexpress", "ena", or "all"
+   - `published_after`/`published_before`: day-granularity date filter (YYYY-MM-DD).
+     Use these for "studies in the last 30 days" / a precise window. Combine with or
+     replace `year_from`/`year_to`.
+   - `sample_tissue` / `sample_disease` / `sample_cell_type`: filter to studies that
+     have at least one sample matching the term (ILIKE substring on ontology_samples_v3).
+     E.g. `sample_tissue=liver` finds studies with any liver sample. Only studies with
+     enriched v3 metadata are findable here.
+   - `count_by`: switch to aggregation mode. Returns `{count_by, total_buckets, buckets:
+     [{bucket, count}, ...]}` instead of paginated rows. Modes: `year`, `source`,
+     `organism`, `country`. Useful for "studies per year by organism" cohort queries.
    Results include a `platforms` array (e.g. `["ILLUMINA", "OXFORD_NANOPORE"]`) showing
    which sequencing platforms each study used.
    Use `search_all` for simple keyword searches; use `search_structured` when specific
    metadata filters are needed.
+   - **Filter enumeration** — to discover valid values for `library_strategy`,
+     `instrument_model`, `journal`, `center` before issuing a filter, call
+     `list_library_strategies`, `list_instrument_models`, `list_journals`,
+     `list_centers`. Each returns `{value, count}` sorted by frequency.
 
 3. **Drill into a result** — call `get_project` with the accession.
    Returns full metadata for GSE, SRP, or E-XXXX.
+   - **Find similar studies** — call `get_project_similar` with a GSE or SRP accession
+     to get the nearest studies in the 2D embedding (title + distance + source for
+     each neighbor). Use for "find studies like X" / "what else is similar".
 
-4. **Explore samples/experiments**:
-   - SRA study → `get_study_experiments`, then `get_sample` for individual samples
-   - GEO series → `get_geo_series_samples`
-   - ArrayExpress experiment → `get_ae_experiment_samples`
+4. **Explore samples/experiments/runs**:
+   - SRA study → `get_study_experiments` (per-experiment metadata), `get_study_samples`
+     (deduped sample list across all experiments — accepts SRP/DRP/ERP/PRJ), or
+     `get_study_runs` (FASTQ/SRA download links for every run).
+   - Single SRA/ENA experiment → `get_experiment` (returns metadata + runs). Use
+     `get_experiment_runs` for just the run list.
+   - Single SRA/ENA run → `get_run` (download links for one SRR/ERR/DRR accession,
+     including fastq_ftp, sra_ftp, and ncbi_sra_lite_* cloud URLs).
+   - GEO series → `get_geo_series_samples`; single GSM via `get_sample_detail`.
+   - ArrayExpress experiment → `get_ae_experiment_samples`.
+   - **Sample → experiment reverse lookup** — call `get_sample_experiments` with an
+     SRS/ERS/DRS/SAM* accession to get the parent experiment accession.
 
 5. **FASTQ download links** — call `get_study_runs` with an SRA study accession
    (SRP/ERP/DRP) to get FASTQ download URLs for all runs. Returns summary statistics
@@ -5646,9 +6096,20 @@ E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GS
    Note: search results and `get_project` also include top-level
    publication fields (pmid, publication_title, journal, doi, authors, citation_count)
    from the primary (most-cited) publication.
+   - **Reverse lookup (paper → datasets)** — call `find_publication` with `pmid=...`
+     or `doi=...` to find ALL datasets linked to a publication across GEO, SRA,
+     ArrayExpress, and ENA. Returns publication metadata + a list of linked
+     accessions. Use when the user is reading a paper and wants the underlying data.
+   - **Author search** — call `search_by_author` with `q=name` to find publications
+     by author name substring (ranked by citation count), each carrying its linked
+     datasets. Only studies with a linked PubMed publication are findable here.
 
 8. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
    to their parent study/series.
+   - **Classify any accession** — call `classify_accession` with any string to learn
+     which database it belongs to, which entity kind it names, and which REST
+     endpoints can be called against it. Pattern-match only — no DB hit. Use this
+     to route an unknown accession to the right tool without guessing.
 
 9. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
 
@@ -5780,24 +6241,37 @@ MCP_OPERATION_IDS = {
     "search_all",
     "search_suggest",
     "search_structured",
+    "search_by_author",
     "get_project",
     "get_project_metadata",
     "get_project_metadata_rows",
     "get_study_experiments",
+    "get_study_samples",
     "get_study_runs",
     "get_study_bams",
     "get_study_download_manifest",
     "download_study_script",
     "get_supplementary_files",
     "download_supplementary_script",
+    "get_experiment",
+    "get_experiment_runs",
+    "get_run",
     "get_sample",
     "get_sample_detail",
+    "get_sample_experiments",
+    "get_project_similar",
+    "list_library_strategies",
+    "list_instrument_models",
+    "list_journals",
+    "list_centers",
     "get_geo_series_samples",
     "get_ae_experiment_samples",
     "resolve_accession_project",
     "resolve_prj_project",
+    "classify_accession",
     "get_project_xref",
     "get_project_cite",
+    "find_publication",
     "get_common_name_by_scientific_name",
     "get_growth_stats",
     "get_organism_growth",

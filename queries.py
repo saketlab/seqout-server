@@ -1063,6 +1063,136 @@ WHERE experiment_accession = %s
 LIMIT 1;
 """
 
+# Distinct samples for an SRA study (caller must uppercase the accession).
+STUDY_SAMPLES_SRA_SQL = """
+SELECT DISTINCT
+    s.accession,
+    s.title,
+    s.scientific_name,
+    s.taxon_id,
+    s.alias
+FROM sra_samples s
+JOIN sra_experiments e ON s.accession = ANY(e.samples)
+WHERE e.study = %s
+ORDER BY s.accession
+LIMIT 1000;
+"""
+
+# Publication -> studies reverse lookup.
+STUDIES_BY_PMID_SQL = """
+SELECT DISTINCT accession, source
+FROM cross_ref_pubmed
+WHERE pubmed_id = %s
+ORDER BY source, accession;
+"""
+
+PUBLICATION_BY_PMID_SQL = """
+SELECT pmid, title, journal, doi, pub_date, authors, citation_count
+FROM pubmed_metadata
+WHERE pmid = %s;
+"""
+
+# Case-insensitive DOI lookup; consider an index on LOWER(doi) if this becomes hot.
+PUBLICATION_BY_DOI_SQL = """
+SELECT pmid, title, journal, doi, pub_date, authors, citation_count
+FROM pubmed_metadata
+WHERE LOWER(doi) = LOWER(%s)
+LIMIT 1;
+"""
+
+# Similar studies via the precomputed neighbors JSONB (2D embedding nearest neighbors).
+# Looks up the source accession in geo_series OR sra_studies, then enriches each
+# neighbor with title/organisms/source from whichever archive owns it.
+# Params: %(acc)s (source accession), %(limit)s (neighbor count).
+SIMILAR_STUDIES_SQL = """
+WITH base AS (
+    SELECT neighbors FROM geo_series   WHERE accession = %(acc)s
+    UNION ALL
+    SELECT neighbors FROM sra_studies  WHERE accession = %(acc)s
+),
+expanded AS (
+    SELECT
+        (n->>'accession')::text AS accession,
+        COALESCE((n->>'distance')::float, (n->>'score')::float, 0.0) AS distance
+    FROM base, jsonb_array_elements(base.neighbors) AS n
+    ORDER BY 2 ASC
+    LIMIT %(limit)s
+)
+SELECT
+    e.accession, e.distance,
+    COALESCE(g.title, s.title, ae.title) AS title,
+    COALESCE(g.organisms, s.organisms, ae.organisms) AS organisms,
+    CASE
+        WHEN g.accession  IS NOT NULL THEN 'geo'
+        WHEN s.accession  IS NOT NULL THEN 'sra'
+        WHEN ae.accession IS NOT NULL THEN 'arrayexpress'
+    END AS source
+FROM expanded e
+LEFT JOIN geo_series              g  ON g.accession  = e.accession
+LEFT JOIN sra_studies             s  ON s.accession  = e.accession
+LEFT JOIN arrayexpress_experiments ae ON ae.accession = e.accession
+ORDER BY e.distance ASC;
+"""
+
+LIST_LIBRARY_STRATEGIES_SQL = """
+SELECT library_strategy AS value, COUNT(*)::bigint AS count
+FROM sra_experiments
+WHERE library_strategy IS NOT NULL AND library_strategy <> ''
+GROUP BY library_strategy
+ORDER BY count DESC, value;
+"""
+
+LIST_INSTRUMENT_MODELS_SQL = """
+SELECT instrument_model AS value, COUNT(*)::bigint AS count
+FROM sra_experiments
+WHERE instrument_model IS NOT NULL AND instrument_model <> ''
+GROUP BY instrument_model
+ORDER BY count DESC, value;
+"""
+
+LIST_JOURNALS_SQL = """
+SELECT journal AS value, COUNT(*)::bigint AS count
+FROM pubmed_metadata
+WHERE journal IS NOT NULL AND journal <> ''
+GROUP BY journal
+ORDER BY count DESC, value
+LIMIT %s;
+"""
+
+LIST_CENTERS_SQL = """
+SELECT center_name AS value, COUNT(*)::bigint AS count
+FROM (
+    SELECT center_name FROM sra_submissions WHERE center_name IS NOT NULL AND center_name <> ''
+    UNION ALL
+    SELECT center_name FROM ena_studies     WHERE center_name IS NOT NULL AND center_name <> ''
+) c
+GROUP BY center_name
+ORDER BY count DESC, value
+LIMIT %s;
+"""
+
+# Author substring search; caller supplies the ILIKE pattern with %-wildcards.
+SEARCH_AUTHORS_SQL = """
+WITH matched AS (
+    SELECT pmid, title, journal, doi, pub_date, authors, citation_count
+    FROM pubmed_metadata
+    WHERE authors ILIKE %s
+    ORDER BY citation_count DESC NULLS LAST
+    LIMIT %s
+)
+SELECT
+    m.pmid, m.title, m.journal, m.doi, m.pub_date, m.authors, m.citation_count,
+    COALESCE(
+        jsonb_agg(DISTINCT jsonb_build_object('accession', c.accession, 'source', c.source))
+        FILTER (WHERE c.accession IS NOT NULL),
+        '[]'::jsonb
+    ) AS studies
+FROM matched m
+LEFT JOIN cross_ref_pubmed c ON c.pubmed_id = m.pmid
+GROUP BY m.pmid, m.title, m.journal, m.doi, m.pub_date, m.authors, m.citation_count
+ORDER BY m.citation_count DESC NULLS LAST;
+"""
+
 PROJECT_AE_SQL = """
 SELECT
     ae.accession,
@@ -1298,10 +1428,27 @@ def build_structured_search(
     assay_l1=None,
     assay_l2=None,
     multi_platform=False,
+    published_after=None,
+    published_before=None,
+    sample_tissue=None,
+    sample_disease=None,
+    sample_cell_type=None,
+    count_by=None,
 ):
     """Build SQL + params for structured search across GEO, SRA, ArrayExpress, ENA.
 
     Returns (sql_string, params_dict) using %(name)s named parameters.
+
+    `published_after`/`published_before` accept ISO date strings (YYYY-MM-DD) and
+    filter the source's publication-date column (geo.published_at,
+    sra.published_at, ae.release_date, ena.first_public).
+
+    `sample_tissue`/`sample_disease`/`sample_cell_type` filter to studies that
+    have at least one matching row in ontology_samples_v3 (ILIKE substring match).
+
+    `count_by` switches the final SELECT to aggregation mode. Supported values:
+    "year", "source", "organism", "country". Returns one row per bucket with
+    {bucket, count} instead of the paginated row list.
     """
     params = {}
     cte_parts = []
@@ -1348,6 +1495,16 @@ def build_structured_search(
         params["journal"] = journal
     if instrument_model:
         params["instrument_model"] = instrument_model
+    if published_after:
+        params["published_after"] = published_after
+    if published_before:
+        params["published_before"] = published_before
+    if sample_tissue:
+        params["sample_tissue"] = f"%{sample_tissue}%"
+    if sample_disease:
+        params["sample_disease"] = f"%{sample_disease}%"
+    if sample_cell_type:
+        params["sample_cell_type"] = f"%{sample_cell_type}%"
 
     # Geo filter kwargs
     geo_kwargs = dict(
@@ -1400,6 +1557,10 @@ def build_structured_search(
             w.append("g.published_at >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("g.published_at <= make_date(%(year_to)s, 12, 31)")
+        if published_after:
+            w.append("g.published_at >= %(published_after)s::date")
+        if published_before:
+            w.append("g.published_at <= %(published_before)s::date")
         if journal:
             w.append(
                 "EXISTS (SELECT 1 FROM study_publications sp"
@@ -1410,6 +1571,24 @@ def build_structured_search(
             w.append("g.instrument_models @> ARRAY[%(instrument_model)s]")
         if multi_platform:
             w.append("array_length(g.platforms, 1) >= 2")
+        if sample_tissue:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = g.accession"
+                " AND os.tissue ILIKE %(sample_tissue)s)"
+            )
+        if sample_disease:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = g.accession"
+                " AND os.disease ILIKE %(sample_disease)s)"
+            )
+        if sample_cell_type:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = g.accession"
+                " AND os.cell_type ILIKE %(sample_cell_type)s)"
+            )
 
         rank = (
             "ts_rank(g.tsv, q.core_q) + ts_rank(g.tsv, q.match_q) * 0.2"
@@ -1458,6 +1637,10 @@ def build_structured_search(
             w.append("s.published_at >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("s.published_at <= make_date(%(year_to)s, 12, 31)")
+        if published_after:
+            w.append("s.published_at >= %(published_after)s::date")
+        if published_before:
+            w.append("s.published_at <= %(published_before)s::date")
         if journal:
             w.append(
                 "EXISTS (SELECT 1 FROM study_publications sp"
@@ -1468,6 +1651,24 @@ def build_structured_search(
             w.append("s.instrument_models @> ARRAY[%(instrument_model)s]")
         if multi_platform:
             w.append("array_length(s.platforms, 1) >= 2")
+        if sample_tissue:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = s.accession"
+                " AND os.tissue ILIKE %(sample_tissue)s)"
+            )
+        if sample_disease:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = s.accession"
+                " AND os.disease ILIKE %(sample_disease)s)"
+            )
+        if sample_cell_type:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = s.accession"
+                " AND os.cell_type ILIKE %(sample_cell_type)s)"
+            )
 
         rank = (
             "(ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7"
@@ -1502,6 +1703,28 @@ def build_structured_search(
             w.append("ae.release_date >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("ae.release_date <= make_date(%(year_to)s, 12, 31)")
+        if published_after:
+            w.append("ae.release_date >= %(published_after)s::date")
+        if published_before:
+            w.append("ae.release_date <= %(published_before)s::date")
+        if sample_tissue:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = ae.accession"
+                " AND os.tissue ILIKE %(sample_tissue)s)"
+            )
+        if sample_disease:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = ae.accession"
+                " AND os.disease ILIKE %(sample_disease)s)"
+            )
+        if sample_cell_type:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = ae.accession"
+                " AND os.cell_type ILIKE %(sample_cell_type)s)"
+            )
         if journal:
             w.append(
                 "EXISTS (SELECT 1 FROM study_publications sp"
@@ -1557,6 +1780,28 @@ def build_structured_search(
             w.append("es.first_public >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
             w.append("es.first_public <= make_date(%(year_to)s, 12, 31)")
+        if published_after:
+            w.append("es.first_public >= %(published_after)s::date")
+        if published_before:
+            w.append("es.first_public <= %(published_before)s::date")
+        if sample_tissue:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = es.study_accession"
+                " AND os.tissue ILIKE %(sample_tissue)s)"
+            )
+        if sample_disease:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = es.study_accession"
+                " AND os.disease ILIKE %(sample_disease)s)"
+            )
+        if sample_cell_type:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                " WHERE os.study_accession = es.study_accession"
+                " AND os.cell_type ILIKE %(sample_cell_type)s)"
+            )
         if journal:
             w.append(
                 "EXISTS (SELECT 1 FROM study_publications sp"
@@ -1623,6 +1868,36 @@ def build_structured_search(
     # Prepend query and geo_accessions CTEs when active
     query_cte_prefix = query_cte
     geo_cte_prefix = f"{geo_cte},\n" if geo_cte else ""
+
+    _COUNT_BUCKETS = {
+        "year": "EXTRACT(YEAR FROM updated_at)::int",
+        "source": "source",
+        "organism": "unnest(organisms)",
+        "country": "unnest(countries)",
+    }
+    if count_by:
+        bucket_expr = _COUNT_BUCKETS.get(count_by)
+        if not bucket_expr:
+            raise ValueError(
+                f"Unsupported count_by={count_by!r}; expected one of {list(_COUNT_BUCKETS)}"
+            )
+        sql = f"""\
+WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
+    {all_matches}
+),
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, updated_at, organisms, countries, source
+    FROM all_matches
+    ORDER BY dedup_key, rank DESC
+)
+SELECT bucket, COUNT(*)::bigint AS count
+FROM (SELECT {bucket_expr} AS bucket FROM deduped) buckets
+WHERE bucket IS NOT NULL
+GROUP BY bucket
+ORDER BY count DESC, bucket
+LIMIT 200;"""
+        return sql, params
 
     sql = f"""\
 WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
