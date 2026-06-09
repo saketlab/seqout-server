@@ -69,7 +69,7 @@ def expand_common_names(conn, query: str) -> list[str]:
         return []
 
     variants = [normalized_query]
-    
+
     pass1_variants = _run_expansion_pass(
         conn, [normalized_query], COMMON_NAME_EXPANSION_SQL, _MAX_COMMON_NAME_ROWS
     )
@@ -221,9 +221,9 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
 
         # Step 1: Generate all contiguous sub-phrase candidates
         candidates = _generate_candidate_subphrases(words)
-        candidate_phrases = list(dict.fromkeys(
-            phrase.lower() for phrase, _, _ in candidates
-        ))
+        candidate_phrases = list(
+            dict.fromkeys(phrase.lower() for phrase, _, _ in candidates)
+        )
 
         # Step 2: Batch-check which candidates exist as Term nodes in Neo4j
         existing: set[str] = set()

@@ -95,6 +95,7 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     RELATED_SQL,
+    RUN_DOWNLOAD_SQL,
     SAMPLE_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
@@ -148,6 +149,7 @@ BULK_PATTERN = re.compile(
 )
 
 STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
+RUN_REGEX = rf"^{_RUN_PREFIX}\d+$"
 SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
 EXPERIMENT_REGEX = rf"^{_EXPERIMENT_PREFIX}\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
@@ -3079,6 +3081,35 @@ def get_study_runs(
 
 
 @api_app.get(
+    "/run/{run}",
+    summary="Download links for a single run",
+    description=(
+        "Return FASTQ/SRA download links and layout for one run accession "
+        "(SRR/ERR/DRR). Returns 404 if the run is unknown."
+    ),
+    operation_id="get_run",
+)
+@limiter.limit("1000/minute")
+def get_run(
+    request: Request,
+    run: str = Path(..., pattern=RUN_REGEX),
+):
+    run = run.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(RUN_DOWNLOAD_SQL, (run,))
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_run")
+        raise HTTPException(500, "Internal server error")
+
+    if not row:
+        raise HTTPException(404, f"No run found for accession {run}")
+    return row
+
+
+@api_app.get(
     "/project/{study}/bams",
     summary="List original BAM files for a study",
     description=(
@@ -5809,10 +5840,10 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
 # combined_app.add_middleware(
-#  CORSMiddleware,
-#  allow_origins=["*"],
-#  allow_methods=["*"],
-#  allow_headers=["*"],
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_methods=["GET", "OPTIONS"],
+#    allow_headers=["*"],
 # )
 
 app = combined_app

@@ -2081,6 +2081,33 @@ LIMIT 500;
 """
 )
 
+# Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
+RUN_DOWNLOAD_SQL = """
+SELECT
+    dl.run_accession,
+    dl.experiment_accession,
+    dl.study_accession,
+    dl.library_layout,
+    dl.fastq_ftp,
+    dl.fastq_bytes,
+    dl.fastq_md5,
+    dl.sra_ftp,
+    dl.sra_bytes,
+    dl.sra_md5,
+    dl.ncbi_sra_url,
+    dl.ncbi_sra_url_aws,
+    dl.ncbi_sra_normalized_url,
+    dl.ncbi_sra_normalized_bytes,
+    dl.ncbi_sra_lite_url,
+    dl.ncbi_sra_lite_bytes,
+    dl.ncbi_sra_lite_s3_url,
+    dl.ncbi_sra_lite_gs_url,
+    ena.run_alias
+FROM sra_run_download_links dl
+LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+WHERE dl.run_accession = %s;
+"""
+
 # ---------------------------------------------------------------------------
 # BAM files: original submitted BAM files from ncbi_files JSONB
 # ---------------------------------------------------------------------------
