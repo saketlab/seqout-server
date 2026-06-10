@@ -6,7 +6,9 @@ import io
 import json
 import logging
 import os
+import pathlib
 import re
+import shutil
 import struct
 import threading
 import time
@@ -20,6 +22,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import (
+    FileResponse,
     JSONResponse,
     PlainTextResponse,
     Response,
@@ -1185,6 +1188,98 @@ def _get_clusters_rows() -> list[dict]:
         return rows
 
 
+# ---------------------------------------------------------------------------
+# Map assets (deepscatter tiles + geojson + countries.json)
+#
+# The frontend map is powered by deepscatter, which needs a quadtree of Arrow
+# tiles plus a cluster geojson and a country list. These are derived from the
+# same points.bin/accessions.bin/clusters payloads above. We generate them once
+# on the first request and cache them on disk under a content-hash version dir,
+# so a restart with unchanged data reuses the existing tiles instead of
+# rebuilding. Generation is heavy (pyarrow + quadfeather), so the builder module
+# is imported lazily inside _ensure_map_assets.
+# ---------------------------------------------------------------------------
+_MAP_ASSETS_DIR = pathlib.Path(
+    os.environ.get(
+        "MAP_ASSETS_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "map_assets"),
+    )
+)
+_MAP_ASSETS_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_map_assets_lock = threading.Lock()
+_map_assets_state: dict = {"ready": False, "version": None, "dir": None}
+
+
+def _compute_map_version(
+    points_bytes: bytes, accessions_bytes: bytes, clusters_rows: list[dict]
+) -> str:
+    h = hashlib.sha256()
+    h.update(points_bytes)
+    h.update(accessions_bytes)
+    h.update(json.dumps(clusters_rows, sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _ensure_map_assets() -> tuple[str, pathlib.Path]:
+    """Build the map assets if needed and return (version, version_dir).
+
+    Thread-safe and idempotent: only the first caller builds; the build is
+    written to a temp dir and atomically renamed into place so partial builds
+    are never served.
+    """
+    with _map_assets_lock:
+        if _map_assets_state["ready"]:
+            return _map_assets_state["version"], _map_assets_state["dir"]
+
+        points_bytes, accessions_bytes = _get_binary_payloads()
+        clusters_rows = _get_clusters_rows()
+        version = _compute_map_version(points_bytes, accessions_bytes, clusters_rows)
+        version_dir = _MAP_ASSETS_DIR / version
+        manifest = version_dir / "tiles" / "manifest.feather"
+
+        if not manifest.exists():
+            import map_assets  # lazy: pulls in pyarrow / quadfeather
+
+            _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_dir = _MAP_ASSETS_DIR / f"{version}.tmp"
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logger.info("Building map assets (version=%s)...", version)
+            map_assets.build_assets(
+                points_bytes, accessions_bytes, clusters_rows, tmp_dir
+            )
+            if version_dir.exists():
+                shutil.rmtree(version_dir, ignore_errors=True)
+            os.replace(tmp_dir, version_dir)
+            logger.info("Built map assets at %s", version_dir)
+
+        _map_assets_state.update(ready=True, version=version, dir=version_dir)
+        return version, version_dir
+
+
+def _serve_map_file(version: str, rel_path: str) -> FileResponse:
+    """Serve a file from a map version dir, guarding against path traversal."""
+    if not _MAP_ID_RE.match(version):
+        raise HTTPException(404, "Not found")
+    base = (_MAP_ASSETS_DIR / version).resolve()
+    target = (base / rel_path).resolve()
+    if target != base and not str(target).startswith(str(base) + os.sep):
+        raise HTTPException(404, "Not found")
+    if not target.is_file():
+        raise HTTPException(404, "Not found")
+    media_type = (
+        "application/json"
+        if target.suffix == ".json"
+        else "application/octet-stream"
+    )
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={"Cache-Control": _MAP_ASSETS_CACHE_CONTROL},
+    )
+
+
 def _build_growth_data() -> dict:
     """Run all growth queries in one connection and return nested dict."""
     queries = {
@@ -1601,6 +1696,80 @@ def get_clusters(request: Request):
         content=rows,
         headers={"Cache-Control": "public, max-age=2592000"},
     )
+
+
+@api_app.get(
+    "/map/meta",
+    summary="Map asset version",
+    description=(
+        "Return the current map-asset version. Building the deepscatter tiles, "
+        "geojson and country list happens lazily on the first call (this request "
+        "may take a while the very first time); afterwards they are served from a "
+        "disk cache. The version is a content hash of the underlying data, so it "
+        "changes only when the data changes. Frontends use it to build asset URLs "
+        "and to invalidate their own caches."
+    ),
+    operation_id="get_map_meta",
+)
+@limiter.limit("60/minute")
+def get_map_meta(request: Request):
+    try:
+        version, _ = _ensure_map_assets()
+    except Exception:
+        logger.exception("Failed to build map assets")
+        raise HTTPException(500, "Internal server error")
+
+    return JSONResponse(
+        content={"version": version},
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# The {rev} segment is an opaque, frontend-controlled cache-busting token (it is
+# not used to locate files — assets live under {version} only). Bumping it gives
+# the browser a fresh URL so it re-downloads instead of using its HTTP cache,
+# which is how the frontend "purge and refetch" works for the tiles that
+# deepscatter loads internally.
+@api_app.get(
+    "/map/{version}/{rev}/geojson.json",
+    summary="Map cluster geojson",
+    operation_id="get_map_geojson",
+)
+def get_map_geojson(
+    request: Request,
+    version: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+    rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+):
+    return _serve_map_file(version, "geojson.json")
+
+
+@api_app.get(
+    "/map/{version}/{rev}/countries.json",
+    summary="Map country list",
+    operation_id="get_map_countries",
+)
+def get_map_countries(
+    request: Request,
+    version: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+    rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+):
+    return _serve_map_file(version, "countries.json")
+
+
+@api_app.get(
+    "/map/{version}/{rev}/tiles/{tile_path:path}",
+    summary="Map deepscatter tile",
+    operation_id="get_map_tile",
+)
+def get_map_tile(
+    request: Request,
+    tile_path: str,
+    version: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+    rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+):
+    if ".." in tile_path or not _MAP_TILE_RE.match(tile_path):
+        raise HTTPException(404, "Not found")
+    return _serve_map_file(version, f"tiles/{tile_path}")
 
 
 @api_app.get(
