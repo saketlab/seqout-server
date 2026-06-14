@@ -3177,6 +3177,13 @@ WHERE study_accession = %s
 ORDER BY sample;
 """
 
+# Low-confidence tags per sample within a study
+LOW_CONFIDENCE_TAGS_SQL = """
+SELECT sample_accession, tags
+FROM low_confidence
+WHERE study_accession = %s;
+"""
+
 SITEMAP_ACCESSIONS_SQL = {
     "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
     "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",

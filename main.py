@@ -88,6 +88,7 @@ from queries import (
     LIST_LIBRARY_STRATEGIES_SQL,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
+    LOW_CONFIDENCE_TAGS_SQL,
     ONTOLOGY_SAMPLES_V3_SQL,
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
@@ -5857,11 +5858,19 @@ def get_project_enriched(
                     cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
                     samples = cur.fetchall()
                     version = "v1"
+
+                cur.execute(LOW_CONFIDENCE_TAGS_SQL, (accession,))
+                low_confidence = {
+                    row["sample_accession"]: row["tags"] for row in cur.fetchall()
+                }
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_enriched")
         raise HTTPException(500, "Internal server error")
+
+    for s in samples:
+        s["low_confidence_tags"] = low_confidence.get(s.get("sample"), [])
 
     if human_readable_age:
         for s in samples:
