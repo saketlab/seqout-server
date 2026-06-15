@@ -1270,9 +1270,7 @@ def _serve_map_file(version: str, rel_path: str) -> FileResponse:
     if not target.is_file():
         raise HTTPException(404, "Not found")
     media_type = (
-        "application/json"
-        if target.suffix == ".json"
-        else "application/octet-stream"
+        "application/json" if target.suffix == ".json" else "application/octet-stream"
     )
     return FileResponse(
         target,
@@ -3807,6 +3805,14 @@ def get_project_metadata_rows(
         logger.exception("Database error in get_project_metadata_rows")
         raise HTTPException(500, "Internal server error")
 
+    return _rows_response(accession, source, rows, cursor, limit)
+
+
+def _rows_response(
+    accession: str, source: str, rows: list[dict], cursor: int, limit: int
+) -> dict:
+    """Build the paginated metadata-rows envelope shared by the project,
+    experiment, and run metadata/rows endpoints."""
     page = rows[cursor : cursor + limit]
     next_cursor = cursor + len(page) if cursor + len(page) < len(rows) else None
     columns = list(page[0].keys()) if page else (list(rows[0].keys()) if rows else [])
@@ -3822,7 +3828,99 @@ def get_project_metadata_rows(
     }
 
 
-_DOWNLOAD_HELPER = r"""# Verify file integrity. 
+@api_app.get(
+    "/experiment/{accession}/metadata/rows",
+    summary="Get experiment metadata rows as JSON",
+    description=(
+        "Return per-run JSON metadata rows for a single SRA/ENA experiment "
+        "(SRX/ERX/DRX), in the same row format as /project/{accession}/metadata/rows "
+        "but scoped to this experiment's runs."
+    ),
+    operation_id="get_experiment_metadata_rows",
+)
+@limiter.limit("100/minute")
+def get_experiment_metadata_rows(
+    request: Request,
+    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                ctx = _build_exp_context(cur, accession)
+                if ctx is None:
+                    raise HTTPException(
+                        404, f"No experiment found for accession {accession}"
+                    )
+                cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
+                rows = [
+                    _study_metadata_row(
+                        ctx["study"],
+                        run,
+                        ctx["exp_map"],
+                        ctx["sample_map"],
+                        ctx["sample_attrs"],
+                    )
+                    for run in cur.fetchall()
+                ]
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_experiment_metadata_rows")
+        raise HTTPException(500, "Internal server error")
+
+    return _rows_response(accession, ctx["source"], rows, cursor, limit)
+
+
+@api_app.get(
+    "/run/{run}/metadata/rows",
+    summary="Get run metadata row as JSON",
+    description=(
+        "Return the single JSON metadata row for one run accession (SRR/ERR/DRR), "
+        "in the same row format as /project/{accession}/metadata/rows."
+    ),
+    operation_id="get_run_metadata_rows",
+)
+@limiter.limit("1000/minute")
+def get_run_metadata_rows(
+    request: Request,
+    run: str = Path(..., pattern=RUN_REGEX),
+):
+    run = run.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(RUN_DOWNLOAD_SQL, (run,))
+                run_row = cur.fetchone()
+                if not run_row:
+                    raise HTTPException(404, f"No run found for accession {run}")
+                study = run_row.get("study_accession") or ""
+                source = "sra"
+                exp_map, sample_map, sample_attrs = {}, {}, {}
+                exp_acc = (run_row.get("experiment_accession") or "").upper()
+                if exp_acc:
+                    ctx = _build_exp_context(cur, exp_acc)
+                    if ctx:
+                        study = study or ctx["study"]
+                        source = ctx["source"]
+                        exp_map = ctx["exp_map"]
+                        sample_map = ctx["sample_map"]
+                        sample_attrs = ctx["sample_attrs"]
+                row = _study_metadata_row(
+                    study, run_row, exp_map, sample_map, sample_attrs
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_run_metadata_rows")
+        raise HTTPException(500, "Internal server error")
+
+    return _rows_response(run, source, [row], 0, 1)
+
+
+_DOWNLOAD_HELPER = r"""# Verify file integrity.
 _is_complete() {
   local f="$1"
   [ -s "$f" ] || return 1
@@ -4002,6 +4100,44 @@ def _prepare_study_metadata(cur, study: str) -> tuple[dict, dict, dict]:
         acc: _parse_sample_attributes(sample) for acc, sample in sample_map.items()
     }
     return exp_map, sample_map, sample_attrs
+
+
+def _build_exp_context(cur, accession: str) -> dict | None:
+    """Build the per-run metadata context for a single SRA/ENA experiment.
+
+    Returns {study, source, exp_map, sample_map, sample_attrs} ready for
+    _study_metadata_row(), or None if the experiment is unknown.
+    """
+    cur.execute(SRA_EXPERIMENT_SQL, (accession,))
+    exp = cur.fetchone()
+    source = "sra"
+    if not exp:
+        cur.execute(ENA_EXPERIMENT_SQL, (accession,))
+        exp = cur.fetchone()
+        source = "ena"
+    if not exp:
+        return None
+
+    samples_list = exp.get("samples") or []
+    sample_acc = samples_list[0] if samples_list else ""
+    exp["_sample_acc"] = sample_acc
+    exp_map = {exp["accession"]: exp}
+
+    sample_map: dict[str, dict] = {}
+    sample_attrs: dict[str, dict[str, str]] = {}
+    if sample_acc:
+        sample = _fetch_sample(cur, sample_acc)
+        if sample:
+            sample_map[sample_acc] = sample
+            sample_attrs[sample_acc] = _parse_sample_attributes(sample)
+
+    return {
+        "study": exp.get("study") or "",
+        "source": source,
+        "exp_map": exp_map,
+        "sample_map": sample_map,
+        "sample_attrs": sample_attrs,
+    }
 
 
 def _resume_status_preamble(paths: list[str], sizes: list[int] | None = None) -> str:
@@ -5839,35 +5975,45 @@ def get_project_enriched(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
-                study = cur.fetchone()
-                if study:
-                    cur.execute(ONTOLOGY_SAMPLES_V3_SQL, (accession,))
-                    samples = cur.fetchall()
-                    if not samples:
-                        cur.execute(ENRICHED_SAMPLES_V3_SQL, (accession,))
-                        samples = cur.fetchall()
-                    version = "v3"
-                else:
-                    cur.execute(ENRICHED_STUDY_SQL, (accession,))
-                    study = cur.fetchone()
-                    if not study:
-                        raise HTTPException(
-                            404, f"No enriched metadata for {accession}"
-                        )
-                    cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
-                    samples = cur.fetchall()
-                    version = "v1"
-
-                cur.execute(LOW_CONFIDENCE_TAGS_SQL, (accession,))
-                low_confidence = {
-                    row["sample_accession"]: row["tags"] for row in cur.fetchall()
-                }
+                return _fetch_project_enriched(cur, accession, human_readable_age)
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_enriched")
         raise HTTPException(500, "Internal server error")
+
+
+def _fetch_project_enriched(
+    cur, accession: str, human_readable_age: bool, sample_filter: set[str] | None = None
+) -> dict:
+    """Fetch ontology-enriched study + sample metadata for a project accession.
+
+    If sample_filter is given, only samples whose `sample` is in the set are
+    returned (used by the experiment/run-scoped endpoints).
+    """
+    cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
+    study = cur.fetchone()
+    if study:
+        cur.execute(ONTOLOGY_SAMPLES_V3_SQL, (accession,))
+        samples = cur.fetchall()
+        if not samples:
+            cur.execute(ENRICHED_SAMPLES_V3_SQL, (accession,))
+            samples = cur.fetchall()
+        version = "v3"
+    else:
+        cur.execute(ENRICHED_STUDY_SQL, (accession,))
+        study = cur.fetchone()
+        if not study:
+            raise HTTPException(404, f"No enriched metadata for {accession}")
+        cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
+        samples = cur.fetchall()
+        version = "v1"
+
+    if sample_filter is not None:
+        samples = [s for s in samples if s.get("sample") in sample_filter]
+
+    cur.execute(LOW_CONFIDENCE_TAGS_SQL, (accession,))
+    low_confidence = {row["sample_accession"]: row["tags"] for row in cur.fetchall()}
 
     for s in samples:
         s["low_confidence_tags"] = low_confidence.get(s.get("sample"), [])
@@ -5884,6 +6030,90 @@ def get_project_enriched(
         "version": version,
         "samples": samples,
     }
+
+
+@api_app.get(
+    "/experiment/{accession}/enriched",
+    summary="Get ontology-enriched metadata for an experiment's sample(s)",
+    description=(
+        "Return the ontology-enriched sample record(s) for a single SRA/ENA "
+        "experiment (SRX/ERX/DRX), scoped from the parent study's enriched metadata. "
+        "Same fields as /project/{accession}/enriched."
+    ),
+    operation_id="get_experiment_enriched",
+)
+@limiter.limit("100/minute")
+def get_experiment_enriched(
+    request: Request,
+    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
+    human_readable_age: bool = Query(
+        True, description="Convert age from hours to human-readable format"
+    ),
+):
+    accession = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                ctx = _build_exp_context(cur, accession)
+                if ctx is None:
+                    raise HTTPException(
+                        404, f"No experiment found for accession {accession}"
+                    )
+                study = ctx["study"]
+                samples = set(ctx["sample_map"].keys())
+                if not study or not samples:
+                    raise HTTPException(404, f"No enriched metadata for {accession}")
+                return _fetch_project_enriched(
+                    cur, study, human_readable_age, sample_filter=samples
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_experiment_enriched")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/run/{run}/enriched",
+    summary="Get ontology-enriched metadata for a run's sample",
+    description=(
+        "Return the ontology-enriched sample record for a single run accession "
+        "(SRR/ERR/DRR), resolved via run → experiment → sample. "
+        "Same fields as /project/{accession}/enriched."
+    ),
+    operation_id="get_run_enriched",
+)
+@limiter.limit("100/minute")
+def get_run_enriched(
+    request: Request,
+    run: str = Path(..., pattern=RUN_REGEX),
+    human_readable_age: bool = Query(
+        True, description="Convert age from hours to human-readable format"
+    ),
+):
+    run = run.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(RUN_DOWNLOAD_SQL, (run,))
+                run_row = cur.fetchone()
+                if not run_row:
+                    raise HTTPException(404, f"No run found for accession {run}")
+                exp_acc = (run_row.get("experiment_accession") or "").upper()
+                ctx = _build_exp_context(cur, exp_acc) if exp_acc else None
+                if not ctx or not ctx["study"] or not ctx["sample_map"]:
+                    raise HTTPException(404, f"No enriched metadata for {run}")
+                return _fetch_project_enriched(
+                    cur,
+                    ctx["study"],
+                    human_readable_age,
+                    sample_filter=set(ctx["sample_map"].keys()),
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_run_enriched")
+        raise HTTPException(500, "Internal server error")
 
 
 @api_app.get(
@@ -6433,7 +6663,9 @@ MCP_OPERATION_IDS = {
     "download_supplementary_script",
     "get_experiment",
     "get_experiment_runs",
+    "get_experiment_metadata_rows",
     "get_run",
+    "get_run_metadata_rows",
     "get_sample",
     "get_sample_detail",
     "get_sample_experiments",
@@ -6459,6 +6691,8 @@ MCP_OPERATION_IDS = {
     "get_global_contribution_filters",
     "get_country_accessions",
     "get_project_enriched",
+    "get_experiment_enriched",
+    "get_run_enriched",
     "get_platform_totals",
     "get_platform_growth",
     "get_platform_instruments",
