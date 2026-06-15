@@ -73,13 +73,15 @@ def flatten_manifest(mani: TileManifest) -> List[Dict]:
 
     while len(queue) > 0:
         current = queue.pop(0)
-        d.append({
-            "key": current.key,
-            "nPoints": current.nPoints,
-            "min_ix": current.min_ix,
-            "max_ix": current.max_ix,
-            "extent": json.dumps(current.to_dict()["extent"]),
-        })
+        d.append(
+            {
+                "key": current.key,
+                "nPoints": current.nPoints,
+                "min_ix": current.min_ix,
+                "max_ix": current.max_ix,
+                "extent": json.dumps(current.to_dict()["extent"]),
+            }
+        )
         queue.extend(current.children)
 
     return d
@@ -401,7 +403,7 @@ def main(
         max_open_filehandles=max_open_filehandles,
         dictionaries=dictionaries,
         randomize=randomize,
-        filesystem=filesystem
+        filesystem=filesystem,
     )
     tiler.insert_files(files=rewritten_files)
 
@@ -421,7 +423,9 @@ class Quadtree:
     def __init__(
         self,
         basedir: Path,
-        extent: Optional[Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]]] = None,
+        extent: Optional[
+            Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]]
+        ] = None,
         mode: Literal["read", "write", "append"] = "read",
         dictionaries: Dict[str, pa.Array] = {},
         schema: pa.Schema = pa.schema({}),
@@ -430,7 +434,7 @@ class Quadtree:
         max_open_filehandles=32,
         sidecars: Dict[str, str] = {},
         randomize=0,
-        filesystem: fs.FileSystem = fs.LocalFileSystem()
+        filesystem: fs.FileSystem = fs.LocalFileSystem(),
     ):
         """
         * sidecars: a dictionary of sidecar files to add to the tileset. The key is the column that
@@ -468,11 +472,18 @@ class Quadtree:
 
     # Easier file system handling methods
 
-    def write_feather(self, write_path: Path, table: pa.Table, compression: Literal["zstd", "uncompressed"] = "zstd"):
+    def write_feather(
+        self,
+        write_path: Path,
+        table: pa.Table,
+        compression: Literal["zstd", "uncompressed"] = "zstd",
+    ):
         with self.filesystem.open_output_stream(write_path.as_posix()) as f:
             feather.write_feather(table, f, compression=compression)
 
-    def read_feather(self, read_path: Path, columns: Optional[List[str]] = None) -> pa.Table:
+    def read_feather(
+        self, read_path: Path, columns: Optional[List[str]] = None
+    ) -> pa.Table:
         with self.filesystem.open_input_file(read_path.as_posix()) as f:
             return feather.read_table(f, columns=columns)
 
@@ -480,7 +491,11 @@ class Quadtree:
         return self.filesystem.get_file_info(path.as_posix()).is_file
 
     @staticmethod
-    def from_dir(basedir: Path, mode: Literal["read", "append"], filesystem: fs.FileSystem = fs.LocalFileSystem()) -> "Quadtree":
+    def from_dir(
+        basedir: Path,
+        mode: Literal["read", "append"],
+        filesystem: fs.FileSystem = fs.LocalFileSystem(),
+    ) -> "Quadtree":
         # Load a quadtree from disk.
         manifest_path = basedir / "manifest.feather"
         manifest_info = filesystem.get_file_info(manifest_path.as_posix())
@@ -719,9 +734,13 @@ class Macrotile:
 
     def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
         if not path in self._open_filehandles:
-            open_filehandle = self.quadtree.filesystem.open_output_stream(path.as_posix())
+            open_filehandle = self.quadtree.filesystem.open_output_stream(
+                path.as_posix()
+            )
             if path.suffix == ".feather":
-                self._open_filehandles[path] = ipc.new_file(open_filehandle, schema=batch.schema)
+                self._open_filehandles[path] = ipc.new_file(
+                    open_filehandle, schema=batch.schema
+                )
             elif path.suffix == ".parquet":
                 self._open_filehandles[path] = pq.ParquetWriter(
                     open_filehandle, schema=batch.schema
@@ -767,7 +786,9 @@ class Macrotile:
 
     def build_bloom_filter(self, id_field: str, m: int, k: int):
         bloom_filter_loc = self.bloom_filter_loc(id_field, m, k)
-        self.quadtree.filesystem.create_dir(bloom_filter_loc.parent.as_posix(), recursive=True)
+        self.quadtree.filesystem.create_dir(
+            bloom_filter_loc.parent.as_posix(), recursive=True
+        )
         if bloom_filter_loc.exists():
             return
 
@@ -815,8 +836,7 @@ class Macrotile:
         # lists in a sane form, so it's not the end of the world.
 
         self.quadtree.filesystem.create_dir(
-            self.bloom_filter_loc(id_field, m, k).parent.as_posix(),
-            recursive=True
+            self.bloom_filter_loc(id_field, m, k).parent.as_posix(), recursive=True
         )
         self.quadtree.write_feather(bloom_filter_loc, tb, compression="zstd")
 
@@ -972,12 +992,14 @@ class Macrotile:
                 # to be a 'matched' file.
                 self.quadtree.filesystem.move(
                     self.candidate_file_loc(new_sidecar_name, m, k).as_posix(),
-                    self.matched_file_loc(new_sidecar_name, m, k).as_posix()
+                    self.matched_file_loc(new_sidecar_name, m, k).as_posix(),
                 )
             else:
                 # Otherwise, we need to recursively insert that file
                 # at an appropriate point in the tree.
-                with self.quadtree.filesystem.open_input_file(self.candidate_file_loc(new_sidecar_name, m, k).as_posix()) as f:
+                with self.quadtree.filesystem.open_input_file(
+                    self.candidate_file_loc(new_sidecar_name, m, k).as_posix()
+                ) as f:
                     for batch in pq.ParquetFile(f).iter_batches():
                         b = pa.Table.from_batches([batch])
                         self.insert_for_join(
@@ -988,7 +1010,9 @@ class Macrotile:
                             new_sidecar_name,
                         )
                 # Clean up the candidate file, because it has now been inserted below here.
-                self.quadtree.filesystem.delete_file(self.candidate_file_loc(new_sidecar_name, m, k).as_posix())
+                self.quadtree.filesystem.delete_file(
+                    self.candidate_file_loc(new_sidecar_name, m, k).as_posix()
+                )
                 # Close the filehandles for the children immediately to avoid
                 # lagging writers
                 self.close_filehandles()
@@ -1032,7 +1056,9 @@ class Macrotile:
                 # Read *only* the relevant rows of the parquet file.
                 # So long as the
                 matched_sidecar_file = self.matched_file_loc(new_sidecar_name, m, k)
-                with self.quadtree.filesystem.open_input_file(matched_sidecar_file.as_posix()) as f:
+                with self.quadtree.filesystem.open_input_file(
+                    matched_sidecar_file.as_posix()
+                ) as f:
                     matches = pq.read_table(
                         f,
                         filters=[(id_field, "in", ids)],
@@ -1226,7 +1252,10 @@ class Tile:
                         for k in self.sidecar_names
                     ],
                 ]
-                files = [self.quadtree.filesystem.open_input_file(tb.as_posix()) for tb in tables]
+                files = [
+                    self.quadtree.filesystem.open_input_file(tb.as_posix())
+                    for tb in tables
+                ]
                 inputs = [pa.ipc.open_file(file) for file in files]
 
                 def yielder() -> Iterator[pa.RecordBatch]:
@@ -1563,6 +1592,7 @@ class Tile:
         if sidecar is not None:
             fname = self.filename.with_suffix(f".{sidecar}.feather")
         return self.quadtree.read_feather(fname, columns=[column])[column]
+
 
 def get_better_codes(col, counter=Counter()):
     for a in pc.value_counts(col):
