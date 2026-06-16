@@ -110,9 +110,11 @@ from queries import (
     SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
+    LAST_UPDATED_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_COUNTS_SQL,
+    SOURCE_TOTALS_SQL,
     SRA_EXPERIMENT_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
     SRA_QUERY_ACCESSIONS_SQL,
@@ -330,6 +332,11 @@ _global_contributions_cache_lock = threading.Lock()
 _global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
 _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
+_source_totals_cache_lock = threading.Lock()
+_source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_last_updated_cache_lock = threading.Lock()
+_last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
 pool = ConnectionPool(
@@ -1549,6 +1556,10 @@ def purge_cache(request: Request):
         _platform_growth_cache.clear()
     with _platform_filters_cache_lock:
         _platform_filters_cache.clear()
+    with _source_totals_cache_lock:
+        _source_totals_cache["ready"] = False
+    with _last_updated_cache_lock:
+        _last_updated_cache["ready"] = False
     return {"message": "All caches purged."}
 
 
@@ -3306,6 +3317,10 @@ def get_run(
     request: Request,
     run: str = Path(..., pattern=RUN_REGEX),
 ):
+    return _fetch_run_row(run)
+
+
+def _fetch_run_row(run: str) -> dict:
     run = run.upper()
     try:
         with pool.connection() as conn:
@@ -3313,12 +3328,74 @@ def get_run(
                 cur.execute(RUN_DOWNLOAD_SQL, (run,))
                 row = cur.fetchone()
     except Exception:
-        logger.exception("Database error in get_run")
+        logger.exception("Database error fetching run %s", run)
         raise HTTPException(500, "Internal server error")
-
     if not row:
         raise HTTPException(404, f"No run found for accession {run}")
     return row
+
+
+def _to_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_url(value: str) -> str:
+    return value if value.startswith("http") else f"https://{value}"
+
+
+def _file_record(url: str, size, md5) -> dict:
+    return {
+        "url": _as_url(url),
+        "filename": url.rstrip("/").rsplit("/", 1)[-1],
+        "bytes": _to_int(size),
+        "md5": md5 or None,
+    }
+
+
+def _zip_run_files(ftp, sizes, hashes) -> list[dict]:
+    urls = [u.strip() for u in (ftp or "").split(";") if u.strip()]
+    size_parts = (sizes or "").split(";")
+    md5_parts = (hashes or "").split(";")
+    return [
+        _file_record(
+            url,
+            size_parts[i] if i < len(size_parts) else "",
+            md5_parts[i] if i < len(md5_parts) else "",
+        )
+        for i, url in enumerate(urls)
+    ]
+
+
+@api_app.get(
+    "/run/{run}/checksums",
+    summary="MD5 checksums and file sizes for a run",
+    description=(
+        "Return per-file FASTQ and SRA download URLs with their byte size and MD5 "
+        "checksum for a run accession (SRR/ERR/DRR), parsed into structured records."
+    ),
+    operation_id="get_run_checksums",
+)
+@limiter.limit("1000/minute")
+def get_run_checksums(
+    request: Request,
+    run: str = Path(..., pattern=RUN_REGEX),
+):
+    row = _fetch_run_row(run)
+    sra = (
+        _file_record(row["sra_ftp"], row.get("sra_bytes"), row.get("sra_md5"))
+        if row.get("sra_ftp")
+        else None
+    )
+    return {
+        "run_accession": run.upper(),
+        "fastq": _zip_run_files(
+            row.get("fastq_ftp"), row.get("fastq_bytes"), row.get("fastq_md5")
+        ),
+        "sra": sra,
+    }
 
 
 @api_app.get(
@@ -5912,14 +5989,8 @@ def sitemap_counts(request: Request):
     except Exception:
         logger.exception("Database error in sitemap_counts")
         raise HTTPException(500, "Internal server error")
-    total = row["geo"] + row["sra"] + row["arrayexpress"] + row["ena"]
-    return {
-        "geo": row["geo"],
-        "sra": row["sra"],
-        "arrayexpress": row["arrayexpress"],
-        "ena": row["ena"],
-        "total": total,
-    }
+    total = sum(row.values())
+    return {**row, "total": total}
 
 
 @api_app.get(
@@ -5949,7 +6020,101 @@ def sitemap_accessions(
     return {"accessions": [r["accession"] for r in rows], "page": page, "limit": limit}
 
 
-# ── Enriched Metadata ────────────────────────────────────────────────────────
+def _get_source_totals() -> dict:
+    with _source_totals_cache_lock:
+        if (
+            _source_totals_cache["ready"]
+            and (time.time() - _source_totals_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _source_totals_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SOURCE_TOTALS_SQL)
+            row = cur.fetchone()
+
+    data = {
+        source: {
+            "projects": row[f"{source}_projects"],
+            "samples": row[f"{source}_samples"],
+        }
+        for source in _STATS_SOURCES
+    }
+    with _source_totals_cache_lock:
+        _source_totals_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+def _get_last_updated() -> dict:
+    with _last_updated_cache_lock:
+        if (
+            _last_updated_cache["ready"]
+            and (time.time() - _last_updated_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _last_updated_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(LAST_UPDATED_SQL)
+            row = cur.fetchone()
+
+    raw = {source: row[source] for source in _STATS_SOURCES}
+    overall = max((v for v in raw.values() if v), default=None)
+    data = {
+        "by_source": {s: (v.isoformat() if v else None) for s, v in raw.items()},
+        "overall": overall.isoformat() if overall else None,
+    }
+    with _last_updated_cache_lock:
+        _last_updated_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/source-totals",
+    summary="Project and sample counts per source",
+    description=(
+        "Return total project and sample counts for GEO, SRA, ArrayExpress, and "
+        "ENA. Cached for 7 days. Returns {geo: {projects, samples}, sra: {...}, ...}."
+    ),
+    operation_id="get_source_totals",
+)
+@limiter.limit("60/minute")
+def get_source_totals(request: Request):
+    try:
+        return _get_source_totals()
+    except Exception:
+        logger.exception("Database error in get_source_totals")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/stats/last-updated",
+    summary="Most recent record date in the index",
+    description=(
+        "Return the date of the newest record in the index. With ?db=<source> "
+        "(geo|sra|arrayexpress|ena) returns that source's latest date; without it, "
+        "the overall maximum. Cached for 7 days. Returns {db, last_updated, by_source}."
+    ),
+    operation_id="get_last_updated",
+)
+@limiter.limit("60/minute")
+def get_last_updated(
+    request: Request,
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
+):
+    try:
+        data = _get_last_updated()
+    except Exception:
+        logger.exception("Database error in get_last_updated")
+        raise HTTPException(500, "Internal server error")
+
+    if db:
+        return {"db": db, "last_updated": data["by_source"].get(db)}
+    return {
+        "db": None,
+        "last_updated": data["overall"],
+        "by_source": data["by_source"],
+    }
 
 
 @api_app.get(

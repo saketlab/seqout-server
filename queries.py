@@ -3033,12 +3033,64 @@ def build_country_filters_sql(
     return sql, params
 
 
-SITEMAP_COUNTS_SQL = """
+SITEMAP_TABLES = {
+    "geo": ("geo_series", "accession", False),
+    "sra": ("sra_studies", "accession", False),
+    "arrayexpress": ("arrayexpress_experiments", "accession", False),
+    "ena": ("ena_studies", "study_accession", False),
+    "sra_exp": ("sra_experiments", "accession", False),
+    "ena_exp": ("ena_experiments", "experiment_accession", True),
+    "run": ("sra_run_download_links", "run_accession", False),
+    "geo_sample": ("geo_samples", "accession", False),
+    "sra_sample": ("sra_samples", "accession", False),
+    "ena_sample": ("ena_samples", "sample_accession", True),
+}
+
+
+def _sitemap_accessions_sql(table: str, col: str, distinct: bool) -> str:
+    select = (
+        f"SELECT DISTINCT {col} AS accession"
+        if distinct
+        else f"SELECT {col} AS accession"
+    )
+    return f"{select} FROM {table} ORDER BY {col} LIMIT %s OFFSET %s;"
+
+
+def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
+    count = f"COUNT(DISTINCT {col})" if distinct else "COUNT(*)"
+    return f"(SELECT {count} FROM {table})"
+
+
+SITEMAP_ACCESSIONS_SQL = {
+    key: _sitemap_accessions_sql(*spec) for key, spec in SITEMAP_TABLES.items()
+}
+
+SITEMAP_COUNTS_SQL = (
+    "SELECT "
+    + ", ".join(
+        f"{_sitemap_count_expr(*spec)} AS {key}" for key, spec in SITEMAP_TABLES.items()
+    )
+    + ";"
+)
+
+SOURCE_TOTALS_SQL = """
 SELECT
-    (SELECT COUNT(*) FROM geo_series) AS geo,
-    (SELECT COUNT(*) FROM sra_studies) AS sra,
-    (SELECT COUNT(*) FROM arrayexpress_experiments) AS arrayexpress,
-    (SELECT COUNT(*) FROM ena_studies) AS ena;
+    (SELECT COUNT(*) FROM geo_series) AS geo_projects,
+    (SELECT COUNT(*) FROM geo_samples) AS geo_samples,
+    (SELECT COUNT(*) FROM sra_studies) AS sra_projects,
+    (SELECT COUNT(*) FROM sra_samples) AS sra_samples,
+    (SELECT COUNT(*) FROM arrayexpress_experiments) AS arrayexpress_projects,
+    (SELECT COUNT(*) FROM arrayexpress_samples) AS arrayexpress_samples,
+    (SELECT COUNT(*) FROM ena_studies) AS ena_projects,
+    (SELECT COUNT(*) FROM ena_samples) AS ena_samples;
+"""
+
+LAST_UPDATED_SQL = """
+SELECT
+    (SELECT MAX(updated_at)::timestamptz FROM geo_series) AS geo,
+    (SELECT MAX(updated_at)::timestamptz FROM sra_studies) AS sra,
+    (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments) AS arrayexpress,
+    (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies) AS ena;
 """
 
 
@@ -3183,10 +3235,3 @@ SELECT sample_accession, tags
 FROM low_confidence
 WHERE study_accession = %s;
 """
-
-SITEMAP_ACCESSIONS_SQL = {
-    "geo": "SELECT accession FROM geo_series ORDER BY accession LIMIT %s OFFSET %s;",
-    "sra": "SELECT accession FROM sra_studies ORDER BY accession LIMIT %s OFFSET %s;",
-    "arrayexpress": "SELECT accession FROM arrayexpress_experiments ORDER BY accession LIMIT %s OFFSET %s;",
-    "ena": "SELECT study_accession AS accession FROM ena_studies ORDER BY study_accession LIMIT %s OFFSET %s;",
-}
