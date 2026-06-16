@@ -3093,6 +3093,148 @@ SELECT
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies) AS ena;
 """
 
+ENRICHED_STAT_COLUMNS = [
+    "tissue",
+    "cell_type",
+    "disease",
+    "assay",
+    "assay_category",
+    "sex",
+    "organism",
+    "development_stage",
+    "sample_type",
+    "strain",
+    "treatment",
+    "cell_line",
+    "ethnicity",
+    "phenotype",
+    "genetic_modification",
+    "tissue_primary_site",
+    "tissue_site_type",
+]
+ENRICHED_TOP_VALUES_PER_COLUMN = 100
+
+
+def _enriched_summary_ddl() -> str:
+    cols = ",\n    ".join(
+        f"COUNT({c}) AS {c}_filled, COUNT(DISTINCT {c}) AS {c}_distinct"
+        for c in ENRICHED_STAT_COLUMNS
+    )
+    return (
+        "DROP MATERIALIZED VIEW IF EXISTS enriched_summary;\n"
+        "CREATE MATERIALIZED VIEW enriched_summary AS\nSELECT\n"
+        "    COUNT(*) AS enriched_samples,\n"
+        "    COUNT(DISTINCT study_accession) AS enriched_projects,\n"
+        f"    {cols}\n"
+        "FROM ontology_samples_v3;"
+    )
+
+
+def _enriched_top_values_ddl() -> str:
+    union = "\n        UNION ALL\n        ".join(
+        f"SELECT '{c}' AS column_name, {c}::text AS value, COUNT(*) AS n "
+        f"FROM ontology_samples_v3 WHERE {c} IS NOT NULL AND {c}::text <> '' "
+        f"GROUP BY {c}"
+        for c in ENRICHED_STAT_COLUMNS
+    )
+    return (
+        "DROP MATERIALIZED VIEW IF EXISTS enriched_column_top_values;\n"
+        "CREATE MATERIALIZED VIEW enriched_column_top_values AS\n"
+        "SELECT column_name, value, n FROM (\n"
+        "    SELECT column_name, value, n,\n"
+        "           ROW_NUMBER() OVER (PARTITION BY column_name ORDER BY n DESC) AS rk\n"
+        "    FROM (\n        " + union + "\n    ) g\n"
+        f") ranked WHERE rk <= {ENRICHED_TOP_VALUES_PER_COLUMN};\n"
+        "CREATE INDEX IF NOT EXISTS idx_enriched_top_values_col_n "
+        "ON enriched_column_top_values (column_name, n DESC);"
+    )
+
+
+ENRICHED_CROSSTAB_COLUMNS = [
+    "organism",
+    "tissue",
+    "cell_type",
+    "disease",
+    "assay",
+    "development_stage",
+    "sample_type",
+    "sex",
+    "ethnicity",
+    "phenotype",
+    "genetic_modification",
+]
+ENRICHED_CROSSTAB_TOP_GROUPS = 100
+ENRICHED_CROSSTAB_TOP_BREAKDOWN = 50
+
+
+def _enriched_crosstab_ddl() -> str:
+    pairs = "\n        UNION ALL\n        ".join(
+        f"SELECT '{g}' AS group_col, {g}::text AS group_val, "
+        f"'{b}' AS breakdown_col, {b}::text AS breakdown_val "
+        f"FROM ontology_samples_v3 "
+        f"WHERE {g} IS NOT NULL AND {g}::text <> '' "
+        f"AND {b} IS NOT NULL AND {b}::text <> ''"
+        for g in ENRICHED_CROSSTAB_COLUMNS
+        for b in ENRICHED_CROSSTAB_COLUMNS
+        if g != b
+    )
+    return (
+        "DROP MATERIALIZED VIEW IF EXISTS enriched_crosstab;\n"
+        "CREATE MATERIALIZED VIEW enriched_crosstab AS\n"
+        "WITH pairs AS (\n        " + pairs + "\n    ),\n"
+        "    counts AS (\n"
+        "        SELECT group_col, group_val, breakdown_col, breakdown_val, COUNT(*) AS n\n"
+        "        FROM pairs GROUP BY 1, 2, 3, 4\n"
+        "    ),\n"
+        "    grp AS (\n"
+        "        SELECT group_col, group_val, breakdown_col,\n"
+        "               SUM(n) AS group_total, COUNT(*) AS group_distinct\n"
+        "        FROM counts GROUP BY 1, 2, 3\n"
+        "    ),\n"
+        "    ranked AS (\n"
+        "        SELECT c.group_col, c.group_val, c.breakdown_col, c.breakdown_val,\n"
+        "               c.n, g.group_total, g.group_distinct,\n"
+        "               ROW_NUMBER() OVER (PARTITION BY c.group_col, c.group_val,\n"
+        "                   c.breakdown_col ORDER BY c.n DESC) AS brk,\n"
+        "               DENSE_RANK() OVER (PARTITION BY c.group_col, c.breakdown_col\n"
+        "                   ORDER BY g.group_total DESC, c.group_val) AS grk\n"
+        "        FROM counts c JOIN grp g USING (group_col, group_val, breakdown_col)\n"
+        "    )\n"
+        "SELECT group_col, group_val, breakdown_col, breakdown_val,\n"
+        "       n, group_total, group_distinct\n"
+        f"FROM ranked WHERE brk <= {ENRICHED_CROSSTAB_TOP_BREAKDOWN} "
+        f"AND grk <= {ENRICHED_CROSSTAB_TOP_GROUPS};\n"
+        "CREATE INDEX IF NOT EXISTS idx_enriched_crosstab_pair "
+        "ON enriched_crosstab (group_col, breakdown_col, group_total DESC);"
+    )
+
+
+# Run once to create, and on each ingestion to refresh (see REFRESH below).
+ENRICHED_STATS_DDL = (
+    _enriched_summary_ddl()
+    + "\n\n"
+    + _enriched_top_values_ddl()
+    + "\n\n"
+    + _enriched_crosstab_ddl()
+)
+ENRICHED_STATS_REFRESH = (
+    "REFRESH MATERIALIZED VIEW enriched_summary;\n"
+    "REFRESH MATERIALIZED VIEW enriched_column_top_values;\n"
+    "REFRESH MATERIALIZED VIEW enriched_crosstab;"
+)
+
+ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary;"
+ENRICHED_COLUMN_VALUES_SQL = (
+    "SELECT value, n FROM enriched_column_top_values "
+    "WHERE column_name = %s ORDER BY n DESC LIMIT %s;"
+)
+
+ENRICHED_CROSSTAB_SQL = (
+    "SELECT group_val, breakdown_val, n, group_total, group_distinct "
+    "FROM enriched_crosstab WHERE group_col = %s AND breakdown_col = %s "
+    "ORDER BY group_total DESC, group_val, n DESC;"
+)
+
 
 def build_country_accessions_sql(
     country: str,

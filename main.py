@@ -55,9 +55,15 @@ from queries import (
     ENA_SAMPLE_TO_EXPERIMENT_SQL,
     ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
+    ENRICHED_COLUMN_VALUES_SQL,
+    ENRICHED_CROSSTAB_COLUMNS,
+    ENRICHED_CROSSTAB_SQL,
     ENRICHED_SAMPLES_SQL,
     ENRICHED_SAMPLES_V3_SQL,
+    ENRICHED_STAT_COLUMNS,
     ENRICHED_STUDY_SQL,
+    ENRICHED_SUMMARY_SQL,
+    ENRICHED_TOP_VALUES_PER_COLUMN,
     ENRICHED_STUDY_V3_SQL,
     EXPERIMENT_RUNS_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
@@ -336,6 +342,8 @@ _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_enriched_crosstab_cache_lock = threading.Lock()
+_enriched_crosstab_cache: dict = {}
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
@@ -1560,6 +1568,8 @@ def purge_cache(request: Request):
         _source_totals_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
+    with _enriched_crosstab_cache_lock:
+        _enriched_crosstab_cache.clear()
     return {"message": "All caches purged."}
 
 
@@ -6118,6 +6128,139 @@ def get_last_updated(
 
 
 @api_app.get(
+    "/stats/enriched",
+    summary="Enriched metadata coverage and per-column stats",
+    description=(
+        "Return how many projects and samples have AI-enriched ontology metadata, "
+        "plus per-column fill count and distinct-value count. Reads the "
+        "enriched_summary materialized view."
+    ),
+    operation_id="get_enriched_stats",
+)
+@limiter.limit("60/minute")
+def get_enriched_stats(request: Request):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(ENRICHED_SUMMARY_SQL)
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_enriched_stats")
+        raise HTTPException(500, "Internal server error")
+
+    if not row:
+        raise HTTPException(503, "Enriched stats not available")
+
+    return {
+        "enriched_projects": row.get("enriched_projects"),
+        "enriched_samples": row.get("enriched_samples"),
+        "columns": [
+            {
+                "name": c,
+                "filled": row.get(f"{c}_filled"),
+                "distinct": row.get(f"{c}_distinct"),
+            }
+            for c in ENRICHED_STAT_COLUMNS
+        ],
+    }
+
+
+def _get_enriched_crosstab(group: str, breakdown: str) -> dict:
+    key = (group, breakdown)
+    with _enriched_crosstab_cache_lock:
+        entry = _enriched_crosstab_cache.get(key)
+        if entry and (time.time() - entry["built_at"]) < _GROWTH_CACHE_TTL:
+            return entry["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(ENRICHED_CROSSTAB_SQL, (group, breakdown))
+            rows = cur.fetchall()
+
+    groups: dict = {}
+    for r in rows:
+        g = groups.get(r["group_val"])
+        if g is None:
+            g = {
+                "value": r["group_val"],
+                "total": r["group_total"],
+                "distinct": r["group_distinct"],
+                "breakdowns": [],
+            }
+            groups[r["group_val"]] = g
+        g["breakdowns"].append({"value": r["breakdown_val"], "count": r["n"]})
+
+    data = {"group": group, "breakdown": breakdown, "groups": list(groups.values())}
+    with _enriched_crosstab_cache_lock:
+        _enriched_crosstab_cache[key] = {"data": data, "built_at": time.time()}
+    return data
+
+
+@api_app.get(
+    "/stats/enriched/crosstab",
+    summary="Crosstab of one enriched column broken down by another",
+    description=(
+        "Return counts of one standardised column (breakdown) within each value "
+        "of another (group) — e.g. group=organism&breakdown=tissue gives the "
+        "tissues seen per organism, with a distinct-tissue count per organism. "
+        "Both axes must be in the curated crosstab column set. Reads the "
+        "enriched_crosstab materialized view."
+    ),
+    operation_id="get_enriched_crosstab",
+)
+@limiter.limit("60/minute")
+def get_enriched_crosstab(
+    request: Request,
+    group: str = Query(..., pattern="^[a-z_]+$"),
+    breakdown: str = Query(..., pattern="^[a-z_]+$"),
+):
+    if group not in ENRICHED_CROSSTAB_COLUMNS:
+        raise HTTPException(404, f"Unknown crosstab column: {group}")
+    if breakdown not in ENRICHED_CROSSTAB_COLUMNS:
+        raise HTTPException(404, f"Unknown crosstab column: {breakdown}")
+    if group == breakdown:
+        raise HTTPException(400, "group and breakdown must differ")
+    try:
+        return _get_enriched_crosstab(group, breakdown)
+    except Exception:
+        logger.exception("Database error in get_enriched_crosstab")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/stats/enriched/{column}",
+    summary="Top values for an enriched column",
+    description=(
+        "Return the most common values (with counts) for one enriched column "
+        "(e.g. tissue, cell_type, disease, assay). Reads the "
+        "enriched_column_top_values materialized view."
+    ),
+    operation_id="get_enriched_column",
+)
+@limiter.limit("60/minute")
+def get_enriched_column(
+    request: Request,
+    column: str = Path(..., pattern="^[a-z_]+$"),
+    limit: int = Query(50, ge=1, le=ENRICHED_TOP_VALUES_PER_COLUMN),
+):
+    if column not in ENRICHED_STAT_COLUMNS:
+        raise HTTPException(404, f"Unknown enriched column: {column}")
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(ENRICHED_COLUMN_VALUES_SQL, (column, limit))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_enriched_column")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "column": column,
+        "values": [{"value": r["value"], "count": r["n"]} for r in rows],
+    }
+
+
+@api_app.get(
     "/project/{accession}/enriched",
     summary="Get ontology-enriched sample metadata",
     description=(
@@ -6891,10 +7034,10 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
 # combined_app.add_middleware(
-#    CORSMiddleware,
-#    allow_origins=["*"],
-#    allow_methods=["GET", "OPTIONS"],
-#    allow_headers=["*"],
+#   CORSMiddleware,
+#   allow_origins=["*"],
+#   allow_methods=["GET", "OPTIONS"],
+#   allow_headers=["*"],
 # )
 
 app = combined_app
