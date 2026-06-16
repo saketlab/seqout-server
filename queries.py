@@ -3057,8 +3057,7 @@ def _sitemap_accessions_sql(table: str, col: str, distinct: bool) -> str:
 
 
 def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
-    count = f"COUNT(DISTINCT {col})" if distinct else "COUNT(*)"
-    return f"(SELECT {count} FROM {table})"
+    return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
 
 
 SITEMAP_ACCESSIONS_SQL = {
@@ -3168,10 +3167,16 @@ ENRICHED_CROSSTAB_TOP_BREAKDOWN = 50
 
 
 def _enriched_crosstab_ddl() -> str:
+    base_cols = ",\n            ".join(
+        "COALESCE(cn.common_name, um.dominant_scientific_name) AS organism"
+        if c == "organism"
+        else f"os.{c}"
+        for c in ENRICHED_CROSSTAB_COLUMNS
+    )
     pairs = "\n        UNION ALL\n        ".join(
         f"SELECT '{g}' AS group_col, {g}::text AS group_val, "
         f"'{b}' AS breakdown_col, {b}::text AS breakdown_val "
-        f"FROM ontology_samples_v3 "
+        f"FROM base "
         f"WHERE {g} IS NOT NULL AND {g}::text <> '' "
         f"AND {b} IS NOT NULL AND {b}::text <> ''"
         for g in ENRICHED_CROSSTAB_COLUMNS
@@ -3181,7 +3186,16 @@ def _enriched_crosstab_ddl() -> str:
     return (
         "DROP MATERIALIZED VIEW IF EXISTS enriched_crosstab;\n"
         "CREATE MATERIALIZED VIEW enriched_crosstab AS\n"
-        "WITH pairs AS (\n        " + pairs + "\n    ),\n"
+        "WITH base AS MATERIALIZED (\n"
+        f"        SELECT\n            {base_cols}\n"
+        "        FROM ontology_samples_v3 os\n"
+        "        LEFT JOIN unified_metadata um "
+        "ON um.canonical_accession = os.study_accession\n"
+        "        LEFT JOIN (SELECT scientific_name, MIN(common_name) AS common_name "
+        "FROM common_names GROUP BY scientific_name) cn "
+        "ON cn.scientific_name = um.dominant_scientific_name\n"
+        "    ),\n"
+        "    pairs AS (\n        " + pairs + "\n    ),\n"
         "    counts AS (\n"
         "        SELECT group_col, group_val, breakdown_col, breakdown_val, COUNT(*) AS n\n"
         "        FROM pairs GROUP BY 1, 2, 3, 4\n"
@@ -3358,7 +3372,6 @@ WHERE study_accession = %s
 ORDER BY sample;
 """
 
-# Fallback when ontology_samples_v3 has no rows yet (e.g. skeleton-only cell-count studies)
 ENRICHED_SAMPLES_V3_SQL = """
 SELECT
     sample, age, sex, ethnicity, phenotype,
