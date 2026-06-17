@@ -7455,11 +7455,11 @@ app = combined_app
 
 
 def _prewarm_caches() -> None:
-    # Warm off the request path so the first typo query doesn't pay the load.
-    try:
-        _ensure_spelling_loaded()
-    except Exception:
-        logger.exception("cache prewarm failed")
+    for warm in (_ensure_spelling_loaded, _get_atlas_payloads, _get_binary_payloads):
+        try:
+            warm()
+        except Exception:
+            logger.exception("cache prewarm failed: %s", warm.__name__)
 
 
 threading.Thread(target=_prewarm_caches, daemon=True, name="prewarm").start()
