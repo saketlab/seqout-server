@@ -1200,6 +1200,8 @@ SELECT
     ae.description AS summary,
     ae.protocols_description AS overall_design,
     ae.organisms,
+    ae.coords_3d,
+    ae.neighbors,
     CASE WHEN ae.pubmed_id IS NOT NULL THEN ARRAY[ae.pubmed_id] ELSE NULL END AS pubmed_id,
     NULL AS samples_ref,
     ae.study_type AS series_type,
