@@ -3057,13 +3057,19 @@ def _sitemap_accessions_sql(table: str, col: str, distinct: bool) -> str:
 
 
 def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
-    # Distinct sources are run-level tables, so reltuples (raw rows) wildly
-    # overshoots the distinct accession count and the sitemap index emits
-    # phantom pages that 502. COUNT(DISTINCT) is exact (index-only scan with the
-    # btree on col); non-distinct sources keep the instant reltuples estimate.
-    if distinct:
-        return f"(SELECT COUNT(DISTINCT {col}) FROM {table})"
-    return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
+    reltuples = (
+        f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
+    )
+    if not distinct:
+        return reltuples
+    return (
+        "(SELECT COALESCE("
+        "(SELECT CASE WHEN s.n_distinct >= 0 THEN s.n_distinct "
+        "ELSE -s.n_distinct * c.reltuples END "
+        f"FROM pg_stats s WHERE s.schemaname = 'public' AND s.tablename = '{table}' "
+        f"AND s.attname = '{col}'), c.reltuples)::bigint "
+        f"FROM pg_class c WHERE c.oid = '{table}'::regclass)"
+    )
 
 
 SITEMAP_ACCESSIONS_SQL = {
@@ -3231,7 +3237,6 @@ def _enriched_crosstab_ddl() -> str:
     )
 
 
-# Run once to create, and on each ingestion to refresh (see REFRESH below).
 ENRICHED_STATS_DDL = (
     _enriched_summary_ddl()
     + "\n\n"
@@ -3336,7 +3341,6 @@ ORDER BY es.sample;
 """
 
 
-# Default (base columns only + NULL placeholders) — overridden at startup by build_enriched_samples_sql()
 ENRICHED_SAMPLES_SQL = """
 SELECT es.sample, es.age, es.sex, es.ethnicity, es.phenotype,
        es.cell_type, es.tissue, es.strain, es.disease, es.assay,
@@ -3354,7 +3358,6 @@ FROM enriched_studies st
 WHERE st.accession = %s;
 """
 
-# ── Ontology-enriched metadata (v3) ─────────────────────────────────────────
 
 ENRICHED_STUDY_V3_SQL = """
 SELECT st.accession, st.title, st.n_samples, st.single_cell_modality

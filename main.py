@@ -349,12 +349,21 @@ _enriched_crosstab_cache: dict = {}
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
+# Per-query ceiling 
+_DEFAULT_STATEMENT_TIMEOUT = "30s"
+
+
+def _configure_connection(conn) -> None:
+    conn.execute(f"SET statement_timeout = '{_DEFAULT_STATEMENT_TIMEOUT}'")
+
+
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
     min_size=2,
     max_size=100,
     timeout=10,
     kwargs={"autocommit": True},
+    configure=_configure_connection,
 )
 
 with pool.connection() as _conn:
