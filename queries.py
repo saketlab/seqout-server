@@ -3072,9 +3072,37 @@ def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
     )
 
 
+def _sitemap_keyset_sql(table: str, col: str, distinct: bool) -> str:
+    # Keyset page from a precomputed boundary: O(limit) at any depth, vs OFFSET.
+    select = (
+        f"SELECT DISTINCT {col} AS accession"
+        if distinct
+        else f"SELECT {col} AS accession"
+    )
+    return f"{select} FROM {table} WHERE {col} >= %s ORDER BY {col} LIMIT %s;"
+
+
 SITEMAP_ACCESSIONS_SQL = {
     key: _sitemap_accessions_sql(*spec) for key, spec in SITEMAP_TABLES.items()
 }
+
+SITEMAP_KEYSET_SQL = {
+    key: _sitemap_keyset_sql(*spec) for key, spec in SITEMAP_TABLES.items()
+}
+
+SITEMAP_PAGE_SIZE = 50000
+SITEMAP_BOUND_LOOKUP_SQL = (
+    "SELECT start_accession FROM sitemap_page_bounds WHERE source = %s AND page = %s;"
+)
+SITEMAP_SOURCE_BUILT_SQL = (
+    "SELECT 1 FROM sitemap_page_bounds WHERE source = %s LIMIT 1;"
+)
+# Accession count = max(page)*PAGE_SIZE + 1 so the frontend's ceil(count/PAGE_SIZE)
+# reproduces the exact page count.
+SITEMAP_BOUNDS_COUNTS_SQL = (
+    "SELECT source, MAX(page) * %s + 1 AS count "
+    "FROM sitemap_page_bounds GROUP BY source;"
+)
 
 SITEMAP_COUNTS_SQL = (
     "SELECT "
@@ -3267,6 +3295,7 @@ def build_country_accessions_sql(
     country: str,
     organism: str | None = None,
     assay_l2: str | None = None,
+    limit: int | None = None,
 ) -> tuple[str, list]:
     """Return accessions for a country with optional organism/assay filters."""
     conditions = [
@@ -3286,9 +3315,12 @@ def build_country_accessions_sql(
         f"SELECT DISTINCT canonical_accession"
         f" FROM unified_metadata"
         f" WHERE {where}"
-        f" ORDER BY canonical_accession;"
+        f" ORDER BY canonical_accession"
     )
-    return sql, params
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    return sql + ";", params
 
 
 _ENRICHED_SAMPLES_BASE_COLS = [
