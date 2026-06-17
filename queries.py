@@ -3112,22 +3112,28 @@ SITEMAP_COUNTS_SQL = (
     + ";"
 )
 
-SOURCE_TOTALS_SQL = """
+
+# reltuples estimates (not exact) 
+def _reltuples(table: str) -> str:
+    return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
+
+
+SOURCE_TOTALS_SQL = f"""
 SELECT
-    (SELECT COUNT(*) FROM geo_series) AS geo_projects,
-    (SELECT COUNT(*) FROM geo_samples) AS geo_samples,
-    (SELECT COUNT(*) FROM sra_studies) AS sra_projects,
-    (SELECT COUNT(*) FROM sra_samples) AS sra_samples,
-    (SELECT COUNT(*) FROM arrayexpress_experiments) AS arrayexpress_projects,
-    (SELECT COUNT(*) FROM arrayexpress_samples) AS arrayexpress_samples,
-    (SELECT COUNT(*) FROM ena_studies) AS ena_projects,
-    (SELECT COUNT(*) FROM ena_samples) AS ena_samples;
+    {_reltuples('geo_series')} AS geo_projects,
+    {_reltuples('geo_samples')} AS geo_samples,
+    {_reltuples('sra_studies')} AS sra_projects,
+    {_reltuples('sra_samples')} AS sra_samples,
+    {_reltuples('arrayexpress_experiments')} AS arrayexpress_projects,
+    {_reltuples('arrayexpress_samples')} AS arrayexpress_samples,
+    {_reltuples('ena_studies')} AS ena_projects,
+    {_reltuples('ena_samples')} AS ena_samples;
 """
 
 LAST_UPDATED_SQL = """
 SELECT
     (SELECT MAX(updated_at)::timestamptz FROM geo_series) AS geo,
-    (SELECT MAX(updated_at)::timestamptz FROM sra_studies) AS sra,
+    (SELECT MAX(published_at)::timestamptz FROM sra_submissions) AS sra,
     (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments) AS arrayexpress,
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies) AS ena;
 """
