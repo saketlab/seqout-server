@@ -3168,9 +3168,11 @@ ENRICHED_CROSSTAB_TOP_BREAKDOWN = 50
 
 def _enriched_crosstab_ddl() -> str:
     base_cols = ",\n            ".join(
-        "COALESCE(cn.common_name, um.dominant_scientific_name) AS organism"
-        if c == "organism"
-        else f"os.{c}"
+        (
+            "COALESCE(cn.common_name, um.dominant_scientific_name) AS organism"
+            if c == "organism"
+            else f"os.{c}"
+        )
         for c in ENRICHED_CROSSTAB_COLUMNS
     )
     pairs = "\n        UNION ALL\n        ".join(

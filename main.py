@@ -1222,6 +1222,7 @@ _MAP_ASSETS_DIR = pathlib.Path(
     )
 )
 _MAP_ASSETS_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_PROJECT_CACHE_CONTROL = "public, s-maxage=2592000, stale-while-revalidate=2592000"
 _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
@@ -3027,6 +3028,7 @@ def search(
 @limiter.limit("100/minute")
 def get_project(
     request: Request,
+    response: Response,
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     accession = accession.upper()
@@ -3057,6 +3059,8 @@ def get_project(
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
 
+    if row:
+        response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     return row
 
 
@@ -3129,16 +3133,19 @@ def get_project_metadata(
 @limiter.limit("100/minute")
 def get_study_experiments(
     request: Request,
+    response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                return _fetch_study_experiments(cur, study)
+                result = _fetch_study_experiments(cur, study)
     except Exception as e:
         logger.exception("Database error in get_study_experiments")
         raise HTTPException(500, "Internal server error")
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    return result
 
 
 @api_app.get(
@@ -3153,6 +3160,7 @@ def get_study_experiments(
 @limiter.limit("1000/minute")
 def get_study_samples(
     request: Request,
+    response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
@@ -3172,6 +3180,7 @@ def get_study_samples(
     except Exception:
         logger.exception("Database error in get_study_samples")
         raise HTTPException(500, "Internal server error")
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     return {"study_accession": study, "total": len(rows), "samples": rows}
 
 
@@ -3273,17 +3282,21 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     "/project/{study}/runs",
     summary="List download links for a study",
     description=(
-        "Return FASTQ/SRA download links for all runs in an SRA study. "
-        "Returns a preview (up to 500 runs) plus summary statistics."
+        "Return FASTQ/SRA download links for runs in an SRA/ENA study. "
+        "Returns summary statistics plus a preview of up to 500 runs; FASTQ "
+        "fields are semicolon-joined for paired-end runs. For complete "
+        "paginated per-file FASTQ entries, use get_study_download_manifest."
     ),
     operation_id="get_study_runs",
 )
 @limiter.limit("100/minute")
 def get_study_runs(
     request: Request,
+    response: Response,
     study: str = Path(..., pattern=STUDY_REGEX),
 ):
     study = study.upper()
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -3318,7 +3331,10 @@ def get_study_runs(
     summary="Download links for a single run",
     description=(
         "Return FASTQ/SRA download links and layout for one run accession "
-        "(SRR/ERR/DRR). Returns 404 if the run is unknown."
+        "(SRR/ERR/DRR). fastq_ftp, fastq_bytes, and fastq_md5 are "
+        "semicolon-joined for paired-end FASTQs. Use get_run_checksums when "
+        "you need parsed per-file FASTQ URLs, byte sizes, and MD5 checksums. "
+        "Returns 404 if the run is unknown."
     ),
     operation_id="get_run",
 )
@@ -3384,7 +3400,8 @@ def _zip_run_files(ftp, sizes, hashes) -> list[dict]:
     summary="MD5 checksums and file sizes for a run",
     description=(
         "Return per-file FASTQ and SRA download URLs with their byte size and MD5 "
-        "checksum for a run accession (SRR/ERR/DRR), parsed into structured records."
+        "checksum for a run accession (SRR/ERR/DRR), parsed into structured "
+        "records so callers do not need to split semicolon-joined FASTQ fields."
     ),
     operation_id="get_run_checksums",
 )
@@ -3845,8 +3862,10 @@ def download_study_metadata_csv(
     summary="Get project metadata rows as JSON",
     description=(
         "Return paginated JSON metadata rows for a project. SRA/ENA studies return "
-        "one row per run with experiment/sample metadata and download links. "
-        "GEO and ArrayExpress projects return flattened sample rows."
+        "one row per run with experiment metadata, sample metadata, flattened "
+        "sample_attribute:* columns, FASTQ/SRA download links, byte sizes, and "
+        "MD5 fields. GEO and ArrayExpress projects return flattened sample rows. "
+        "Prefer this structured JSON endpoint over CSV downloads for MCP use."
     ),
     operation_id="get_project_metadata_rows",
 )
@@ -4309,7 +4328,8 @@ _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
     "/project/{study}/download-manifest",
     summary="Get structured download manifest for a study",
     description=(
-        "Return paginated JSON file entries for downloading an SRA study. "
+        "Return paginated JSON file entries for downloading an SRA/ENA study. "
+        "This is the preferred MCP tool for complete per-file FASTQ retrieval. "
         "Modes: fastq, sra, sra_lite, s3, or gcs. Each entry includes URL, "
         "target path, checksum/size when available, and run/experiment metadata."
     ),
@@ -4680,16 +4700,20 @@ def download_supplementary_script(
 @limiter.limit("100/minute")
 def get_sample(
     request: Request,
+    response: Response,
     accession: str = Path(..., pattern=SAMPLE_OR_ENA_REGEX),
 ):
     accession = accession.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                return _fetch_sample(cur, accession)
+                sample = _fetch_sample(cur, accession)
     except Exception as e:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
+    if sample:
+        response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    return sample
 
 
 SAMPLE_DETAIL_REGEX = rf"^({_EXPERIMENT_PREFIX}|{_SAMPLE_PREFIX}|GSM|SAM[A-Z]+)\d+$"
@@ -5670,7 +5694,10 @@ def find_publication(
     description=(
         "Search across GEO, SRA, ArrayExpress, and ENA with structured filters "
         "(organism, library_strategy, platform, country, center, year range, "
-        "journal, instrument_model) optionally combined with full-text search. "
+        "journal, instrument_model, assay_l1/assay_l2, geo_* location fields, "
+        "published_after/published_before, multi_platform, and enriched sample "
+        "filters sample_tissue/sample_disease/sample_cell_type) optionally "
+        "combined with full-text search. "
         "At least one of q or a filter parameter is required. "
         "Use cursors (rank + accession) for pagination. "
         "Returns {results: object[], total: int, took_ms: float, "
@@ -6267,7 +6294,9 @@ def get_enriched_column(
         "Return structured metadata extracted by LLM with ontology mappings. "
         "Fields include tissue, cell_type, disease, assay, development_stage "
         "each with standardised ontology IDs (UBERON, CL, MONDO, EFO). "
-        "Falls back to legacy enriched_samples if v3 data is unavailable."
+        "Falls back to legacy enriched_samples if v3 data is unavailable. "
+        "Use alongside metadata/rows when raw run/sample fields or FASTQ links "
+        "are also needed."
     ),
     operation_id="get_project_enriched",
 )
@@ -6628,331 +6657,252 @@ def _age_hours_to_human(value: str | None) -> str | None:
 
 
 MCP_INSTRUCTIONS = """\
-You are connected to pysraweb, a genomics study search engine covering
-NCBI GEO, SRA/ENA/DDBJ, and ArrayExpress databases.
+You are connected to pysraweb, a genomics study search engine covering NCBI
+GEO, SRA/ENA/DDBJ, ArrayExpress, BioProject, publication links, download links,
+and ontology-enriched sample metadata.
 
-## CRITICAL: Search tool usage rules
+Your job is to choose the narrowest correct tool, preserve context, and avoid
+making users re-state accessions or filters. Do not guess when an accession can
+be classified or resolved by a tool.
 
-BEFORE calling `search_all` or any database-specific search, ask yourself:
+## Critical Routing Rules
 
-**"Do I already have search results from this conversation that could answer
-the user's current request?"**
+1. Reuse existing results before searching.
+   Before calling `search_all`, `search_structured`, or a source-specific search,
+   ask: "Do I already have search results in this conversation that can answer
+   the current request?" If yes, filter/sort/summarize those rows locally.
+   Do not search again just to narrow by keyword, organism, source, year, country,
+   title, summary, organisms, updated_at, or publication fields already in hand.
 
-If YES → DO NOT search again. Filter/analyze existing results instead.
-If NO → Proceed with the search.
+2. Paginate instead of starting over.
+   Search tools return up to 200 rows, `total`, and `next_cursor`.
+   - Default relevance pagination: call the same search with the same `q` plus
+     `cursor_rank=next_cursor.rank` and `cursor_acc=next_cursor.accession`.
+   - `sortby` pagination: call the same search with the same `q`, `sortby`, and
+     `order`, plus `cursor_sort=next_cursor.sort_value` and `cursor_acc`.
+   Changing `q` is a new search. Changing only cursors is continuation.
 
-A new search is ONLY appropriate when the user requests a genuinely new topic
-that cannot be answered by filtering, summarizing, or analyzing existing results.
+3. Classify unknown accessions first.
+   Use `classify_accession` when the user gives an accession and the right tool is
+   unclear. It is pattern-only and cheap. Use `resolve_accession_project` for
+   GSM/SRS/ERS/DRS/SRX/ERX/DRX child-to-project lookup. Use `resolve_prj_project`
+   for PRJNA/PRJEB/PRJDA before calling study-only download tools.
 
-### What counts as filtering (NEVER re-search for these)
+4. Prefer structured JSON tools for MCP.
+   Use JSON tools (`get_project_metadata_rows`, `get_study_download_manifest`,
+   `get_run_checksums`, `get_project_enriched`) when the agent must inspect or
+   transform data. Use script/plain-text tools only when the user explicitly asks
+   for a ready-to-run script or accession list.
 
-- Narrowing by keyword: "show only liver results" → check `title` and `summary` fields
-  for the keyword.
-- Narrowing by organism: "only human studies" → check `organisms` array.
-- Narrowing by source: "only GEO" → check `source` field.
-- Narrowing by date: "after 2020" → check `updated_at` field.
-- Summarizing, counting, or comparing existing results.
+## Accession Routing
 
-All of these are client-side operations on data you already have. Use `title`,
-`summary`, `organisms`, `updated_at`, and `source` fields.
+- `GSE...` GEO series: `get_project`, `get_geo_series_samples`,
+  `get_project_metadata_rows`, `get_supplementary_files`,
+  `download_supplementary_script`, `get_project_enriched` if enriched data exists.
+- `GSM...` GEO sample: `get_sample_detail`; use `resolve_accession_project` to find
+  the parent GSE.
+- `SRP/ERP/DRP...` study: `get_project`, `get_study_experiments`,
+  `get_study_samples`, `get_study_runs`, `get_study_download_manifest`,
+  `download_study_script`, `get_project_metadata_rows`, `get_project_enriched`.
+- `SRX/ERX/DRX...` experiment: `get_experiment`, `get_experiment_runs`,
+  `get_experiment_metadata_rows`, `get_experiment_enriched`,
+  `resolve_accession_project`.
+- `SRR/ERR/DRR...` run: `get_run_checksums` for parsed FASTQ/SRA files,
+  `get_run` for raw run fields, `get_run_metadata_rows` for the joined metadata row,
+  `get_run_enriched` for ontology-enriched sample context.
+- `SRS/ERS/DRS...` or `SAM...` sample/BioSample: `get_sample_detail` for parent
+  project, experiment, sample attributes, and runs; `get_sample` only for raw
+  SRA/ENA sample metadata; `get_sample_experiments` for reverse sample->experiment.
+- `E-XXXX-NNN` ArrayExpress experiment: `get_project`, `get_ae_experiment_samples`,
+  `get_project_metadata_rows`, `get_supplementary_files`,
+  `download_supplementary_script`.
+- `PRJ...` BioProject: `get_project` can return ENA PRJ project metadata, but FASTQ
+  download tools require a resolved SRP/ERP/DRP study accession. Call
+  `resolve_prj_project` first when the user asks for FASTQs/downloads from a PRJ.
 
-### Paginate-and-filter pattern
+## Search And Cohort Discovery
 
-Each search returns up to 200 results, a `total` count, and a `next_cursor`.
-When the user asks to filter and the current page has few or no matches:
+Use `search_all` for ordinary keyword search across all sources. Pass
+`db=geo|sra|arrayexpress|ena` only when the user restricts the source. Use
+`sortby=citations|journal|year` with `order=desc|asc` when the user asks for
+most cited, journal-sorted, newest, or oldest results. Results are automatically
+enriched with publication and center fields when available: `publications`,
+`pmid`, `publication_title`, `journal`, `doi`, `authors`, `citation_count`, and
+`center_name`.
 
-1. Check `total` — if it's much larger than results seen so far, more pages exist.
-2. Call `search_all` again with the **SAME `q`** parameter plus `cursor_rank` and
-   `cursor_acc` from `next_cursor` to fetch the next page.
-3. Filter that page. Repeat until you find enough matches or exhaust results.
+Use `search_suggest` only when a query returns no or very few results and appears
+misspelled. If suggestions are returned inside `search_all`, present or use them
+instead of guessing.
 
-This is NOT a new search — it is pagination of the original query. The `q` parameter
-must stay the same. Only `cursor_rank` and `cursor_acc` change.
+Use `search_structured` for explicit metadata filters or cohort questions. It can
+combine `q` with:
+- `organism`: exact scientific name, such as `Homo sapiens`.
+- `library_strategy`: RNA-Seq, ChIP-Seq, WGS, ATAC-seq, etc.
+- `platform`: platform code such as ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT.
+- `instrument_model`: exact instrument model, such as Illumina NovaSeq 6000.
+- `source=geo|sra|arrayexpress|ena|all` to restrict the archive.
+- `country`, `center`, `journal`, `year_from`, `year_to`.
+- `published_after` and `published_before` as YYYY-MM-DD for exact windows.
+- `assay_l1`, `assay_l2`, `geo_country`, `geo_country_code`,
+  `geo_country_code_iso2`, `geo_city`, `geo_state`, `geo_district`,
+  `geo_postcode`, and `geo_lat`/`geo_lng` with optional `geo_radius_km`.
+- `multi_platform=true` for studies with 2+ sequencing platforms.
+- `sample_tissue`, `sample_disease`, `sample_cell_type` for ontology-enriched
+  sample filters. These only find studies that have enriched v3 sample metadata.
+- `count_by=year|source|organism|country` for bucket counts instead of rows.
 
-## Data hierarchy
+Structured-search caveats:
+- `platform` excludes GEO and ArrayExpress.
+- `instrument_model` excludes ArrayExpress and ENA.
+- `country` excludes ArrayExpress.
+- `multi_platform` is GEO/SRA only.
+- `sample_tissue`, `sample_disease`, and `sample_cell_type` prove at least one
+  enriched sample matched; call `get_project_enriched` to inspect which sample(s).
 
-GEO:  Series (GSE) → Samples (GSM)
-SRA:  Study (SRP/ERP/DRP) → Experiments (SRX/ERX/DRX) → Samples (SRS/ERS/DRS)
-ArrayExpress:  Experiment (E-MTAB-NNN, E-GEOD-NNN, etc.) → Samples (with ENA links)
-BioProject:  PRJNA/PRJEB/PRJDA can link to GEO or SRA
+Before choosing filter values, use `list_library_strategies`,
+`list_instrument_models`, `list_journals`, and `list_centers`.
+Use `search_organisms` for organism autocomplete and `get_common_name_by_scientific_name`
+for common-name display.
 
-Many GEO series have a linked SRA study (the SRA study's `alias` field = GSE accession).
-E-GEOD experiments in ArrayExpress correspond to GEO series (E-GEOD-50760 ↔ GSE50760).
+## Project Drilldown
 
-## Recommended workflow
+Use `get_project` for full project/study/series metadata after a search result or
+known accession. Use `get_project_metadata` only for a fast title + description.
+Use `get_project_xref` to find cross-archive equivalents, including GEO<->SRA,
+BioProject, ENA, and E-GEOD/GSE naming links. Use `get_project_similar` for
+"studies like this" on GSE or SRP accessions.
 
-1. **Search** — call `search_all` for simple keyword searches.
-   The `source` field tells you: 'geo', 'sra', 'arrayexpress', or 'ena'.
-   Only pass `db="geo"|"sra"|"arrayexpress"|"ena"` if user explicitly restricts.
-   - **Spelling correction** — if a query returns 0 results and looks like a typo,
-     call `search_suggest` with the same `q` to get spelling suggestions, then
-     re-issue `search_all` with the corrected term.
-   - **Sorting**: pass `sortby` to re-order results:
-     - `sortby=citations`: sort by citation count of the primary publication.
-     - `sortby=journal`: sort by journal name of the primary publication.
-     - `sortby=year`: sort by study date (updated_at).
-     - `order=desc` (default) or `order=asc`.
-   - When `sortby` is used, pagination cursors change: `next_cursor` returns
-     `{sort_value, accession}` instead of `{rank, accession}`. Pass these back
-     as `cursor_sort` + `cursor_acc` (not `cursor_rank`).
+Use sample-list tools when the user wants the child records:
+- GEO: `get_geo_series_samples`.
+- ArrayExpress: `get_ae_experiment_samples`.
+- SRA/ENA study: `get_study_experiments` and `get_study_samples`.
+- SRA/ENA experiment: `get_experiment` for metadata plus runs, or
+  `get_experiment_runs` for just runs.
+- SRA/ENA sample/experiment/GSM with parent context: `get_sample_detail`.
 
-2. **Structured search** — call `search_structured` when the user wants to filter by
-   organism, library strategy (e.g. RNA-Seq, ChIP-Seq), platform (e.g. ILLUMINA),
-   country, institution/center, date range, journal, or instrument model. Searches
-   across GEO, SRA, ArrayExpress, and ENA. Filters can be combined with a keyword
-   query (`q`). At least one filter or `q` is required.
-   - `organism`: exact species name, e.g. "Homo sapiens", "Mus musculus"
-   - `library_strategy`: SRA/ENA library strategy, e.g. "RNA-Seq", "ChIP-Seq", "WGS"
-     (also matches ArrayExpress `technology` field)
-   - `platform`: sequencing platform, e.g. "ILLUMINA", "OXFORD_NANOPORE"
-     (SRA and ENA only; GEO and ArrayExpress are excluded when this filter is active)
-   - `country`: country name, e.g. "United States", "United Kingdom"
-     (GEO via contributors, SRA via geocoded countries, ENA via experiment metadata;
-     ArrayExpress is excluded — no structured country data)
-   - `center`: institution name (partial match), e.g. "Broad Institute"
-   - `year_from`/`year_to`: publication year range
-   - `journal`: exact journal name, e.g. "Nature", "Cell"
-     (filters by the primary publication's journal across all sources)
-   - `instrument_model`: exact instrument model, e.g. "Illumina HiSeq 2500"
-     (GEO and SRA only; ArrayExpress and ENA are excluded when this filter is active)
-   - `multi_platform`: set to `true` to find only studies with 2+ sequencing platforms
-     (e.g. mixed Illumina + Nanopore). GEO and SRA only.
-   - `source`: restrict to "geo", "sra", "arrayexpress", "ena", or "all"
-   - `published_after`/`published_before`: day-granularity date filter (YYYY-MM-DD).
-     Use these for "studies in the last 30 days" / a precise window. Combine with or
-     replace `year_from`/`year_to`.
-   - `sample_tissue` / `sample_disease` / `sample_cell_type`: filter to studies that
-     have at least one sample matching the term (ILIKE substring on ontology_samples_v3).
-     E.g. `sample_tissue=liver` finds studies with any liver sample. Only studies with
-     enriched v3 metadata are findable here.
-   - `count_by`: switch to aggregation mode. Returns `{count_by, total_buckets, buckets:
-     [{bucket, count}, ...]}` instead of paginated rows. Modes: `year`, `source`,
-     `organism`, `country`. Useful for "studies per year by organism" cohort queries.
-   Results include a `platforms` array (e.g. `["ILLUMINA", "OXFORD_NANOPORE"]`) showing
-   which sequencing platforms each study used.
-   Use `search_all` for simple keyword searches; use `search_structured` when specific
-   metadata filters are needed.
-   - **Filter enumeration** — to discover valid values for `library_strategy`,
-     `instrument_model`, `journal`, `center` before issuing a filter, call
-     `list_library_strategies`, `list_instrument_models`, `list_journals`,
-     `list_centers`. Each returns `{value, count}` sorted by frequency.
+## FASTQ, SRA, BAM, And Supplementary Retrieval
 
-3. **Drill into a result** — call `get_project` with the accession.
-   Returns full metadata for GSE, SRP, or E-XXXX.
-   - **Find similar studies** — call `get_project_similar` with a GSE or SRP accession
-     to get the nearest studies in the 2D embedding (title + distance + source for
-     each neighbor). Use for "find studies like X" / "what else is similar".
+FASTQ files exist at the run level. A study/project accession is a container for
+runs. Do not claim that GEO or ArrayExpress projects have SRA FASTQs unless a
+linked SRA/ENA accession is found with `get_project_xref` or `resolve_prj_project`.
+For GEO/ArrayExpress processed files, use supplementary-file tools instead.
 
-4. **Explore samples/experiments/runs**:
-   - SRA study → `get_study_experiments` (per-experiment metadata), `get_study_samples`
-     (deduped sample list across all experiments — accepts SRP/DRP/ERP/PRJ), or
-     `get_study_runs` (FASTQ/SRA download links for every run).
-   - Single SRA/ENA experiment → `get_experiment` (returns metadata + runs). Use
-     `get_experiment_runs` for just the run list.
-   - Single SRA/ENA run → `get_run` (download links for one SRR/ERR/DRR accession,
-     including fastq_ftp, sra_ftp, and ncbi_sra_lite_* cloud URLs).
-   - GEO series → `get_geo_series_samples`; single GSM via `get_sample_detail`.
-   - ArrayExpress experiment → `get_ae_experiment_samples`.
-   - **Sample → experiment reverse lookup** — call `get_sample_experiments` with an
-     SRS/ERS/DRS/SAM* accession to get the parent experiment accession.
+Preferred FASTQ workflow:
+1. If the user gives PRJ, GSM, SRS/ERS/DRS, SRX/ERX/DRX, or GSE, resolve to the
+   relevant SRP/ERP/DRP or run/experiment first.
+2. For a whole study, call `get_study_download_manifest(study, mode="fastq")`.
+   This is complete, paginated, per-file JSON. Each file has `url`, `path`,
+   `filename`, `bytes`, `md5`, `run_accession`, `experiment_accession`, and
+   `download_command`. Continue with `next_cursor` until enough files are seen.
+3. For a quick study overview, call `get_study_runs`. It returns `total_runs`,
+   `paired_runs`, `single_runs`, `total_fastq_bytes`, and a preview of up to 500
+   runs. Its `fastq_ftp`, `fastq_bytes`, and `fastq_md5` values are semicolon-joined
+   for paired-end runs.
+4. For one run, prefer `get_run_checksums`. It returns parsed `fastq` file records
+   and optional `sra` file record. Use `get_run` only when raw run-level fields are
+   needed.
+5. For one experiment, use `get_experiment_runs` or `get_experiment_metadata_rows`.
+6. For a ready-to-run script, use `download_study_script(study, mode)`. Modes are
+   `fastq`, `sra`, `sra_lite`, `s3`, and `gcs`. Default/recommended raw FASTQ mode
+   is `fastq`; `sra_lite` is smaller but lossy for quality scores.
 
-5. **FASTQ download links** — call `get_study_runs` with an SRA study accession
-   (SRP/ERP/DRP) to get FASTQ download URLs for all runs. Returns summary statistics
-   (total_runs, paired_runs, single_runs, total_fastq_bytes) and a list of runs with
-   fields: run_accession, experiment_accession, library_layout, fastq_ftp,
-   fastq_bytes, fastq_md5, plus cloud URLs (ncbi_sra_lite_url, ncbi_sra_normalized_url,
-   ncbi_sra_lite_s3_url, ncbi_sra_lite_gs_url). Use this when the user asks how to
-   download raw data, FASTQs, or sequencing files for a study.
-   - FASTQ URLs are EBI FTP paths (prefix with `https://` to make downloadable links).
-   - Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields (R1;R2).
-   - **Structured manifest** — call `get_study_download_manifest` for paginated JSON
-     file entries. Use this when the user wants exact download instructions that an
-     agent can inspect or transform. Modes: `fastq`, `sra`, `sra_lite`, `s3`, `gcs`.
-     Each file includes URL, target path, size, MD5 when available, and command.
-   - **Original BAM files** — call `get_study_bams` to list original submitted BAM
-     download links from NCBI file metadata. Not all studies have BAMs.
-   - **Download scripts** — call `download_study_script` with a study accession and a
-     mode to get a ready-to-run bash script. Available modes:
-     - `fastq` — wget commands for EBI FASTQ files (default, recommended)
-     - `sra` — wget commands for SRA normalized format (full quality)
-     - `sra_lite` — wget commands for SRA Lite format (smaller, lossy quality scores)
-     - `s3` — aws s3 cp commands using s3:// URIs
-     - `gcs` — gsutil cp commands using gs:// URIs
-     Example: `https://seqout.org/api/project/SRP123456/download/fastq`
-   - **Merged metadata CSV** — call `download_study_metadata_csv` with a study accession
-     to get a CSV merging experiment metadata, sample attributes (as dynamic columns),
-     and run download links. One row per run. Useful when users need a complete metadata
-     table for a study.
-     Example: `https://seqout.org/api/project/SRP123456/metadata/download`
-   - **Supplementary file download** — call `download_supplementary_script` with a
-     GEO (GSE) or ArrayExpress (E-MTAB) accession to get a bash script that downloads
-     all supplementary / processed data files using curl.
-     Call `get_supplementary_files` when structured JSON file links are preferred.
-     Example: `https://seqout.org/api/project/GSE119945/supplementary/download`
-     FTP URLs are automatically converted to HTTPS. Only works for GEO and ArrayExpress
-     accessions (SRA studies use `download_study_script` instead).
-   - Or direct them to the web UI at `https://seqout.org/p/{study}` which
-     has an interactive download section with per-file links and batch download scripts.
+URL/checksum rules:
+- In raw run rows, `fastq_ftp` may be a semicolon-separated EBI host/path with no
+  scheme. Do not hand-parse unless needed; prefer manifest or checksum tools.
+- `get_study_download_manifest` and `get_run_checksums` already provide per-file
+  URL/bytes/MD5 fields suitable for download and verification.
+- If a user asks for "MD5", "checksums", "file sizes", or "verify downloads",
+  use `get_run_checksums` for a run or `get_study_download_manifest` for a study.
 
-6. **Cross-reference lookup** — call `get_project_xref` with any accession (GSE, SRP,
-   E-XXXX, PRJNA) to discover cross-references across all archives. Shows cross-reference
-   links (SRA, BioProject, ENA, GEO), naming convention links (E-GEOD ↔ GSE), and
-   SRA alias connections. Use this when the user asks "is this study also in SRA/GEO?"
-   or wants to find all versions of a dataset.
+Other retrieval tools:
+- `get_study_bams` lists original submitted BAMs for an SRA/ENA study when present.
+- `get_supplementary_files` lists GEO/ArrayExpress supplementary or processed files
+  as JSON; `download_supplementary_script` returns a curl script.
+- Web UI pages such as `https://seqout.org/p/{accession}` have interactive download
+  sections, but use MCP tools first when answering programmatically.
 
-7. **Citations & publications** — call `get_project_cite` with any accession to get
-   publication metadata and BibTeX citations. Returns title, authors, journal, DOI,
-   pub_date, citation_count, and formatted BibTeX for each linked paper.
-   - `type=original` (default): returns the original/earliest publication (smallest PMID).
-   - `type=all`: returns all linked publications sorted by PMID ascending.
-   - `format=json` (default): returns structured JSON with all fields.
-   - `format=bibtex`: returns raw plain-text BibTeX, ready to copy-paste into a .bib file.
-   Use this when the user asks for citations, references, BibTeX, or paper details
-   for a study. When the user wants copy-pasteable BibTeX, use `format=bibtex`.
-   Note: search results and `get_project` also include top-level
-   publication fields (pmid, publication_title, journal, doi, authors, citation_count)
-   from the primary (most-cited) publication.
-   - **Reverse lookup (paper → datasets)** — call `find_publication` with `pmid=...`
-     or `doi=...` to find ALL datasets linked to a publication across GEO, SRA,
-     ArrayExpress, and ENA. Returns publication metadata + a list of linked
-     accessions. Use when the user is reading a paper and wants the underlying data.
-   - **Author search** — call `search_by_author` with `q=name` to find publications
-     by author name substring (ranked by citation count), each carrying its linked
-     datasets. Only studies with a linked PubMed publication are findable here.
+## Metadata Rows And Enrichment
 
-8. **Resolve child → parent** — `resolve_accession_project` maps samples/experiments
-   to their parent study/series.
-   - **Classify any accession** — call `classify_accession` with any string to learn
-     which database it belongs to, which entity kind it names, and which REST
-     endpoints can be called against it. Pattern-match only — no DB hit. Use this
-     to route an unknown accession to the right tool without guessing.
+There are three different metadata layers. Keep them distinct:
 
-9. **Resolve BioProject** — `resolve_prj_project` maps PRJNA/PRJEB/PRJDA to GSE or SRP.
+1. Project metadata: `get_project` and search results. These include study-level
+   title/abstract/organisms and publication/center enrichment when available.
+2. Raw flattened row metadata: `get_project_metadata_rows`,
+   `get_experiment_metadata_rows`, and `get_run_metadata_rows`. SRA/ENA rows are
+   one row per run with experiment fields, sample fields, dynamic `sample_attribute:*`
+   columns, FASTQ/SRA URLs, bytes, and MD5 fields. GEO and ArrayExpress rows are
+   flattened sample rows. Use these for "metadata table", "sample sheet",
+   "one row per run", or "metadata plus FASTQs".
+3. Ontology/AI-enriched metadata: `get_project_enriched`, `get_experiment_enriched`,
+   and `get_run_enriched`. These return normalized fields such as tissue, cell_type,
+   disease, assay, development_stage, organism/taxid, ontology IDs (UBERON, CL,
+   MONDO, EFO), low_confidence_tags, and enrichment version. Use these for "parsed",
+   "standardized", "ontology", "tissue/disease/cell type", or "enriched" metadata.
 
-10. **Quick metadata** — call `get_project_metadata` with any accession (GSE, SRP, E-XXXX)
-    or PRJ accession to get just the title and description without full project details.
-    Faster than `get_project` when you only need a quick summary.
+When users need both sample attributes and ontology fields, call both
+`get_project_metadata_rows` and `get_project_enriched` and explain that the first is
+raw archive metadata while the second is normalized enrichment. Enriched endpoints
+may return 404 for projects without enrichment; fall back to raw metadata rows.
+For multiple GSE/SRP/ERP/DRP projects, use `bulk_project_samples_metadata` to get
+project summaries plus flattened sample rows; for one project, prefer
+`get_project_metadata_rows`.
 
-11. **Species common name** — call `get_common_name_by_scientific_name` with a scientific
-    name (e.g. "Homo sapiens") to get its common name (e.g. "human"). Useful when
-    displaying organism info in a friendly format.
+For enriched aggregate exploration:
+- `get_enriched_stats`: coverage and per-column fill/distinct counts.
+- `get_enriched_column`: call with `column=...` for top values from tissue,
+  cell_type, disease, assay, etc.
+- `get_enriched_crosstab`: call with `group=...` and `breakdown=...` for cross-tabs
+  such as organism by tissue or disease by assay.
 
-12. **Database growth stats** — call `get_growth_stats` with `mode=projects`,
-    `mode=experiments`, or `mode=bases` (data volume in bytes) to get monthly counts
-    per database (GEO, SRA, ArrayExpress, ENA). Optionally filter by `db` (e.g.
-    `db=geo`). Returns per-month (non-cumulative) counts. Use this when the user asks
-    about database size, growth trends, or historical data volume.
+## Publications And Citations
 
-13. **Bulk project+samples metadata** — call `bulk_project_samples_metadata` with a list
-    of project accessions (GSE, SRP, ERP, DRP) to get project title/description plus
-    flattened sample rows. Useful for comparing sample-level metadata across studies.
+Search results and `get_project` are enriched with publication fields from linked
+PubMed data when available. Use:
+- `get_project_cite` for citation metadata and BibTeX. `type=original` returns the
+  earliest/smallest PMID; `type=all` returns all linked publications; `format=bibtex`
+  returns plain BibTeX.
+- `find_publication` for paper-to-datasets lookup by PMID or DOI.
+- `search_by_author` for author-name substring search across linked publications.
 
-    For a single project, prefer `get_project_metadata_rows`. It returns paginated JSON:
-    SRA/ENA studies are one row per run with experiment/sample metadata and download
-    links; GEO and ArrayExpress are flattened sample rows.
+## Statistics And Discovery
 
-14. **Organism growth stats** — call `get_organism_growth` with an organism scientific
-    name (e.g. "Homo sapiens") to get monthly experiment counts across GEO, SRA,
-    ArrayExpress, and ENA. Use `mode=absolute` for raw counts or `mode=percentage`
-    for the organism's share of total experiments per month. Optionally filter to a
-    single database with `db=geo|sra|arrayexpress|ena`. Returns per-db series with
-    monthly count and cumulative total. Use this when the user asks about trends,
-    growth, or historical data for a specific organism.
+- `get_source_totals`: project/sample totals by source.
+- `get_last_updated`: index freshness overall or by source.
+- `get_growth_stats`: monthly projects, experiments, or data volume. In `mode=bases`,
+  ENA uses nucleotide bases while SRA uses FASTQ/SRA bytes; optional `db` includes
+  `sra_fastq_bytes` and `sra_sra_bytes`.
+- `get_organism_growth`: monthly counts/share for one scientific organism name.
+- `get_organism_totals`: largest organisms by total experiments, with source split.
+- `search_organisms`: organism autocomplete; prefer this over `list_organisms`.
+- `get_global_contributions`: geographic aggregation by lat/lng from unified_metadata;
+  filters include organism, assay_l1, assay_l2, place_type, address_type.
+- `get_global_contribution_filters`: valid filter values for the global map, optional
+  country/organism scope.
+- `get_country_accessions`: plain newline accession list for a country, optionally
+  organism and assay_l2 filtered.
+- `get_platform_totals`, `get_platform_growth`, `get_platform_instruments`, and
+  `get_platform_filters`: sequencing technology totals, trends, instruments, and
+  filter options.
 
-15. **Organism totals** — call `get_organism_totals` to get total experiment counts
-    per organism across all databases. Optionally filter by `year_from`/`year_to`
-    and limit results with `limit`. Returns organisms sorted by total count
-    (descending) with per-database breakdown (geo, sra, arrayexpress, ena) and
-    common names. Use this when the user asks which organisms have the most data.
+## Tools Not Exposed Or Usually Avoided In MCP
 
-16. **Organism search** — call `search_organisms` with a partial name query (`q`)
-    to find organisms by scientific or common name. Returns up to `limit` results
-    sorted by total experiment count. Use this for organism name lookup/autocomplete.
-
-17. **Global contributions map** — call `get_global_contributions` to get geographic
-    contribution data aggregated by lat/lng from the `unified_metadata` table. Returns
-    per-location counts (projects, experiments, samples), source breakdown (GEO, SRA,
-    ArrayExpress, ENA), city, country, and top 5 organisms. Optionally filter by:
-    - `organism`: exact scientific name (e.g. "Homo sapiens")
-    - `assay_l1`: broad assay category
-    - `assay_l2`: specific assay type
-    Unfiltered results are cached for 7 days; filtered requests run fresh.
-    Use this when the user asks about geographic distribution of genomics studies,
-    which countries or institutions contribute the most data, or wants a world map
-    view of sequencing contributions.
-
-18. **Global contribution filters** — call `get_global_contribution_filters` to get
-    the available filter values (organisms, assay_l1, assay_l2) for the global
-    contributions map, each with counts, sorted by frequency. Cached for 7 days.
-    Optionally pass `country` to scope counts to a specific country, and `organism`
-    to further scope assay counts to a specific organism within that country (organism
-    list always reflects the full country, never self-filtered). When `country` is
-    provided, the response includes a `total` field with the exact project count for
-    that scope. Use this to populate filter dropdowns or to discover valid filter
-    values before calling `get_global_contributions` with filters.
-
-19. **Country accessions** — call `get_country_accessions` with a required `country`
-    name to get all distinct project accessions from that country. Optionally filter
-    by `organism` (scientific name) and `assay_l2` (assay type). Returns a plain-text
-    newline-separated list of accession strings. Use this when the user wants to list
-    or export all project accessions for a country.
-
-20. **Enriched metadata** — call `get_project_enriched` with a project accession to get
-    ontology-enriched sample metadata. Returns `version: "v3"` with ontology IDs
-    (MONDO, UBERON, CL, EFO) for disease, tissue, cell_type, assay, development_stage,
-    plus organism/taxid from Cellosaurus. Falls back to `version: "v1"` (legacy) with
-    basic LLM-extracted fields. Returns 404 if no enriched data exists.
-    Use this when the user asks for structured/parsed sample attributes beyond what the
-    raw metadata provides.
-
-21. **Platform totals** — call `get_platform_totals` to get total experiment counts
-    per sequencing platform (ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT, etc.) with
-    per-database breakdown (geo, sra, ena) and display names. Also available at
-    `/platforms`. Use this when the user asks which sequencing technologies are most
-    used, or wants a breakdown of platforms.
-
-22. **Platform growth** — call `get_platform_growth` with a platform code (e.g.
-    `platform=ILLUMINA`) to get monthly experiment or project counts. Options:
-    - `mode=experiments` (default) or `mode=projects`
-    - `instrument_model`: drill down to specific instrument (e.g. "Illumina NovaSeq 6000")
-    - `organism`, `assay`, `country`: cross-filters using unified_metadata
-    Returns per-db series (geo, sra, ena) with monthly count and cumulative total.
-    Use this when the user asks about growth trends for a specific sequencing technology.
-
-23. **Platform instruments** — call `get_platform_instruments` with a platform code to
-    get all instrument models for that platform with experiment counts. E.g. for
-    OXFORD_NANOPORE returns GridION, MinION, PromethION with their counts.
-
-24. **Platform filters** — call `get_platform_filters` with a platform code to get
-    available organisms, assays (dominant_assay_l2), and countries for that platform.
-    Used to populate filter dropdowns. Each filter value includes a count.
-
-## Context rules
-
-- **Stay focused** on current search results unless user explicitly requests new search.
-- Summarize key fields: title, organisms, summary, sample/experiment count, dates.
-- When comparing studies, fetch both with `get_project` and present side-by-side.
-
-## Tools not exposed via MCP
-
-- `bulk_metadata`, `download_by_query`, `bulk_project_metadata` return binary/bulk data
-  and are REST-only. Tell users to use the REST API or web interface directly.
-- `download_study_runs_tsv` streams a TSV file — use `get_study_runs` instead to get
-  structured JSON with download links, or `download_study_script` to get a ready-to-run
-  bash script for any download mode (fastq, sra, sra_lite, s3, gcs).
-- `download_study_metadata_csv` streams a merged metadata CSV — not useful for LLMs.
-  Use `get_project_metadata_rows` for structured JSON metadata rows.
-- `get_points_bin`, `get_accessions_bin`, `get_clusters` return binary/JSON data for
-  the 2D map visualization — not useful for conversational LLM interactions.
-- `get_geo_series_neighbors_coords` returns raw neighbor/3D coordinate data for the
-  similarity graph — not useful for conversational use.
-- `purge_cache` is an admin REST endpoint and must never be called through MCP.
-- `health_check` is only for REST connectivity checks.
-- `search_geo` and `search_sra` are redundant — use `search_all` with `db` parameter.
-- `list_organisms` returns all ~283K organisms — use `search_organisms` or
-  `get_organism_totals` (with `limit`) instead for conversational use.
+- `bulk_metadata`, `bulk_project_metadata`, and `download_by_query` are binary/bulk
+  REST downloads; direct users to REST or web UI when needed.
+- `download_study_runs_tsv`, `download_study_bams_tsv`, `download_study_metadata_csv`,
+  and `download_sample_detail_csv` stream TSV/CSV files. Use JSON tools instead:
+  `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
+  `get_sample_detail`.
+- `get_points_bin`, `get_accessions_bin`, `get_clusters`, `get_projects_atlas_v1`,
+  `get_atlas_labels_v1`, `get_map_meta`, `get_map_geojson`, `get_map_countries`,
+  and `get_map_tile` serve visualization assets, not conversational answers.
+- `get_geo_series_neighbors_coords` is low-level map/similarity data; use
+  `get_project_similar` for conversational similarity.
+- `search_geo` and `search_sra` are redundant; use `search_all` with `db`.
+- `sitemap_counts` and `sitemap_accessions` are for SEO.
+- `purge_cache` is admin-only. `health_check` is REST connectivity only.
+- `list_organisms` can return hundreds of thousands of rows; use `search_organisms`
+  or `get_organism_totals(limit=...)`.
 """
-
 MCP_OPERATION_IDS = {
     "search_all",
     "search_suggest",
@@ -6973,6 +6923,7 @@ MCP_OPERATION_IDS = {
     "get_experiment_runs",
     "get_experiment_metadata_rows",
     "get_run",
+    "get_run_checksums",
     "get_run_metadata_rows",
     "get_sample",
     "get_sample_detail",
@@ -6991,6 +6942,11 @@ MCP_OPERATION_IDS = {
     "get_project_cite",
     "find_publication",
     "get_common_name_by_scientific_name",
+    "get_source_totals",
+    "get_last_updated",
+    "get_enriched_stats",
+    "get_enriched_crosstab",
+    "get_enriched_column",
     "get_growth_stats",
     "get_organism_growth",
     "get_organism_totals",
