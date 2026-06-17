@@ -3074,9 +3074,37 @@ def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
     )
 
 
+def _sitemap_keyset_sql(table: str, col: str, distinct: bool) -> str:
+    # Keyset page from a precomputed boundary: O(limit) at any depth, vs OFFSET.
+    select = (
+        f"SELECT DISTINCT {col} AS accession"
+        if distinct
+        else f"SELECT {col} AS accession"
+    )
+    return f"{select} FROM {table} WHERE {col} >= %s ORDER BY {col} LIMIT %s;"
+
+
 SITEMAP_ACCESSIONS_SQL = {
     key: _sitemap_accessions_sql(*spec) for key, spec in SITEMAP_TABLES.items()
 }
+
+SITEMAP_KEYSET_SQL = {
+    key: _sitemap_keyset_sql(*spec) for key, spec in SITEMAP_TABLES.items()
+}
+
+SITEMAP_PAGE_SIZE = 50000
+SITEMAP_BOUND_LOOKUP_SQL = (
+    "SELECT start_accession FROM sitemap_page_bounds WHERE source = %s AND page = %s;"
+)
+SITEMAP_SOURCE_BUILT_SQL = (
+    "SELECT 1 FROM sitemap_page_bounds WHERE source = %s LIMIT 1;"
+)
+# Accession count = max(page)*PAGE_SIZE + 1 so the frontend's ceil(count/PAGE_SIZE)
+# reproduces the exact page count.
+SITEMAP_BOUNDS_COUNTS_SQL = (
+    "SELECT source, MAX(page) * %s + 1 AS count "
+    "FROM sitemap_page_bounds GROUP BY source;"
+)
 
 SITEMAP_COUNTS_SQL = (
     "SELECT "
@@ -3086,22 +3114,28 @@ SITEMAP_COUNTS_SQL = (
     + ";"
 )
 
-SOURCE_TOTALS_SQL = """
+
+# reltuples estimates (not exact) 
+def _reltuples(table: str) -> str:
+    return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
+
+
+SOURCE_TOTALS_SQL = f"""
 SELECT
-    (SELECT COUNT(*) FROM geo_series) AS geo_projects,
-    (SELECT COUNT(*) FROM geo_samples) AS geo_samples,
-    (SELECT COUNT(*) FROM sra_studies) AS sra_projects,
-    (SELECT COUNT(*) FROM sra_samples) AS sra_samples,
-    (SELECT COUNT(*) FROM arrayexpress_experiments) AS arrayexpress_projects,
-    (SELECT COUNT(*) FROM arrayexpress_samples) AS arrayexpress_samples,
-    (SELECT COUNT(*) FROM ena_studies) AS ena_projects,
-    (SELECT COUNT(*) FROM ena_samples) AS ena_samples;
+    {_reltuples('geo_series')} AS geo_projects,
+    {_reltuples('geo_samples')} AS geo_samples,
+    {_reltuples('sra_studies')} AS sra_projects,
+    {_reltuples('sra_samples')} AS sra_samples,
+    {_reltuples('arrayexpress_experiments')} AS arrayexpress_projects,
+    {_reltuples('arrayexpress_samples')} AS arrayexpress_samples,
+    {_reltuples('ena_studies')} AS ena_projects,
+    {_reltuples('ena_samples')} AS ena_samples;
 """
 
 LAST_UPDATED_SQL = """
 SELECT
     (SELECT MAX(updated_at)::timestamptz FROM geo_series) AS geo,
-    (SELECT MAX(updated_at)::timestamptz FROM sra_studies) AS sra,
+    (SELECT MAX(published_at)::timestamptz FROM sra_submissions) AS sra,
     (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments) AS arrayexpress,
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies) AS ena;
 """
@@ -3269,6 +3303,7 @@ def build_country_accessions_sql(
     country: str,
     organism: str | None = None,
     assay_l2: str | None = None,
+    limit: int | None = None,
 ) -> tuple[str, list]:
     """Return accessions for a country with optional organism/assay filters."""
     conditions = [
@@ -3288,9 +3323,12 @@ def build_country_accessions_sql(
         f"SELECT DISTINCT canonical_accession"
         f" FROM unified_metadata"
         f" WHERE {where}"
-        f" ORDER BY canonical_accession;"
+        f" ORDER BY canonical_accession"
     )
-    return sql, params
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    return sql + ";", params
 
 
 _ENRICHED_SAMPLES_BASE_COLS = [

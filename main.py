@@ -119,7 +119,12 @@ from queries import (
     LAST_UPDATED_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
+    SITEMAP_BOUND_LOOKUP_SQL,
+    SITEMAP_BOUNDS_COUNTS_SQL,
     SITEMAP_COUNTS_SQL,
+    SITEMAP_KEYSET_SQL,
+    SITEMAP_PAGE_SIZE,
+    SITEMAP_SOURCE_BUILT_SQL,
     SOURCE_TOTALS_SQL,
     SRA_EXPERIMENT_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
@@ -186,6 +191,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_QUERY_DOWNLOAD = 100
+
+MAX_BULK_ACCESSIONS = 100
+MAX_COUNTRY_ACCESSIONS = 50_000
+MAX_METADATA_ROWS = 200_000
+_MAX_CROSSTAB_CACHE_ENTRIES = 200
+
+
+def _require_bulk_limit(accessions: list) -> None:
+    if len(accessions) > MAX_BULK_ACCESSIONS:
+        raise HTTPException(
+            413, f"Too many accessions: {len(accessions)} (max {MAX_BULK_ACCESSIONS})"
+        )
+
+
 COMBINED_BIN_ROWS_SQL = """
 WITH combined AS (
     SELECT accession, coords_2d, countries_iso AS countries
@@ -349,7 +368,7 @@ _enriched_crosstab_cache: dict = {}
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
-# Per-query ceiling 
+# Per-query ceiling
 _DEFAULT_STATEMENT_TIMEOUT = "30s"
 
 
@@ -2349,7 +2368,7 @@ def get_country_accessions(
     assay_l2: str | None = Query(None, description="Filter by assay type"),
 ):
     sql, params = build_country_accessions_sql(
-        country, organism=organism, assay_l2=assay_l2
+        country, organism=organism, assay_l2=assay_l2, limit=MAX_COUNTRY_ACCESSIONS
     )
     try:
         with pool.connection() as conn:
@@ -4139,6 +4158,8 @@ def get_project_metadata_rows(
                             )
                             for run in batch
                         )
+                        if len(rows) >= MAX_METADATA_ROWS:
+                            break
                     if not rows and accession.startswith("PRJ"):
                         rows = flatten_sra_study(cur, accession)
                     source = "ena" if accession.startswith("PRJ") else "sra"
@@ -4148,14 +4169,23 @@ def get_project_metadata_rows(
         logger.exception("Database error in get_project_metadata_rows")
         raise HTTPException(500, "Internal server error")
 
-    return _rows_response(accession, source, rows, cursor, limit)
+    truncated = len(rows) >= MAX_METADATA_ROWS
+    if truncated:
+        rows = rows[:MAX_METADATA_ROWS]
+    return _rows_response(accession, source, rows, cursor, limit, truncated=truncated)
 
 
 def _rows_response(
-    accession: str, source: str, rows: list[dict], cursor: int, limit: int
+    accession: str,
+    source: str,
+    rows: list[dict],
+    cursor: int,
+    limit: int,
+    truncated: bool = False,
 ) -> dict:
     """Build the paginated metadata-rows envelope shared by the project,
-    experiment, and run metadata/rows endpoints."""
+    experiment, and run metadata/rows endpoints. `truncated` is True when the
+    source row set was capped at MAX_METADATA_ROWS before paging."""
     page = rows[cursor : cursor + limit]
     next_cursor = cursor + len(page) if cursor + len(page) < len(rows) else None
     columns = list(page[0].keys()) if page else (list(rows[0].keys()) if rows else [])
@@ -4163,6 +4193,7 @@ def _rows_response(
         "accession": accession,
         "source": source,
         "total_rows": len(rows),
+        "truncated": truncated,
         "cursor": cursor,
         "limit": limit,
         "next_cursor": next_cursor,
@@ -5538,6 +5569,8 @@ def bulk_metadata(request: Request, payload: dict):
             raise HTTPException(400, f"Invalid accession format: {acc}")
         validated.append(acc)
 
+    _require_bulk_limit(validated)
+
     try:
         buf = io.BytesIO()
 
@@ -5620,6 +5653,8 @@ def bulk_project_metadata(request: Request, payload: dict):
             seen.add(normalized)
             validated.append(normalized)
 
+    _require_bulk_limit(validated)
+
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -5653,6 +5688,8 @@ def bulk_project_samples_metadata(request: Request, payload: dict):
         if not PROJECT_PATTERN.match(normalized):
             raise HTTPException(400, f"Invalid accession format: {acc}")
         validated.append(normalized)
+
+    _require_bulk_limit(validated)
 
     try:
         out = []
@@ -6389,10 +6426,14 @@ def sitemap_counts(request: Request):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(SITEMAP_COUNTS_SQL)
                 row = cur.fetchone()
+                # Exact page counts where bounds are built; estimate otherwise.
+                cur.execute(SITEMAP_BOUNDS_COUNTS_SQL, (SITEMAP_PAGE_SIZE,))
+                bounds = {r["source"]: r["count"] for r in cur.fetchall()}
     except Exception:
         logger.exception("Database error in sitemap_counts")
         raise HTTPException(500, "Internal server error")
-    data = {**row, "total": sum(row.values())}
+    counts = {k: bounds.get(k, v) for k, v in row.items()}
+    data = {**counts, "total": sum(counts.values())}
     with _sitemap_counts_cache_lock:
         _sitemap_counts_cache.update(ready=True, data=data, built_at=time.time())
     return data
@@ -6410,15 +6451,28 @@ def sitemap_accessions(
     page: int = Query(0, ge=0),
     limit: int = Query(50000, ge=1, le=50000),
 ):
-    offset = page * limit
-    sql = SITEMAP_ACCESSIONS_SQL.get(source)
-    if sql is None:
+    if source not in SITEMAP_KEYSET_SQL:
         raise HTTPException(400, f"Unknown source: {source}")
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql, (limit, offset))
-                rows = cur.fetchall()
+                cur.execute(SITEMAP_BOUND_LOOKUP_SQL, (source, page))
+                bound = cur.fetchone()
+                if bound is not None:
+                    cur.execute(
+                        SITEMAP_KEYSET_SQL[source], (bound["start_accession"], limit)
+                    )
+                    rows = cur.fetchall()
+                else:
+                    cur.execute(SITEMAP_SOURCE_BUILT_SQL, (source,))
+                    if cur.fetchone() is not None:
+                        rows = []  # past the last page
+                    else:
+                        # bounds not built yet OFFSET fallback
+                        cur.execute(
+                            SITEMAP_ACCESSIONS_SQL[source], (limit, page * limit)
+                        )
+                        rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in sitemap_accessions")
         raise HTTPException(500, "Internal server error")
@@ -6587,6 +6641,15 @@ def _get_enriched_crosstab(group: str, breakdown: str) -> dict:
 
     data = {"group": group, "breakdown": breakdown, "groups": list(groups.values())}
     with _enriched_crosstab_cache_lock:
+        if (
+            len(_enriched_crosstab_cache) >= _MAX_CROSSTAB_CACHE_ENTRIES
+            and key not in _enriched_crosstab_cache
+        ):
+            oldest = min(
+                _enriched_crosstab_cache,
+                key=lambda k: _enriched_crosstab_cache[k]["built_at"],
+            )
+            del _enriched_crosstab_cache[oldest]
         _enriched_crosstab_cache[key] = {"data": data, "built_at": time.time()}
     return data
 
@@ -6859,6 +6922,21 @@ def _list_filter(sql: str, params: tuple = ()) -> list[dict]:
             return cur.fetchall()
 
 
+_filter_list_cache_lock = threading.Lock()
+_filter_list_cache: dict[str, dict] = {}
+
+
+def _cached_list_filter(sql: str) -> list[dict]:
+    with _filter_list_cache_lock:
+        entry = _filter_list_cache.get(sql)
+        if entry and (time.time() - entry["built_at"]) < _GROWTH_CACHE_TTL:
+            return entry["data"]
+    rows = _list_filter(sql)
+    with _filter_list_cache_lock:
+        _filter_list_cache[sql] = {"data": rows, "built_at": time.time()}
+    return rows
+
+
 @api_app.get(
     "/filters/library-strategies",
     summary="Enumerate library strategies",
@@ -6872,7 +6950,7 @@ def _list_filter(sql: str, params: tuple = ()) -> list[dict]:
 @limiter.limit("100/minute")
 def list_library_strategies(request: Request):
     try:
-        rows = _list_filter(LIST_LIBRARY_STRATEGIES_SQL)
+        rows = _cached_list_filter(LIST_LIBRARY_STRATEGIES_SQL)
     except Exception:
         logger.exception("Database error in list_library_strategies")
         raise HTTPException(500, "Internal server error")
@@ -6892,7 +6970,7 @@ def list_library_strategies(request: Request):
 @limiter.limit("100/minute")
 def list_instrument_models(request: Request):
     try:
-        rows = _list_filter(LIST_INSTRUMENT_MODELS_SQL)
+        rows = _cached_list_filter(LIST_INSTRUMENT_MODELS_SQL)
     except Exception:
         logger.exception("Database error in list_instrument_models")
         raise HTTPException(500, "Internal server error")
@@ -7374,3 +7452,14 @@ combined_app.add_middleware(AnalyticsMiddleware)
 # )
 
 app = combined_app
+
+
+def _prewarm_caches() -> None:
+    for warm in (_ensure_spelling_loaded, _get_atlas_payloads, _get_binary_payloads):
+        try:
+            warm()
+        except Exception:
+            logger.exception("cache prewarm failed: %s", warm.__name__)
+
+
+threading.Thread(target=_prewarm_caches, daemon=True, name="prewarm").start()
