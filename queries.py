@@ -3043,7 +3043,7 @@ SITEMAP_TABLES = {
     "run": ("sra_run_download_links", "run_accession", False),
     "geo_sample": ("geo_samples", "accession", False),
     "sra_sample": ("sra_samples", "accession", False),
-    "ena_sample": ("ena_samples", "sample_accession", True),
+    "ena_sample": ("ena_samples", "sample_accession", False),
 }
 
 
@@ -3057,6 +3057,12 @@ def _sitemap_accessions_sql(table: str, col: str, distinct: bool) -> str:
 
 
 def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
+    # Distinct sources are run-level tables, so reltuples (raw rows) wildly
+    # overshoots the distinct accession count and the sitemap index emits
+    # phantom pages that 502. COUNT(DISTINCT) is exact (index-only scan with the
+    # btree on col); non-distinct sources keep the instant reltuples estimate.
+    if distinct:
+        return f"(SELECT COUNT(DISTINCT {col}) FROM {table})"
     return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
 
 

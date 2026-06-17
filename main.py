@@ -342,6 +342,8 @@ _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_sitemap_counts_cache_lock = threading.Lock()
+_sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _enriched_crosstab_cache_lock = threading.Lock()
 _enriched_crosstab_cache: dict = {}
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
@@ -3184,33 +3186,240 @@ def get_study_samples(
     return {"study_accession": study, "total": len(rows), "samples": rows}
 
 
-def _split_fastq_fields(row: dict, study: str) -> list[dict]:
-    """Expand a single run row into one dict per FASTQ file.
+_URL_SCHEMES = ("http://", "https://", "ftp://", "s3://", "gs://")
 
-    Paired-end runs have semicolon-separated fastq_ftp/bytes/md5 fields;
-    this splits them into individual file entries with directory paths.
-    Each entry includes separate columns for SRA Lite, SRA (normalized),
-    S3/AWS, and GCS URLs alongside the FASTQ URL.
+
+def _split_semicolon_values(value: object) -> list[str]:
+    return [v.strip() for v in str(value or "").split(";") if v.strip()]
+
+
+def _normalize_download_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url or url.startswith(_URL_SCHEMES):
+        return url
+    return f"ftp://{url}"
+
+
+def _fastq_file_count(row: dict) -> int:
+    return len(_split_semicolon_values(row.get("fastq_ftp")))
+
+
+def _is_interleaved_paired_fastq(row: dict) -> bool:
+    return (row.get("library_layout") or "").upper() == "PAIRED" and _fastq_file_count(
+        row
+    ) == 1
+
+
+def _preferred_fastq_conversion_source_from_row(row: dict) -> dict | None:
+    candidates = [
+        (
+            "sra",
+            row.get("ncbi_sra_normalized_url"),
+            row.get("ncbi_sra_normalized_bytes"),
+            row.get("sra_md5"),
+        ),
+        (
+            "sra_lite",
+            row.get("ncbi_sra_lite_url"),
+            row.get("ncbi_sra_lite_bytes"),
+            row.get("sra_md5"),
+        ),
+        ("sra", row.get("sra_ftp"), row.get("sra_bytes"), row.get("sra_md5")),
+        ("sra", row.get("ncbi_sra_url"), row.get("sra_bytes"), row.get("sra_md5")),
+    ]
+    for source, url, bytes_, md5 in candidates:
+        url = _normalize_download_url(url or "")
+        if url:
+            return {
+                "source": source,
+                "url": url,
+                "bytes": bytes_ or "",
+                "md5": md5 or "",
+            }
+    return None
+
+
+def _annotate_run_download(row: dict) -> dict:
+    count = _fastq_file_count(row)
+    interleaved = _is_interleaved_paired_fastq(row)
+    source = _preferred_fastq_conversion_source_from_row(row) if interleaved else None
+    row["fastq_file_count"] = count
+    row["fastq_is_interleaved"] = interleaved
+    row["fastq_conversion_required"] = interleaved
+    row["fastq_conversion_available"] = bool(source)
+    row["recommended_fastq_source"] = source["source"] if source else "fastq"
+    return row
+
+
+def _annotate_run_downloads(rows: list[dict]) -> list[dict]:
+    return [_annotate_run_download(row) for row in rows]
+
+
+def _preferred_fastq_conversion_source_from_entry(entry: dict) -> dict | None:
+    candidates = [
+        ("sra", entry.get("sra_url"), entry.get("sra_bytes"), entry.get("sra_md5")),
+        (
+            "sra_lite",
+            entry.get("sra_lite_url"),
+            entry.get("sra_lite_bytes"),
+            entry.get("sra_md5"),
+        ),
+    ]
+    for source, url, bytes_, md5 in candidates:
+        url = _normalize_download_url(url or "")
+        if url:
+            return {
+                "source": source,
+                "url": url,
+                "bytes": bytes_ or "",
+                "md5": md5 or "",
+            }
+    return None
+
+
+def _source_filename(url: str, run: str, source: str) -> str:
+    filename = url.rstrip("/").rsplit("/", 1)[-1]
+    if filename and "." in filename:
+        return filename
+    suffix = "sra_lite.sra" if source == "sra_lite" else "sra"
+    return f"{run}.{suffix}"
+
+
+def _expected_split_fastq_paths(entry: dict) -> list[str]:
+    run = entry["run_accession"]
+    directory = entry["directory_path"]
+    if (entry.get("library_layout") or "").upper() == "PAIRED":
+        return [f"{directory}/{run}_1.fastq.gz", f"{directory}/{run}_2.fastq.gz"]
+    return [f"{directory}/{run}.fastq.gz"]
+
+
+def _sracha_format(source_mode: str) -> str:
+    return "sralite" if source_mode == "sra_lite" else "sra"
+
+
+def _sracha_fastq_shell_call(run: str, directory_path: str, source_mode: str) -> str:
+    return (
+        f"sracha_interleaved_fastq {_shell_escape(run)} "
+        f"{_shell_escape(directory_path)} {_shell_escape(_sracha_format(source_mode))}"
+    )
+
+
+def _download_manifest_entry(
+    study: str,
+    mode: str,
+    method: str,
+    url_key: str,
+    bytes_key: str | None,
+    md5_key: str,
+    entry: dict,
+) -> dict | None:
+    url = entry.get(url_key) or ""
+    if not url:
+        return None
+    filename = entry["filename"]
+    path = f"{entry['directory_path']}/{filename}"
+    bytes_value = entry.get(bytes_key) if bytes_key else ""
+    checksum = entry.get(md5_key) or ""
+    interleaved = bool(entry.get("fastq_is_interleaved"))
+    return {
+        "study_accession": study,
+        "mode": mode,
+        "method": method,
+        "run_accession": entry["run_accession"],
+        "run_alias": entry.get("run_alias") or "",
+        "experiment_accession": entry["experiment_accession"],
+        "library_layout": entry.get("library_layout") or "",
+        "fastq_file_count": entry.get("fastq_file_count", 0),
+        "fastq_is_interleaved": interleaved,
+        "fastq_conversion_required": interleaved and mode == "fastq",
+        "fastq_conversion_available": False,
+        "recommended_fastq_source": entry.get("recommended_fastq_source") or "fastq",
+        "url": url,
+        "path": path,
+        "filename": filename,
+        "bytes": _coerce_int(bytes_value),
+        "md5": checksum,
+        "directory_path": entry["directory_path"],
+        "download_command": _download_command(method, url, path),
+    }
+
+
+def _fastq_conversion_manifest_entry(study: str, entry: dict) -> dict | None:
+    source = _preferred_fastq_conversion_source_from_entry(entry)
+    if not source:
+        return None
+    run = entry["run_accession"]
+    filename = _source_filename(source["url"], run, source["source"])
+    path = f"{entry['directory_path']}/{filename}"
+    sracha_command = _sracha_fastq_shell_call(
+        run, entry["directory_path"], source["source"]
+    )
+    source_download_command = _download_command("wget", source["url"], path)
+    return {
+        "study_accession": study,
+        "mode": "fastq",
+        "method": "sra_to_fastq",
+        "source_mode": source["source"],
+        "run_accession": run,
+        "run_alias": entry.get("run_alias") or "",
+        "experiment_accession": entry["experiment_accession"],
+        "library_layout": entry.get("library_layout") or "",
+        "fastq_file_count": entry.get("fastq_file_count", 0),
+        "fastq_is_interleaved": True,
+        "fastq_conversion_required": True,
+        "fastq_conversion_available": True,
+        "recommended_fastq_source": source["source"],
+        "original_fastq_url": entry.get("fastq_url") or "",
+        "url": source["url"],
+        "path": path,
+        "filename": filename,
+        "bytes": _coerce_int(source.get("bytes")),
+        "md5": source.get("md5") or "",
+        "directory_path": entry["directory_path"],
+        "expected_fastq_paths": _expected_split_fastq_paths(entry),
+        "download_command": sracha_command,
+        "conversion_command": sracha_command,
+        "source_download_command": source_download_command,
+        "download_commands": [sracha_command],
+    }
+
+
+def _split_fastq_fields(row: dict, study: str) -> list[dict]:
+    """Expand a single run row into one dict per downloadable file.
+
+    Paired-end runs usually have semicolon-separated fastq_ftp/bytes/md5 fields.
+    If a paired-layout run has exactly one ENA FASTQ, mark it as interleaved so
+    callers can use SRA/SRA Lite conversion instead of treating it as R1/R2 data.
     """
     ftp = row.get("fastq_ftp") or ""
     bytes_ = row.get("fastq_bytes") or ""
     md5s = row.get("fastq_md5") or ""
-    urls = [u.strip() for u in ftp.split(";") if u.strip()]
-    sizes = [s.strip() for s in bytes_.split(";") if s.strip()]
-    checksums = [m.strip() for m in md5s.split(";") if m.strip()]
+    urls = _split_semicolon_values(ftp)
+    sizes = _split_semicolon_values(bytes_)
+    checksums = _split_semicolon_values(md5s)
 
     run = row["run_accession"]
     exp = row.get("experiment_accession") or "unknown"
     dir_path = f"{study}/{exp}/{run}"
+    fastq_is_interleaved = _is_interleaved_paired_fastq(row)
+    conversion_source = (
+        _preferred_fastq_conversion_source_from_row(row)
+        if fastq_is_interleaved
+        else None
+    )
 
-    # Cloud / SRA URLs
-    sra_lite_url = row.get("ncbi_sra_lite_url") or ""
+    sra_url = _normalize_download_url(
+        row.get("ncbi_sra_normalized_url")
+        or row.get("sra_ftp")
+        or row.get("ncbi_sra_url")
+        or row.get("ncbi_sra_url_aws")
+        or ""
+    )
+    sra_lite_url = _normalize_download_url(row.get("ncbi_sra_lite_url") or "")
+    sra_bytes = row.get("ncbi_sra_normalized_bytes") or row.get("sra_bytes") or ""
     sra_lite_bytes = row.get("ncbi_sra_lite_bytes") or ""
-    sra_url = row.get("ncbi_sra_normalized_url") or ""
-    sra_bytes = row.get("ncbi_sra_normalized_bytes") or ""
     s3_url = row.get("ncbi_sra_lite_s3_url") or ""
     gs_url = row.get("ncbi_sra_lite_gs_url") or ""
-
     sra_md5 = row.get("sra_md5") or ""
 
     common = {
@@ -3218,6 +3427,13 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
         "run_alias": row.get("run_alias") or "",
         "experiment_accession": exp,
         "library_layout": row.get("library_layout") or "",
+        "fastq_file_count": len(urls),
+        "fastq_is_interleaved": fastq_is_interleaved,
+        "fastq_conversion_required": fastq_is_interleaved,
+        "fastq_conversion_available": bool(conversion_source),
+        "recommended_fastq_source": (
+            conversion_source["source"] if conversion_source else "fastq"
+        ),
         "sra_lite_url": sra_lite_url,
         "sra_lite_bytes": sra_lite_bytes,
         "sra_url": sra_url,
@@ -3232,12 +3448,11 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
         results = []
         for i, url in enumerate(urls):
             filename = url.rsplit("/", 1)[-1] if "/" in url else url
+            normalized_url = _normalize_download_url(url)
             results.append(
                 {
                     **common,
-                    "fastq_url": (
-                        f"ftp://{url}" if not url.startswith("ftp://") else url
-                    ),
+                    "fastq_url": normalized_url,
                     "fastq_bytes": sizes[i] if i < len(sizes) else "",
                     "fastq_md5": checksums[i] if i < len(checksums) else "",
                     "filename": filename,
@@ -3245,28 +3460,11 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
             )
         return results
 
-    # No FASTQ FTP so emit one row
-    # with empty FASTQ columns but cloud URLs
-    best_url = (
-        sra_url
-        or sra_lite_url
-        or row.get("ncbi_sra_url")
-        or row.get("ncbi_sra_url_aws")
-        or ""
-    )
+    best_url = sra_url or sra_lite_url or s3_url or gs_url
     if not best_url:
-        sra_ftp = row.get("sra_ftp") or ""
-        if sra_ftp:
-            best_url = (
-                f"ftp://{sra_ftp}" if not sra_ftp.startswith("ftp://") else sra_ftp
-            )
-            common["sra_url"] = best_url
-            common["sra_bytes"] = row.get("sra_bytes") or ""
-    if not best_url and not s3_url:
         return []
 
     filename = best_url.rsplit("/", 1)[-1] if "/" in best_url else run
-
     return [
         {
             **common,
@@ -3284,8 +3482,10 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     description=(
         "Return FASTQ/SRA download links for runs in an SRA/ENA study. "
         "Returns summary statistics plus a preview of up to 500 runs; FASTQ "
-        "fields are semicolon-joined for paired-end runs. For complete "
-        "paginated per-file FASTQ entries, use get_study_download_manifest."
+        "fields are semicolon-joined for paired-end runs. If a paired-layout "
+        "run has one ENA FASTQ, fastq_is_interleaved is true and SRA/SRA Lite "
+        "conversion should be used. For complete paginated per-file entries, "
+        "use get_study_download_manifest."
     ),
     operation_id="get_study_runs",
 )
@@ -3312,7 +3512,7 @@ def get_study_runs(
                     }
 
                 cur.execute(STUDY_RUNS_PREVIEW_SQL, (study, study))
-                rows = cur.fetchall()
+                rows = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in get_study_runs")
         raise HTTPException(500, "Internal server error")
@@ -3332,8 +3532,10 @@ def get_study_runs(
     description=(
         "Return FASTQ/SRA download links and layout for one run accession "
         "(SRR/ERR/DRR). fastq_ftp, fastq_bytes, and fastq_md5 are "
-        "semicolon-joined for paired-end FASTQs. Use get_run_checksums when "
-        "you need parsed per-file FASTQ URLs, byte sizes, and MD5 checksums. "
+        "semicolon-joined for paired-end FASTQs. If a paired-layout run has "
+        "one ENA FASTQ, fastq_is_interleaved is true and SRA/SRA Lite conversion "
+        "should be used. Use get_run_checksums when you need parsed per-file "
+        "FASTQ URLs, byte sizes, and MD5 checksums. "
         "Returns 404 if the run is unknown."
     ),
     operation_id="get_run",
@@ -3358,7 +3560,7 @@ def _fetch_run_row(run: str) -> dict:
         raise HTTPException(500, "Internal server error")
     if not row:
         raise HTTPException(404, f"No run found for accession {run}")
-    return row
+    return _annotate_run_download(row)
 
 
 def _to_int(value) -> int | None:
@@ -3369,7 +3571,10 @@ def _to_int(value) -> int | None:
 
 
 def _as_url(value: str) -> str:
-    return value if value.startswith("http") else f"https://{value}"
+    value = value or ""
+    if not value or value.startswith(_URL_SCHEMES):
+        return value
+    return f"https://{value}"
 
 
 def _file_record(url: str, size, md5) -> dict:
@@ -3401,7 +3606,9 @@ def _zip_run_files(ftp, sizes, hashes) -> list[dict]:
     description=(
         "Return per-file FASTQ and SRA download URLs with their byte size and MD5 "
         "checksum for a run accession (SRR/ERR/DRR), parsed into structured "
-        "records so callers do not need to split semicolon-joined FASTQ fields."
+        "records so callers do not need to split semicolon-joined FASTQ fields. "
+        "For paired-layout runs with one ENA FASTQ, flags indicate that SRA/SRA "
+        "Lite conversion is required and which source should be used."
     ),
     operation_id="get_run_checksums",
 )
@@ -3411,17 +3618,38 @@ def get_run_checksums(
     run: str = Path(..., pattern=RUN_REGEX),
 ):
     row = _fetch_run_row(run)
+    conversion_source = (
+        _preferred_fastq_conversion_source_from_row(row)
+        if row.get("fastq_is_interleaved")
+        else None
+    )
     sra = (
         _file_record(row["sra_ftp"], row.get("sra_bytes"), row.get("sra_md5"))
         if row.get("sra_ftp")
         else None
     )
+    conversion_record = None
+    if conversion_source:
+        conversion_record = {
+            "source": conversion_source["source"],
+            **_file_record(
+                conversion_source["url"],
+                conversion_source.get("bytes"),
+                conversion_source.get("md5"),
+            ),
+        }
     return {
         "run_accession": run.upper(),
+        "fastq_file_count": row.get("fastq_file_count", 0),
+        "fastq_is_interleaved": row.get("fastq_is_interleaved", False),
+        "fastq_conversion_required": row.get("fastq_conversion_required", False),
+        "fastq_conversion_available": row.get("fastq_conversion_available", False),
+        "recommended_fastq_source": row.get("recommended_fastq_source", "fastq"),
         "fastq": _zip_run_files(
             row.get("fastq_ftp"), row.get("fastq_bytes"), row.get("fastq_md5")
         ),
         "sra": sra,
+        "conversion_source": conversion_record,
     }
 
 
@@ -3451,7 +3679,7 @@ def get_experiment(
                     experiment = cur.fetchone()
                 if experiment:
                     cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
-                    experiment["runs"] = cur.fetchall()
+                    experiment["runs"] = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in get_experiment")
         raise HTTPException(500, "Internal server error")
@@ -3476,7 +3704,7 @@ def get_experiment_runs(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
-                runs = cur.fetchall()
+                runs = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in get_experiment_runs")
         raise HTTPException(500, "Internal server error")
@@ -4062,7 +4290,21 @@ download_one() {
   if [ "$expected" -gt 0 ] && [ "$sz" -gt "$expected" ]; then
     echo "oversized, redownloading" >&2
     rm -f "$out" "$out.done"
-  elif _is_complete "$out"; then
+  elif [ "$expected" -gt 0 ] && [ "$sz" -gt 0 ] && [ "$sz" -lt "$expected" ] && { [ "$method" = "wget" ] || [ "$method" = "curl" ]; }; then
+    echo "partial, resuming" >&2
+    rm -f "$out.done"
+    case "$method" in
+      wget) wget -c -q --show-progress --tries=10 --timeout=60 --retry-connrefused -O "$out" "$url" || true ;;
+      curl) curl -L -C - --retry 10 --retry-delay 5 --retry-all-errors --fail -o "$out" "$url" || true ;;
+    esac
+    if { [ "$expected" -le 0 ] || [ "$(stat -c %s "$out" 2>/dev/null || echo 0)" -ge "$expected" ]; } && _is_complete "$out"; then
+      : > "$out.done"
+      echo "$prefix: resumed OK" >&2
+      return 0
+    fi
+    echo "$prefix: WARN integrity check failed after resume; redownloading from scratch" >&2
+    rm -f "$out" "$out.done"
+  elif { [ "$expected" -le 0 ] || [ "$sz" -ge "$expected" ]; } && _is_complete "$out"; then
     : > "$out.done"
     echo "valid, skip" >&2
     return 0
@@ -4073,7 +4315,7 @@ download_one() {
       wget) wget -c -q --show-progress --tries=10 --timeout=60 --retry-connrefused -O "$out" "$url" || true ;;
       curl) curl -L -C - --retry 10 --retry-delay 5 --retry-all-errors --fail -o "$out" "$url" || true ;;
     esac
-    if _is_complete "$out"; then
+    if { [ "$expected" -le 0 ] || [ "$(stat -c %s "$out" 2>/dev/null || echo 0)" -ge "$expected" ]; } && _is_complete "$out"; then
       : > "$out.done"
       echo "$prefix: resumed OK" >&2
       return 0
@@ -4093,9 +4335,42 @@ download_one() {
     gsutil) gsutil cp "$url" "$out" ;;
     *) echo "ERR: unknown download method '$method'" >&2; return 1 ;;
   esac
-  _is_complete "$out" || { echo "$prefix: ERR corrupted after fresh download (re-run script)" >&2; rm -f "$out" "$out.done"; return 1; }
+  { [ "$expected" -le 0 ] || [ "$(stat -c %s "$out" 2>/dev/null || echo 0)" -ge "$expected" ]; } && _is_complete "$out" || { echo "$prefix: ERR corrupted after fresh download (re-run script)" >&2; rm -f "$out" "$out.done"; return 1; }
   : > "$out.done"
   echo "$prefix: done" >&2
+}
+
+"""
+
+_SRACHA_FASTQ_HELPER = r"""# Interleaved paired FASTQ handling.
+# For paired-layout runs where ENA exposes one interleaved FASTQ, this script uses
+# sracha-rs from the Hesselberth group at CU Anschutz to fetch SRA/SRA Lite and
+# emit split FASTQ files.
+# Project: https://github.com/rnabioco/sracha-rs
+# Install before running this section, for example:
+#   pixi add bioconda::sracha
+# or:
+#   cargo install --git https://github.com/rnabioco/sracha-rs sracha
+sracha_interleaved_fastq() {
+  local run="$1" outdir="$2" format="${3:-sra}"
+  local r1="$outdir/${run}_1.fastq.gz"
+  local r2="$outdir/${run}_2.fastq.gz"
+  if [ -s "$r1" ] && [ -s "$r2" ] && gzip -t "$r1" 2>/dev/null && gzip -t "$r2" 2>/dev/null; then
+    echo "FASTQs already converted for $run, skip" >&2
+    return 0
+  fi
+  command -v sracha >/dev/null 2>&1 || {
+    echo "ERR: sracha is required for paired runs with one ENA FASTQ." >&2
+    echo "Install with: pixi add bioconda::sracha" >&2
+    echo "Or: cargo install --git https://github.com/rnabioco/sracha-rs sracha" >&2
+    return 1
+  }
+  mkdir -p "$outdir"
+  sracha get "$run" --format "$format" --split split-files -O "$outdir"
+  [ -s "$r1" ] && [ -s "$r2" ] || {
+    echo "ERR: expected split paired FASTQs for $run after sracha conversion" >&2
+    return 1
+  }
 }
 
 """
@@ -4149,6 +4424,27 @@ def _study_metadata_row(
         "study_accession": study,
         "run_accession": run.get("run_accession") or "",
         "run_alias": run.get("run_alias") or "",
+        "fastq_file_count": run.get("fastq_file_count", _fastq_file_count(run)),
+        "fastq_is_interleaved": run.get(
+            "fastq_is_interleaved", _is_interleaved_paired_fastq(run)
+        ),
+        "fastq_conversion_required": run.get(
+            "fastq_conversion_required", _is_interleaved_paired_fastq(run)
+        ),
+        "fastq_conversion_available": run.get(
+            "fastq_conversion_available",
+            (
+                bool(_preferred_fastq_conversion_source_from_row(run))
+                if _is_interleaved_paired_fastq(run)
+                else False
+            ),
+        ),
+        "recommended_fastq_source": run.get("recommended_fastq_source")
+        or (
+            (_preferred_fastq_conversion_source_from_row(run) or {}).get("source")
+            if _is_interleaved_paired_fastq(run)
+            else "fastq"
+        ),
         "fastq_ftp": run.get("fastq_ftp") or "",
         "fastq_bytes": run.get("fastq_bytes") or "",
         "fastq_md5": run.get("fastq_md5") or "",
@@ -4330,6 +4626,8 @@ _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
     description=(
         "Return paginated JSON file entries for downloading an SRA/ENA study. "
         "This is the preferred MCP tool for complete per-file FASTQ retrieval. "
+        "For paired-layout runs with one ENA FASTQ, mode=fastq returns an "
+        "SRA/SRA Lite source plus sracha conversion command. "
         "Modes: fastq, sra, sra_lite, s3, or gcs. Each entry includes URL, "
         "target path, checksum/size when available, and run/experiment metadata."
     ),
@@ -4369,8 +4667,29 @@ def get_study_download_manifest(
                         break
                     for row in batch:
                         for entry in _split_fastq_fields(row, study):
-                            url = entry.get(url_key) or ""
-                            if not url:
+                            if mode == "fastq" and entry.get("fastq_is_interleaved"):
+                                item = _fastq_conversion_manifest_entry(study, entry)
+                                if item is None:
+                                    item = _download_manifest_entry(
+                                        study,
+                                        mode,
+                                        method,
+                                        url_key,
+                                        bytes_key,
+                                        md5_key,
+                                        entry,
+                                    )
+                            else:
+                                item = _download_manifest_entry(
+                                    study,
+                                    mode,
+                                    method,
+                                    url_key,
+                                    bytes_key,
+                                    md5_key,
+                                    entry,
+                                )
+                            if item is None:
                                 continue
                             if seen < cursor:
                                 seen += 1
@@ -4378,33 +4697,7 @@ def get_study_download_manifest(
                             if len(entries) >= limit:
                                 has_more = True
                                 break
-
-                            filename = entry["filename"]
-                            path = f"{entry['directory_path']}/{filename}"
-                            bytes_value = entry.get(bytes_key) if bytes_key else ""
-                            checksum = entry.get(md5_key) or ""
-                            entries.append(
-                                {
-                                    "study_accession": study,
-                                    "mode": mode,
-                                    "method": method,
-                                    "run_accession": entry["run_accession"],
-                                    "run_alias": entry.get("run_alias") or "",
-                                    "experiment_accession": entry[
-                                        "experiment_accession"
-                                    ],
-                                    "library_layout": entry.get("library_layout") or "",
-                                    "url": url,
-                                    "path": path,
-                                    "filename": filename,
-                                    "bytes": _coerce_int(bytes_value),
-                                    "md5": checksum,
-                                    "directory_path": entry["directory_path"],
-                                    "download_command": _download_command(
-                                        method, url, path
-                                    ),
-                                }
-                            )
+                            entries.append(item)
                             seen += 1
                         if has_more:
                             break
@@ -4432,8 +4725,9 @@ def get_study_download_manifest(
     summary="Download script for a study",
     description=(
         "Return a bash script to download all runs in a study using the "
-        "specified source: fastq (EBI FASTQ via wget), sra (SRA normalized "
-        "via wget), sra_lite (SRA Lite via wget), s3 (AWS S3 via aws cli), "
+        "specified source: fastq (EBI FASTQ via wget; paired single-FASTQ "
+        "runs are converted from SRA/SRA Lite with sracha), sra "
+        "(SRA normalized via wget), sra_lite (SRA Lite via wget), s3 (AWS S3 via aws cli), "
         "or gcs (Google Cloud via gsutil)."
     ),
     operation_id="download_study_script",
@@ -4459,6 +4753,9 @@ def download_study_script(
     expected_paths: list[str] = []
     expected_sizes: list[int] = []
     checksums: list[tuple[str, str]] = []  # (md5, filepath)
+    download_count = 0
+    interleaved_conversion_count = 0
+    interleaved_direct_count = 0
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -4469,6 +4766,38 @@ def download_study_script(
                         break
                     for row in batch:
                         for entry in _split_fastq_fields(row, study):
+                            conversion_source = None
+                            if mode == "fastq" and entry.get("fastq_is_interleaved"):
+                                conversion_source = (
+                                    _preferred_fastq_conversion_source_from_entry(entry)
+                                )
+                            if conversion_source:
+                                dirpath = entry["directory_path"]
+                                fastq_url = entry.get("fastq_url") or ""
+                                if fastq_url:
+                                    fastq_path = f"{dirpath}/{entry['filename']}"
+                                    fastq_size = _coerce_int(entry.get("fastq_bytes"))
+                                    lines.append(
+                                        "# Direct ENA FASTQ is interleaved for this paired run; "
+                                        "kept for reference only."
+                                    )
+                                    lines.append(
+                                        f"# download_one {_shell_escape(fastq_url)} {_shell_escape(fastq_path)} wget {fastq_size}"
+                                    )
+                                lines.append(
+                                    _sracha_fastq_shell_call(
+                                        entry["run_accession"],
+                                        dirpath,
+                                        conversion_source["source"],
+                                    )
+                                )
+                                for expected_path in _expected_split_fastq_paths(entry):
+                                    expected_paths.append(expected_path)
+                                    expected_sizes.append(0)
+                                download_count += 1
+                                interleaved_conversion_count += 1
+                                continue
+
                             url = entry.get(url_key) or ""
                             if not url:
                                 continue
@@ -4484,6 +4813,9 @@ def download_study_script(
                             md5 = entry.get(md5_key) or ""
                             if md5:
                                 checksums.append((md5, path))
+                            download_count += 1
+                            if mode == "fastq" and entry.get("fastq_is_interleaved"):
+                                interleaved_direct_count += 1
     except Exception:
         logger.exception("Error generating download script for %s", study)
         raise HTTPException(500, "Internal error generating download script")
@@ -4494,22 +4826,41 @@ def download_study_script(
             f"No {label} URLs available for {study}",
         )
 
+    conversion_note = (
+        f"# Paired-layout runs with one ENA FASTQ: {interleaved_conversion_count}; "
+        f"using sracha-rs SRA/SRA Lite fetch with --split split-files.\n"
+        if interleaved_conversion_count
+        else ""
+    )
+    direct_note = (
+        f"# WARNING: {interleaved_direct_count} paired-layout run(s) had one ENA FASTQ "
+        f"but no SRA/SRA Lite URL was available, so the interleaved FASTQ was downloaded directly.\n"
+        if interleaved_direct_count
+        else ""
+    )
+    conversion_helper = _SRACHA_FASTQ_HELPER if interleaved_conversion_count else ""
+
     script = (
         f"#!/usr/bin/env bash\n"
         f"# Download {label} for {study}\n"
         f"# Generated by seqout.org\n"
         f"# Resumable: re-run this script to skip completed files and continue partial transfers.\n"
-        f"# Integrity-checked: corrupted .gz / .bam files are detected and redownloaded automatically.\n\n"
+        f"# Integrity-checked: corrupted .gz / .bam files are detected and redownloaded automatically.\n"
+        f"{conversion_note}"
+        f"{direct_note}\n"
         f"set -euo pipefail\n\n"
         f"{_DOWNLOAD_HELPER}"
-        f"{_resume_status_preamble(expected_paths, expected_sizes)}"
+        f"{conversion_helper}"
+        f"{_resume_status_preamble(expected_paths, expected_sizes if all(expected_sizes) else None)}"
         f"# Download metadata\n"
         f"curl -sS --retry 10 --retry-delay 5 --retry-all-errors --fail"
         f' "https://seqout.org/api/project/{study}/metadata/download"'
         f' -o "{study}/metadata.csv" --create-dirs\n\n'
     )
     script += "\n".join(lines) + "\n"
-    script += f'\necho "Done. {len(lines)} files saved under ./{study}/"\n'
+    script += (
+        f'\necho "Done. {download_count} source files processed under ./{study}/"\n'
+    )
     if checksums:
         script += "\n# Verify checksums\n"
         script += "echo 'Verifying MD5 checksums...'\n"
@@ -4793,7 +5144,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
 
         # Fetch runs for this experiment
         cur.execute(EXPERIMENT_RUNS_SQL, (acc,))
-        runs = cur.fetchall()
+        runs = _annotate_run_downloads(cur.fetchall())
 
         result = {
             "sample_type": "sra_experiment",
@@ -4821,7 +5172,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         cur.execute(SRA_EXPERIMENT_SQL, (exp_acc,))
         experiment = cur.fetchone()
         cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
-        runs = cur.fetchall()
+        runs = _annotate_run_downloads(cur.fetchall())
     else:
         # Try ENA
         cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
@@ -4831,7 +5182,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
             cur.execute(ENA_EXPERIMENT_SQL, (exp_acc,))
             experiment = cur.fetchone()
             cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
-            runs = cur.fetchall()
+            runs = _annotate_run_downloads(cur.fetchall())
 
     # Find parent study
     study_acc = None
@@ -6018,6 +6369,12 @@ def get_project_cite(
     operation_id="sitemap_counts",
 )
 def sitemap_counts(request: Request):
+    with _sitemap_counts_cache_lock:
+        if (
+            _sitemap_counts_cache["ready"]
+            and (time.time() - _sitemap_counts_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _sitemap_counts_cache["data"]
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -6026,8 +6383,10 @@ def sitemap_counts(request: Request):
     except Exception:
         logger.exception("Database error in sitemap_counts")
         raise HTTPException(500, "Internal server error")
-    total = sum(row.values())
-    return {**row, "total": total}
+    data = {**row, "total": sum(row.values())}
+    with _sitemap_counts_cache_lock:
+        _sitemap_counts_cache.update(ready=True, data=data, built_at=time.time())
+    return data
 
 
 @api_app.get(
@@ -6798,11 +7157,17 @@ Preferred FASTQ workflow:
    `paired_runs`, `single_runs`, `total_fastq_bytes`, and a preview of up to 500
    runs. Its `fastq_ftp`, `fastq_bytes`, and `fastq_md5` values are semicolon-joined
    for paired-end runs.
-4. For one run, prefer `get_run_checksums`. It returns parsed `fastq` file records
-   and optional `sra` file record. Use `get_run` only when raw run-level fields are
-   needed.
-5. For one experiment, use `get_experiment_runs` or `get_experiment_metadata_rows`.
-6. For a ready-to-run script, use `download_study_script(study, mode)`. Modes are
+4. Interleaved paired FASTQ rule: if `library_layout=PAIRED` and
+   `fastq_file_count=1` or `fastq_is_interleaved=true`, do not treat that single
+   ENA FASTQ as a complete R1/R2 pair. Use SRA normalized format first, or SRA Lite
+   if normalized SRA is unavailable, then fetch/convert with `sracha get --split split-files`.
+   `get_study_download_manifest(mode="fastq")` and `download_study_script(...,
+   mode="fastq")` do this automatically when `fastq_conversion_available=true`.
+5. For one run, prefer `get_run_checksums`. It returns parsed `fastq` file records,
+   optional `sra` file record, and interleaved/conversion flags. Use `get_run` only
+   when raw run-level fields are needed.
+6. For one experiment, use `get_experiment_runs` or `get_experiment_metadata_rows`.
+7. For a ready-to-run script, use `download_study_script(study, mode)`. Modes are
    `fastq`, `sra`, `sra_lite`, `s3`, and `gcs`. Default/recommended raw FASTQ mode
    is `fastq`; `sra_lite` is smaller but lossy for quality scores.
 
@@ -6810,7 +7175,10 @@ URL/checksum rules:
 - In raw run rows, `fastq_ftp` may be a semicolon-separated EBI host/path with no
   scheme. Do not hand-parse unless needed; prefer manifest or checksum tools.
 - `get_study_download_manifest` and `get_run_checksums` already provide per-file
-  URL/bytes/MD5 fields suitable for download and verification.
+  URL/bytes/MD5 fields suitable for download and verification. For interleaved
+  paired runs, look at `fastq_conversion_required`, `fastq_conversion_available`,
+  `recommended_fastq_source`, `source_mode`, `conversion_command`, and
+  `expected_fastq_paths`.
 - If a user asks for "MD5", "checksums", "file sizes", or "verify downloads",
   use `get_run_checksums` for a run or `get_study_download_manifest` for a study.
 
