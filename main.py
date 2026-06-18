@@ -1289,6 +1289,19 @@ def _compute_map_version(
     return h.hexdigest()[:16]
 
 
+def _prune_old_map_versions(keep: str) -> None:
+    """Remove stale map-asset version dirs, keeping only `keep`. Best-effort, so
+    disk holds at most one version. Leaves the CURRENT pointer and any in-progress
+    `*.tmp` dirs alone (their names don't match the version pattern)."""
+    try:
+        entries = list(_MAP_ASSETS_DIR.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name != keep and entry.is_dir() and _MAP_ID_RE.match(entry.name):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def _ensure_map_assets() -> tuple[str, pathlib.Path]:
     """Build the map assets if needed and return (version, version_dir).
 
@@ -1311,6 +1324,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             _MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather"
         ).exists():
             version_dir = _MAP_ASSETS_DIR / cached
+            _prune_old_map_versions(cached)
             _map_assets_state.update(ready=True, version=cached, dir=version_dir)
             return cached, version_dir
 
@@ -1340,6 +1354,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
 
         _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         _MAP_CURRENT_FILE.write_text(version)
+        _prune_old_map_versions(version)
         _map_assets_state.update(ready=True, version=version, dir=version_dir)
         return version, version_dir
 
