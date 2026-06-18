@@ -62,9 +62,9 @@ from queries import (
     ENRICHED_SAMPLES_V3_SQL,
     ENRICHED_STAT_COLUMNS,
     ENRICHED_STUDY_SQL,
+    ENRICHED_STUDY_V3_SQL,
     ENRICHED_SUMMARY_SQL,
     ENRICHED_TOP_VALUES_PER_COLUMN,
-    ENRICHED_STUDY_V3_SQL,
     EXPERIMENT_RUNS_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_SQL,
@@ -88,6 +88,7 @@ from queries import (
     GROWTH_PROJECTS_ENA_SQL,
     GROWTH_PROJECTS_GEO_SQL,
     GROWTH_PROJECTS_SRA_SQL,
+    LAST_UPDATED_SQL,
     LIST_CENTERS_SQL,
     LIST_INSTRUMENT_MODELS_SQL,
     LIST_JOURNALS_SQL,
@@ -116,7 +117,6 @@ from queries import (
     SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
-    LAST_UPDATED_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_BOUND_LOOKUP_SQL,
@@ -7103,7 +7103,7 @@ def _age_hours_to_human(value: str | None) -> str | None:
 
 
 MCP_INSTRUCTIONS = """\
-You are connected to pysraweb, a genomics study search engine covering NCBI
+You are connected to seqout, a genomics study search engine covering NCBI
 GEO, SRA/ENA/DDBJ, ArrayExpress, BioProject, publication links, download links,
 and ontology-enriched sample metadata.
 
@@ -7429,7 +7429,7 @@ mcp_api_app.router.routes.extend(
 
 mcp = FastMCP.from_fastapi(
     app=mcp_api_app,
-    name="pysraweb MCP",
+    name="seqout MCP",
     instructions=MCP_INSTRUCTIONS,
 )
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
