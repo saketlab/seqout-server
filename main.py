@@ -1272,6 +1272,9 @@ _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
 _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
+# Pointer to the last-built version, so a cold start can serve /map/meta without
+# rescanning the ~800k-row point set. Cleared by /cache/purge to force a rebuild.
+_MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 
 def _compute_map_version(
@@ -1297,6 +1300,21 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         if _map_assets_state["ready"]:
             return _map_assets_state["version"], _map_assets_state["dir"]
 
+        # Fast path: a prior build is recorded and its tiles are on disk — serve
+        # it without loading/hashing the ~800k-row point set. Data changes are
+        # picked up via /cache/purge ("Refresh data"), which clears the pointer.
+        try:
+            cached = _MAP_CURRENT_FILE.read_text().strip()
+        except OSError:
+            cached = ""
+        if cached and _MAP_ID_RE.match(cached) and (
+            _MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather"
+        ).exists():
+            version_dir = _MAP_ASSETS_DIR / cached
+            _map_assets_state.update(ready=True, version=cached, dir=version_dir)
+            return cached, version_dir
+
+        # Slow path: derive the content version and build the tiles if missing.
         rows, labels, levels = _get_map_data()
         color_level = _map_color_level(levels)
         version = _compute_map_version(rows, labels, color_level)
@@ -1320,6 +1338,8 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             os.replace(tmp_dir, version_dir)
             logger.info("Built map assets at %s", version_dir)
 
+        _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        _MAP_CURRENT_FILE.write_text(version)
         _map_assets_state.update(ready=True, version=version, dir=version_dir)
         return version, version_dir
 
@@ -1599,6 +1619,7 @@ def purge_cache(request: Request):
         _map_data_cache["ready"] = False
     with _map_assets_lock:
         _map_assets_state["ready"] = False
+        _MAP_CURRENT_FILE.unlink(missing_ok=True)
     with _growth_cache_lock:
         _growth_cache["ready"] = False
     with _spelling_cache_lock:
