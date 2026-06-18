@@ -1,18 +1,17 @@
-"""Build deepscatter map assets — quadfeather tiles, geojson.json (cluster
-labels), countries.json — from the rows the API loads out of Postgres.
+"""Build deepscatter map assets — quadfeather tiles and countries.json — from the
+rows the API loads out of Postgres.
 
-Each point is colored by its cluster at one representative layer (``color_level``);
-the geojson carries one label per cluster per layer, its font size scaled by
-member count so deepscatter's label-collision reveals coarse clusters when zoomed
-out and finer ones as you zoom in (no per-zoom backend work needed). Heavy deps
-(pyarrow / i18n-iso-countries) import with this module, which the server does
-lazily on the first map request.
+Each point is colored by its cluster at one representative layer (``color_level``),
+baked into the tiles as ``cluster_id``. Labels are NOT baked here; the frontend
+fetches them on demand per viewport/zoom from the /map/labels endpoint, so the
+heavy all-layers label set never hits the browser at once. Heavy deps (pyarrow /
+i18n-iso-countries) import with this module, which the server does lazily on the
+first map request.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import pathlib
 import shutil
 from functools import lru_cache
@@ -23,12 +22,6 @@ from i18n_iso_countries import get_country_name
 from vendor.qf_tiler import main as qf_main
 
 TILE_SIZE = 10_000
-
-# Font point range for cluster labels. Member counts are log-scaled into this
-# range: big (coarse) clusters get large fonts → wider collision boxes → they win
-# when zoomed out; small (fine) clusters get small fonts → revealed on zoom-in.
-MIN_LABEL_PT = 11.0
-MAX_LABEL_PT = 34.0
 
 # Country codes the i18n-iso-countries library can't decode on its own. Kept
 # verbatim from the original pipeline so the generated names match what the
@@ -68,57 +61,6 @@ def country_names(codes) -> list[str]:
         if name:
             out.append(name)
     return out
-
-
-def build_labels_geojson(labels: list[dict], color_level: str | None) -> dict:
-    """All cluster labels (every layer) as a GeoJSON FeatureCollection.
-
-    ``size`` is a font point size (log-scaled member count) that drives
-    deepscatter's zoom-aware label collision. ``level``/``cluster_id`` let the
-    frontend tie a clicked point back to its label at the color layer.
-    """
-    placed = [
-        lbl
-        for lbl in labels
-        if lbl.get("centroid_x") is not None and lbl.get("centroid_y") is not None
-    ]
-    sizes = [lbl["size"] for lbl in placed if lbl.get("size")]
-    lo = math.log(min(sizes) + 1) if sizes else 0.0
-    span = (math.log(max(sizes) + 1) - lo) if sizes else 0.0
-
-    def font_pt(size) -> float:
-        if span <= 0:
-            return MIN_LABEL_PT
-        t = (math.log((size or 1) + 1) - lo) / span
-        return round(MIN_LABEL_PT + t * (MAX_LABEL_PT - MIN_LABEL_PT), 2)
-
-    features = []
-    max_color_id = 0
-    for lbl in placed:
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [lbl["centroid_x"], lbl["centroid_y"]],
-                },
-                "properties": {
-                    "label": lbl["label"],
-                    "size": font_pt(lbl["size"]),
-                    "level": lbl["level"],
-                    "cluster_id": lbl["cluster_id"],
-                },
-            }
-        )
-        if lbl["level"] == color_level:
-            max_color_id = max(max_color_id, int(lbl["cluster_id"]))
-
-    return {
-        "type": "FeatureCollection",
-        "features": features,
-        "color_level": color_level,
-        "max_cluster_id": max_color_id,
-    }
 
 
 def cluster_at(clusters: dict | None, level: str | None) -> int:
@@ -163,25 +105,21 @@ def _run_quadfeather(
 
 def build_assets(
     rows: list[dict],
-    labels: list[dict],
     color_level: str | None,
     out_dir: pathlib.Path | str,
     tile_size: int = TILE_SIZE,
 ) -> None:
-    """Generate countries.json, geojson.json and the tiles/ quadtree into out_dir.
+    """Generate countries.json and the tiles/ quadtree into out_dir.
 
-    ``rows`` are the map points ({accession, x, y, countries, clusters}); ``labels``
-    are the cluster_labels rows. out_dir is expected to be a fresh directory (the
-    caller builds into a temp dir and atomically renames it into place).
+    ``rows`` are the map points ({accession, x, y, countries, clusters}). out_dir
+    is expected to be a fresh directory (the caller builds into a temp dir and
+    atomically renames it into place).
     """
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     countries = sorted({c for r in rows for c in country_names(r.get("countries"))})
     (out_dir / "countries.json").write_text(json.dumps(countries))
-
-    geojson = build_labels_geojson(labels, color_level)
-    (out_dir / "geojson.json").write_text(json.dumps(geojson))
 
     csv_path = out_dir / "points.csv"
     _write_points_csv(rows, color_level, csv_path)
@@ -190,8 +128,8 @@ def build_assets(
 
 
 if __name__ == "__main__":
-    # ponytail: self-check the pure logic (translation, geojson scaling, noise
-    # handling, csv shape) without running the heavy quadfeather tiler.
+    # ponytail: self-check the pure logic (translation, noise handling, csv shape)
+    # without running the heavy quadfeather tiler.
     import tempfile
 
     assert cluster_at({"cluster_l4": 2}, "cluster_l4") == 2
@@ -201,22 +139,6 @@ if __name__ == "__main__":
 
     names = country_names(["US", "", "----------", None])
     assert len(names) == 1 and "United" in names[0], names
-
-    labels = [
-        {"level": "cluster_l0", "cluster_id": 5, "label": "fine",
-         "size": 10, "centroid_x": 1.0, "centroid_y": 2.0},
-        {"level": "cluster_l4", "cluster_id": 2, "label": "coarse",
-         "size": 100000, "centroid_x": 1.5, "centroid_y": 2.5},
-        {"level": "cluster_l4", "cluster_id": 9, "label": "nowhere",
-         "size": 5, "centroid_x": None, "centroid_y": None},  # dropped, no centroid
-    ]
-    gj = build_labels_geojson(labels, "cluster_l4")
-    assert gj["color_level"] == "cluster_l4"
-    assert gj["max_cluster_id"] == 2  # id 9 dropped (no centroid)
-    assert len(gj["features"]) == 2
-    by_label = {f["properties"]["label"]: f["properties"]["size"] for f in gj["features"]}
-    assert by_label["coarse"] == MAX_LABEL_PT and by_label["fine"] == MIN_LABEL_PT
-    assert all(MIN_LABEL_PT <= s <= MAX_LABEL_PT for s in by_label.values())
 
     rows = [
         {"accession": "GSE1", "x": 1.0, "y": 2.0,

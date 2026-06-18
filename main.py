@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -323,6 +324,20 @@ CLUSTER_LABELS_SQL = """
 SELECT level, cluster_id, label, size, centroid_x, centroid_y
 FROM cluster_labels
 ORDER BY level, cluster_id;
+"""
+
+# Labels for one layer within a viewport, biggest-first. Powers the dynamic
+# /map/labels endpoint — the frontend asks for just the layer matching the
+# current zoom and just the on-screen bbox, so only a few hundred labels are ever
+# sent/rendered instead of the whole (potentially many-thousand) label set.
+CLUSTER_LABELS_BBOX_SQL = """
+SELECT cluster_id, label, size, centroid_x, centroid_y
+FROM cluster_labels
+WHERE level = %(level)s
+  AND centroid_x BETWEEN %(minx)s AND %(maxx)s
+  AND centroid_y BETWEEN %(miny)s AND %(maxy)s
+ORDER BY size DESC NULLS LAST
+LIMIT %(limit)s;
 """
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"labels": None, "levels": None}
@@ -1249,12 +1264,56 @@ def _get_clusters_rows() -> list[dict]:
     ]
 
 
+# Font point range for labels (member counts log-scaled into it, big clusters
+# bigger). Global so a cluster's font size is stable across viewport refetches.
+_LABEL_MIN_PT = 11.0
+_LABEL_MAX_PT = 34.0
+
+
+def _label_font_pt(size, size_min: float, size_max: float) -> float:
+    lo = math.log((size_min or 0) + 1)
+    span = math.log((size_max or 0) + 1) - lo
+    if span <= 0:
+        return _LABEL_MIN_PT
+    t = (math.log((size or 1) + 1) - lo) / span
+    return round(_LABEL_MIN_PT + t * (_LABEL_MAX_PT - _LABEL_MIN_PT), 2)
+
+
+def _get_labels_config() -> dict:
+    """Bootstrap for the dynamic label system: the layer list (finest→coarsest),
+    the coordinate extent (so the frontend can map zoom depth → layer), the color
+    layer + its max cluster id (for point coloring), and the global member-count
+    range (for stable font scaling). Derived from the cached label set."""
+    labels, levels = _get_cluster_labels()
+    color_level = _map_color_level(levels)
+    xs = [lbl["centroid_x"] for lbl in labels if lbl["centroid_x"] is not None]
+    ys = [lbl["centroid_y"] for lbl in labels if lbl["centroid_y"] is not None]
+    sizes = [lbl["size"] for lbl in labels if lbl["size"]]
+    max_cluster_id = max(
+        (int(lbl["cluster_id"]) for lbl in labels if lbl["level"] == color_level),
+        default=0,
+    )
+    return {
+        "levels": levels,
+        "color_level": color_level,
+        "max_cluster_id": max_cluster_id,
+        "extent": {
+            "minx": min(xs) if xs else 0.0,
+            "maxx": max(xs) if xs else 0.0,
+            "miny": min(ys) if ys else 0.0,
+            "maxy": max(ys) if ys else 0.0,
+        },
+        "size_min": min(sizes) if sizes else 0.0,
+        "size_max": max(sizes) if sizes else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Map assets (deepscatter tiles + geojson + countries.json)
+# Map assets (deepscatter tiles + countries.json; labels served live via /map/labels)
 #
 # The frontend map is powered by deepscatter, which needs a quadtree of Arrow
-# tiles plus a cluster-label geojson and a country list. These are derived from
-# the map points + cluster_labels loaded by _get_map_data. We generate them once
+# tiles and a country list (labels are served live via /map/labels). These are
+# derived from the map points loaded by _get_map_data. We generate them once
 # on the first request and cache them on disk under a content-hash version dir,
 # so a restart with unchanged data reuses the existing tiles instead of
 # rebuilding. Generation is heavy (pyarrow + quadfeather), so the builder module
@@ -1277,15 +1336,20 @@ _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
 _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 
-def _compute_map_version(
-    rows: list[dict], labels: list[dict], color_level: str | None
-) -> str:
+# Bump when the asset-generation logic (tile columns, color layer) changes, so the
+# version hash moves and clients rebuild without a manual /cache/purge.
+_MAP_ASSET_REV = "3"
+
+
+def _compute_map_version(rows: list[dict], color_level: str | None) -> str:
+    # Tiles depend only on the points + which layer is baked as cluster_id. Labels
+    # are served live, so they're intentionally not part of this hash.
     h = hashlib.sha256()
+    h.update(_MAP_ASSET_REV.encode("utf-8"))
     h.update((color_level or "").encode("utf-8"))
     for r in rows:
         h.update(f"{r['accession']}|{r['x']}|{r['y']}|".encode("utf-8"))
         h.update(json.dumps(r["clusters"], sort_keys=True, default=str).encode("utf-8"))
-    h.update(json.dumps(labels, sort_keys=True, default=str).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -1313,14 +1377,15 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         if _map_assets_state["ready"]:
             return _map_assets_state["version"], _map_assets_state["dir"]
 
-        # Fast path: a prior build is recorded and its tiles are on disk — serve
-        # it without loading/hashing the ~800k-row point set. Data changes are
-        # picked up via /cache/purge ("Refresh data"), which clears the pointer.
+        # Fast path: a prior build (same asset rev) is recorded and its tiles are
+        # on disk — serve it without loading/hashing the ~800k-row point set. The
+        # pointer is "<rev>:<version>"; a rev bump (generation-logic change) or
+        # /cache/purge ("Refresh data") invalidates it and forces a rebuild.
         try:
-            cached = _MAP_CURRENT_FILE.read_text().strip()
+            cached_rev, _, cached = _MAP_CURRENT_FILE.read_text().strip().partition(":")
         except OSError:
-            cached = ""
-        if cached and _MAP_ID_RE.match(cached) and (
+            cached_rev, cached = "", ""
+        if cached_rev == _MAP_ASSET_REV and _MAP_ID_RE.match(cached) and (
             _MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather"
         ).exists():
             version_dir = _MAP_ASSETS_DIR / cached
@@ -1329,9 +1394,9 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             return cached, version_dir
 
         # Slow path: derive the content version and build the tiles if missing.
-        rows, labels, levels = _get_map_data()
+        rows, _labels, levels = _get_map_data()
         color_level = _map_color_level(levels)
-        version = _compute_map_version(rows, labels, color_level)
+        version = _compute_map_version(rows, color_level)
         version_dir = _MAP_ASSETS_DIR / version
         manifest = version_dir / "tiles" / "manifest.feather"
 
@@ -1346,14 +1411,14 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
                 version,
                 color_level,
             )
-            map_assets.build_assets(rows, labels, color_level, tmp_dir)
+            map_assets.build_assets(rows, color_level, tmp_dir)
             if version_dir.exists():
                 shutil.rmtree(version_dir, ignore_errors=True)
             os.replace(tmp_dir, version_dir)
             logger.info("Built map assets at %s", version_dir)
 
         _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-        _MAP_CURRENT_FILE.write_text(version)
+        _MAP_CURRENT_FILE.write_text(f"{_MAP_ASSET_REV}:{version}")
         _prune_old_map_versions(version)
         _map_assets_state.update(ready=True, version=version, dir=version_dir)
         return version, version_dir
@@ -1760,14 +1825,15 @@ def get_clusters(request: Request):
 
 @api_app.get(
     "/map/meta",
-    summary="Map asset version",
+    summary="Map asset version + label config",
     description=(
-        "Return the current map-asset version. Building the deepscatter tiles, "
-        "geojson and country list happens lazily on the first call (this request "
-        "may take a while the very first time); afterwards they are served from a "
-        "disk cache. The version is a content hash of the underlying data, so it "
-        "changes only when the data changes. Frontends use it to build asset URLs "
-        "and to invalidate their own caches."
+        "Return the current map-asset version plus the dynamic-label bootstrap: "
+        "the cluster layers (finest→coarsest), the coordinate extent, the color "
+        "layer and its max cluster id, and the global cluster-size range. Building "
+        "the deepscatter tiles and country list happens lazily on the first call "
+        "(this request may take a while the very first time); afterwards they are "
+        "served from a disk cache. Labels themselves are fetched on demand from "
+        "/map/labels based on the current zoom and viewport."
     ),
     operation_id="get_map_meta",
 )
@@ -1775,12 +1841,13 @@ def get_clusters(request: Request):
 def get_map_meta(request: Request):
     try:
         version, _ = _ensure_map_assets()
+        config = _get_labels_config()
     except Exception:
         logger.exception("Failed to build map assets")
         raise HTTPException(500, "Internal server error")
 
     return JSONResponse(
-        content={"version": version},
+        content={"version": version, **config},
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -1791,16 +1858,72 @@ def get_map_meta(request: Request):
 # which is how the frontend "purge and refetch" works for the tiles that
 # deepscatter loads internally.
 @api_app.get(
-    "/map/{version}/{rev}/geojson.json",
-    summary="Map cluster geojson",
-    operation_id="get_map_geojson",
+    "/map/labels",
+    summary="Cluster labels for a layer within a viewport",
+    description=(
+        "Return cluster labels for one layer (matching the current zoom) within the "
+        "given coordinate bbox, biggest cluster first, as a GeoJSON FeatureCollection "
+        "ready for deepscatter add_labels. The frontend calls this on pan/zoom so only "
+        "the on-screen, zoom-appropriate labels are ever loaded. Omit the bbox to get "
+        "the whole layer (used once to map cluster ids to names)."
+    ),
+    operation_id="get_map_labels",
 )
-def get_map_geojson(
+@limiter.limit("300/minute")
+def get_map_labels(
     request: Request,
-    version: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
-    rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+    level: str = Query(..., min_length=1, max_length=64),
+    minx: float = Query(-1e18),
+    miny: float = Query(-1e18),
+    maxx: float = Query(1e18),
+    maxy: float = Query(1e18),
+    limit: int = Query(300, ge=1, le=2000),
 ):
-    return _serve_map_file(version, "geojson.json")
+    try:
+        _, levels = _get_cluster_labels()
+        if level not in levels:
+            raise HTTPException(404, "Unknown level")
+        cfg = _get_labels_config()
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    CLUSTER_LABELS_BBOX_SQL,
+                    {
+                        "level": level,
+                        "minx": minx,
+                        "maxx": maxx,
+                        "miny": miny,
+                        "maxy": maxy,
+                        "limit": limit,
+                    },
+                )
+                rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_map_labels")
+        raise HTTPException(500, "Internal server error")
+
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [r["centroid_x"], r["centroid_y"]],
+            },
+            "properties": {
+                "label": r["label"],
+                "size": _label_font_pt(r["size"], cfg["size_min"], cfg["size_max"]),
+                "level": level,
+                "cluster_id": r["cluster_id"],
+            },
+        }
+        for r in rows
+    ]
+    return JSONResponse(
+        content={"type": "FeatureCollection", "features": features},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @api_app.get(
@@ -7357,7 +7480,7 @@ PubMed data when available. Use:
   `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
   `get_sample_detail`.
 - `get_clusters`, `get_projects_atlas_v1`, `get_atlas_labels_v1`, `get_map_meta`,
-  `get_map_geojson`, `get_map_countries`, and `get_map_tile` serve visualization
+  `get_map_labels`, `get_map_countries`, and `get_map_tile` serve visualization
   assets, not conversational answers.
 - `get_geo_series_neighbors_coords` is low-level map/similarity data; use
   `get_project_similar` for conversational similarity.
