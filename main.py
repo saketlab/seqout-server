@@ -9,7 +9,6 @@ import os
 import pathlib
 import re
 import shutil
-import struct
 import threading
 import time
 import zipfile
@@ -205,35 +204,6 @@ def _require_bulk_limit(accessions: list) -> None:
         )
 
 
-COMBINED_BIN_ROWS_SQL = """
-WITH combined AS (
-    SELECT accession, coords_2d, countries_iso AS countries
-    FROM geo_series
-    WHERE coords_2d IS NOT NULL
-    UNION ALL
-    SELECT accession, coords_2d, countries
-    FROM sra_studies
-    WHERE coords_2d IS NOT NULL
-),
-eligible AS (
-    SELECT
-        accession,
-        coords_2d,
-        countries
-    FROM combined
-    WHERE array_length(coords_2d, 1) >= 2
-      AND coords_2d[1] IS NOT NULL
-      AND coords_2d[2] IS NOT NULL
-      AND accession ~ '^[A-Za-z]+\\d+$'
-)
-SELECT
-    accession,
-    countries,
-    coords_2d[1]::real AS x,
-    coords_2d[2]::real AS y
-FROM eligible
-ORDER BY accession;
-"""
 ATLAS_PROJECTS_ROWS_SQL = """
 WITH atlas_base AS (
     SELECT
@@ -354,8 +324,6 @@ SELECT level, cluster_id, label, size, centroid_x, centroid_y
 FROM cluster_labels
 ORDER BY level, cluster_id;
 """
-_bin_cache_lock = threading.Lock()
-_bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
 _clusters_cache = {"labels": None, "levels": None}
 _map_data_cache_lock = threading.Lock()
@@ -1210,46 +1178,6 @@ def _etag_matches(if_none_match: str | None, etag: str) -> bool:
     return "*" in candidates or etag in candidates
 
 
-def _build_binary_payloads() -> tuple[bytes, bytes]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(COMBINED_BIN_ROWS_SQL)
-            rows = cur.fetchall()
-
-    points_buf = bytearray(len(rows) * 8)
-    accessions_buf = bytearray()
-    offset = 0
-
-    for accession, countries, x, y in rows:
-        struct.pack_into("<ff", points_buf, offset, x, y)
-        offset += 8
-
-        accession_encoded = accession.encode("utf-8")
-        accessions_buf.extend(struct.pack("<I", len(accession_encoded)))
-        accessions_buf.extend(accession_encoded)
-
-        country_values = countries or []
-        accessions_buf.extend(struct.pack("<I", len(country_values)))
-        for country in country_values:
-            country_encoded = country.encode("utf-8")
-            accessions_buf.extend(struct.pack("<I", len(country_encoded)))
-            accessions_buf.extend(country_encoded)
-
-    return bytes(points_buf), bytes(accessions_buf)
-
-
-def _get_binary_payloads() -> tuple[bytes, bytes]:
-    with _bin_cache_lock:
-        if _bin_cache["ready"]:
-            return _bin_cache["points"], _bin_cache["accessions"]
-
-        points_bytes, accessions_bytes = _build_binary_payloads()
-        _bin_cache["ready"] = True
-        _bin_cache["points"] = points_bytes
-        _bin_cache["accessions"] = accessions_bytes
-        return points_bytes, accessions_bytes
-
-
 def _level_num(level: str) -> int:
     """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse↔fine)."""
     digits = "".join(ch for ch in level if ch.isdigit())
@@ -1664,8 +1592,6 @@ def hello():
 def purge_cache(request: Request):
     with _atlas_cache_lock:
         _atlas_cache["ready"] = False
-    with _bin_cache_lock:
-        _bin_cache["ready"] = False
     with _clusters_cache_lock:
         _clusters_cache["labels"] = None
         _clusters_cache["levels"] = None
@@ -1698,55 +1624,6 @@ def purge_cache(request: Request):
     with _enriched_crosstab_cache_lock:
         _enriched_crosstab_cache.clear()
     return {"message": "All caches purged."}
-
-
-@api_app.get(
-    "/points.bin",
-    summary="Download 2D points as binary",
-    description=(
-        "Return all GEO+SRA 2D coordinates in accession order as packed little-endian "
-        "float32 pairs (x, y)."
-    ),
-    operation_id="get_points_bin",
-)
-@limiter.limit("20/minute")
-def get_points_bin(request: Request):
-    try:
-        points_bytes, _ = _get_binary_payloads()
-    except Exception:
-        logger.exception("Database error in get_points_bin")
-        raise HTTPException(500, "Internal server error")
-
-    return Response(
-        content=points_bytes,
-        media_type="application/octet-stream",
-        headers={"Cache-Control": "public, max-age=2592000"},
-    )
-
-
-@api_app.get(
-    "/accessions.bin",
-    summary="Download accessions as binary",
-    description=(
-        "Return all GEO+SRA full accessions and countries in accession order. "
-        "Record format: accession_len(uint32 LE), accession_utf8, "
-        "country_count(uint32 LE), then repeated country_len(uint32 LE), country_utf8."
-    ),
-    operation_id="get_accessions_bin",
-)
-@limiter.limit("20/minute")
-def get_accessions_bin(request: Request):
-    try:
-        _, accessions_bytes = _get_binary_payloads()
-    except Exception:
-        logger.exception("Database error in get_accessions_bin")
-        raise HTTPException(500, "Internal server error")
-
-    return Response(
-        content=accessions_bytes,
-        media_type="application/octet-stream",
-        headers={"Cache-Control": "public, max-age=2592000"},
-    )
 
 
 @api_app.get(
@@ -7443,9 +7320,9 @@ PubMed data when available. Use:
   and `download_sample_detail_csv` stream TSV/CSV files. Use JSON tools instead:
   `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
   `get_sample_detail`.
-- `get_points_bin`, `get_accessions_bin`, `get_clusters`, `get_projects_atlas_v1`,
-  `get_atlas_labels_v1`, `get_map_meta`, `get_map_geojson`, `get_map_countries`,
-  and `get_map_tile` serve visualization assets, not conversational answers.
+- `get_clusters`, `get_projects_atlas_v1`, `get_atlas_labels_v1`, `get_map_meta`,
+  `get_map_geojson`, `get_map_countries`, and `get_map_tile` serve visualization
+  assets, not conversational answers.
 - `get_geo_series_neighbors_coords` is low-level map/similarity data; use
   `get_project_similar` for conversational similarity.
 - `search_geo` and `search_sra` are redundant; use `search_all` with `db`.
@@ -7551,7 +7428,7 @@ app = combined_app
 
 
 def _prewarm_caches() -> None:
-    for warm in (_ensure_spelling_loaded, _get_atlas_payloads, _get_binary_payloads):
+    for warm in (_ensure_spelling_loaded, _get_atlas_payloads):
         try:
             warm()
         except Exception:
