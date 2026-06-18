@@ -317,18 +317,49 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
-CLUSTERS_SQL = """
+# Map points: every plottable dataset across the three sources shares one 2D
+# coordinate space and one (hierarchical) cluster space. coords_2d is NULL for
+# alias rows (not embedded), so we filter those out. `clusters` is the per-dataset
+# jsonb of layer-wise memberships ({"cluster_l3": 307, ...}); a missing layer key
+# means the dataset is noise at that layer.
+MAP_POINTS_SQL = """
+WITH combined AS (
+    SELECT accession, coords_2d, countries_iso AS countries, clusters
+    FROM geo_series WHERE coords_2d IS NOT NULL
+    UNION ALL
+    SELECT accession, coords_2d, countries, clusters
+    FROM sra_studies WHERE coords_2d IS NOT NULL
+    UNION ALL
+    SELECT accession, coords_2d, countries, clusters
+    FROM arrayexpress_experiments WHERE coords_2d IS NOT NULL
+)
 SELECT
-    title,
-    centroid,
-    num_points
-FROM clusters
-ORDER BY title;
+    accession,
+    coords_2d[1]::real AS x,
+    coords_2d[2]::real AS y,
+    countries,
+    clusters
+FROM combined
+WHERE array_length(coords_2d, 1) >= 2
+  AND coords_2d[1] IS NOT NULL
+  AND coords_2d[2] IS NOT NULL
+  AND accession ~ '^[A-Za-z]+\\d+$'
+ORDER BY accession;
+"""
+
+# One label per cluster per layer, at the cluster centroid (same coordinate space
+# as coords_2d). size = member count, used for label priority / font scaling.
+CLUSTER_LABELS_SQL = """
+SELECT level, cluster_id, label, size, centroid_x, centroid_y
+FROM cluster_labels
+ORDER BY level, cluster_id;
 """
 _bin_cache_lock = threading.Lock()
 _bin_cache = {"ready": False, "points": b"", "accessions": b""}
 _clusters_cache_lock = threading.Lock()
-_clusters_cache = {"ready": False, "rows": []}
+_clusters_cache = {"labels": None, "levels": None}
+_map_data_cache_lock = threading.Lock()
+_map_data_cache = {"ready": False, "rows": None, "labels": None, "levels": None}
 _ATLAS_SCHEMA_VERSION = "v2"
 _ATLAS_EXTENT = 2200.0
 _ATLAS_HALF_EXTENT = _ATLAS_EXTENT / 2
@@ -1219,27 +1250,83 @@ def _get_binary_payloads() -> tuple[bytes, bytes]:
         return points_bytes, accessions_bytes
 
 
-def _get_clusters_rows() -> list[dict]:
+def _level_num(level: str) -> int:
+    """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse↔fine)."""
+    digits = "".join(ch for ch in level if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _get_cluster_labels() -> tuple[list[dict], list[str]]:
+    """Load cluster_labels once, cached (cheap — a few thousand rows). Returns
+    (labels, levels) with levels sorted finest→coarsest (cluster_l0 … cluster_lN,
+    discovered at runtime — the layer count changes when re-clustered)."""
     with _clusters_cache_lock:
-        if _clusters_cache["ready"]:
-            return _clusters_cache["rows"]
+        if _clusters_cache.get("labels") is not None:
+            return _clusters_cache["labels"], _clusters_cache["levels"]
 
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(CLUSTERS_SQL)
+                cur.execute(CLUSTER_LABELS_SQL)
+                labels = cur.fetchall()
+
+        levels = sorted({lbl["level"] for lbl in labels}, key=_level_num)
+        _clusters_cache["labels"] = labels
+        _clusters_cache["levels"] = levels
+        return labels, levels
+
+
+def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
+    """Load the full map point set (heavy — ~1M rows) plus cluster labels, cached.
+    Returns (rows, labels, levels). Only the tile builder needs the points; the
+    label-only consumers use _get_cluster_labels."""
+    with _map_data_cache_lock:
+        if _map_data_cache["ready"]:
+            return (
+                _map_data_cache["rows"],
+                _map_data_cache["labels"],
+                _map_data_cache["levels"],
+            )
+
+        labels, levels = _get_cluster_labels()
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(MAP_POINTS_SQL)
                 rows = cur.fetchall()
 
-        _clusters_cache["ready"] = True
-        _clusters_cache["rows"] = rows
-        return rows
+        _map_data_cache.update(ready=True, rows=rows, labels=labels, levels=levels)
+        return rows, labels, levels
+
+
+def _map_color_level(levels: list[str]) -> str | None:
+    """Layer used to color points. A mid-depth layer reads clearly (finest =
+    thousands of tiny clusters, coarsest = a handful). Shift the index for
+    denser/coarser coloring; labels still span all layers regardless."""
+    return levels[len(levels) // 2] if levels else None
+
+
+def _get_clusters_rows() -> list[dict]:
+    # Back-compat shape (title/centroid/num_points) for /clusters.json and the
+    # atlas labels, sourced from the coarsest cluster layer of cluster_labels.
+    # Cheap filter over the cached labels — no need to cache the derived rows.
+    labels, levels = _get_cluster_labels()
+    coarsest = levels[-1] if levels else None
+    return [
+        {
+            "title": lbl["label"],
+            "centroid": [lbl["centroid_x"], lbl["centroid_y"]],
+            "num_points": lbl["size"],
+        }
+        for lbl in labels
+        if lbl["level"] == coarsest
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Map assets (deepscatter tiles + geojson + countries.json)
 #
 # The frontend map is powered by deepscatter, which needs a quadtree of Arrow
-# tiles plus a cluster geojson and a country list. These are derived from the
-# same points.bin/accessions.bin/clusters payloads above. We generate them once
+# tiles plus a cluster-label geojson and a country list. These are derived from
+# the map points + cluster_labels loaded by _get_map_data. We generate them once
 # on the first request and cache them on disk under a content-hash version dir,
 # so a restart with unchanged data reuses the existing tiles instead of
 # rebuilding. Generation is heavy (pyarrow + quadfeather), so the builder module
@@ -1260,12 +1347,14 @@ _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
 
 
 def _compute_map_version(
-    points_bytes: bytes, accessions_bytes: bytes, clusters_rows: list[dict]
+    rows: list[dict], labels: list[dict], color_level: str | None
 ) -> str:
     h = hashlib.sha256()
-    h.update(points_bytes)
-    h.update(accessions_bytes)
-    h.update(json.dumps(clusters_rows, sort_keys=True, default=str).encode("utf-8"))
+    h.update((color_level or "").encode("utf-8"))
+    for r in rows:
+        h.update(f"{r['accession']}|{r['x']}|{r['y']}|".encode("utf-8"))
+        h.update(json.dumps(r["clusters"], sort_keys=True, default=str).encode("utf-8"))
+    h.update(json.dumps(labels, sort_keys=True, default=str).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -1280,9 +1369,9 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         if _map_assets_state["ready"]:
             return _map_assets_state["version"], _map_assets_state["dir"]
 
-        points_bytes, accessions_bytes = _get_binary_payloads()
-        clusters_rows = _get_clusters_rows()
-        version = _compute_map_version(points_bytes, accessions_bytes, clusters_rows)
+        rows, labels, levels = _get_map_data()
+        color_level = _map_color_level(levels)
+        version = _compute_map_version(rows, labels, color_level)
         version_dir = _MAP_ASSETS_DIR / version
         manifest = version_dir / "tiles" / "manifest.feather"
 
@@ -1292,10 +1381,12 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
             tmp_dir = _MAP_ASSETS_DIR / f"{version}.tmp"
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            logger.info("Building map assets (version=%s)...", version)
-            map_assets.build_assets(
-                points_bytes, accessions_bytes, clusters_rows, tmp_dir
+            logger.info(
+                "Building map assets (version=%s, color_level=%s)...",
+                version,
+                color_level,
             )
+            map_assets.build_assets(rows, labels, color_level, tmp_dir)
             if version_dir.exists():
                 shutil.rmtree(version_dir, ignore_errors=True)
             os.replace(tmp_dir, version_dir)
@@ -1576,7 +1667,12 @@ def purge_cache(request: Request):
     with _bin_cache_lock:
         _bin_cache["ready"] = False
     with _clusters_cache_lock:
-        _clusters_cache["ready"] = False
+        _clusters_cache["labels"] = None
+        _clusters_cache["levels"] = None
+    with _map_data_cache_lock:
+        _map_data_cache["ready"] = False
+    with _map_assets_lock:
+        _map_assets_state["ready"] = False
     with _growth_cache_lock:
         _growth_cache["ready"] = False
     with _spelling_cache_lock:

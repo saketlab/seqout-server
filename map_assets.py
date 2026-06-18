@@ -1,28 +1,34 @@
-"""Build deepscatter map assets — quadfeather tiles, geojson.json, countries.json
-— from the in-memory binary payloads the API already produces.
+"""Build deepscatter map assets — quadfeather tiles, geojson.json (cluster
+labels), countries.json — from the rows the API loads out of Postgres.
 
-Ported from saketlab-experiments/pipeline.py, adapted to operate on the bytes
-and cluster rows the server already has in memory (no HTTP downloads, no tqdm
-progress output). The quadfeather tiler itself is vendored under ``vendor/``.
-
-Heavy deps (pyarrow / numpy / i18n-iso-countries) are only imported when this
-module is imported, which the server does lazily on the first map request.
+Each point is colored by its cluster at one representative layer (``color_level``);
+the geojson carries one label per cluster per layer, its font size scaled by
+member count so deepscatter's label-collision reveals coarse clusters when zoomed
+out and finer ones as you zoom in (no per-zoom backend work needed). Heavy deps
+(pyarrow / i18n-iso-countries) import with this module, which the server does
+lazily on the first map request.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import shutil
-import struct
+from functools import lru_cache
 
-import numpy as np
 import pyarrow as pa
 from i18n_iso_countries import get_country_name
 
 from vendor.qf_tiler import main as qf_main
 
 TILE_SIZE = 10_000
+
+# Font point range for cluster labels. Member counts are log-scaled into this
+# range: big (coarse) clusters get large fonts → wider collision boxes → they win
+# when zoomed out; small (fine) clusters get small fonts → revealed on zoom-in.
+MIN_LABEL_PT = 11.0
+MAX_LABEL_PT = 34.0
 
 # Country codes the i18n-iso-countries library can't decode on its own. Kept
 # verbatim from the original pipeline so the generated names match what the
@@ -36,140 +42,102 @@ def _normalize_country_name(country_name: str) -> str:
     return country_name.strip().split(",")[0]
 
 
-def parse_accessions(accessions_bytes: bytes) -> dict[str, list[str]]:
-    """Decode accessions.bin into {accession: [country_name, ...]}.
+@lru_cache(maxsize=4096)
+def _translate_one(code: str) -> str | None:
+    """ISO country code -> display name, or None for junk/undecodable codes."""
+    code = (code or "").strip()
+    if not code or code == "----------":
+        return None
+    try:
+        name = get_country_name(code=code, language="en")
+    except ValueError as e:
+        if "country 3 letter code parameters error" in str(e) and code == "EUR":
+            name = "Europe"
+        elif "parameters error" in str(e) and code in _SELF_NAMED:
+            name = code
+        else:
+            return None
+    return _normalize_country_name(name)
 
-    Record format: accession_len(uint32 LE), accession_utf8,
-    country_count(uint32 LE), then repeated country_len(uint32 LE), country_utf8.
+
+def country_names(codes) -> list[str]:
+    """Translate a row's ISO country codes to display names, dropping unknowns."""
+    out = []
+    for code in codes or []:
+        name = _translate_one(code)
+        if name:
+            out.append(name)
+    return out
+
+
+def build_labels_geojson(labels: list[dict], color_level: str | None) -> dict:
+    """All cluster labels (every layer) as a GeoJSON FeatureCollection.
+
+    ``size`` is a font point size (log-scaled member count) that drives
+    deepscatter's zoom-aware label collision. ``level``/``cluster_id`` let the
+    frontend tie a clicked point back to its label at the color layer.
     """
-    accessions: dict[str, list[str]] = {}
-    buf = accessions_bytes
-    buf_len = len(buf)
-    offset = 0
+    placed = [
+        lbl
+        for lbl in labels
+        if lbl.get("centroid_x") is not None and lbl.get("centroid_y") is not None
+    ]
+    sizes = [lbl["size"] for lbl in placed if lbl.get("size")]
+    lo = math.log(min(sizes) + 1) if sizes else 0.0
+    span = (math.log(max(sizes) + 1) - lo) if sizes else 0.0
 
-    while offset + 4 <= buf_len:
-        length = struct.unpack_from("<I", buf, offset)[0]
-        offset += 4
-        if offset + length > buf_len:
-            break
+    def font_pt(size) -> float:
+        if span <= 0:
+            return MIN_LABEL_PT
+        t = (math.log((size or 1) + 1) - lo) / span
+        return round(MIN_LABEL_PT + t * (MAX_LABEL_PT - MIN_LABEL_PT), 2)
 
-        accession = buf[offset : offset + length].decode("utf-8")
-        offset += length
-
-        countries: list[str] = []
-
-        if offset + 4 <= buf_len:
-            num_countries = struct.unpack_from("<I", buf, offset)[0]
-            offset += 4
-            complete = True
-
-            for _ in range(num_countries):
-                if offset + 4 > buf_len:
-                    complete = False
-                    break
-                country_len = struct.unpack_from("<I", buf, offset)[0]
-                offset += 4
-                if offset + country_len > buf_len:
-                    complete = False
-                    break
-
-                country_code = (
-                    buf[offset : offset + country_len].decode("utf-8").strip()
-                )
-                offset += country_len
-                if len(country_code) == 0:
-                    continue
-
-                try:
-                    country_name = get_country_name(code=country_code, language="en")
-                except ValueError as e:
-                    if (
-                        "country 3 letter code parameters error" in str(e)
-                        and country_code == "EUR"
-                    ):
-                        country_name = "Europe"
-                    elif "parameters error" in str(e) and country_code in _SELF_NAMED:
-                        country_name = country_code
-                    elif country_code == "----------":
-                        continue
-                    else:
-                        raise
-
-                countries.append(_normalize_country_name(country_name))
-
-            if not complete:
-                countries = []
-                offset = buf_len
-
-        accessions[accession] = countries
-
-    return accessions
-
-
-def parse_points(points_bytes: bytes) -> list[tuple[float, float]]:
-    """Decode points.bin (packed little-endian float32 x,y pairs)."""
-    points: list[tuple[float, float]] = []
-    offset = 0
-    n = len(points_bytes)
-    while offset < n:
-        x, y = struct.unpack_from("<ff", points_bytes, offset)
-        points.append((x, y))
-        offset += 8
-    return points
-
-
-def build_geojson(clusters_rows: list[dict]) -> dict:
-    """Cluster rows -> GeoJSON FeatureCollection (centroid + title)."""
     features = []
-    for cluster in clusters_rows:
+    max_color_id = 0
+    for lbl in placed:
         features.append(
             {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": list(cluster["centroid"]),
+                    "coordinates": [lbl["centroid_x"], lbl["centroid_y"]],
                 },
-                "properties": {"title": cluster["title"]},
+                "properties": {
+                    "label": lbl["label"],
+                    "size": font_pt(lbl["size"]),
+                    "level": lbl["level"],
+                    "cluster_id": lbl["cluster_id"],
+                },
             }
         )
-    return {"type": "FeatureCollection", "features": features}
+        if lbl["level"] == color_level:
+            max_color_id = max(max_color_id, int(lbl["cluster_id"]))
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "color_level": color_level,
+        "max_cluster_id": max_color_id,
+    }
 
 
-def _assign_clusters(
-    points: list[tuple[float, float]],
-    centroids: list[tuple[float, float]],
-    batch_size: int = 10_000,
-) -> np.ndarray:
-    centroid_arr = np.array(centroids, dtype=np.float32)
-    points_arr = np.array(points, dtype=np.float32)
-    cluster_ids = np.empty(len(points_arr), dtype=np.int32)
-
-    for start in range(0, len(points_arr), batch_size):
-        end = min(start + batch_size, len(points_arr))
-        batch = points_arr[start:end]
-        diffs = batch[:, None, :] - centroid_arr[None, :, :]
-        dists = (diffs**2).sum(axis=2)
-        cluster_ids[start:end] = dists.argmin(axis=1)
-        del batch, diffs, dists
-
-    return cluster_ids
+def cluster_at(clusters: dict | None, level: str | None) -> int:
+    """Point's cluster id at ``level``, or -1 for noise (layer key absent/null)."""
+    if not clusters or level is None:
+        return -1
+    val = clusters.get(level)
+    return int(val) if val is not None else -1
 
 
 def _write_points_csv(
-    points: list[tuple[float, float]],
-    accessions_items: list[tuple[str, list[str]]],
-    clusters_rows: list[dict],
-    csv_path: pathlib.Path,
+    rows: list[dict], color_level: str | None, csv_path: pathlib.Path
 ) -> None:
-    centroids = [(c["centroid"][0], c["centroid"][1]) for c in clusters_rows]
-    cluster_ids = _assign_clusters(points, centroids)
-
     with open(csv_path, "w") as f:
         f.write("x,y,accession,cluster_id,countries\n")
-        for i, (x, y) in enumerate(points):
-            acc, countries = accessions_items[i]
-            country_str = ";".join(countries) if countries else ""
-            f.write(f"{x},{y},{acc},{cluster_ids[i]},{country_str}\n")
+        for r in rows:
+            countries = ";".join(country_names(r.get("countries")))
+            cid = cluster_at(r.get("clusters"), color_level)
+            f.write(f"{r['x']},{r['y']},{r['accession']},{cid},{countries}\n")
 
 
 def _run_quadfeather(
@@ -194,32 +162,73 @@ def _run_quadfeather(
 
 
 def build_assets(
-    points_bytes: bytes,
-    accessions_bytes: bytes,
-    clusters_rows: list[dict],
+    rows: list[dict],
+    labels: list[dict],
+    color_level: str | None,
     out_dir: pathlib.Path | str,
     tile_size: int = TILE_SIZE,
 ) -> None:
     """Generate countries.json, geojson.json and the tiles/ quadtree into out_dir.
 
-    out_dir is expected to be a fresh directory (the caller builds into a temp
-    dir and atomically renames it into place).
+    ``rows`` are the map points ({accession, x, y, countries, clusters}); ``labels``
+    are the cluster_labels rows. out_dir is expected to be a fresh directory (the
+    caller builds into a temp dir and atomically renames it into place).
     """
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    accessions = parse_accessions(accessions_bytes)
-
-    countries = sorted({c for names in accessions.values() for c in names})
+    countries = sorted({c for r in rows for c in country_names(r.get("countries"))})
     (out_dir / "countries.json").write_text(json.dumps(countries))
 
-    geojson = build_geojson(clusters_rows)
+    geojson = build_labels_geojson(labels, color_level)
     (out_dir / "geojson.json").write_text(json.dumps(geojson))
 
-    points = parse_points(points_bytes)
-    accessions_items = list(accessions.items())
     csv_path = out_dir / "points.csv"
-    _write_points_csv(points, accessions_items, clusters_rows, csv_path)
-
+    _write_points_csv(rows, color_level, csv_path)
     _run_quadfeather(csv_path, out_dir / "tiles", tile_size)
     csv_path.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    # ponytail: self-check the pure logic (translation, geojson scaling, noise
+    # handling, csv shape) without running the heavy quadfeather tiler.
+    import tempfile
+
+    assert cluster_at({"cluster_l4": 2}, "cluster_l4") == 2
+    assert cluster_at({"cluster_l4": 2}, "cluster_l0") == -1  # absent layer -> noise
+    assert cluster_at({}, "cluster_l4") == -1
+    assert cluster_at(None, "cluster_l4") == -1
+
+    names = country_names(["US", "", "----------", None])
+    assert len(names) == 1 and "United" in names[0], names
+
+    labels = [
+        {"level": "cluster_l0", "cluster_id": 5, "label": "fine",
+         "size": 10, "centroid_x": 1.0, "centroid_y": 2.0},
+        {"level": "cluster_l4", "cluster_id": 2, "label": "coarse",
+         "size": 100000, "centroid_x": 1.5, "centroid_y": 2.5},
+        {"level": "cluster_l4", "cluster_id": 9, "label": "nowhere",
+         "size": 5, "centroid_x": None, "centroid_y": None},  # dropped, no centroid
+    ]
+    gj = build_labels_geojson(labels, "cluster_l4")
+    assert gj["color_level"] == "cluster_l4"
+    assert gj["max_cluster_id"] == 2  # id 9 dropped (no centroid)
+    assert len(gj["features"]) == 2
+    by_label = {f["properties"]["label"]: f["properties"]["size"] for f in gj["features"]}
+    assert by_label["coarse"] == MAX_LABEL_PT and by_label["fine"] == MIN_LABEL_PT
+    assert all(MIN_LABEL_PT <= s <= MAX_LABEL_PT for s in by_label.values())
+
+    rows = [
+        {"accession": "GSE1", "x": 1.0, "y": 2.0,
+         "countries": ["US", "----------"], "clusters": {"cluster_l0": 5, "cluster_l4": 2}},
+        {"accession": "SRP2", "x": 3.0, "y": 4.0, "countries": None, "clusters": {}},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d) / "p.csv"
+        _write_points_csv(rows, "cluster_l4", p)
+        lines = p.read_text().strip().splitlines()
+        assert lines[0] == "x,y,accession,cluster_id,countries"
+        assert lines[1].startswith("1.0,2.0,GSE1,2,"), lines[1]
+        assert lines[2] == "3.0,4.0,SRP2,-1,", lines[2]  # noise -> -1, no countries
+
+    print("map_assets self-check OK")
