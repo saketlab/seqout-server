@@ -1324,9 +1324,14 @@ _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
 _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 
-# Bump when the asset-generation logic (tile columns, sidecars) changes, so the
-# version hash moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "4"
+# Bump when the asset-generation logic (tile columns) changes, so the version hash
+# moves and clients rebuild without a manual /cache/purge.
+_MAP_ASSET_REV = "5"
+
+# How many of the finest layers (cluster_l0 …) to bake as categorical columns for
+# point coloring. Must cover the frontend's color window (LABEL_LAYER_MAX + 1 in
+# the map engine — currently l0…l3, so 4).
+_COLOR_LAYER_COUNT = 4
 
 
 def _compute_map_version(rows: list[dict]) -> str:
@@ -1382,6 +1387,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
 
         # Slow path: derive the content version and build the tiles if missing.
         rows, _labels, levels = _get_map_data()
+        bake_levels = levels[:_COLOR_LAYER_COUNT]
         version = _compute_map_version(rows)
         version_dir = _MAP_ASSETS_DIR / version
         manifest = version_dir / "tiles" / "manifest.feather"
@@ -1393,11 +1399,11 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             tmp_dir = _MAP_ASSETS_DIR / f"{version}.tmp"
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info(
-                "Building map assets (version=%s, %d layers)...",
+                "Building map assets (version=%s, color layers=%s)...",
                 version,
-                len(levels),
+                bake_levels,
             )
-            map_assets.build_assets(rows, levels, tmp_dir)
+            map_assets.build_assets(rows, bake_levels, tmp_dir)
             if version_dir.exists():
                 shutil.rmtree(version_dir, ignore_errors=True)
             os.replace(tmp_dir, version_dir)
