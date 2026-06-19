@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import logging
-import math
 import os
 import pathlib
 import re
@@ -1240,13 +1239,6 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
         return rows, labels, levels
 
 
-def _map_color_level(levels: list[str]) -> str | None:
-    """Layer used to color points. A mid-depth layer reads clearly (finest =
-    thousands of tiny clusters, coarsest = a handful). Shift the index for
-    denser/coarser coloring; labels still span all layers regardless."""
-    return levels[len(levels) // 2] if levels else None
-
-
 def _get_clusters_rows() -> list[dict]:
     # Back-compat shape (title/centroid/num_points) for /clusters.json and the
     # atlas labels, sourced from the coarsest cluster layer of cluster_labels.
@@ -1264,47 +1256,43 @@ def _get_clusters_rows() -> list[dict]:
     ]
 
 
-# Font point range for labels (member counts log-scaled into it, big clusters
-# bigger). Global so a cluster's font size is stable across viewport refetches.
-_LABEL_MIN_PT = 11.0
-_LABEL_MAX_PT = 34.0
+# Label font scales by layer coarseness, not cluster size: coarser layers get
+# smaller, more minimal labels; finer (more localized) layers a touch larger.
+# Uniform within a layer, so no single big-cluster label dominates the view.
+_LABEL_FINEST_PT = 15.0  # finest layer (cluster_l0)
+_LABEL_COARSEST_PT = 10.0  # coarsest layer
 
 
-def _label_font_pt(size, size_min: float, size_max: float) -> float:
-    lo = math.log((size_min or 0) + 1)
-    span = math.log((size_max or 0) + 1) - lo
-    if span <= 0:
-        return _LABEL_MIN_PT
-    t = (math.log((size or 1) + 1) - lo) / span
-    return round(_LABEL_MIN_PT + t * (_LABEL_MAX_PT - _LABEL_MIN_PT), 2)
+def _label_font_pt(level: str, levels: list[str]) -> float:
+    if len(levels) <= 1:
+        return _LABEL_FINEST_PT
+    rank = levels.index(level) / (len(levels) - 1)  # 0 finest .. 1 coarsest
+    return round(_LABEL_FINEST_PT - rank * (_LABEL_FINEST_PT - _LABEL_COARSEST_PT), 2)
 
 
 def _get_labels_config() -> dict:
     """Bootstrap for the dynamic label system: the layer list (finest→coarsest),
-    the coordinate extent (so the frontend can map zoom depth → layer), the color
-    layer + its max cluster id (for point coloring), and the global member-count
-    range (for stable font scaling). Derived from the cached label set."""
+    the coordinate extent (so the frontend can map zoom depth → layer), and the
+    max cluster id per layer (so point coloring can size its color domain for the
+    layer matching the current zoom). Derived from the cached label set."""
     labels, levels = _get_cluster_labels()
-    color_level = _map_color_level(levels)
     xs = [lbl["centroid_x"] for lbl in labels if lbl["centroid_x"] is not None]
     ys = [lbl["centroid_y"] for lbl in labels if lbl["centroid_y"] is not None]
-    sizes = [lbl["size"] for lbl in labels if lbl["size"]]
-    max_cluster_id = max(
-        (int(lbl["cluster_id"]) for lbl in labels if lbl["level"] == color_level),
-        default=0,
-    )
+    cluster_max: dict[str, int] = {}
+    for lbl in labels:
+        cid = int(lbl["cluster_id"])
+        lvl = lbl["level"]
+        if cid > cluster_max.get(lvl, -1):
+            cluster_max[lvl] = cid
     return {
         "levels": levels,
-        "color_level": color_level,
-        "max_cluster_id": max_cluster_id,
+        "cluster_max": cluster_max,
         "extent": {
             "minx": min(xs) if xs else 0.0,
             "maxx": max(xs) if xs else 0.0,
             "miny": min(ys) if ys else 0.0,
             "maxy": max(ys) if ys else 0.0,
         },
-        "size_min": min(sizes) if sizes else 0.0,
-        "size_max": max(sizes) if sizes else 0.0,
     }
 
 
@@ -1336,17 +1324,16 @@ _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
 _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 
-# Bump when the asset-generation logic (tile columns, color layer) changes, so the
+# Bump when the asset-generation logic (tile columns, sidecars) changes, so the
 # version hash moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "3"
+_MAP_ASSET_REV = "4"
 
 
-def _compute_map_version(rows: list[dict], color_level: str | None) -> str:
-    # Tiles depend only on the points + which layer is baked as cluster_id. Labels
-    # are served live, so they're intentionally not part of this hash.
+def _compute_map_version(rows: list[dict]) -> str:
+    # Tiles depend on the points and their per-layer cluster ids (baked as sidecar
+    # columns). Labels are served live, so they're intentionally not in this hash.
     h = hashlib.sha256()
     h.update(_MAP_ASSET_REV.encode("utf-8"))
-    h.update((color_level or "").encode("utf-8"))
     for r in rows:
         h.update(f"{r['accession']}|{r['x']}|{r['y']}|".encode("utf-8"))
         h.update(json.dumps(r["clusters"], sort_keys=True, default=str).encode("utf-8"))
@@ -1395,8 +1382,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
 
         # Slow path: derive the content version and build the tiles if missing.
         rows, _labels, levels = _get_map_data()
-        color_level = _map_color_level(levels)
-        version = _compute_map_version(rows, color_level)
+        version = _compute_map_version(rows)
         version_dir = _MAP_ASSETS_DIR / version
         manifest = version_dir / "tiles" / "manifest.feather"
 
@@ -1407,11 +1393,11 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             tmp_dir = _MAP_ASSETS_DIR / f"{version}.tmp"
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info(
-                "Building map assets (version=%s, color_level=%s)...",
+                "Building map assets (version=%s, %d layers)...",
                 version,
-                color_level,
+                len(levels),
             )
-            map_assets.build_assets(rows, color_level, tmp_dir)
+            map_assets.build_assets(rows, levels, tmp_dir)
             if version_dir.exists():
                 shutil.rmtree(version_dir, ignore_errors=True)
             os.replace(tmp_dir, version_dir)
@@ -1883,7 +1869,6 @@ def get_map_labels(
         _, levels = _get_cluster_labels()
         if level not in levels:
             raise HTTPException(404, "Unknown level")
-        cfg = _get_labels_config()
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -1904,6 +1889,7 @@ def get_map_labels(
         logger.exception("Database error in get_map_labels")
         raise HTTPException(500, "Internal server error")
 
+    font_pt = _label_font_pt(level, levels)  # uniform within a layer
     features = [
         {
             "type": "Feature",
@@ -1913,7 +1899,7 @@ def get_map_labels(
             },
             "properties": {
                 "label": r["label"],
-                "size": _label_font_pt(r["size"], cfg["size_min"], cfg["size_max"]),
+                "size": font_pt,
                 "level": level,
                 "cluster_id": r["cluster_id"],
             },

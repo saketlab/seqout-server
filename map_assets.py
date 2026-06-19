@@ -1,10 +1,12 @@
 """Build deepscatter map assets — quadfeather tiles and countries.json — from the
 rows the API loads out of Postgres.
 
-Each point is colored by its cluster at one representative layer (``color_level``),
-baked into the tiles as ``cluster_id``. Labels are NOT baked here; the frontend
-fetches them on demand per viewport/zoom from the /map/labels endpoint, so the
-heavy all-layers label set never hits the browser at once. Heavy deps (pyarrow /
+Every cluster layer (cluster_l0 … cluster_lN) is baked as a per-point column so
+the frontend can color points by their cluster at whatever layer matches the
+current zoom. Each layer goes in its own quadfeather *sidecar* file, so the main
+tile stays lean (x/y/accession/countries) and a layer's column is fetched only
+when you actually color by it. Labels are NOT baked here; the frontend fetches
+them on demand per viewport/zoom from /map/labels. Heavy deps (pyarrow /
 i18n-iso-countries) import with this module, which the server does lazily on the
 first map request.
 """
@@ -72,32 +74,41 @@ def cluster_at(clusters: dict | None, level: str | None) -> int:
 
 
 def _write_points_csv(
-    rows: list[dict], color_level: str | None, csv_path: pathlib.Path
+    rows: list[dict], levels: list[str], csv_path: pathlib.Path
 ) -> None:
+    cols = ["x", "y", "accession", "countries", *levels]
     with open(csv_path, "w") as f:
-        f.write("x,y,accession,cluster_id,countries\n")
+        f.write(",".join(cols) + "\n")
         for r in rows:
             countries = ";".join(country_names(r.get("countries")))
-            cid = cluster_at(r.get("clusters"), color_level)
-            f.write(f"{r['x']},{r['y']},{r['accession']},{cid},{countries}\n")
+            clusters = r.get("clusters")
+            cids = ",".join(str(cluster_at(clusters, lvl)) for lvl in levels)
+            f.write(f"{r['x']},{r['y']},{r['accession']},{countries},{cids}\n")
 
 
 def _run_quadfeather(
-    csv_path: pathlib.Path, tiles_dir: pathlib.Path, tile_size: int
+    csv_path: pathlib.Path,
+    tiles_dir: pathlib.Path,
+    levels: list[str],
+    tile_size: int,
 ) -> None:
+    schema = pa.schema(
+        [
+            pa.field("x", pa.float32()),
+            pa.field("y", pa.float32()),
+            pa.field("accession", pa.utf8()),
+            pa.field("countries", pa.utf8()),
+            *[pa.field(lvl, pa.int32()) for lvl in levels],
+        ]
+    )
+    # Each cluster layer in its own sidecar file → fetched only when coloring by it.
+    sidecars = {lvl: lvl for lvl in levels}
     qf_main(
         files=[csv_path],
         destination=tiles_dir,
         tile_size=tile_size,
-        schema=pa.schema(
-            [
-                pa.field("x", pa.float32()),
-                pa.field("y", pa.float32()),
-                pa.field("accession", pa.utf8()),
-                pa.field("cluster_id", pa.int32()),
-                pa.field("countries", pa.utf8()),
-            ]
-        ),
+        schema=schema,
+        sidecars=sidecars,
     )
     # quadfeather leaves a temp dir next to the csv that it doesn't clean up.
     shutil.rmtree(csv_path.parent / "_deepscatter_tmp", ignore_errors=True)
@@ -105,15 +116,16 @@ def _run_quadfeather(
 
 def build_assets(
     rows: list[dict],
-    color_level: str | None,
+    levels: list[str],
     out_dir: pathlib.Path | str,
     tile_size: int = TILE_SIZE,
 ) -> None:
     """Generate countries.json and the tiles/ quadtree into out_dir.
 
-    ``rows`` are the map points ({accession, x, y, countries, clusters}). out_dir
-    is expected to be a fresh directory (the caller builds into a temp dir and
-    atomically renames it into place).
+    ``rows`` are the map points ({accession, x, y, countries, clusters}); ``levels``
+    are the cluster layers to bake (each as a sidecar column). out_dir is expected
+    to be a fresh directory (the caller builds into a temp dir and atomically
+    renames it into place).
     """
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -122,8 +134,8 @@ def build_assets(
     (out_dir / "countries.json").write_text(json.dumps(countries))
 
     csv_path = out_dir / "points.csv"
-    _write_points_csv(rows, color_level, csv_path)
-    _run_quadfeather(csv_path, out_dir / "tiles", tile_size)
+    _write_points_csv(rows, levels, csv_path)
+    _run_quadfeather(csv_path, out_dir / "tiles", levels, tile_size)
     csv_path.unlink(missing_ok=True)
 
 
@@ -147,10 +159,12 @@ if __name__ == "__main__":
     ]
     with tempfile.TemporaryDirectory() as d:
         p = pathlib.Path(d) / "p.csv"
-        _write_points_csv(rows, "cluster_l4", p)
+        _write_points_csv(rows, ["cluster_l0", "cluster_l4"], p)
         lines = p.read_text().strip().splitlines()
-        assert lines[0] == "x,y,accession,cluster_id,countries"
-        assert lines[1].startswith("1.0,2.0,GSE1,2,"), lines[1]
-        assert lines[2] == "3.0,4.0,SRP2,-1,", lines[2]  # noise -> -1, no countries
+        assert lines[0] == "x,y,accession,countries,cluster_l0,cluster_l4"
+        # GSE1: l0=5, l4=2; countries US -> name
+        assert lines[1].startswith("1.0,2.0,GSE1,United") and lines[1].endswith(",5,2"), lines[1]
+        # SRP2: noise at both layers -> -1, no countries
+        assert lines[2] == "3.0,4.0,SRP2,,-1,-1", lines[2]
 
     print("map_assets self-check OK")
