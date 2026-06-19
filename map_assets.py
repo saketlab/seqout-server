@@ -13,6 +13,7 @@ first map request.
 
 from __future__ import annotations
 
+import csv
 import json
 import pathlib
 import shutil
@@ -65,6 +66,23 @@ def country_names(codes) -> list[str]:
     return out
 
 
+def clean_values(values) -> list[str]:
+    """Sanitize a row's facet array into distinct display strings safe for the
+    ;-joined tile column: drop empties, strip, and replace the ; list-delimiter
+    (and newlines) inside a value so the frontend's split stays correct. Commas
+    are fine — the CSV writer quotes them."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values or []:
+        if v is None:
+            continue
+        s = str(v).strip().replace(";", ",").replace("\n", " ").replace("\r", " ")
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def cluster_at(clusters: dict | None, level: str | None) -> int:
     """Point's cluster id at ``level``, or -1 for noise (layer key absent/null)."""
     if not clusters or level is None:
@@ -74,16 +92,23 @@ def cluster_at(clusters: dict | None, level: str | None) -> int:
 
 
 def _write_points_csv(
-    rows: list[dict], levels: list[str], csv_path: pathlib.Path
+    rows: list[dict],
+    levels: list[str],
+    csv_path: pathlib.Path,
+    filter_columns: list[str],
 ) -> None:
-    cols = ["x", "y", "accession", "countries", *levels]
-    with open(csv_path, "w") as f:
-        f.write(",".join(cols) + "\n")
+    cols = ["x", "y", "accession", "countries", *filter_columns, *levels]
+    # csv.writer (not hand-rolled) because enriched facet values can contain commas
+    # / quotes; pyarrow's CSV reader (quadfeather) parses the RFC4180 quoting back.
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(cols)
         for r in rows:
             countries = ";".join(country_names(r.get("countries")))
+            facets = [";".join(clean_values(r.get(c))) for c in filter_columns]
             clusters = r.get("clusters")
-            cids = ",".join(str(cluster_at(clusters, lvl)) for lvl in levels)
-            f.write(f"{r['x']},{r['y']},{r['accession']},{countries},{cids}\n")
+            cids = [str(cluster_at(clusters, lvl)) for lvl in levels]
+            w.writerow([r["x"], r["y"], r["accession"], countries, *facets, *cids])
 
 
 def _layer_dictionaries(rows: list[dict], levels: list[str]) -> dict:
@@ -105,18 +130,21 @@ def _run_quadfeather(
     csv_path: pathlib.Path,
     tiles_dir: pathlib.Path,
     levels: list[str],
+    filter_columns: list[str],
     dictionaries: dict,
     tile_size: int,
 ) -> None:
     # Cluster layers are dictionary-encoded so deepscatter treats them as
     # categorical (distinct colors). They live in the main tile (small index ints)
-    # so they're available the moment a tile loads.
+    # so they're available the moment a tile loads. Facet columns are plain utf8
+    # (;-joined values) like `countries`, scanned by the frontend's filter.
     schema = pa.schema(
         [
             pa.field("x", pa.float32()),
             pa.field("y", pa.float32()),
             pa.field("accession", pa.utf8()),
             pa.field("countries", pa.utf8()),
+            *[pa.field(c, pa.utf8()) for c in filter_columns],
             *[pa.field(lvl, pa.dictionary(pa.int32(), pa.utf8())) for lvl in levels],
         ]
     )
@@ -136,24 +164,38 @@ def build_assets(
     levels: list[str],
     out_dir: pathlib.Path | str,
     tile_size: int = TILE_SIZE,
+    filter_columns: list[str] | None = None,
 ) -> None:
-    """Generate countries.json and the tiles/ quadtree into out_dir.
+    """Generate countries.json, the facet filter/<col>.json lists, and the tiles/
+    quadtree into out_dir.
 
-    ``rows`` are the map points ({accession, x, y, countries, clusters}); ``levels``
-    are the cluster layers to bake as categorical (dictionary) columns for point
-    coloring. out_dir is expected to be a fresh directory (the caller builds into a
-    temp dir and atomically renames it into place).
+    ``rows`` are the map points ({accession, x, y, countries, clusters, <facets>});
+    ``levels`` are the cluster layers to bake as categorical (dictionary) columns
+    for point coloring; ``filter_columns`` are the enriched facet columns to bake as
+    ;-joined utf8 columns (each also gets a distinct-values sidecar). out_dir is
+    expected to be a fresh directory (the caller builds into a temp dir and
+    atomically renames it into place).
     """
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    filter_columns = filter_columns or []
 
     countries = sorted({c for r in rows for c in country_names(r.get("countries"))})
     (out_dir / "countries.json").write_text(json.dumps(countries))
 
+    if filter_columns:
+        filter_dir = out_dir / "filter"
+        filter_dir.mkdir(exist_ok=True)
+        for col in filter_columns:
+            vals = sorted({v for r in rows for v in clean_values(r.get(col))})
+            (filter_dir / f"{col}.json").write_text(json.dumps(vals))
+
     dictionaries = _layer_dictionaries(rows, levels)
     csv_path = out_dir / "points.csv"
-    _write_points_csv(rows, levels, csv_path)
-    _run_quadfeather(csv_path, out_dir / "tiles", levels, dictionaries, tile_size)
+    _write_points_csv(rows, levels, csv_path, filter_columns)
+    _run_quadfeather(
+        csv_path, out_dir / "tiles", levels, filter_columns, dictionaries, tile_size
+    )
     csv_path.unlink(missing_ok=True)
 
 
@@ -170,10 +212,16 @@ if __name__ == "__main__":
     names = country_names(["US", "", "----------", None])
     assert len(names) == 1 and "United" in names[0], names
 
+    # Facet sanitizing: distinct, empties dropped, ; replaced (commas kept).
+    assert clean_values(["RNA-seq", "RNA-seq", "", None, "a;b"]) == ["RNA-seq", "a,b"]
+    assert clean_values(None) == []
+
     rows = [
         {"accession": "GSE1", "x": 1.0, "y": 2.0,
-         "countries": ["US", "----------"], "clusters": {"cluster_l0": 5, "cluster_l4": 2}},
-        {"accession": "SRP2", "x": 3.0, "y": 4.0, "countries": None, "clusters": {}},
+         "countries": ["US", "----------"], "clusters": {"cluster_l0": 5, "cluster_l4": 2},
+         "tissue": ["brain", "brain"], "assay": ["scRNA-seq, 10x"]},
+        {"accession": "SRP2", "x": 3.0, "y": 4.0, "countries": None, "clusters": {},
+         "tissue": None, "assay": None},
     ]
     dicts = _layer_dictionaries(rows, ["cluster_l0", "cluster_l4"])
     assert dicts["cluster_l0"].to_pylist() == ["-1", "5"]  # SRP2 noise(-1) + GSE1's 5
@@ -181,12 +229,17 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as d:
         p = pathlib.Path(d) / "p.csv"
-        _write_points_csv(rows, ["cluster_l0", "cluster_l4"], p)
-        lines = p.read_text().strip().splitlines()
-        assert lines[0] == "x,y,accession,countries,cluster_l0,cluster_l4"
-        # GSE1: l0=5, l4=2; countries US -> name
-        assert lines[1].startswith("1.0,2.0,GSE1,United") and lines[1].endswith(",5,2"), lines[1]
-        # SRP2: noise at both layers -> -1, no countries
-        assert lines[2] == "3.0,4.0,SRP2,,-1,-1", lines[2]
+        _write_points_csv(rows, ["cluster_l0", "cluster_l4"], p, ["tissue", "assay"])
+        # Re-parse with a real CSV reader: the assay value's comma must round-trip
+        # as one field (it's quoted), not split the row.
+        with open(p, newline="") as f:
+            parsed = list(csv.reader(f))
+        assert parsed[0] == ["x", "y", "accession", "countries", "tissue", "assay",
+                             "cluster_l0", "cluster_l4"], parsed[0]
+        assert parsed[1][2] == "GSE1" and parsed[1][4] == "brain"
+        assert parsed[1][5] == "scRNA-seq, 10x"  # comma preserved inside the field
+        assert parsed[1][6:] == ["5", "2"]
+        assert parsed[2][2] == "SRP2" and parsed[2][3] == "" and parsed[2][4] == ""
+        assert parsed[2][6:] == ["-1", "-1"]
 
     print("map_assets self-check OK")

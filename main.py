@@ -287,12 +287,40 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
+# Enriched per-sample facets (from ontology_samples_v3) aggregated per project and
+# baked into the map tiles as ;-joined columns, so the map sidebar can offer the
+# same multi-select filtering it does for countries. Keep this list small — every
+# column here is force-loaded with each tile the frontend downloads, and gets its
+# own distinct-values sidecar JSON. Bump _MAP_ASSET_REV when changing it so clients
+# rebuild.
+MAP_FILTER_COLUMNS = ["organism", "tissue", "disease", "assay"]
+MAP_FILTER_LABELS = {
+    "organism": "Organism",
+    "tissue": "Tissue",
+    "disease": "Disease",
+    "assay": "Assay",
+}
+
+# Dominant value per facet per project: mode() = the most frequent non-empty
+# sample value (NULL when the project has no enriched samples). Wrapped in a
+# 1-element array so map_assets treats every facet column the same (list -> ;-join,
+# here just a single value). Each project therefore carries one tissue, one
+# disease, etc. — what the study is mostly about — rather than the union.
+_MAP_ENRICHED_AGG = ",\n        ".join(
+    f"ARRAY[mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
+    f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '')] AS {c}"
+    for c in MAP_FILTER_COLUMNS
+)
+_MAP_ENRICHED_COLS = "".join(f",\n    e.{c}" for c in MAP_FILTER_COLUMNS)
+
 # Map points: every plottable dataset across the three sources shares one 2D
 # coordinate space and one (hierarchical) cluster space. coords_2d is NULL for
 # alias rows (not embedded), so we filter those out. `clusters` is the per-dataset
 # jsonb of layer-wise memberships ({"cluster_l3": 307, ...}); a missing layer key
-# means the dataset is noise at that layer.
-MAP_POINTS_SQL = """
+# means the dataset is noise at that layer. Enriched facets are LEFT JOINed per
+# project (study_accession == canonical map accession), each reduced to its
+# dominant sample value; projects with no enriched samples get NULL (no facet).
+MAP_POINTS_SQL = f"""
 WITH combined AS (
     SELECT accession, coords_2d, countries_iso AS countries, clusters
     FROM geo_series WHERE coords_2d IS NOT NULL
@@ -302,19 +330,26 @@ WITH combined AS (
     UNION ALL
     SELECT accession, coords_2d, countries, clusters
     FROM arrayexpress_experiments WHERE coords_2d IS NOT NULL
+),
+enriched_agg AS (
+    SELECT study_accession AS accession,
+        {_MAP_ENRICHED_AGG}
+    FROM ontology_samples_v3
+    GROUP BY study_accession
 )
 SELECT
-    accession,
+    combined.accession,
     coords_2d[1]::real AS x,
     coords_2d[2]::real AS y,
     countries,
-    clusters
+    clusters{_MAP_ENRICHED_COLS}
 FROM combined
+LEFT JOIN enriched_agg e ON e.accession = combined.accession
 WHERE array_length(coords_2d, 1) >= 2
   AND coords_2d[1] IS NOT NULL
   AND coords_2d[2] IS NOT NULL
-  AND accession ~ '^[A-Za-z]+\\d+$'
-ORDER BY accession;
+  AND combined.accession ~ '^[A-Za-z]+\\d+$'
+ORDER BY combined.accession;
 """
 
 # One label per cluster per layer, at the cluster centroid (same coordinate space
@@ -1330,7 +1365,7 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 # Bump when the asset-generation logic (tile columns) changes, so the version hash
 # moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "5"
+_MAP_ASSET_REV = "7"
 
 # How many of the finest layers (cluster_l0 …) to bake as categorical columns for
 # point coloring. Must cover the frontend's color window (LABEL_LAYER_MAX + 1 in
@@ -1407,7 +1442,9 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
                 version,
                 bake_levels,
             )
-            map_assets.build_assets(rows, bake_levels, tmp_dir)
+            map_assets.build_assets(
+                rows, bake_levels, tmp_dir, filter_columns=MAP_FILTER_COLUMNS
+            )
             if version_dir.exists():
                 shutil.rmtree(version_dir, ignore_errors=True)
             os.replace(tmp_dir, version_dir)
@@ -1842,8 +1879,12 @@ def get_map_meta(request: Request):
         logger.exception("Failed to build map assets")
         raise HTTPException(500, "Internal server error")
 
+    filters = [
+        {"key": c, "label": MAP_FILTER_LABELS.get(c, c), "file": f"filter/{c}.json"}
+        for c in MAP_FILTER_COLUMNS
+    ]
     return JSONResponse(
-        content={"version": version, **config},
+        content={"version": version, "filters": filters, **config},
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -1933,6 +1974,22 @@ def get_map_countries(
     rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
 ):
     return _serve_map_file(version, "countries.json")
+
+
+@api_app.get(
+    "/map/{version}/{rev}/filter/{name}.json",
+    summary="Map facet filter value list",
+    operation_id="get_map_filter",
+)
+def get_map_filter(
+    request: Request,
+    name: str = Path(..., pattern=r"^[a-z_]{1,40}$"),
+    version: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+    rev: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,64}$"),
+):
+    if name not in MAP_FILTER_COLUMNS:
+        raise HTTPException(404, "Not found")
+    return _serve_map_file(version, f"filter/{name}.json")
 
 
 @api_app.get(
