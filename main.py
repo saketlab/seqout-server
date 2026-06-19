@@ -1273,20 +1273,24 @@ def _label_font_pt(level: str, levels: list[str]) -> float:
 def _get_labels_config() -> dict:
     """Bootstrap for the dynamic label system: the layer list (finest→coarsest),
     the coordinate extent (so the frontend can map zoom depth → layer), and the
-    max cluster id per layer (so point coloring can size its color domain for the
-    layer matching the current zoom). Derived from the cached label set."""
+    max cluster id + cluster count per layer (so point coloring can size its color
+    domain and avoid layers too large for deepscatter's color texture). Derived
+    from the cached label set."""
     labels, levels = _get_cluster_labels()
     xs = [lbl["centroid_x"] for lbl in labels if lbl["centroid_x"] is not None]
     ys = [lbl["centroid_y"] for lbl in labels if lbl["centroid_y"] is not None]
     cluster_max: dict[str, int] = {}
+    cluster_count: dict[str, int] = {}
     for lbl in labels:
         cid = int(lbl["cluster_id"])
         lvl = lbl["level"]
         if cid > cluster_max.get(lvl, -1):
             cluster_max[lvl] = cid
+        cluster_count[lvl] = cluster_count.get(lvl, 0) + 1
     return {
         "levels": levels,
         "cluster_max": cluster_max,
+        "cluster_count": cluster_count,
         "extent": {
             "minx": min(xs) if xs else 0.0,
             "maxx": max(xs) if xs else 0.0,
