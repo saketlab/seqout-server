@@ -67,13 +67,18 @@ def country_names(codes) -> list[str]:
 
 
 def clean_values(values) -> list[str]:
-    """Sanitize a row's facet array into distinct display strings safe for the
+    """Sanitize a row's facet value(s) into distinct display strings safe for the
     ;-joined tile column: drop empties, strip, and replace the ; list-delimiter
     (and newlines) inside a value so the frontend's split stays correct. Commas
-    are fine — the CSV writer quotes them."""
+    are fine — the CSV writer quotes them. Accepts a scalar (the dominant value),
+    a list, or None."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
     out: list[str] = []
     seen: set[str] = set()
-    for v in values or []:
+    for v in values:
         if v is None:
             continue
         s = str(v).strip().replace(";", ",").replace("\n", " ").replace("\r", " ")
@@ -213,13 +218,15 @@ if __name__ == "__main__":
     assert len(names) == 1 and "United" in names[0], names
 
     # Facet sanitizing: distinct, empties dropped, ; replaced (commas kept).
+    # Accepts a scalar (the per-project dominant value), a list, or None.
     assert clean_values(["RNA-seq", "RNA-seq", "", None, "a;b"]) == ["RNA-seq", "a,b"]
+    assert clean_values("brain") == ["brain"]
     assert clean_values(None) == []
 
     rows = [
         {"accession": "GSE1", "x": 1.0, "y": 2.0,
          "countries": ["US", "----------"], "clusters": {"cluster_l0": 5, "cluster_l4": 2},
-         "tissue": ["brain", "brain"], "assay": ["scRNA-seq, 10x"]},
+         "tissue": "brain", "assay": "scRNA-seq, 10x"},
         {"accession": "SRP2", "x": 3.0, "y": 4.0, "countries": None, "clusters": {},
          "tissue": None, "assay": None},
     ]

@@ -302,13 +302,12 @@ MAP_FILTER_LABELS = {
 }
 
 # Dominant value per facet per project: mode() = the most frequent non-empty
-# sample value (NULL when the project has no enriched samples). Wrapped in a
-# 1-element array so map_assets treats every facet column the same (list -> ;-join,
-# here just a single value). Each project therefore carries one tissue, one
-# disease, etc. — what the study is mostly about — rather than the union.
+# sample value (NULL when the project has no enriched samples). Each project
+# therefore carries one tissue, one disease, etc. — what the study is mostly
+# about — rather than the union. Returns a scalar; map_assets handles it.
 _MAP_ENRICHED_AGG = ",\n        ".join(
-    f"ARRAY[mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
-    f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '')] AS {c}"
+    f"mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
+    f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '') AS {c}"
     for c in MAP_FILTER_COLUMNS
 )
 _MAP_ENRICHED_COLS = "".join(f",\n    e.{c}" for c in MAP_FILTER_COLUMNS)
@@ -1267,8 +1266,15 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
         labels, levels = _get_cluster_labels()
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(MAP_POINTS_SQL)
-                rows = cur.fetchall()
+                # One-time build query: the per-project enriched mode() aggregation
+                # over all of ontology_samples_v3 can exceed the default 30s
+                # statement_timeout. Raise it just for this query (explicit
+                # transaction so SET LOCAL actually applies under autocommit, and
+                # auto-resets when the block ends).
+                with conn.transaction():
+                    cur.execute("SET LOCAL statement_timeout = '600s'")
+                    cur.execute(MAP_POINTS_SQL)
+                    rows = cur.fetchall()
 
         _map_data_cache.update(ready=True, rows=rows, labels=labels, levels=levels)
         return rows, labels, levels
