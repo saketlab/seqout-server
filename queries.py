@@ -760,7 +760,7 @@ SELECT
     NULL::text[] AS organisms,
     NULL::jsonb AS center
 FROM ena_studies es
-WHERE UPPER(es.study_accession) = UPPER(%s)
+WHERE es.study_accession = %s
 LIMIT 1;
 """
 
