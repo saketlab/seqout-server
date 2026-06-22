@@ -45,6 +45,7 @@ from queries import (
     AE_QUERY_ACCESSIONS_SQL,
     AE_SEARCH_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
+    BATCH_ENA_SAMPLES_SQL,
     BATCH_SAMPLES_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
@@ -792,6 +793,33 @@ def _fetch_sample(cur, accession: str) -> dict | None:
     return cur.fetchone()
 
 
+def _fetch_samples_batch(cur, accessions) -> dict[str, dict]:
+    """Batch equivalent of _fetch_sample: SRA first, ENA fallback for misses.
+
+    Returns a map keyed by the *input* accession (what experiments reference
+    via samples[0]/_sample_acc), collapsing what used to be 1-2 round-trips
+    per sample into 2 queries total.
+    """
+    accs = list(dict.fromkeys(a for a in accessions if a))
+    if not accs:
+        return {}
+
+    out: dict[str, dict] = {}
+    cur.execute(BATCH_SAMPLES_SQL, (accs,))
+    for s in cur.fetchall():
+        out[s["accession"]] = s
+
+    missing = [a for a in accs if a not in out]
+    if missing:
+        cur.execute(BATCH_ENA_SAMPLES_SQL, ([a.upper() for a in missing],))
+        ena_by_upper = {s["accession"].upper(): s for s in cur.fetchall()}
+        for a in missing:
+            s = ena_by_upper.get(a.upper())
+            if s:
+                out[a] = s
+    return out
+
+
 def flatten_sra_study(cur, study: str) -> list[dict]:
     # 1. Fetch experiments (like /project/{study}/experiments endpoint)
     experiments = _fetch_study_experiments(cur, study)
@@ -809,17 +837,15 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
 
     # Fetch all samples and parse attributes_json
     samples_map = {}
-    for sample_acc in unique_sample_accs:
-        sample = _fetch_sample(cur, sample_acc)
-        if sample:
-            # Parse attributes_json if it's a string (like frontend does)
-            attrs = sample.get("attributes_json")
-            if attrs and isinstance(attrs, str):
-                try:
-                    sample["attributes_json"] = json.loads(attrs)
-                except (json.JSONDecodeError, ValueError):
-                    sample["attributes_json"] = None
-            samples_map[sample_acc] = sample
+    for sample_acc, sample in _fetch_samples_batch(cur, unique_sample_accs).items():
+        # Parse attributes_json if it's a string (like frontend does)
+        attrs = sample.get("attributes_json")
+        if attrs and isinstance(attrs, str):
+            try:
+                sample["attributes_json"] = json.loads(attrs)
+            except (json.JSONDecodeError, ValueError):
+                sample["attributes_json"] = None
+        samples_map[sample_acc] = sample
 
     # 3. Collect all unique attribute keys (like frontend's useMemo)
     attribute_keys = set()
@@ -4132,18 +4158,8 @@ def download_study_metadata_csv(
                     if sample_acc:
                         sample_accs.append(sample_acc)
 
-                # 2. Batch-fetch samples
-                sample_map: dict[str, dict] = {}
-                if sample_accs:
-                    if _is_ena_study(study):
-                        for sample_acc in sample_accs:
-                            s = _fetch_sample(cur, sample_acc)
-                            if s:
-                                sample_map[s["accession"]] = s
-                    else:
-                        cur.execute(BATCH_SAMPLES_SQL, (sample_accs,))
-                        for s in cur.fetchall():
-                            sample_map[s["accession"]] = s
+                # 2. Batch-fetch samples (SRA first, ENA fallback)
+                sample_map = _fetch_samples_batch(cur, sample_accs)
 
                 # 3. Collect dynamic attribute keys (order-preserving)
                 all_attr_keys: list[str] = []
@@ -4723,11 +4739,7 @@ def _prepare_study_metadata(cur, study: str) -> tuple[dict, dict, dict]:
         if sample_acc:
             sample_accs.append(sample_acc)
 
-    sample_map: dict[str, dict] = {}
-    for sample_acc in dict.fromkeys(sample_accs):
-        sample = _fetch_sample(cur, sample_acc)
-        if sample:
-            sample_map[sample["accession"]] = sample
+    sample_map = _fetch_samples_batch(cur, sample_accs)
 
     sample_attrs = {
         acc: _parse_sample_attributes(sample) for acc, sample in sample_map.items()

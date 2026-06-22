@@ -873,6 +873,46 @@ FROM sra_samples
 WHERE accession = ANY(%s);
 """
 
+# Batched ENA fallback for _fetch_samples_batch. Mirrors ENA_SAMPLE_SQL but
+# matches a list (uppercased) via the ena_samples_accession_upper_idx index.
+BATCH_ENA_SAMPLES_SQL = """
+SELECT
+    s.sample_accession AS accession,
+    s.sample_alias AS alias,
+    s.sample_description AS description,
+    s.sample_title AS title,
+    s.scientific_name,
+    s.tax_id AS taxon_id,
+    s.secondary_sample_accession AS external_id,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object('tag', kv.key, 'value', kv.value)
+                ORDER BY kv.key
+            )
+            FROM jsonb_each_text(
+                jsonb_strip_nulls(
+                    to_jsonb(s) - ARRAY[
+                        'sample_accession',
+                        'secondary_sample_accession',
+                        'sample_alias',
+                        'sample_title',
+                        'sample_description',
+                        'tax_id',
+                        'scientific_name',
+                        'study_accession'
+                    ]::text[]
+                )
+            ) AS kv
+        ),
+        '[]'::jsonb
+    ) AS attributes_json,
+    s.submission_accession AS submission,
+    NULL::jsonb AS links
+FROM ena_samples s
+WHERE UPPER(s.sample_accession) = ANY(%s);
+"""
+
 COMMON_NAME_BY_SCIENTIFIC_NAME_SQL = """
 SELECT
     tax_id,
