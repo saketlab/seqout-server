@@ -90,10 +90,12 @@ def expand_common_names(conn, query: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 # Cypher: batch-check which candidate sub-phrases exist as Term nodes
+# Term.name is already all-lowercase, so toLower() only on the parameter side —
+# never on t.name — keeps the term_name index usable instead of a full :Term scan.
 _CYPHER_BATCH_EXISTS = """
 UNWIND $candidates AS candidate
 MATCH (t:Term)
-WHERE toLower(t.name) = toLower(candidate)
+WHERE t.name = toLower(candidate)
 RETURN candidate
 """
 
@@ -101,7 +103,7 @@ RETURN candidate
 _CYPHER_SYNONYM_CLUSTER = """
 UNWIND $terms AS term
 MATCH (start:Term)
-WHERE toLower(start.name) = toLower(term)
+WHERE start.name = toLower(term)
 OPTIONAL MATCH (start)-[:MAPS_TO*]-(connected:Term)
 RETURN term, collect(DISTINCT connected.name) AS synonyms
 """
