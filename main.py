@@ -426,10 +426,13 @@ def _configure_connection(conn) -> None:
 
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
-    min_size=2,
-    max_size=100,
+    min_size=4,
+    # ponytail: fewer, busier connections warm their per-connection plan cache;
+    # 100 connections each needed prepare_threshold hits before caching, so most
+    # never did. prepare_threshold=2 warms plans after 2 hits instead of 5.
+    max_size=20,
     timeout=10,
-    kwargs={"autocommit": True},
+    kwargs={"autocommit": True, "prepare_threshold": 2},
     configure=_configure_connection,
 )
 
