@@ -3385,6 +3385,8 @@ def get_study_experiments(
     request: Request,
     response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    limit: int | None = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     study = study.upper()
     try:
@@ -3394,6 +3396,10 @@ def get_study_experiments(
     except Exception as e:
         logger.exception("Database error in get_study_experiments")
         raise HTTPException(500, "Internal server error")
+    # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
+    result.sort(key=lambda e: e.get("accession") or "")
+    if limit is not None:
+        result = result[offset : offset + limit]
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     return result
 
@@ -5687,6 +5693,8 @@ def get_common_name_by_scientific_name(
 def get_geo_series_samples(
     request: Request,
     accession: str = Path(...),
+    limit: int | None = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     accession = accession.upper()
     source = _accession_source(accession)
@@ -5698,13 +5706,18 @@ def get_geo_series_samples(
             with conn.cursor(row_factory=dict_row) as cur:
                 if source == "arrayexpress":
                     cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
-                    return [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
+                    rows = [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
                 else:
                     cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
-                    return cur.fetchall()
+                    rows = cur.fetchall()
     except Exception as e:
         logger.exception("Database error in get_geo_series_samples")
         raise HTTPException(500, "Internal server error")
+    # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
+    rows.sort(key=lambda s: str(s.get("accession") or ""))
+    if limit is not None:
+        rows = rows[offset : offset + limit]
+    return rows
 
 
 @api_app.get(
@@ -6944,17 +6957,23 @@ def get_project_enriched(
     human_readable_age: bool = Query(
         True, description="Convert age from hours to human-readable format"
     ),
+    limit: int | None = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     accession = accession.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                return _fetch_project_enriched(cur, accession, human_readable_age)
+                result = _fetch_project_enriched(cur, accession, human_readable_age)
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_enriched")
         raise HTTPException(500, "Internal server error")
+    # ponytail: samples already ORDER BY sample; slice for pagination, keep n_samples as the full total.
+    if limit is not None:
+        result["samples"] = result["samples"][offset : offset + limit]
+    return result
 
 
 def _fetch_project_enriched(
