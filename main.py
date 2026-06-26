@@ -95,7 +95,6 @@ from queries import (
     LIST_LIBRARY_STRATEGIES_SQL,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
-    LOW_CONFIDENCE_TAGS_SQL,
     ONTOLOGY_SAMPLES_V3_SQL,
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
@@ -3372,6 +3371,16 @@ def get_project(
                     _enrich_with_publications([row], cur)
                     if is_geo_project and geo_contributor_authors:
                         row["authors"] = geo_contributor_authors
+                    # Cheap existence probe so the UI can show/hide the Enriched
+                    # tab without eagerly loading the heavy enriched payload.
+                    cur.execute(
+                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s)"
+                        " OR EXISTS(SELECT 1 FROM enriched_samples_v3 WHERE study_accession = %s)"
+                        " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
+                        " AS has_enriched",
+                        (accession, accession, accession),
+                    )
+                    row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
@@ -7020,6 +7029,7 @@ def get_enriched_column(
 @limiter.limit("100/minute")
 def get_project_enriched(
     request: Request,
+    response: Response,
     accession: str = Path(..., pattern=PROJECT_REGEX),
     human_readable_age: bool = Query(
         True, description="Convert age from hours to human-readable format"
@@ -7028,52 +7038,89 @@ def get_project_enriched(
     offset: int = Query(0, ge=0),
 ):
     accession = accession.upper()
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                result = _fetch_project_enriched(cur, accession, human_readable_age)
+                result = _fetch_project_enriched(
+                    cur, accession, human_readable_age, limit=limit, offset=offset
+                )
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_enriched")
         raise HTTPException(500, "Internal server error")
-    # ponytail: samples already ORDER BY sample; slice for pagination, keep n_samples as the full total.
-    if limit is not None:
-        result["samples"] = result["samples"][offset : offset + limit]
     return result
 
 
+def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
+    # ponytail: huge studies (100k+ samples) can't fetch every enriched row per
+    # request, so paginate in SQL. Each query already ORDERs BY sample.
+    if limit is None:
+        cur.execute(sql, (accession,))
+    else:
+        cur.execute(
+            sql.rstrip().rstrip(";") + "\nLIMIT %s OFFSET %s",
+            (accession, limit, offset),
+        )
+    return cur.fetchall()
+
+
 def _fetch_project_enriched(
-    cur, accession: str, human_readable_age: bool, sample_filter: set[str] | None = None
+    cur,
+    accession: str,
+    human_readable_age: bool,
+    sample_filter: set[str] | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict:
     """Fetch ontology-enriched study + sample metadata for a project accession.
 
     If sample_filter is given, only samples whose `sample` is in the set are
-    returned (used by the experiment/run-scoped endpoints).
+    returned (used by the experiment/run-scoped endpoints); pagination is
+    ignored in that case since those callers need the full set to filter.
     """
+    # Scoped callers filter in Python and need every row; the public endpoint
+    # paginates in SQL.
+    page_limit = None if sample_filter is not None else limit
+
     cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
     study = cur.fetchone()
     if study:
-        cur.execute(ONTOLOGY_SAMPLES_V3_SQL, (accession,))
-        samples = cur.fetchall()
-        if not samples:
-            cur.execute(ENRICHED_SAMPLES_V3_SQL, (accession,))
-            samples = cur.fetchall()
+        # Pick the source once (per-study, offset-independent) so paginated pages
+        # stay on the same table instead of an empty page tripping the fallback.
+        cur.execute(
+            "SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s LIMIT 1",
+            (accession,),
+        )
+        sql = ONTOLOGY_SAMPLES_V3_SQL if cur.fetchone() else ENRICHED_SAMPLES_V3_SQL
+        samples = _exec_enriched_samples(cur, sql, accession, page_limit, offset)
         version = "v3"
     else:
         cur.execute(ENRICHED_STUDY_SQL, (accession,))
         study = cur.fetchone()
         if not study:
             raise HTTPException(404, f"No enriched metadata for {accession}")
-        cur.execute(ENRICHED_SAMPLES_SQL, (accession,))
-        samples = cur.fetchall()
+        samples = _exec_enriched_samples(
+            cur, ENRICHED_SAMPLES_SQL, accession, page_limit, offset
+        )
         version = "v1"
 
     if sample_filter is not None:
         samples = [s for s in samples if s.get("sample") in sample_filter]
 
-    cur.execute(LOW_CONFIDENCE_TAGS_SQL, (accession,))
-    low_confidence = {row["sample_accession"]: row["tags"] for row in cur.fetchall()}
+    # Scope low-confidence tags to the rows we're returning so a 100k-sample
+    # study doesn't pull its whole low_confidence table on every page.
+    sample_accs = [s.get("sample") for s in samples if s.get("sample")]
+    if sample_accs:
+        cur.execute(
+            "SELECT sample_accession, tags FROM low_confidence "
+            "WHERE study_accession = %s AND sample_accession = ANY(%s)",
+            (accession, sample_accs),
+        )
+        low_confidence = {r["sample_accession"]: r["tags"] for r in cur.fetchall()}
+    else:
+        low_confidence = {}
 
     for s in samples:
         s["low_confidence_tags"] = low_confidence.get(s.get("sample"), [])
