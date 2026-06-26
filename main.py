@@ -3398,6 +3398,7 @@ def get_study_experiments(
         raise HTTPException(500, "Internal server error")
     # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
     result.sort(key=lambda e: e.get("accession") or "")
+    response.headers["X-Total-Count"] = str(len(result))
     if limit is not None:
         result = result[offset : offset + limit]
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
@@ -5692,6 +5693,7 @@ def get_common_name_by_scientific_name(
 @limiter.limit("100/minute")
 def get_geo_series_samples(
     request: Request,
+    response: Response,
     accession: str = Path(...),
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -5715,6 +5717,7 @@ def get_geo_series_samples(
         raise HTTPException(500, "Internal server error")
     # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
     rows.sort(key=lambda s: str(s.get("accession") or ""))
+    response.headers["X-Total-Count"] = str(len(rows))
     if limit is not None:
         rows = rows[offset : offset + limit]
     return rows
