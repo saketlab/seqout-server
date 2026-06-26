@@ -765,6 +765,46 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
     }
 
 
+def _fetch_geo_series_samples(
+    cur, accession: str, source: str, limit: int | None = None, offset: int = 0
+) -> list[dict]:
+    # ponytail: always ORDER BY in SQL for deterministic pages; LIMIT/OFFSET only
+    # when paginating, so huge series don't fetch+sort every row in Python.
+    if source == "arrayexpress":
+        sql = AE_EXPERIMENT_SAMPLES_SQL.rstrip().rstrip(";")
+        sql += "\nORDER BY COALESCE(ena_run, ena_experiment, source_name)"
+        params: list = [accession]
+        if limit is not None:
+            sql += "\nLIMIT %s OFFSET %s"
+            params += [limit, offset]
+        cur.execute(sql, tuple(params))
+        return [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
+    sql = GEO_SERIES_SAMPLES_SQL.rstrip().rstrip(";") + "\nORDER BY s.accession"
+    params = [accession]
+    if limit is not None:
+        sql += "\nLIMIT %s OFFSET %s"
+        params += [limit, offset]
+    cur.execute(sql, tuple(params))
+    return cur.fetchall()
+
+
+def _count_geo_series_samples(cur, accession: str, source: str) -> int:
+    if source == "arrayexpress":
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM arrayexpress_samples "
+            "WHERE experiment_accession = %s",
+            (accession,),
+        )
+    else:
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM geo_samples s "
+            "JOIN geo_series g ON s.accession = ANY (g.samples_ref) "
+            "WHERE g.accession = %s",
+            (accession,),
+        )
+    return cur.fetchone()["count"]
+
+
 def rows_to_csv(rows: list[dict]) -> str:
     if not rows:
         return ""
@@ -780,10 +820,37 @@ def _is_ena_study(study: str) -> bool:
     return study.upper().startswith("PRJ")
 
 
-def _fetch_study_experiments(cur, study: str) -> list[dict]:
-    sql = ENA_STUDY_EXPERIMENTS_SQL if _is_ena_study(study) else STUDY_EXPERIMENTS_SQL
-    cur.execute(sql, (study,))
+def _fetch_study_experiments(
+    cur, study: str, limit: int | None = None, offset: int = 0
+) -> list[dict]:
+    is_ena = _is_ena_study(study)
+    sql = ENA_STUDY_EXPERIMENTS_SQL if is_ena else STUDY_EXPERIMENTS_SQL
+    if limit is None:
+        cur.execute(sql, (study,))
+        return cur.fetchall()
+    # ponytail: huge studies (100k+ experiments) can't be fully fetched + sliced
+    # in Python without timing out, so paginate in SQL. ENA already ORDERs via
+    # DISTINCT ON; SRA needs an explicit deterministic ORDER BY.
+    base = sql.rstrip().rstrip(";")
+    paged = base + ("\nLIMIT %s OFFSET %s" if is_ena else
+                    "\nORDER BY accession\nLIMIT %s OFFSET %s")
+    cur.execute(paged, (study, limit, offset))
     return cur.fetchall()
+
+
+def _count_study_experiments(cur, study: str) -> int:
+    if _is_ena_study(study):
+        cur.execute(
+            "SELECT COUNT(DISTINCT experiment_accession) AS count "
+            "FROM ena_experiments WHERE study_accession = UPPER(%s)",
+            (study,),
+        )
+    else:
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM sra_experiments WHERE study = %s",
+            (study,),
+        )
+    return cur.fetchone()["count"]
 
 
 def _fetch_sample(cur, accession: str) -> dict | None:
@@ -3392,15 +3459,16 @@ def get_study_experiments(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                result = _fetch_study_experiments(cur, study)
+                # Count is a cheap indexed query; the page fetch uses SQL
+                # LIMIT/OFFSET so 100k-experiment studies don't time out.
+                total = _count_study_experiments(cur, study)
+                result = _fetch_study_experiments(
+                    cur, study, limit=limit, offset=offset
+                )
     except Exception as e:
         logger.exception("Database error in get_study_experiments")
         raise HTTPException(500, "Internal server error")
-    # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
-    result.sort(key=lambda e: e.get("accession") or "")
-    response.headers["X-Total-Count"] = str(len(result))
-    if limit is not None:
-        result = result[offset : offset + limit]
+    response.headers["X-Total-Count"] = str(total)
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     return result
 
@@ -5706,20 +5774,16 @@ def get_geo_series_samples(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                if source == "arrayexpress":
-                    cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
-                    rows = [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
-                else:
-                    cur.execute(GEO_SERIES_SAMPLES_SQL, (accession,))
-                    rows = cur.fetchall()
+                # Cheap indexed count + a SQL-paginated page so 100k-sample
+                # series don't fetch every row.
+                total = _count_geo_series_samples(cur, accession, source)
+                rows = _fetch_geo_series_samples(
+                    cur, accession, source, limit=limit, offset=offset
+                )
     except Exception as e:
         logger.exception("Database error in get_geo_series_samples")
         raise HTTPException(500, "Internal server error")
-    # ponytail: sort+slice in Python for stable pagination, keeps shared SQL untouched.
-    rows.sort(key=lambda s: str(s.get("accession") or ""))
-    response.headers["X-Total-Count"] = str(len(rows))
-    if limit is not None:
-        rows = rows[offset : offset + limit]
+    response.headers["X-Total-Count"] = str(total)
     return rows
 
 
