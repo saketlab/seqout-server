@@ -146,6 +146,7 @@ from queries import (
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
     build_search_facets,
+    build_search_results,
     build_sorted_search_sql,
     build_structured_search,
     init_global_contributions_filters_sql,
@@ -3173,7 +3174,37 @@ def search(
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
+    organism: str | None = Query(None),
+    country: list[str] | None = Query(None),
+    library_strategy: list[str] | None = Query(None),
+    instrument_model: list[str] | None = Query(None),
+    platform: list[str] | None = Query(None),
+    journal: list[str] | None = Query(None),
+    multi_platform: bool = Query(False),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
 ):
+    sidebar_filters = {
+        "organism": organism,
+        "country": country,
+        "library_strategy": library_strategy,
+        "instrument_model": instrument_model,
+        "platform": platform,
+        "journal": journal,
+        "multi_platform": multi_platform,
+        "year_from": year_from,
+        "year_to": year_to,
+    }
+    has_filter = any(
+        v not in (None, False, []) for v in sidebar_filters.values()
+    )
+
+    # Sidebar-filtered search: relevance-ordered, server-side filters, paginated
+    # over the same match set as the facets so list and counts agree. (Custom
+    # sortby is ignored here — filtering implies relevance order.)
+    if has_filter:
+        return _search_filtered(q, db, cursor_rank, cursor_acc, sidebar_filters)
+
     if not sortby:
         acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter=db)
         if acc_result is not None:
@@ -3334,6 +3365,43 @@ def search(
             result["suggestions"] = suggestions
 
     return result
+
+
+def _search_filtered(q, db, cursor_rank, cursor_acc, filters):
+    """Run a sidebar-filtered search via build_search_results and shape the
+    response like the unfiltered /search path (results, total, took_ms,
+    next_cursor)."""
+    q = _replace_query_hyphens(q)
+    start = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            q_variants = _search_query_variants(conn, q)
+            sql, params = build_search_results(
+                q=q,
+                q_variants=q_variants,
+                db=db,
+                cursor_rank=cursor_rank,
+                cursor_acc=cursor_acc,
+                **filters,
+            )
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
+    except Exception:
+        logger.exception("Database error in filtered search")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        "results": rows,
+        "total": rows[0]["total_count"] if rows else 0,
+        "took_ms": round((time.perf_counter() - start) * 1000, 2),
+        "next_cursor": (
+            None
+            if not rows
+            else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
+        ),
+    }
 
 
 def _compute_search_facets(q: str, db: str | None, **filters) -> dict[str, list[dict]]:

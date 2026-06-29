@@ -238,11 +238,13 @@ LIMIT 200;
 """
 
 
-# Match set for sidebar facets: same UNION + alias-dedup as the result search
-# (so counts agree with the deduped result list), carrying every column a filter
-# or facet branch needs. GEO↔SRA mirrors share an alias, so the dedup is
-# load-bearing — without it those rows double-count.
-_SEARCH_FACETS_MATCH_CTE = """
+# Match set shared by the result list and the sidebar facets: one UNION across
+# the four sources + alias-dedup, carrying every column a result row, filter, or
+# facet branch needs — so the filtered result list and the facet counts always
+# agree (same dedup, same ISO country codes, same filter clauses). GEO↔SRA
+# mirrors share an alias, so the dedup is load-bearing: without it those rows
+# double-count.
+_SEARCH_MATCH_CTE = """
 WITH q AS (
     SELECT plainto_tsquery('english', %(q)s) AS core_q,
            (
@@ -256,38 +258,41 @@ WITH q AS (
            ) AS match_q
 ),
 all_matches AS (
-    SELECT accession, organisms, countries_iso AS countries, instrument_models,
-           library_strategies, platforms, updated_at, 'geo'::text AS source,
-           accession AS dedup_key,
+    SELECT accession, title, summary, updated_at, organisms,
+           countries_iso AS countries, instrument_models, library_strategies,
+           platforms, 'geo'::text AS source, accession AS dedup_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
     WHERE tsv @@ q.match_q
     UNION ALL
-    SELECT s.accession, s.organisms, s.countries, s.instrument_models,
-           s.library_strategies, s.platforms, s.updated_at, 'sra'::text,
-           COALESCE(s.alias, s.accession),
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,
+           s.organisms, s.countries, s.instrument_models, s.library_strategies,
+           s.platforms, 'sra'::text, COALESCE(s.alias, s.accession),
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
     WHERE s.tsv @@ q.match_q
     UNION ALL
-    SELECT accession, organisms, countries, NULL::text[], NULL::text[],
-           NULL::text[], release_date, 'arrayexpress'::text,
-           COALESCE(alias, accession),
+    SELECT accession, title, description AS summary, release_date AS updated_at,
+           organisms, countries, NULL::text[], NULL::text[], NULL::text[],
+           'arrayexpress'::text, COALESCE(alias, accession),
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.match_q
     UNION ALL
-    SELECT accession, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
-           NULL::text[], COALESCE(last_updated, first_public), 'ena'::text,
-           accession,
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[], NULL::text[], NULL::text[], NULL::text[], NULL::text[],
+           'ena'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
     WHERE tsv @@ q.match_q
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, organisms, countries, instrument_models, library_strategies,
-        platforms, updated_at, source
+        accession, title, summary, updated_at, organisms, countries,
+        instrument_models, library_strategies, platforms, source, rank
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
@@ -313,10 +318,8 @@ _FACET_BRANCHES = (
 )
 
 
-def build_search_facets(
-    q=None,
-    q_variants=None,
-    db=None,
+def _search_filter_clauses(
+    params,
     organism=None,
     country=None,
     library_strategy=None,
@@ -327,20 +330,14 @@ def build_search_facets(
     year_from=None,
     year_to=None,
 ):
-    """Filter-aware sidebar facet counts (exclude-self narrowing).
+    """Build sidebar-filter SQL over the `matched` CTE columns.
 
-    Each facet is counted over the q+db match set narrowed by every *other*
-    active sidebar filter plus the year range, so selecting one filter narrows
-    the others' counts (standard faceted search). Multi-value filters
-    (country/library_strategy/instrument_model/platform/journal) accept lists and
-    match on overlap. Returns (sql, params) with %(name)s params; top-1000
-    values per facet.
+    Mutates `params` with the bound values and returns
+    (dim_clauses: {dimension -> sql}, always_clauses: [sql]). `dim_clauses` is
+    keyed by facet dimension so a facet can exclude its own clause (exclude-self
+    narrowing); `always_clauses` (year range) apply everywhere. Multi-value
+    filters accept lists and match on array overlap / ANY.
     """
-    params = {"q": q, "q_variants": q_variants, "db": db}
-
-    # Filter clauses keyed by the facet dimension they constrain, evaluated
-    # against the `matched` CTE columns. A facet branch skips the clause keyed to
-    # its own dimension (exclude-self) so its options stay switchable.
     dim_clauses = {}
     if organism:
         dim_clauses["organism"] = "matched.organisms @> ARRAY[%(organism)s]"
@@ -374,7 +371,6 @@ def build_search_facets(
         )
         params["journal"] = list(journal)
 
-    # Year always applies (it's the time filter, not a facet dimension).
     always_clauses = []
     if year_from is not None:
         always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) >= %(year_from)s")
@@ -382,6 +378,20 @@ def build_search_facets(
     if year_to is not None:
         always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) <= %(year_to)s")
         params["year_to"] = year_to
+
+    return dim_clauses, always_clauses
+
+
+def build_search_facets(q=None, q_variants=None, db=None, **filters):
+    """Filter-aware sidebar facet counts (exclude-self narrowing).
+
+    Each facet is counted over the q+db match set narrowed by every *other*
+    active sidebar filter plus the year range, so selecting one filter narrows
+    the others' counts (standard faceted search). Returns (sql, params) with
+    %(name)s params; top-1000 values per facet.
+    """
+    params = {"q": q, "q_variants": q_variants, "db": db}
+    dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
 
     branches = []
     for facet, value_expr, from_clause in _FACET_BRANCHES:
@@ -398,7 +408,7 @@ def build_search_facets(
         )
 
     sql = (
-        _SEARCH_FACETS_MATCH_CTE
+        _SEARCH_MATCH_CTE
         + ", facets AS (\n"
         + "\n    UNION ALL\n".join(branches)
         + "\n),\n"
@@ -410,6 +420,49 @@ def build_search_facets(
         + ")\n"
         + "SELECT facet, value, count FROM ranked WHERE rn <= 1000\n"
         + "ORDER BY facet, count DESC, value;"
+    )
+    return sql, params
+
+
+def build_search_results(
+    q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None, **filters
+):
+    """Paginated, relevance-ordered result list over the same filtered match set
+    as build_search_facets — so the list and the sidebar counts always agree.
+
+    All active filters apply (no exclude-self). Keyset paginated on (rank,
+    accession), 200/page, with COUNT(*) OVER for the full total. Returns (sql,
+    params) with %(name)s params and the same column layout as SEARCH_SQL.
+    """
+    params = {
+        "q": q,
+        "q_variants": q_variants,
+        "db": db,
+        "cursor_rank": cursor_rank,
+        "cursor_acc": cursor_acc,
+    }
+    dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
+    conds = list(dim_clauses.values()) + always_clauses
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+
+    sql = (
+        _SEARCH_MATCH_CTE
+        + ", filtered AS (\n"
+        + "    SELECT * FROM matched" + where + "\n"
+        + "),\n"
+        + "counted AS (\n"
+        + "    SELECT *, COUNT(*) OVER () AS total_count FROM filtered\n"
+        + "),\n"
+        + "paged AS (\n"
+        + "    SELECT * FROM counted\n"
+        + "    WHERE (%(cursor_rank)s::float8 IS NULL\n"
+        + "           OR (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text))\n"
+        + ")\n"
+        + "SELECT accession, title, summary, updated_at, organisms, countries,\n"
+        + "       rank, source, total_count, instrument_models, library_strategies\n"
+        + "FROM paged\n"
+        + "ORDER BY rank DESC, accession DESC\n"
+        + "LIMIT 200;"
     )
     return sql, params
 
