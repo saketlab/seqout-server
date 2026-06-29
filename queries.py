@@ -238,51 +238,47 @@ LIMIT 200;
 """
 
 
-# Exact sidebar facet counts over the FULL match set (not just the loaded page),
-# so the frontend can show real organism/country/journal/etc. totals without
-# fetching every result page. Mirrors SEARCH_SQL's match + alias-dedup so counts
-# agree with the (alias-deduped) default result list; the trailing source filter
-# restricts to one db. Run only on the first page — it's one extra pass.
-# ponytail: db-restricted paths (db=sra/geo via the per-source endpoints) don't
-# alias-dedup their result lists, so an SRA study sharing an alias could be
-# undercounted here by 1. Rare; revisit only if it shows up.
-SEARCH_FACETS_SQL = """
+# Match set for sidebar facets: same UNION + alias-dedup as the result search
+# (so counts agree with the deduped result list), carrying every column a filter
+# or facet branch needs. GEO↔SRA mirrors share an alias, so the dedup is
+# load-bearing — without it those rows double-count.
+_SEARCH_FACETS_MATCH_CTE = """
 WITH q AS (
-    SELECT plainto_tsquery('english', %s) AS core_q,
+    SELECT plainto_tsquery('english', %(q)s) AS core_q,
            (
                SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
                FROM (
                    SELECT plainto_tsquery('english', term) AS term_q
-                   FROM unnest(%s::text[]) AS terms(term)
+                   FROM unnest(%(q_variants)s::text[]) AS terms(term)
                    WHERE btrim(term) <> ''
                ) parsed_terms
                WHERE term_q::text <> ''
            ) AS match_q
 ),
 all_matches AS (
-    SELECT accession, organisms, countries_iso AS countries,
-           instrument_models, library_strategies, 'geo'::text AS source,
+    SELECT accession, organisms, countries_iso AS countries, instrument_models,
+           library_strategies, platforms, updated_at, 'geo'::text AS source,
            accession AS dedup_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
     WHERE tsv @@ q.match_q
     UNION ALL
-    SELECT s.accession, s.organisms, s.countries,
-           s.instrument_models, s.library_strategies, 'sra'::text,
+    SELECT s.accession, s.organisms, s.countries, s.instrument_models,
+           s.library_strategies, s.platforms, s.updated_at, 'sra'::text,
            COALESCE(s.alias, s.accession),
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
     WHERE s.tsv @@ q.match_q
     UNION ALL
-    SELECT accession, organisms, countries,
-           NULL::text[], NULL::text[], 'arrayexpress'::text,
+    SELECT accession, organisms, countries, NULL::text[], NULL::text[],
+           NULL::text[], release_date, 'arrayexpress'::text,
            COALESCE(alias, accession),
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
     WHERE tsv @@ q.match_q
     UNION ALL
-    SELECT accession, NULL::text[], NULL::text[],
-           NULL::text[], NULL::text[], 'ena'::text,
+    SELECT accession, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[], COALESCE(last_updated, first_public), 'ena'::text,
            accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
@@ -290,44 +286,132 @@ all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, organisms, countries, instrument_models, library_strategies, source
+        accession, organisms, countries, instrument_models, library_strategies,
+        platforms, updated_at, source
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 ),
 matched AS (
     SELECT * FROM deduped
-    WHERE (%s::text IS NULL OR source = %s)
-),
-facets AS (
-    SELECT 'organism'::text AS facet, o AS value, COUNT(*)::int AS count
-      FROM matched, unnest(organisms) o WHERE o <> '' GROUP BY o
-    UNION ALL
-    SELECT 'country', c, COUNT(*)::int
-      FROM matched, unnest(countries) c WHERE c <> '' GROUP BY c
-    UNION ALL
-    SELECT 'library_strategy', ls, COUNT(*)::int
-      FROM matched, unnest(library_strategies) ls WHERE ls <> '' GROUP BY ls
-    UNION ALL
-    SELECT 'instrument_model', im, COUNT(*)::int
-      FROM matched, unnest(instrument_models) im WHERE im <> '' GROUP BY im
-    UNION ALL
-    SELECT 'journal', sp.publications->0->>'journal', COUNT(*)::int
-      FROM matched m
-      JOIN study_publications sp ON sp.accession = m.accession
-      WHERE sp.publications->0->>'journal' IS NOT NULL
-        AND sp.publications->0->>'journal' <> ''
-      GROUP BY sp.publications->0->>'journal'
-),
-ranked AS (
-    SELECT facet, value, count,
-           ROW_NUMBER() OVER (PARTITION BY facet ORDER BY count DESC, value) AS rn
-    FROM facets
+    WHERE (%(db)s::text IS NULL OR source = %(db)s)
 )
-SELECT facet, value, count
-FROM ranked
-WHERE rn <= 50
-ORDER BY facet, count DESC, value;
 """
+
+# Each sidebar facet, with the column it unnests/derives and the filter-dimension
+# key it represents (so it can be excluded from its own narrowing).
+_FACET_BRANCHES = (
+    ("organism", "value", "matched, unnest(organisms) value"),
+    ("country", "value", "matched, unnest(countries) value"),
+    ("library_strategy", "value", "matched, unnest(library_strategies) value"),
+    ("instrument_model", "value", "matched, unnest(instrument_models) value"),
+    ("platform", "value", "matched, unnest(platforms) value"),
+    (
+        "journal",
+        "sp.publications->0->>'journal'",
+        "matched JOIN study_publications sp ON sp.accession = matched.accession",
+    ),
+)
+
+
+def build_search_facets(
+    q=None,
+    q_variants=None,
+    db=None,
+    organism=None,
+    country=None,
+    library_strategy=None,
+    instrument_model=None,
+    platform=None,
+    journal=None,
+    multi_platform=False,
+    year_from=None,
+    year_to=None,
+):
+    """Filter-aware sidebar facet counts (exclude-self narrowing).
+
+    Each facet is counted over the q+db match set narrowed by every *other*
+    active sidebar filter plus the year range, so selecting one filter narrows
+    the others' counts (standard faceted search). Multi-value filters
+    (country/library_strategy/instrument_model/platform/journal) accept lists and
+    match on overlap. Returns (sql, params) with %(name)s params; top-1000
+    values per facet.
+    """
+    params = {"q": q, "q_variants": q_variants, "db": db}
+
+    # Filter clauses keyed by the facet dimension they constrain, evaluated
+    # against the `matched` CTE columns. A facet branch skips the clause keyed to
+    # its own dimension (exclude-self) so its options stay switchable.
+    dim_clauses = {}
+    if organism:
+        dim_clauses["organism"] = "matched.organisms @> ARRAY[%(organism)s]"
+        params["organism"] = organism
+    if country:
+        dim_clauses["country"] = "matched.countries && %(country)s::text[]"
+        params["country"] = list(country)
+    if library_strategy:
+        dim_clauses["library_strategy"] = (
+            "matched.library_strategies && %(library_strategy)s::text[]"
+        )
+        params["library_strategy"] = list(library_strategy)
+    if instrument_model:
+        dim_clauses["instrument_model"] = (
+            "matched.instrument_models && %(instrument_model)s::text[]"
+        )
+        params["instrument_model"] = list(instrument_model)
+    if platform or multi_platform:
+        platform_parts = []
+        if platform:
+            platform_parts.append("matched.platforms && %(platform)s::text[]")
+            params["platform"] = list(platform)
+        if multi_platform:
+            platform_parts.append("array_length(matched.platforms, 1) >= 2")
+        dim_clauses["platform"] = "(" + " AND ".join(platform_parts) + ")"
+    if journal:
+        dim_clauses["journal"] = (
+            "EXISTS (SELECT 1 FROM study_publications sp2"
+            " WHERE sp2.accession = matched.accession"
+            " AND sp2.publications->0->>'journal' = ANY(%(journal)s))"
+        )
+        params["journal"] = list(journal)
+
+    # Year always applies (it's the time filter, not a facet dimension).
+    always_clauses = []
+    if year_from is not None:
+        always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) >= %(year_from)s")
+        params["year_from"] = year_from
+    if year_to is not None:
+        always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) <= %(year_to)s")
+        params["year_to"] = year_to
+
+    branches = []
+    for facet, value_expr, from_clause in _FACET_BRANCHES:
+        conds = [c for dim, c in dim_clauses.items() if dim != facet]
+        conds += always_clauses
+        conds.append(f"{value_expr} IS NOT NULL")
+        conds.append(f"{value_expr} <> ''")
+        where = " WHERE " + " AND ".join(conds)
+        branches.append(
+            f"SELECT '{facet}'::text AS facet, {value_expr} AS value,"
+            f" COUNT(*)::int AS count"
+            f" FROM {from_clause}{where}"
+            f" GROUP BY {value_expr}"
+        )
+
+    sql = (
+        _SEARCH_FACETS_MATCH_CTE
+        + ", facets AS (\n"
+        + "\n    UNION ALL\n".join(branches)
+        + "\n),\n"
+        + "ranked AS (\n"
+        + "    SELECT facet, value, count,\n"
+        + "           ROW_NUMBER() OVER (PARTITION BY facet"
+        + " ORDER BY count DESC, value) AS rn\n"
+        + "    FROM facets\n"
+        + ")\n"
+        + "SELECT facet, value, count FROM ranked WHERE rn <= 1000\n"
+        + "ORDER BY facet, count DESC, value;"
+    )
+    return sql, params
 
 
 # Per-kind dispatch (vs. one giant UNION CTE) so each lookup gets its own plan;

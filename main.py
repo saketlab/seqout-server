@@ -115,7 +115,6 @@ from queries import (
     SAMPLE_SQL,
     SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
-    SEARCH_FACETS_SQL,
     SEARCH_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
@@ -146,6 +145,7 @@ from queries import (
     build_enriched_samples_sql,
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
+    build_search_facets,
     build_sorted_search_sql,
     build_structured_search,
     init_global_contributions_filters_sql,
@@ -3336,24 +3336,30 @@ def search(
     return result
 
 
-def _compute_search_facets(q: str, db: str | None) -> dict[str, list[dict]]:
+def _compute_search_facets(q: str, db: str | None, **filters) -> dict[str, list[dict]]:
     """Exact counts per sidebar filter over the full match set for a query.
 
-    Returns {facet_name: [{value, count}, ...]} grouped from SEARCH_FACETS_SQL.
-    Best-effort: any DB error (incl. statement timeout) yields {} so the caller
-    degrades to no facets instead of failing.
+    `filters` (organism, country, library_strategy, instrument_model, platform,
+    journal, multi_platform, year_from, year_to) narrow each facet by every
+    *other* active filter (exclude-self), matching the result list.
+
+    Returns {facet_name: [{value, count}, ...]}. Best-effort: any DB error (incl.
+    statement timeout) yields {} so the caller degrades to no facets.
     """
     out: dict[str, list[dict]] = {}
     try:
         with pool.connection() as conn:
             q_variants = _search_query_variants(conn, q)
+            sql, params = build_search_facets(
+                q=q, q_variants=q_variants, db=db, **filters
+            )
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     # ponytail: cap pathological broad-term queries (e.g. "human",
                     # 130k+ matches) so faceting degrades to {} instead of hanging
                     # the request. Bump if real queries start losing facets.
                     cur.execute("SET LOCAL statement_timeout = 10000")
-                    cur.execute(SEARCH_FACETS_SQL, (q, q_variants, db, db))
+                    cur.execute(sql, params)
                     for r in cur.fetchall():
                         out.setdefault(r["facet"], []).append(
                             {"value": r["value"], "count": r["count"]}
@@ -3382,9 +3388,32 @@ def search_facets(
     response: Response,
     q: str = Query(..., min_length=1, max_length=500),
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
+    organism: str | None = Query(None),
+    country: list[str] | None = Query(None),
+    library_strategy: list[str] | None = Query(None),
+    instrument_model: list[str] | None = Query(None),
+    platform: list[str] | None = Query(None),
+    journal: list[str] | None = Query(None),
+    multi_platform: bool = Query(False),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
 ):
     t0 = time.perf_counter()
-    facets = _compute_search_facets(_replace_query_hyphens(q), db)
+    facets = _compute_search_facets(
+        _replace_query_hyphens(q),
+        db,
+        organism=organism,
+        country=country,
+        library_strategy=library_strategy,
+        instrument_model=instrument_model,
+        platform=platform,
+        journal=journal,
+        multi_platform=multi_platform,
+        year_from=year_from,
+        year_to=year_to,
+    )
+    # Filter-specific counts still cache (URL includes the filters), just with a
+    # lower hit rate than the bare query.
     response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
     return {"facets": facets, "took_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
