@@ -238,6 +238,98 @@ LIMIT 200;
 """
 
 
+# Exact sidebar facet counts over the FULL match set (not just the loaded page),
+# so the frontend can show real organism/country/journal/etc. totals without
+# fetching every result page. Mirrors SEARCH_SQL's match + alias-dedup so counts
+# agree with the (alias-deduped) default result list; the trailing source filter
+# restricts to one db. Run only on the first page — it's one extra pass.
+# ponytail: db-restricted paths (db=sra/geo via the per-source endpoints) don't
+# alias-dedup their result lists, so an SRA study sharing an alias could be
+# undercounted here by 1. Rare; revisit only if it shows up.
+SEARCH_FACETS_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
+),
+all_matches AS (
+    SELECT accession, organisms, countries_iso AS countries,
+           instrument_models, library_strategies, 'geo'::text AS source,
+           accession AS dedup_key,
+           ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
+    FROM geo_series, q
+    WHERE tsv @@ q.match_q
+    UNION ALL
+    SELECT s.accession, s.organisms, s.countries,
+           s.instrument_models, s.library_strategies, 'sra'::text,
+           COALESCE(s.alias, s.accession),
+           (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
+    FROM sra_studies s, q
+    WHERE s.tsv @@ q.match_q
+    UNION ALL
+    SELECT accession, organisms, countries,
+           NULL::text[], NULL::text[], 'arrayexpress'::text,
+           COALESCE(alias, accession),
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
+    FROM arrayexpress_experiments, q
+    WHERE tsv @@ q.match_q
+    UNION ALL
+    SELECT accession, NULL::text[], NULL::text[],
+           NULL::text[], NULL::text[], 'ena'::text,
+           accession,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
+    FROM ena_studies_search, q
+    WHERE tsv @@ q.match_q
+),
+deduped AS (
+    SELECT DISTINCT ON (dedup_key)
+        accession, organisms, countries, instrument_models, library_strategies, source
+    FROM all_matches
+    ORDER BY dedup_key, rank DESC
+),
+matched AS (
+    SELECT * FROM deduped
+    WHERE (%s::text IS NULL OR source = %s)
+),
+facets AS (
+    SELECT 'organism'::text AS facet, o AS value, COUNT(*)::int AS count
+      FROM matched, unnest(organisms) o WHERE o <> '' GROUP BY o
+    UNION ALL
+    SELECT 'country', c, COUNT(*)::int
+      FROM matched, unnest(countries) c WHERE c <> '' GROUP BY c
+    UNION ALL
+    SELECT 'library_strategy', ls, COUNT(*)::int
+      FROM matched, unnest(library_strategies) ls WHERE ls <> '' GROUP BY ls
+    UNION ALL
+    SELECT 'instrument_model', im, COUNT(*)::int
+      FROM matched, unnest(instrument_models) im WHERE im <> '' GROUP BY im
+    UNION ALL
+    SELECT 'journal', sp.publications->0->>'journal', COUNT(*)::int
+      FROM matched m
+      JOIN study_publications sp ON sp.accession = m.accession
+      WHERE sp.publications->0->>'journal' IS NOT NULL
+        AND sp.publications->0->>'journal' <> ''
+      GROUP BY sp.publications->0->>'journal'
+),
+ranked AS (
+    SELECT facet, value, count,
+           ROW_NUMBER() OVER (PARTITION BY facet ORDER BY count DESC, value) AS rn
+    FROM facets
+)
+SELECT facet, value, count
+FROM ranked
+WHERE rn <= 50
+ORDER BY facet, count DESC, value;
+"""
+
+
 # Per-kind dispatch (vs. one giant UNION CTE) so each lookup gets its own plan;
 # bind-param values can't be constant-folded across union branches in a prepared
 # statement. Column layout matches SEARCH_SQL so rows flow straight into responses.

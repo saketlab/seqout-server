@@ -115,6 +115,7 @@ from queries import (
     SAMPLE_SQL,
     SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
+    SEARCH_FACETS_SQL,
     SEARCH_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
@@ -3324,12 +3325,40 @@ def search(
             ),
         }
 
+    # Exact sidebar facet counts, computed once on the first page only (no cursor).
+    # Additive + best-effort: failure leaves facets absent, never breaks the search.
+    first_page = cursor_rank is None and cursor_sort is None and cursor_acc is None
+    if first_page and result.get("results"):
+        result["facets"] = _compute_search_facets(q, db)
+
     if result.get("total", 0) <= _SUGGESTION_THRESHOLD:
         suggestions = _get_suggestions(original_q)
         if suggestions:
             result["suggestions"] = suggestions
 
     return result
+
+
+def _compute_search_facets(q: str, db: str | None) -> dict[str, list[dict]]:
+    """Exact counts per sidebar filter over the full match set (first page only).
+
+    Returns {facet_name: [{value, count}, ...]} grouped from SEARCH_FACETS_SQL.
+    Best-effort: any DB error yields {} so search never fails on faceting.
+    """
+    out: dict[str, list[dict]] = {}
+    try:
+        with pool.connection() as conn:
+            q_variants = _search_query_variants(conn, q)
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SEARCH_FACETS_SQL, (q, q_variants, db, db))
+                for r in cur.fetchall():
+                    out.setdefault(r["facet"], []).append(
+                        {"value": r["value"], "count": r["count"]}
+                    )
+    except Exception:
+        logger.exception("Database error computing search facets")
+        return {}
+    return out
 
 
 @api_app.get(
