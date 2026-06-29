@@ -1456,6 +1456,9 @@ _MAP_ASSETS_DIR = pathlib.Path(
 )
 _MAP_ASSETS_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _PROJECT_CACHE_CONTROL = "public, s-maxage=2592000, stale-while-revalidate=2592000"
+# Facets only change on reindex; cache hard at the edge so repeat/bot hits on a
+# query are free and the slow first computation is paid at most once per query.
+_SEARCH_FACETS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
 _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
@@ -3325,12 +3328,6 @@ def search(
             ),
         }
 
-    # Exact sidebar facet counts, computed once on the first page only (no cursor).
-    # Additive + best-effort: failure leaves facets absent, never breaks the search.
-    first_page = cursor_rank is None and cursor_sort is None and cursor_acc is None
-    if first_page and result.get("results"):
-        result["facets"] = _compute_search_facets(q, db)
-
     if result.get("total", 0) <= _SUGGESTION_THRESHOLD:
         suggestions = _get_suggestions(original_q)
         if suggestions:
@@ -3340,25 +3337,56 @@ def search(
 
 
 def _compute_search_facets(q: str, db: str | None) -> dict[str, list[dict]]:
-    """Exact counts per sidebar filter over the full match set (first page only).
+    """Exact counts per sidebar filter over the full match set for a query.
 
     Returns {facet_name: [{value, count}, ...]} grouped from SEARCH_FACETS_SQL.
-    Best-effort: any DB error yields {} so search never fails on faceting.
+    Best-effort: any DB error (incl. statement timeout) yields {} so the caller
+    degrades to no facets instead of failing.
     """
     out: dict[str, list[dict]] = {}
     try:
         with pool.connection() as conn:
             q_variants = _search_query_variants(conn, q)
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SEARCH_FACETS_SQL, (q, q_variants, db, db))
-                for r in cur.fetchall():
-                    out.setdefault(r["facet"], []).append(
-                        {"value": r["value"], "count": r["count"]}
-                    )
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # ponytail: cap pathological broad-term queries (e.g. "human",
+                    # 130k+ matches) so faceting degrades to {} instead of hanging
+                    # the request. Bump if real queries start losing facets.
+                    cur.execute("SET LOCAL statement_timeout = 10000")
+                    cur.execute(SEARCH_FACETS_SQL, (q, q_variants, db, db))
+                    for r in cur.fetchall():
+                        out.setdefault(r["facet"], []).append(
+                            {"value": r["value"], "count": r["count"]}
+                        )
     except Exception:
         logger.exception("Database error computing search facets")
         return {}
     return out
+
+
+@api_app.get(
+    "/search/facets",
+    summary="Exact sidebar facet counts for a search",
+    description=(
+        "Exact counts per sidebar filter (organism, country, library_strategy, "
+        "instrument_model, journal) over the FULL match set for a query, so the "
+        "UI can show real totals without paging through every result. Computed "
+        "independently of /search so it doesn't block result rendering. "
+        "Returns {facets: {name: [{value, count}], ...}, took_ms}."
+    ),
+    operation_id="search_facets",
+)
+@limiter.limit("100/minute")
+def search_facets(
+    request: Request,
+    response: Response,
+    q: str = Query(..., min_length=1, max_length=500),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
+):
+    t0 = time.perf_counter()
+    facets = _compute_search_facets(_replace_query_hyphens(q), db)
+    response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+    return {"facets": facets, "took_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
 
 @api_app.get(
