@@ -146,8 +146,10 @@ from queries import (
     build_enriched_samples_sql,
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
-    build_search_facets,
+    build_search_facets_over_matched,
+    build_search_match_temp,
     build_search_results,
+    build_search_total_over_matched,
     build_sorted_search_sql,
     build_structured_search,
     init_global_contributions_filters_sql,
@@ -3410,38 +3412,58 @@ def _search_filtered(q, db, cursor_rank, cursor_acc, filters):
     }
 
 
-def _compute_search_facets(q: str, db: str | None, **filters) -> dict[str, list[dict]]:
-    """Exact counts per sidebar filter over the full match set for a query.
+def _compute_search_facets(
+    q: str, db: str | None, **filters
+) -> tuple[dict[str, list[dict]], int | None]:
+    """Exact result total and per-filter facet counts for a query.
 
-    `filters` (organism, country, library_strategy, instrument_model, platform,
-    journal, multi_platform, year_from, year_to) narrow each facet by every
-    *other* active filter (exclude-self), matching the result list.
+    The match set is materialized ONCE into a temp table (the single FTS pass);
+    the total counts it (reliable) and the facets aggregate it (best-effort).
+    `filters` narrow each facet by every *other* active filter (exclude-self);
+    the total applies all filters.
 
-    Returns {facet_name: [{value, count}, ...]}. Best-effort: any DB error (incl.
-    statement timeout) yields {} so the caller degrades to no facets.
+    Returns ({facet_name: [{value, count}, ...]}, total). The facets degrade to
+    {} on a facet-only timeout while the total survives; a hard failure (the FTS
+    itself, etc.) yields ({}, None) so the caller can avoid caching it.
     """
     out: dict[str, list[dict]] = {}
+    total: int | None = None
     try:
         with pool.connection() as conn:
             q_variants = _search_query_variants(conn, q)
-            sql, params = build_search_facets(
-                q=q, q_variants=q_variants, db=db, **filters
-            )
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # ponytail: cap pathological broad-term queries (e.g. "human",
-                    # 130k+ matches) so faceting degrades to {} instead of hanging
-                    # the request. Bump if real queries start losing facets.
-                    cur.execute("SET LOCAL statement_timeout = 10000")
-                    cur.execute(sql, params)
-                    for r in cur.fetchall():
-                        out.setdefault(r["facet"], []).append(
-                            {"value": r["value"], "count": r["count"]}
-                        )
+                    # Single FTS pass: materialize the match set, then reuse it.
+                    msql, mparams = build_search_match_temp(
+                        q=q, q_variants=q_variants, db=db
+                    )
+                    cur.execute(msql, mparams)
+                    # Total: cheap count over the materialized set. Runs under the
+                    # default timeout so it stays reliable even when facets are slow.
+                    tsql, tparams = build_search_total_over_matched(**filters)
+                    cur.execute(tsql, tparams)
+                    total = cur.fetchone()["total"]
+                    # Facets: best-effort. A timeout rolls back only this savepoint
+                    # (the total, already fetched, is unaffected); the temp table
+                    # lives in the outer transaction.
+                    try:
+                        with conn.transaction():
+                            # ponytail: cap pathological broad-term faceting (e.g.
+                            # "human") so it degrades to {} instead of hanging. Bump
+                            # if real queries start losing facets.
+                            cur.execute("SET LOCAL statement_timeout = 10000")
+                            fsql, fparams = build_search_facets_over_matched(**filters)
+                            cur.execute(fsql, fparams)
+                            for r in cur.fetchall():
+                                out.setdefault(r["facet"], []).append(
+                                    {"value": r["value"], "count": r["count"]}
+                                )
+                    except Exception:
+                        logger.warning("Search facets degraded (timeout?)", exc_info=True)
     except Exception:
         logger.exception("Database error computing search facets")
-        return {}
-    return out
+        return {}, None
+    return out, total
 
 
 @api_app.get(
@@ -3473,7 +3495,7 @@ def search_facets(
     year_to: int | None = Query(None, ge=1900, le=2100),
 ):
     t0 = time.perf_counter()
-    facets = _compute_search_facets(
+    facets, total = _compute_search_facets(
         _replace_query_hyphens(q),
         db,
         organism=organism,
@@ -3486,13 +3508,15 @@ def search_facets(
         year_from=year_from,
         year_to=year_to,
     )
-    # The 'total' pseudo-facet carries the exact result count (deferred from
-    # /search). Pull it out to a top-level field; absent if faceting timed out.
-    total_rows = facets.pop("total", None)
-    total = total_rows[0]["count"] if total_rows else None
-    # Filter-specific counts still cache (URL includes the filters), just with a
-    # lower hit rate than the bare query.
-    response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+    # Only cache a complete response. A timeout degrades to {facets:{}, total:null};
+    # caching that for a week would pin the wrong total (e.g. the loaded-page count)
+    # on every later search of this query, so leave it uncached to allow a retry.
+    if total is not None:
+        # Filter-specific counts still cache (URL includes the filters), just with
+        # a lower hit rate than the bare query.
+        response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+    else:
+        response.headers["Cache-Control"] = "no-store"
     return {
         "facets": facets,
         "total": total,

@@ -388,15 +388,41 @@ def _search_filter_clauses(
     return dim_clauses, always_clauses
 
 
-def build_search_facets(q=None, q_variants=None, db=None, **filters):
-    """Filter-aware sidebar facet counts (exclude-self narrowing).
-
-    Each facet is counted over the q+db match set narrowed by every *other*
-    active sidebar filter plus the year range, so selecting one filter narrows
-    the others' counts (standard faceted search). Returns (sql, params) with
-    %(name)s params; top-1000 values per facet.
+def build_search_match_temp(q=None, q_variants=None, db=None):
+    """CREATE TEMP TABLE `matched` (ON COMMIT DROP) holding the q+db match set,
+    deduped. This is the single expensive FTS pass; the count and facet queries
+    then read this materialized table, so a slow facet can't kill the total and
+    the FTS is never computed twice. Caller must run inside a transaction.
     """
-    params = {"q": q, "q_variants": q_variants, "db": db}
+    sql = (
+        "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
+        + _SEARCH_MATCH_CTE
+        + "\nSELECT * FROM matched;"
+    )
+    return sql, {"q": q, "q_variants": q_variants, "db": db}
+
+
+def build_search_total_over_matched(**filters):
+    """Exact result total over the materialized `matched` temp table, with every
+    active filter applied (no exclude-self). Cheap — a filtered scan/count, no FTS.
+    """
+    params = {}
+    dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
+    conds = list(dim_clauses.values()) + always_clauses
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    return f"SELECT COUNT(*)::int AS total FROM matched{where};", params
+
+
+def build_search_facets_over_matched(**filters):
+    """Filter-aware sidebar facet counts (exclude-self narrowing) over the
+    materialized `matched` temp table.
+
+    Each facet is counted over the match set narrowed by every *other* active
+    sidebar filter plus the year range, so selecting one filter narrows the
+    others' counts (standard faceted search). Returns (sql, params); top-1000
+    values per facet.
+    """
+    params = {}
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
 
     branches = []
@@ -413,19 +439,8 @@ def build_search_facets(q=None, q_variants=None, db=None, **filters):
             f" GROUP BY {value_expr}"
         )
 
-    # The exact result total (all filters applied, no exclude-self) rides along
-    # with the facets so /search can skip the expensive COUNT(*) OVER. It scans
-    # the already-built `matched` CTE once more — cheap next to the facet branches.
-    total_conds = list(dim_clauses.values()) + always_clauses
-    total_where = (" WHERE " + " AND ".join(total_conds)) if total_conds else ""
-    branches.append(
-        "SELECT 'total'::text AS facet, ''::text AS value,"
-        f" COUNT(*)::int AS count FROM matched{total_where}"
-    )
-
     sql = (
-        _SEARCH_MATCH_CTE
-        + ", facets AS (\n"
+        "WITH facets AS (\n"
         + "\n    UNION ALL\n".join(branches)
         + "\n),\n"
         + "ranked AS (\n"
@@ -444,7 +459,7 @@ def build_search_results(
     q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None, **filters
 ):
     """Paginated, relevance-ordered result list over the same filtered match set
-    as build_search_facets — so the list and the sidebar counts always agree.
+    as the facet/total queries — so the list and the sidebar counts always agree.
 
     All active filters apply (no exclude-self). Keyset paginated on (rank,
     accession), 200/page. total_count is NULL — the exact total is deferred to
