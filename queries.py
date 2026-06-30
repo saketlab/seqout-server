@@ -34,7 +34,8 @@ all_matches AS (
     WHERE tsv @@ q.match_q
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
+    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -70,7 +71,8 @@ all_matches AS (
     WHERE tsv @@ q.match_q
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
+    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -106,7 +108,8 @@ all_matches AS (
     WHERE tsv @@ q.match_q
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
+    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -149,7 +152,8 @@ all_matches AS (
     WHERE tsv @@ q.match_q
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM all_matches
+    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
     SELECT *
@@ -223,7 +227,9 @@ deduped AS (
     ORDER BY dedup_key, rank DESC
 ),
 counted AS (
-    SELECT *, COUNT(*) OVER () AS total_count FROM deduped
+    -- total deferred to /search/facets so this path returns the top page via a
+    -- bounded heapsort instead of materializing the full match set for COUNT.
+    SELECT *, NULL::bigint AS total_count FROM deduped
 ),
 paged AS (
     SELECT *
@@ -407,6 +413,16 @@ def build_search_facets(q=None, q_variants=None, db=None, **filters):
             f" GROUP BY {value_expr}"
         )
 
+    # The exact result total (all filters applied, no exclude-self) rides along
+    # with the facets so /search can skip the expensive COUNT(*) OVER. It scans
+    # the already-built `matched` CTE once more — cheap next to the facet branches.
+    total_conds = list(dim_clauses.values()) + always_clauses
+    total_where = (" WHERE " + " AND ".join(total_conds)) if total_conds else ""
+    branches.append(
+        "SELECT 'total'::text AS facet, ''::text AS value,"
+        f" COUNT(*)::int AS count FROM matched{total_where}"
+    )
+
     sql = (
         _SEARCH_MATCH_CTE
         + ", facets AS (\n"
@@ -431,8 +447,9 @@ def build_search_results(
     as build_search_facets — so the list and the sidebar counts always agree.
 
     All active filters apply (no exclude-self). Keyset paginated on (rank,
-    accession), 200/page, with COUNT(*) OVER for the full total. Returns (sql,
-    params) with %(name)s params and the same column layout as SEARCH_SQL.
+    accession), 200/page. total_count is NULL — the exact total is deferred to
+    /search/facets. Returns (sql, params) with %(name)s params and the same
+    column layout as SEARCH_SQL.
     """
     params = {
         "q": q,
@@ -451,7 +468,8 @@ def build_search_results(
         + "    SELECT * FROM matched" + where + "\n"
         + "),\n"
         + "counted AS (\n"
-        + "    SELECT *, COUNT(*) OVER () AS total_count FROM filtered\n"
+        # total deferred to /search/facets — see SEARCH_SQL note.
+        + "    SELECT *, NULL::bigint AS total_count FROM filtered\n"
         + "),\n"
         + "paged AS (\n"
         + "    SELECT * FROM counted\n"

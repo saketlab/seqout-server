@@ -3360,7 +3360,12 @@ def search(
             ),
         }
 
-    if result.get("total", 0) <= _SUGGESTION_THRESHOLD:
+    # total is deferred (None) on the unified path now, so fall back to the
+    # first-page row count as the low-result proxy for "did you mean".
+    total_for_suggest = result.get("total")
+    if total_for_suggest is None:
+        total_for_suggest = len(result.get("results", []))
+    if total_for_suggest <= _SUGGESTION_THRESHOLD:
         suggestions = _get_suggestions(original_q)
         if suggestions:
             result["suggestions"] = suggestions
@@ -3481,10 +3486,18 @@ def search_facets(
         year_from=year_from,
         year_to=year_to,
     )
+    # The 'total' pseudo-facet carries the exact result count (deferred from
+    # /search). Pull it out to a top-level field; absent if faceting timed out.
+    total_rows = facets.pop("total", None)
+    total = total_rows[0]["count"] if total_rows else None
     # Filter-specific counts still cache (URL includes the filters), just with a
     # lower hit rate than the bare query.
     response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
-    return {"facets": facets, "took_ms": round((time.perf_counter() - t0) * 1000, 2)}
+    return {
+        "facets": facets,
+        "total": total,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
 
 
 @api_app.get(
