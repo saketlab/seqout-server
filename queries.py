@@ -1152,6 +1152,18 @@ WHERE LOWER(scientific_name) = LOWER(%s)
 ORDER BY common_name;
 """
 
+# Batch variant: one round-trip for a whole facet list. %s is a list of
+# already-lowercased names matched against LOWER(scientific_name).
+COMMON_NAMES_BY_SCIENTIFIC_NAMES_SQL = """
+SELECT
+    tax_id,
+    scientific_name,
+    common_name
+FROM common_names
+WHERE LOWER(scientific_name) = ANY(%s)
+ORDER BY scientific_name, common_name;
+"""
+
 GEO_SERIES_SAMPLES_SQL = """
 SELECT s.*
 FROM geo_samples s

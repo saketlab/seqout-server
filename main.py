@@ -50,6 +50,7 @@ from queries import (
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
     COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
+    COMMON_NAMES_BY_SCIENTIFIC_NAMES_SQL,
     ENA_EXPERIMENT_SQL,
     ENA_SAMPLE_SQL,
     ENA_SAMPLE_TO_EXPERIMENT_SQL,
@@ -5911,6 +5912,37 @@ def get_common_name_by_scientific_name(
             404,
             f"No common names found for scientific_name '{scientific_name}'",
         )
+
+    return rows
+
+
+@api_app.get(
+    "/common-names",
+    summary="Get common names for many scientific names",
+    description=(
+        "Batch variant of /common-name: pass scientific_name repeatedly to "
+        "resolve a whole list in one request. Missing names are simply absent "
+        "from the result (no 404)."
+    ),
+    operation_id="get_common_names_by_scientific_names",
+)
+@limiter.limit("100/minute")
+def get_common_names_by_scientific_names(
+    request: Request,
+    # ponytail: 200 cap matches the facet top-N; the UI never asks for more.
+    scientific_name: list[str] = Query(..., min_length=1, max_length=200),
+):
+    names = sorted({n.strip().lower() for n in scientific_name if n.strip()})
+    if not names:
+        raise HTTPException(400, "No valid scientific_name provided")
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(COMMON_NAMES_BY_SCIENTIFIC_NAMES_SQL, (names,))
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_common_names_by_scientific_names")
+        raise HTTPException(500, "Internal server error")
 
     return rows
 
