@@ -39,7 +39,7 @@ _CYPHER_SYNONYM_CLUSTER = """
 UNWIND $terms AS term
 MATCH (start:Term)
 WHERE start.name = toLower(term)
-OPTIONAL MATCH (start)-[:MAPS_TO*]-(connected:Term)
+OPTIONAL MATCH (start)-[:MAPS_TO*1..2]-(connected:Term)
 RETURN term, collect(DISTINCT connected.name) AS synonyms
 """
 
