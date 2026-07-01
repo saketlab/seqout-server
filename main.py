@@ -39,7 +39,7 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
-from expansions import expand_common_names, expand_terms
+from expansions import expand_terms
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -1701,23 +1701,14 @@ def _try_accession_search(
     }
 
 
-def _search_query_variants(conn, q: str) -> list[str]:
-    variants = [q]
+def _search_query_variants(q: str) -> list[str]:
+    # Organism scientific/common names now live in the Neo4j graph alongside
+    # every other synonym, so a single expand_terms pass covers them too.
     try:
-        variants = expand_common_names(conn, q)
+        return list(dict.fromkeys(expand_terms(neo4j_driver, q)))
     except Exception:
-        logger.debug("Common/scientific name query expansion failed", exc_info=True)
-
-    final_variants = []
-    for v in variants:
-        try:
-            term_variants = expand_terms(neo4j_driver, v)
-            final_variants.extend(term_variants)
-        except Exception:
-            logger.debug("Term query expansion failed", exc_info=True)
-            final_variants.append(v)
-
-    return list(dict.fromkeys(final_variants))
+        logger.debug("Term query expansion failed", exc_info=True)
+        return [q]
 
 
 _SUGGESTION_THRESHOLD = 5
@@ -3040,7 +3031,7 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc):
 
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(conn, q)
+            q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     GEO_SEARCH_SQL,
@@ -3101,7 +3092,7 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc):
 
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(conn, q)
+            q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SRA_SEARCH_SQL,
@@ -3220,7 +3211,7 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(conn, q)
+                q_variants = _search_query_variants(q)
                 sql, params = build_sorted_search_sql(
                     q=q,
                     q_variants=q_variants,
@@ -3262,7 +3253,7 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(conn, q)
+                q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         AE_SEARCH_SQL,
@@ -3294,7 +3285,7 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(conn, q)
+                q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         ENA_SEARCH_SQL,
@@ -3327,7 +3318,7 @@ def search(
 
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(conn, q)
+                q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         SEARCH_SQL,
@@ -3383,7 +3374,7 @@ def _search_filtered(q, db, cursor_rank, cursor_acc, filters):
     start = time.perf_counter()
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(conn, q)
+            q_variants = _search_query_variants(q)
             sql, params = build_search_results(
                 q=q,
                 q_variants=q_variants,
@@ -3430,7 +3421,7 @@ def _compute_search_facets(
     total: int | None = None
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(conn, q)
+            q_variants = _search_query_variants(q)
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Single FTS pass: materialize the match set, then reuse it.
@@ -6745,7 +6736,7 @@ def search_structured(
     q_variants = None
     if q:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(conn, q)
+            q_variants = _search_query_variants(q)
 
     sql, params = build_structured_search(
         q=q,

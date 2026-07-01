@@ -17,3 +17,4 @@ test_*
 # Generated map assets (quadfeather tiles, geojson, countries.json)
 data/map_assets/
 schema.sql
+.env
