@@ -46,6 +46,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;
 """
 
@@ -83,6 +84,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;
 """
 
@@ -120,6 +122,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;
 """
 
@@ -164,6 +167,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;
 """
 
@@ -240,6 +244,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;
 """
 
@@ -456,7 +461,8 @@ def build_search_facets_over_matched(**filters):
 
 
 def build_search_results(
-    q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None, **filters
+    q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None,
+    offset=None, **filters
 ):
     """Paginated, relevance-ordered result list over the same filtered match set
     as the facet/total queries — so the list and the sidebar counts always agree.
@@ -472,6 +478,7 @@ def build_search_results(
         "db": db,
         "cursor_rank": cursor_rank,
         "cursor_acc": cursor_acc,
+        "offset": offset,
     }
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
     conds = list(dim_clauses.values()) + always_clauses
@@ -495,6 +502,7 @@ def build_search_results(
         + "       rank, source, total_count, instrument_models, library_strategies\n"
         + "FROM paged\n"
         + "ORDER BY rank DESC, accession DESC\n"
+        + "OFFSET COALESCE(%(offset)s::bigint, 0)\n"
         + "LIMIT 200;"
     )
     return sql, params
@@ -2237,6 +2245,7 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
 LIMIT 200;"""
 
     return sql, params
@@ -2250,6 +2259,7 @@ def build_sorted_search_sql(
     cursor_sort=None,
     cursor_acc=None,
     q_variants=None,
+    offset=None,
 ):
     """Build search SQL sorted by citations, journal, or year.
 
@@ -2384,8 +2394,10 @@ SELECT
     sort_val, total_count
 FROM paged
 ORDER BY sort_val {direction} NULLS LAST, accession {direction}
+OFFSET COALESCE(%(offset)s::bigint, 0)
 LIMIT 200;"""
 
+    params["offset"] = offset
     return sql, params
 
 

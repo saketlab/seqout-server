@@ -3026,7 +3026,7 @@ def search_geo(
     return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
-def _search_geo_impl(request, q, cursor_rank, cursor_acc):
+def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None):
     start = time.perf_counter()
 
     try:
@@ -3035,7 +3035,7 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     GEO_SEARCH_SQL,
-                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
+                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                 )
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
@@ -3087,7 +3087,7 @@ def search_sra(
     return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
-def _search_sra_impl(request, q, cursor_rank, cursor_acc):
+def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None):
     start = time.perf_counter()
 
     try:
@@ -3096,7 +3096,7 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     SRA_SEARCH_SQL,
-                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
+                    (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                 )
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
@@ -3165,6 +3165,7 @@ def search(
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
     cursor_sort: str | None = Query(None),
+    offset: int | None = Query(None, ge=0),
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena)$"),
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
@@ -3197,9 +3198,11 @@ def search(
     # over the same match set as the facets so list and counts agree. (Custom
     # sortby is ignored here — filtering implies relevance order.)
     if has_filter:
-        return _search_filtered(q, db, cursor_rank, cursor_acc, sidebar_filters)
+        return _search_filtered(q, db, cursor_rank, cursor_acc, sidebar_filters, offset)
 
-    if not sortby:
+    # Skip accession shortcut when paging (offset > 0): it returns a fixed small
+    # set, so it only makes sense on the first page.
+    if not sortby and not offset:
         acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter=db)
         if acc_result is not None:
             return acc_result
@@ -3220,6 +3223,7 @@ def search(
                     db=db,
                     cursor_sort=cursor_sort,
                     cursor_acc=cursor_acc,
+                    offset=offset,
                 )
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(sql, params)
@@ -3246,9 +3250,9 @@ def search(
             ),
         }
     elif db == "geo":
-        result = _search_geo_impl(request, q, cursor_rank, cursor_acc)
+        result = _search_geo_impl(request, q, cursor_rank, cursor_acc, offset)
     elif db == "sra":
-        result = _search_sra_impl(request, q, cursor_rank, cursor_acc)
+        result = _search_sra_impl(request, q, cursor_rank, cursor_acc, offset)
     elif db == "arrayexpress":
         start = time.perf_counter()
         try:
@@ -3257,7 +3261,7 @@ def search(
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         AE_SEARCH_SQL,
-                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
+                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                     )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
@@ -3289,7 +3293,7 @@ def search(
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         ENA_SEARCH_SQL,
-                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc),
+                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                     )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
@@ -3328,6 +3332,7 @@ def search(
                             cursor_rank,
                             cursor_rank,
                             cursor_acc,
+                            offset,
                         ),
                     )
                     rows = cur.fetchall()
@@ -3366,7 +3371,7 @@ def search(
     return result
 
 
-def _search_filtered(q, db, cursor_rank, cursor_acc, filters):
+def _search_filtered(q, db, cursor_rank, cursor_acc, filters, offset=None):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
     next_cursor)."""
@@ -3381,6 +3386,7 @@ def _search_filtered(q, db, cursor_rank, cursor_acc, filters):
                 db=db,
                 cursor_rank=cursor_rank,
                 cursor_acc=cursor_acc,
+                offset=offset,
                 **filters,
             )
             with conn.cursor(row_factory=dict_row) as cur:
