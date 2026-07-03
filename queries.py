@@ -3361,30 +3361,51 @@ def build_country_filters_sql(
     return sql, params
 
 
+# Spec is (table, column, distinct, where). ENA mirrors the whole INSDC space,
+# so sra_exp/ena_exp are prefix-partitioned (SRX vs ERX/DRX) to avoid emitting
+# the same /e URL twice.
 SITEMAP_TABLES = {
-    "geo": ("geo_series", "accession", False),
-    "sra": ("sra_studies", "accession", False),
-    "arrayexpress": ("arrayexpress_experiments", "accession", False),
-    "ena": ("ena_studies", "study_accession", False),
-    "sra_exp": ("sra_experiments", "accession", False),
-    "ena_exp": ("ena_experiments", "experiment_accession", True),
-    "run": ("sra_run_download_links", "run_accession", False),
-    "geo_sample": ("geo_samples", "accession", False),
-    "sra_sample": ("sra_samples", "accession", False),
-    "ena_sample": ("ena_samples", "sample_accession", False),
+    "geo": ("geo_series", "accession", False, None),
+    "sra": ("sra_studies", "accession", False, None),
+    "arrayexpress": ("arrayexpress_experiments", "accession", False, None),
+    "ena": ("ena_studies", "study_accession", False, None),
+    "sra_exp": (
+        "sra_experiments",
+        "accession",
+        False,
+        "accession >= 'SRX' AND accession < 'SRY'",
+    ),
+    "ena_exp": (
+        "ena_experiments",
+        "experiment_accession",
+        True,
+        "((experiment_accession >= 'DRX' AND experiment_accession < 'DRY') "
+        "OR (experiment_accession >= 'ERX' AND experiment_accession < 'ERY'))",
+    ),
+    "run": ("sra_run_download_links", "run_accession", False, None),
+    "geo_sample": ("geo_samples", "accession", False, None),
+    "sra_sample": ("sra_samples", "accession", False, None),
+    "ena_sample": ("ena_samples", "sample_accession", False, None),
 }
 
 
-def _sitemap_accessions_sql(table: str, col: str, distinct: bool) -> str:
+def _sitemap_accessions_sql(
+    table: str, col: str, distinct: bool, where: str | None
+) -> str:
     select = (
         f"SELECT DISTINCT {col} AS accession"
         if distinct
         else f"SELECT {col} AS accession"
     )
-    return f"{select} FROM {table} ORDER BY {col} LIMIT %s OFFSET %s;"
+    where_clause = f" WHERE {where}" if where else ""
+    return f"{select} FROM {table}{where_clause} ORDER BY {col} LIMIT %s OFFSET %s;"
 
 
-def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
+def _sitemap_count_expr(
+    table: str, col: str, distinct: bool, where: str | None
+) -> str:
+    if where:
+        return f"(SELECT COUNT(*) FROM {table} WHERE {where})::bigint"
     reltuples = (
         f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
     )
@@ -3400,14 +3421,19 @@ def _sitemap_count_expr(table: str, col: str, distinct: bool) -> str:
     )
 
 
-def _sitemap_keyset_sql(table: str, col: str, distinct: bool) -> str:
+def _sitemap_keyset_sql(
+    table: str, col: str, distinct: bool, where: str | None
+) -> str:
     # Keyset page from a precomputed boundary: O(limit) at any depth, vs OFFSET.
     select = (
         f"SELECT DISTINCT {col} AS accession"
         if distinct
         else f"SELECT {col} AS accession"
     )
-    return f"{select} FROM {table} WHERE {col} >= %s ORDER BY {col} LIMIT %s;"
+    extra = f" AND {where}" if where else ""
+    return (
+        f"{select} FROM {table} WHERE {col} >= %s{extra} ORDER BY {col} LIMIT %s;"
+    )
 
 
 SITEMAP_ACCESSIONS_SQL = {
