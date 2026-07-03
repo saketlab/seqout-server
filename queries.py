@@ -399,10 +399,15 @@ def build_search_match_temp(q=None, q_variants=None, db=None):
     then read this materialized table, so a slow facet can't kill the total and
     the FTS is never computed twice. Caller must run inside a transaction.
     """
+    # Only the columns the count + facet + filter queries actually read. Notably
+    # NOT title/summary (summary holds full abstracts — tens of MB over a broad
+    # match) — those exist in the shared CTE for the result-list path, not here.
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + _SEARCH_MATCH_CTE
-        + "\nSELECT * FROM matched;"
+        + "\nSELECT accession, updated_at, organisms, countries,"
+        + " instrument_models, library_strategies, platforms\n"
+        + "FROM matched;"
     )
     return sql, {"q": q, "q_variants": q_variants, "db": db}
 

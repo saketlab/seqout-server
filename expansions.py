@@ -129,6 +129,37 @@ def _cross_multiply_variants(
     return variants
 
 
+def extract_graph_terms(neo4j_driver, query: str) -> list[str]:
+    """Return the query sub-phrases that exist as :Term nodes, in query order.
+
+    Reuses the same longest-match logic as expand_terms: split the query into
+    words, generate contiguous sub-phrases, check which exist in the graph, then
+    greedily keep the longest non-overlapping matches. Returns lowercased phrase
+    names (matching Term.name), deduped and ordered by position in the query.
+
+    This is the term-detection step behind the search page's "Deep dive" picker.
+    """
+    words = " ".join(query.split()).split()
+    if not words:
+        return []
+
+    candidates = _generate_candidate_subphrases(words)
+    candidate_phrases = list(dict.fromkeys(phrase.lower() for phrase, _, _ in candidates))
+
+    existing: set[str] = set()
+    records, _, _ = neo4j_driver.execute_query(
+        _CYPHER_BATCH_EXISTS,
+        candidates=candidate_phrases,
+        database_="neo4j",
+    )
+    for record in records:
+        existing.add(record["candidate"].lower())
+
+    matched = _greedy_match(candidates, existing)
+    matched.sort(key=lambda m: m[1])  # by start index -> query order
+    return list(dict.fromkeys(phrase.lower() for phrase, _, _ in matched))
+
+
 def expand_terms(neo4j_driver, query: str) -> list[str]:
     """Return query variants using Neo4j graph-based synonym expansion."""
     normalized_query = " ".join(query.split())

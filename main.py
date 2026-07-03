@@ -39,6 +39,7 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
+from deep_dive import fetch_deep_dive_children, fetch_deep_dive_terms
 from expansions import expand_terms
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
@@ -3142,6 +3143,65 @@ def search_suggest(
     took_ms = (time.perf_counter() - start) * 1000
     result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
     return result
+
+
+# ---------------------------------------------------------------------------
+# Deep dive: ontology-hierarchy exploration of query terms
+# ---------------------------------------------------------------------------
+# Thin wrappers over deep_dive.py (kept there so the graph logic stays testable
+# without a live Postgres). See deep_dive.py for the graph shape / semantics.
+
+
+@api_app.get(
+    "/search/deep-dive/terms",
+    summary="Deep-dive candidate terms",
+    description=(
+        "For a search query, return the sub-phrases that exist in the ontology "
+        "graph AND have hierarchy children (SUBCLASS_OF / PART_OF), traversing "
+        "MAPS_TO synonyms transparently. Powers the search page 'Deep dive for' picker. "
+        "Returns {terms: [{term, name, child_count}], took_ms}."
+    ),
+    operation_id="deep_dive_terms",
+)
+@limiter.limit("100/minute")
+def deep_dive_terms(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=500),
+):
+    start = time.perf_counter()
+    try:
+        terms = fetch_deep_dive_terms(neo4j_driver, q)
+    except Exception:
+        logger.exception("deep_dive_terms failed for q=%r", q)
+        raise HTTPException(500, "Internal server error")
+    took_ms = (time.perf_counter() - start) * 1000
+    return {"terms": terms, "took_ms": round(took_ms, 2)}
+
+
+@api_app.get(
+    "/search/deep-dive/children",
+    summary="Deep-dive term children",
+    description=(
+        "Return the direct hierarchy children of a graph term (SUBCLASS_OF and "
+        "PART_OF merged), traversing MAPS_TO synonyms transparently. Each child "
+        "carries has_children so the graph knows if it can expand further. "
+        "Capped at 300 children. Returns {term, children: [{name, has_children}], took_ms}."
+    ),
+    operation_id="deep_dive_children",
+)
+@limiter.limit("100/minute")
+def deep_dive_children(
+    request: Request,
+    term: str = Query(..., min_length=1, max_length=200),
+):
+    start = time.perf_counter()
+    try:
+        children = fetch_deep_dive_children(neo4j_driver, term)
+    except Exception:
+        logger.exception("deep_dive_children failed for term=%r", term)
+        raise HTTPException(500, "Internal server error")
+    took_ms = (time.perf_counter() - start) * 1000
+    return {"term": term.lower(), "children": children, "took_ms": round(took_ms, 2)}
 
 
 @api_app.get(

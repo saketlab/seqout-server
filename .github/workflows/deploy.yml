@@ -30,7 +30,7 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_PORT || 22 }}
-          source: "main.py,map_assets.py,queries.py,expansions.py,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
+          source: "main.py,map_assets.py,queries.py,expansions.py,deep_dive.py,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
           target: /var/www/sramap/backend
           strip_components: 0
 
