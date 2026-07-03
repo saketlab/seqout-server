@@ -3404,8 +3404,6 @@ def _sitemap_accessions_sql(
 def _sitemap_count_expr(
     table: str, col: str, distinct: bool, where: str | None
 ) -> str:
-    if where:
-        return f"(SELECT COUNT(*) FROM {table} WHERE {where})::bigint"
     reltuples = (
         f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
     )
