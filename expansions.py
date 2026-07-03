@@ -129,35 +129,64 @@ def _cross_multiply_variants(
     return variants
 
 
-def extract_graph_terms(neo4j_driver, query: str) -> list[str]:
-    """Return the query sub-phrases that exist as :Term nodes, in query order.
+# Split a glued "seq" suffix off a word: atacseq -> atac seq, chipseq -> chip seq.
+_SEQ_RE = re.compile(r"\b([a-z0-9]+)(seq)\b", re.IGNORECASE)
 
-    Reuses the same longest-match logic as expand_terms: split the query into
-    words, generate contiguous sub-phrases, check which exist in the graph, then
-    greedily keep the longest non-overlapping matches. Returns lowercased phrase
-    names (matching Term.name), deduped and ordered by position in the query.
 
-    This is the term-detection step behind the search page's "Deep dive" picker.
+def _graph_norm(phrase: str) -> str:
+    """Normalise a phrase to how Term.name is stored in the graph.
+
+    Term.name is lowercase with -/_/ turned into spaces, and ontologies write
+    e.g. "ATAC-seq" as "atac seq". Users may type "atac-seq" or "atacseq" — both
+    must resolve to "atac seq". So: split a glued "seq", turn -/_/ into spaces,
+    lowercase, and collapse whitespace.
     """
-    words = " ".join(query.split()).split()
+    p = _SEQ_RE.sub(r"\1 \2", phrase)  # atacseq -> atac seq
+    p = re.sub(r"[-_/]", " ", p).lower()  # atac-seq -> atac seq
+    p = re.sub(r"\s+", " ", p).strip()
+    return p
+
+
+def extract_graph_terms(neo4j_driver, query: str) -> list[tuple[str, str]]:
+    """Return (phrase, name) for query sub-phrases that exist as :Term nodes.
+
+    `phrase` is the substring exactly as it appears in the query, so callers can
+    swap it back into the raw query. `name` is its graph key (see _graph_norm:
+    lowercase, -/_/ -> space, glued "seq" split — "atac-seq"/"atacseq" both ->
+    "atac seq"). Longest non-overlapping matches, in query order.
+
+    This is the term-detection step behind the search page's "Enhance search".
+    """
+    words = query.split()
     if not words:
         return []
 
-    candidates = _generate_candidate_subphrases(words)
-    candidate_phrases = list(dict.fromkeys(phrase.lower() for phrase, _, _ in candidates))
+    candidates = _generate_candidate_subphrases(words)  # (phrase, start, end), longest first
+    norm_by_phrase = {phrase: _graph_norm(phrase) for phrase, _, _ in candidates}
 
     existing: set[str] = set()
     records, _, _ = neo4j_driver.execute_query(
         _CYPHER_BATCH_EXISTS,
-        candidates=candidate_phrases,
+        candidates=list(dict.fromkeys(norm_by_phrase.values())),
         database_="neo4j",
     )
     for record in records:
         existing.add(record["candidate"].lower())
 
-    matched = _greedy_match(candidates, existing)
-    matched.sort(key=lambda m: m[1])  # by start index -> query order
-    return list(dict.fromkeys(phrase.lower() for phrase, _, _ in matched))
+    # Greedy longest-first, non-overlapping — matching on the normalised name.
+    consumed: set[int] = set()
+    matched: list[tuple[int, str, str]] = []  # (start, phrase, name)
+    for phrase, start, end in candidates:
+        positions = set(range(start, end))
+        if positions & consumed:
+            continue
+        name = norm_by_phrase[phrase]
+        if name in existing:
+            consumed |= positions
+            matched.append((start, phrase, name))
+
+    matched.sort(key=lambda m: m[0])  # query order
+    return [(phrase, name) for _, phrase, name in matched]
 
 
 def expand_terms(neo4j_driver, query: str) -> list[str]:

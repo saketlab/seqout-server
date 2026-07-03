@@ -57,21 +57,27 @@ ORDER BY name
 def fetch_deep_dive_terms(neo4j_driver, query: str) -> list[dict]:
     """Query sub-phrases that exist in the graph AND have hierarchy children.
 
-    Returns [{term, name, child_count}] in query order, term = the phrase as it
-    appeared in the query, name = its lowercase graph key. Empty if none qualify.
+    Returns [{term, name, child_count}] in query order. `term` is the phrase as
+    it appeared in the query (so the frontend can swap it back into the raw
+    query); `name` is its normalised graph key. Empty if none qualify.
     """
-    terms = extract_graph_terms(neo4j_driver, query)
-    if not terms:
+    pairs = extract_graph_terms(neo4j_driver, query)  # [(phrase, name)]
+    if not pairs:
         return []
+    names = list(dict.fromkeys(name for _, name in pairs))
     records, _, _ = neo4j_driver.execute_query(
-        _CYPHER_CHILDCOUNTS, terms=terms, database_="neo4j"
+        _CYPHER_CHILDCOUNTS, terms=names, database_="neo4j"
     )
     counts = {r["term"].lower(): r["child_count"] for r in records}
     result: list[dict] = []
-    for t in terms:  # keep query order
-        count = counts.get(t.lower(), 0)
+    seen: set[str] = set()
+    for phrase, name in pairs:  # keep query order, first phrase wins per name
+        if name in seen:
+            continue
+        seen.add(name)
+        count = counts.get(name, 0)
         if count > 0:
-            result.append({"term": t, "name": t.lower(), "child_count": count})
+            result.append({"term": phrase, "name": name, "child_count": count})
     return result
 
 
