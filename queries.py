@@ -1773,7 +1773,7 @@ def build_structured_search(
     sra.published_at, ae.release_date, ena.first_public).
 
     `sample_tissue`/`sample_disease`/`sample_cell_type` filter to studies that
-    have at least one matching row in ontology_samples_v3 (ILIKE substring match).
+    have at least one matching row in ontology_samples_v4 (ILIKE substring match).
 
     `count_by` switches the final SELECT to aggregation mode. Supported values:
     "year", "source", "organism", "country". Returns one row per bucket with
@@ -1902,19 +1902,19 @@ def build_structured_search(
             w.append("array_length(g.platforms, 1) >= 2")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -1982,19 +1982,19 @@ def build_structured_search(
             w.append("array_length(s.platforms, 1) >= 2")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -2038,19 +2038,19 @@ def build_structured_search(
             w.append("ae.release_date <= %(published_before)s::date")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -2115,19 +2115,19 @@ def build_structured_search(
             w.append("es.first_public <= %(published_before)s::date")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v3 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -3528,14 +3528,14 @@ def _enriched_summary_ddl() -> str:
         "    COUNT(*) AS enriched_samples,\n"
         "    COUNT(DISTINCT study_accession) AS enriched_projects,\n"
         f"    {cols}\n"
-        "FROM ontology_samples_v3;"
+        "FROM ontology_samples_v4;"
     )
 
 
 def _enriched_top_values_ddl() -> str:
     union = "\n        UNION ALL\n        ".join(
         f"SELECT '{c}' AS column_name, {c}::text AS value, COUNT(*) AS n "
-        f"FROM ontology_samples_v3 WHERE {c} IS NOT NULL AND {c}::text <> '' "
+        f"FROM ontology_samples_v4 WHERE {c} IS NOT NULL AND {c}::text <> '' "
         f"GROUP BY {c}"
         for c in ENRICHED_STAT_COLUMNS
     )
@@ -3593,7 +3593,7 @@ def _enriched_crosstab_ddl() -> str:
         "CREATE MATERIALIZED VIEW enriched_crosstab AS\n"
         "WITH base AS MATERIALIZED (\n"
         f"        SELECT\n            {base_cols}\n"
-        "        FROM ontology_samples_v3 os\n"
+        "        FROM ontology_samples_v4 os\n"
         "        LEFT JOIN unified_metadata um "
         "ON um.canonical_accession = os.study_accession\n"
         "        LEFT JOIN (SELECT scientific_name, MIN(common_name) AS common_name "
@@ -3756,7 +3756,7 @@ WHERE st.accession = %s;
 
 ENRICHED_STUDY_V3_SQL = """
 SELECT st.accession, st.title, st.n_samples, st.single_cell_modality
-FROM enriched_studies_v3 st
+FROM enriched_studies_v4 st
 WHERE st.accession = %s;
 """
 
@@ -3773,7 +3773,7 @@ SELECT
     cell_type_ontology_id, cell_type_ontology_name,
     assay_ontology_id, assay_ontology_name,
     development_stage_ontology_id, development_stage_ontology_name
-FROM ontology_samples_v3
+FROM ontology_samples_v4
 WHERE study_accession = %s
 ORDER BY sample;
 """
@@ -3785,7 +3785,7 @@ SELECT
     assay_category, cell_line, treatment,
     development_stage, sample_type, genetic_modification,
     cell_count, gene_count, cell_count_estimated
-FROM enriched_samples_v3
+FROM enriched_samples_v4
 WHERE study_accession = %s
 ORDER BY sample;
 """

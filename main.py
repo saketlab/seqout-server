@@ -293,7 +293,7 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
-# Enriched per-sample facets (from ontology_samples_v3) aggregated per project and
+# Enriched per-sample facets (from ontology_samples_v4) aggregated per project and
 # baked into the map tiles as ;-joined columns, so the map sidebar can offer the
 # same multi-select filtering it does for countries. Keep this list small — every
 # column here is force-loaded with each tile the frontend downloads, and gets its
@@ -339,7 +339,7 @@ WITH combined AS (
 enriched_agg AS (
     SELECT study_accession AS accession,
         {_MAP_ENRICHED_AGG}
-    FROM ontology_samples_v3
+    FROM ontology_samples_v4
     GROUP BY study_accession
 )
 SELECT
@@ -1368,7 +1368,7 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # One-time build query: the per-project enriched mode() aggregation
-                # over all of ontology_samples_v3 can exceed the default 30s
+                # over all of ontology_samples_v4 can exceed the default 30s
                 # statement_timeout. Raise it just for this query (explicit
                 # transaction so SET LOCAL actually applies under autocommit, and
                 # auto-resets when the block ends).
@@ -3623,8 +3623,8 @@ def get_project(
                     # Cheap existence probe so the UI can show/hide the Enriched
                     # tab without eagerly loading the heavy enriched payload.
                     cur.execute(
-                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s)"
-                        " OR EXISTS(SELECT 1 FROM enriched_samples_v3 WHERE study_accession = %s)"
+                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
+                        " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
                         " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                         " AS has_enriched",
                         (accession, accession, accession),
@@ -7370,7 +7370,7 @@ def _fetch_project_enriched(
         # Pick the source once (per-study, offset-independent) so paginated pages
         # stay on the same table instead of an empty page tripping the fallback.
         cur.execute(
-            "SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s LIMIT 1",
+            "SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s LIMIT 1",
             (accession,),
         )
         sql = ONTOLOGY_SAMPLES_V3_SQL if cur.fetchone() else ENRICHED_SAMPLES_V3_SQL
