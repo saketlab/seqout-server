@@ -7383,6 +7383,21 @@ def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
     return cur.fetchall()
 
 
+def _fetch_sample_titles(cur, sample_accs: list[str]) -> dict:
+    """Map enriched sample accessions to (title, description). GEO samples live in
+    geo_samples, SRA/ENA in sra_samples; the namespaces are disjoint so a union
+    covers both without resolving the study's archive first."""
+    if not sample_accs:
+        return {}
+    cur.execute(
+        "SELECT accession, title, description FROM geo_samples WHERE accession = ANY(%s) "
+        "UNION ALL "
+        "SELECT accession, title, description FROM sra_samples WHERE accession = ANY(%s)",
+        (sample_accs, sample_accs),
+    )
+    return {r["accession"]: (r["title"], r["description"]) for r in cur.fetchall()}
+
+
 def _fetch_project_enriched(
     cur,
     accession: str,
@@ -7444,6 +7459,12 @@ def _fetch_project_enriched(
 
     for s in samples:
         s["low_confidence_tags"] = low_confidence.get(s.get("sample"), [])
+
+    titles = _fetch_sample_titles(cur, sample_accs)
+    for s in samples:
+        td = titles.get(s.get("sample"))
+        s["title"] = td[0] if td else None
+        s["description"] = td[1] if td else None
 
     if human_readable_age:
         for s in samples:
