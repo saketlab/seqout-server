@@ -837,8 +837,9 @@ def _fetch_study_experiments(
     # in Python without timing out, so paginate in SQL. ENA already ORDERs via
     # DISTINCT ON; SRA needs an explicit deterministic ORDER BY.
     base = sql.rstrip().rstrip(";")
-    paged = base + ("\nLIMIT %s OFFSET %s" if is_ena else
-                    "\nORDER BY accession\nLIMIT %s OFFSET %s")
+    paged = base + (
+        "\nLIMIT %s OFFSET %s" if is_ena else "\nORDER BY accession\nLIMIT %s OFFSET %s"
+    )
     cur.execute(paged, (study, limit, offset))
     return cur.fetchall()
 
@@ -1526,9 +1527,11 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             cached_rev, _, cached = _MAP_CURRENT_FILE.read_text().strip().partition(":")
         except OSError:
             cached_rev, cached = "", ""
-        if cached_rev == _MAP_ASSET_REV and _MAP_ID_RE.match(cached) and (
-            _MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather"
-        ).exists():
+        if (
+            cached_rev == _MAP_ASSET_REV
+            and _MAP_ID_RE.match(cached)
+            and (_MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather").exists()
+        ):
             version_dir = _MAP_ASSETS_DIR / cached
             _prune_old_map_versions(cached)
             _map_assets_state.update(ready=True, version=cached, dir=version_dir)
@@ -3250,9 +3253,7 @@ def search(
         "year_from": year_from,
         "year_to": year_to,
     }
-    has_filter = any(
-        v not in (None, False, []) for v in sidebar_filters.values()
-    )
+    has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
 
     # Sidebar-filtered search: relevance-ordered, server-side filters, paginated
     # over the same match set as the facets so list and counts agree. (Custom
@@ -3516,7 +3517,9 @@ def _compute_search_facets(
                                     {"value": r["value"], "count": r["count"]}
                                 )
                     except Exception:
-                        logger.warning("Search facets degraded (timeout?)", exc_info=True)
+                        logger.warning(
+                            "Search facets degraded (timeout?)", exc_info=True
+                        )
     except Exception:
         logger.exception("Database error computing search facets")
         return {}, None
@@ -3620,6 +3623,16 @@ def get_project(
                     _enrich_with_publications([row], cur)
                     if is_geo_project and geo_contributor_authors:
                         row["authors"] = geo_contributor_authors
+                    # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP, not the PRJ.
+                    enrich_acc = accession
+                    if accession.startswith("PRJ"):
+                        gse, srp = (r := _resolve_prj(cur, accession))["gse"], r["srp"]
+                        if gse and not row.get("alias"):
+                            row["alias"] = gse
+                        xref = {k: v for k, v in (("GEO", gse), ("SRA", srp)) if v}
+                        if xref and not row.get("external_id"):
+                            row["external_id"] = xref
+                        enrich_acc = gse or srp or accession
                     # Cheap existence probe so the UI can show/hide the Enriched
                     # tab without eagerly loading the heavy enriched payload.
                     cur.execute(
@@ -3627,7 +3640,7 @@ def get_project(
                         " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
                         " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                         " AS has_enriched",
-                        (accession, accession, accession),
+                        (enrich_acc, enrich_acc, enrich_acc),
                     )
                     row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
     except Exception as e:
@@ -7333,6 +7346,30 @@ def get_project_enriched(
     return result
 
 
+def _resolve_prj(cur, accession: str) -> dict:
+    """PRJ* -> {"gse", "srp"}. PRJNA checks geo_series first; all check sra_studies."""
+    gse = None
+    if accession.upper().startswith("PRJNA"):
+        cur.execute(PRJNA_TO_GEO_SERIES_SQL, (accession,))
+        row = cur.fetchone()
+        gse = row["accession"] if row else None
+    cur.execute(PRJ_TO_SRA_STUDY_SQL, (accession,))
+    row = cur.fetchone()
+    return {"gse": gse, "srp": row["accession"] if row else None}
+
+
+def _resolve_enrichment_accession(cur, accession: str) -> str:
+    """Map a PRJ* to the accession enrichment is keyed under (GSE or SRP).
+
+    Enrichment keys on the GEO series / SRA study, not the bare PRJ, so a raw PRJ*
+    404s even when the study is enriched. Unchanged for non-PRJ / unmapped input.
+    """
+    if not accession.upper().startswith("PRJ"):
+        return accession
+    r = _resolve_prj(cur, accession)
+    return r["gse"] or r["srp"] or accession
+
+
 def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
     # ponytail: huge studies (100k+ samples) can't fetch every enriched row per
     # request, so paginate in SQL. Each query already ORDERs BY sample.
@@ -7363,6 +7400,9 @@ def _fetch_project_enriched(
     # Scoped callers filter in Python and need every row; the public endpoint
     # paginates in SQL.
     page_limit = None if sample_filter is not None else limit
+
+    # PRJ* accessions are keyed under their GSE/SRP in the enrichment tables.
+    accession = _resolve_enrichment_accession(cur, accession)
 
     cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
     study = cur.fetchone()

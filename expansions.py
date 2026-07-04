@@ -161,7 +161,9 @@ def extract_graph_terms(neo4j_driver, query: str) -> list[tuple[str, str]]:
     if not words:
         return []
 
-    candidates = _generate_candidate_subphrases(words)  # (phrase, start, end), longest first
+    candidates = _generate_candidate_subphrases(
+        words
+    )  # (phrase, start, end), longest first
     norm_by_phrase = {phrase: _graph_norm(phrase) for phrase, _, _ in candidates}
 
     existing: set[str] = set()
