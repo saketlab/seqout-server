@@ -466,8 +466,13 @@ def build_search_facets_over_matched(**filters):
 
 
 def build_search_results(
-    q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None,
-    offset=None, **filters
+    q=None,
+    q_variants=None,
+    db=None,
+    cursor_rank=None,
+    cursor_acc=None,
+    offset=None,
+    **filters,
 ):
     """Paginated, relevance-ordered result list over the same filtered match set
     as the facet/total queries — so the list and the sidebar counts always agree.
@@ -492,7 +497,9 @@ def build_search_results(
     sql = (
         _SEARCH_MATCH_CTE
         + ", filtered AS (\n"
-        + "    SELECT * FROM matched" + where + "\n"
+        + "    SELECT * FROM matched"
+        + where
+        + "\n"
         + "),\n"
         + "counted AS (\n"
         # total deferred to /search/facets — see SEARCH_SQL note.
@@ -3384,8 +3391,7 @@ SITEMAP_TABLES = {
         "ena_experiments",
         "experiment_accession",
         True,
-        "((experiment_accession >= 'DRX' AND experiment_accession < 'DRY') "
-        "OR (experiment_accession >= 'ERX' AND experiment_accession < 'ERY'))",
+        "experiment_accession >= 'DRX' AND experiment_accession < 'ERY'",
     ),
     "run": ("sra_run_download_links", "run_accession", False, None),
     "geo_sample": ("geo_samples", "accession", False, None),
@@ -3406,9 +3412,7 @@ def _sitemap_accessions_sql(
     return f"{select} FROM {table}{where_clause} ORDER BY {col} LIMIT %s OFFSET %s;"
 
 
-def _sitemap_count_expr(
-    table: str, col: str, distinct: bool, where: str | None
-) -> str:
+def _sitemap_count_expr(table: str, col: str, distinct: bool, where: str | None) -> str:
     reltuples = (
         f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
     )
@@ -3424,9 +3428,7 @@ def _sitemap_count_expr(
     )
 
 
-def _sitemap_keyset_sql(
-    table: str, col: str, distinct: bool, where: str | None
-) -> str:
+def _sitemap_keyset_sql(table: str, col: str, distinct: bool, where: str | None) -> str:
     # Keyset page from a precomputed boundary: O(limit) at any depth, vs OFFSET.
     select = (
         f"SELECT DISTINCT {col} AS accession"
@@ -3434,9 +3436,7 @@ def _sitemap_keyset_sql(
         else f"SELECT {col} AS accession"
     )
     extra = f" AND {where}" if where else ""
-    return (
-        f"{select} FROM {table} WHERE {col} >= %s{extra} ORDER BY {col} LIMIT %s;"
-    )
+    return f"{select} FROM {table} WHERE {col} >= %s{extra} ORDER BY {col} LIMIT %s;"
 
 
 SITEMAP_ACCESSIONS_SQL = {
@@ -3470,7 +3470,7 @@ SITEMAP_COUNTS_SQL = (
 )
 
 
-# reltuples estimates (not exact) 
+# reltuples estimates (not exact)
 def _reltuples(table: str) -> str:
     return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
 
