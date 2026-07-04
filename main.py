@@ -3254,11 +3254,13 @@ def search(
         v not in (None, False, []) for v in sidebar_filters.values()
     )
 
-    # Sidebar-filtered search: relevance-ordered, server-side filters, paginated
-    # over the same match set as the facets so list and counts agree. (Custom
-    # sortby is ignored here — filtering implies relevance order.)
+    # Sidebar-filtered search: server-side filters, paginated over the same match
+    # set as the facets so list and counts agree. Honors sortby (default
+    # relevance) so filtered results order the same as unfiltered.
     if has_filter:
-        return _search_filtered(q, db, cursor_rank, cursor_acc, sidebar_filters, offset)
+        return _search_filtered(
+            q, db, cursor_rank, cursor_acc, sidebar_filters, offset, sortby, order
+        )
 
     # Skip accession shortcut when paging (offset > 0): it returns a fixed small
     # set, so it only makes sense on the first page.
@@ -3431,7 +3433,9 @@ def search(
     return result
 
 
-def _search_filtered(q, db, cursor_rank, cursor_acc, filters, offset=None):
+def _search_filtered(
+    q, db, cursor_rank, cursor_acc, filters, offset=None, sortby=None, order="desc"
+):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
     next_cursor)."""
@@ -3447,6 +3451,8 @@ def _search_filtered(q, db, cursor_rank, cursor_acc, filters, offset=None):
                 cursor_rank=cursor_rank,
                 cursor_acc=cursor_acc,
                 offset=offset,
+                sortby=sortby,
+                order=order,
                 **filters,
             )
             with conn.cursor(row_factory=dict_row) as cur:

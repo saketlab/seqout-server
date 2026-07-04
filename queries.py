@@ -467,15 +467,17 @@ def build_search_facets_over_matched(**filters):
 
 def build_search_results(
     q=None, q_variants=None, db=None, cursor_rank=None, cursor_acc=None,
-    offset=None, **filters
+    offset=None, sortby=None, order="desc", **filters
 ):
-    """Paginated, relevance-ordered result list over the same filtered match set
-    as the facet/total queries — so the list and the sidebar counts always agree.
+    """Paginated result list over the same filtered match set as the facet/total
+    queries — so the list and the sidebar counts always agree.
 
-    All active filters apply (no exclude-self). Keyset paginated on (rank,
-    accession), 200/page. total_count is NULL — the exact total is deferred to
-    /search/facets. Returns (sql, params) with %(name)s params and the same
-    column layout as SEARCH_SQL.
+    Default order is relevance (rank). `sortby` (year|citations|journal) overrides
+    it with the same sort expression as build_sorted_search_sql, so filtered and
+    unfiltered results order identically. All active filters apply (no
+    exclude-self). Offset-paginated, 200/page. total_count is NULL — the exact
+    total is deferred to /search/facets. Returns (sql, params) with %(name)s
+    params and the same column layout as SEARCH_SQL.
     """
     params = {
         "q": q,
@@ -488,6 +490,25 @@ def build_search_results(
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
     conds = list(dim_clauses.values()) + always_clauses
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
+
+    # Sort mirrors build_sorted_search_sql. Offset paginates (the keyset cursor
+    # below is only exercised by the unsorted geo path), so re-ordering the final
+    # SELECT is all that's needed.
+    if sortby in ("citations", "journal", "year"):
+        direction = "DESC" if order == "desc" else "ASC"
+        if sortby == "citations":
+            sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
+            join_clause = " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+        elif sortby == "journal":
+            sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
+            join_clause = " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+        else:  # year
+            sort_expr = "COALESCE(paged.updated_at::date, '1970-01-01'::date)"
+            join_clause = ""
+        order_by = f"ORDER BY {sort_expr} {direction} NULLS LAST, paged.accession {direction}"
+    else:
+        join_clause = ""
+        order_by = "ORDER BY paged.rank DESC, paged.accession DESC"
 
     sql = (
         _SEARCH_MATCH_CTE
@@ -503,10 +524,11 @@ def build_search_results(
         + "    WHERE (%(cursor_rank)s::float8 IS NULL\n"
         + "           OR (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text))\n"
         + ")\n"
-        + "SELECT accession, title, summary, updated_at, organisms, countries,\n"
-        + "       rank, source, total_count, instrument_models, library_strategies\n"
-        + "FROM paged\n"
-        + "ORDER BY rank DESC, accession DESC\n"
+        + "SELECT paged.accession, paged.title, paged.summary, paged.updated_at,\n"
+        + "       paged.organisms, paged.countries, paged.rank, paged.source,\n"
+        + "       paged.total_count, paged.instrument_models, paged.library_strategies\n"
+        + "FROM paged" + join_clause + "\n"
+        + order_by + "\n"
         + "OFFSET COALESCE(%(offset)s::bigint, 0)\n"
         + "LIMIT 200;"
     )
