@@ -224,11 +224,24 @@ if __name__ == "__main__":
     assert clean_values(None) == []
 
     rows = [
-        {"accession": "GSE1", "x": 1.0, "y": 2.0,
-         "countries": ["US", "----------"], "clusters": {"cluster_l0": 5, "cluster_l4": 2},
-         "tissue": "brain", "assay": "scRNA-seq, 10x"},
-        {"accession": "SRP2", "x": 3.0, "y": 4.0, "countries": None, "clusters": {},
-         "tissue": None, "assay": None},
+        {
+            "accession": "GSE1",
+            "x": 1.0,
+            "y": 2.0,
+            "countries": ["US", "----------"],
+            "clusters": {"cluster_l0": 5, "cluster_l4": 2},
+            "tissue": "brain",
+            "assay": "scRNA-seq, 10x",
+        },
+        {
+            "accession": "SRP2",
+            "x": 3.0,
+            "y": 4.0,
+            "countries": None,
+            "clusters": {},
+            "tissue": None,
+            "assay": None,
+        },
     ]
     dicts = _layer_dictionaries(rows, ["cluster_l0", "cluster_l4"])
     assert dicts["cluster_l0"].to_pylist() == ["-1", "5"]  # SRP2 noise(-1) + GSE1's 5
@@ -241,8 +254,16 @@ if __name__ == "__main__":
         # as one field (it's quoted), not split the row.
         with open(p, newline="") as f:
             parsed = list(csv.reader(f))
-        assert parsed[0] == ["x", "y", "accession", "countries", "tissue", "assay",
-                             "cluster_l0", "cluster_l4"], parsed[0]
+        assert parsed[0] == [
+            "x",
+            "y",
+            "accession",
+            "countries",
+            "tissue",
+            "assay",
+            "cluster_l0",
+            "cluster_l4",
+        ], parsed[0]
         assert parsed[1][2] == "GSE1" and parsed[1][4] == "brain"
         assert parsed[1][5] == "scRNA-seq, 10x"  # comma preserved inside the field
         assert parsed[1][6:] == ["5", "2"]

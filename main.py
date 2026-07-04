@@ -293,7 +293,7 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
-# Enriched per-sample facets (from ontology_samples_v3) aggregated per project and
+# Enriched per-sample facets (from ontology_samples_v4) aggregated per project and
 # baked into the map tiles as ;-joined columns, so the map sidebar can offer the
 # same multi-select filtering it does for countries. Keep this list small — every
 # column here is force-loaded with each tile the frontend downloads, and gets its
@@ -339,7 +339,7 @@ WITH combined AS (
 enriched_agg AS (
     SELECT study_accession AS accession,
         {_MAP_ENRICHED_AGG}
-    FROM ontology_samples_v3
+    FROM ontology_samples_v4
     GROUP BY study_accession
 )
 SELECT
@@ -837,8 +837,9 @@ def _fetch_study_experiments(
     # in Python without timing out, so paginate in SQL. ENA already ORDERs via
     # DISTINCT ON; SRA needs an explicit deterministic ORDER BY.
     base = sql.rstrip().rstrip(";")
-    paged = base + ("\nLIMIT %s OFFSET %s" if is_ena else
-                    "\nORDER BY accession\nLIMIT %s OFFSET %s")
+    paged = base + (
+        "\nLIMIT %s OFFSET %s" if is_ena else "\nORDER BY accession\nLIMIT %s OFFSET %s"
+    )
     cur.execute(paged, (study, limit, offset))
     return cur.fetchall()
 
@@ -1368,7 +1369,7 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # One-time build query: the per-project enriched mode() aggregation
-                # over all of ontology_samples_v3 can exceed the default 30s
+                # over all of ontology_samples_v4 can exceed the default 30s
                 # statement_timeout. Raise it just for this query (explicit
                 # transaction so SET LOCAL actually applies under autocommit, and
                 # auto-resets when the block ends).
@@ -1526,9 +1527,11 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             cached_rev, _, cached = _MAP_CURRENT_FILE.read_text().strip().partition(":")
         except OSError:
             cached_rev, cached = "", ""
-        if cached_rev == _MAP_ASSET_REV and _MAP_ID_RE.match(cached) and (
-            _MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather"
-        ).exists():
+        if (
+            cached_rev == _MAP_ASSET_REV
+            and _MAP_ID_RE.match(cached)
+            and (_MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather").exists()
+        ):
             version_dir = _MAP_ASSETS_DIR / cached
             _prune_old_map_versions(cached)
             _map_assets_state.update(ready=True, version=cached, dir=version_dir)
@@ -3250,9 +3253,7 @@ def search(
         "year_from": year_from,
         "year_to": year_to,
     }
-    has_filter = any(
-        v not in (None, False, []) for v in sidebar_filters.values()
-    )
+    has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
 
     # Sidebar-filtered search: server-side filters, paginated over the same match
     # set as the facets so list and counts agree. Honors sortby (default
@@ -3522,7 +3523,9 @@ def _compute_search_facets(
                                     {"value": r["value"], "count": r["count"]}
                                 )
                     except Exception:
-                        logger.warning("Search facets degraded (timeout?)", exc_info=True)
+                        logger.warning(
+                            "Search facets degraded (timeout?)", exc_info=True
+                        )
     except Exception:
         logger.exception("Database error computing search facets")
         return {}, None
@@ -3626,14 +3629,24 @@ def get_project(
                     _enrich_with_publications([row], cur)
                     if is_geo_project and geo_contributor_authors:
                         row["authors"] = geo_contributor_authors
+                    # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP, not the PRJ.
+                    enrich_acc = accession
+                    if accession.startswith("PRJ"):
+                        gse, srp = (r := _resolve_prj(cur, accession))["gse"], r["srp"]
+                        if gse and not row.get("alias"):
+                            row["alias"] = gse
+                        xref = {k: v for k, v in (("GEO", gse), ("SRA", srp)) if v}
+                        if xref and not row.get("external_id"):
+                            row["external_id"] = xref
+                        enrich_acc = gse or srp or accession
                     # Cheap existence probe so the UI can show/hide the Enriched
                     # tab without eagerly loading the heavy enriched payload.
                     cur.execute(
-                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s)"
-                        " OR EXISTS(SELECT 1 FROM enriched_samples_v3 WHERE study_accession = %s)"
+                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
+                        " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
                         " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                         " AS has_enriched",
-                        (accession, accession, accession),
+                        (enrich_acc, enrich_acc, enrich_acc),
                     )
                     row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
     except Exception as e:
@@ -7339,6 +7352,30 @@ def get_project_enriched(
     return result
 
 
+def _resolve_prj(cur, accession: str) -> dict:
+    """PRJ* -> {"gse", "srp"}. PRJNA checks geo_series first; all check sra_studies."""
+    gse = None
+    if accession.upper().startswith("PRJNA"):
+        cur.execute(PRJNA_TO_GEO_SERIES_SQL, (accession,))
+        row = cur.fetchone()
+        gse = row["accession"] if row else None
+    cur.execute(PRJ_TO_SRA_STUDY_SQL, (accession,))
+    row = cur.fetchone()
+    return {"gse": gse, "srp": row["accession"] if row else None}
+
+
+def _resolve_enrichment_accession(cur, accession: str) -> str:
+    """Map a PRJ* to the accession enrichment is keyed under (GSE or SRP).
+
+    Enrichment keys on the GEO series / SRA study, not the bare PRJ, so a raw PRJ*
+    404s even when the study is enriched. Unchanged for non-PRJ / unmapped input.
+    """
+    if not accession.upper().startswith("PRJ"):
+        return accession
+    r = _resolve_prj(cur, accession)
+    return r["gse"] or r["srp"] or accession
+
+
 def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
     # ponytail: huge studies (100k+ samples) can't fetch every enriched row per
     # request, so paginate in SQL. Each query already ORDERs BY sample.
@@ -7350,6 +7387,21 @@ def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
             (accession, limit, offset),
         )
     return cur.fetchall()
+
+
+def _fetch_sample_titles(cur, sample_accs: list[str]) -> dict:
+    """Map enriched sample accessions to (title, description). GEO samples live in
+    geo_samples, SRA/ENA in sra_samples; the namespaces are disjoint so a union
+    covers both without resolving the study's archive first."""
+    if not sample_accs:
+        return {}
+    cur.execute(
+        "SELECT accession, title, description FROM geo_samples WHERE accession = ANY(%s) "
+        "UNION ALL "
+        "SELECT accession, title, description FROM sra_samples WHERE accession = ANY(%s)",
+        (sample_accs, sample_accs),
+    )
+    return {r["accession"]: (r["title"], r["description"]) for r in cur.fetchall()}
 
 
 def _fetch_project_enriched(
@@ -7370,13 +7422,16 @@ def _fetch_project_enriched(
     # paginates in SQL.
     page_limit = None if sample_filter is not None else limit
 
+    # PRJ* accessions are keyed under their GSE/SRP in the enrichment tables.
+    accession = _resolve_enrichment_accession(cur, accession)
+
     cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
     study = cur.fetchone()
     if study:
         # Pick the source once (per-study, offset-independent) so paginated pages
         # stay on the same table instead of an empty page tripping the fallback.
         cur.execute(
-            "SELECT 1 FROM ontology_samples_v3 WHERE study_accession = %s LIMIT 1",
+            "SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s LIMIT 1",
             (accession,),
         )
         sql = ONTOLOGY_SAMPLES_V3_SQL if cur.fetchone() else ENRICHED_SAMPLES_V3_SQL
@@ -7410,6 +7465,12 @@ def _fetch_project_enriched(
 
     for s in samples:
         s["low_confidence_tags"] = low_confidence.get(s.get("sample"), [])
+
+    titles = _fetch_sample_titles(cur, sample_accs)
+    for s in samples:
+        td = titles.get(s.get("sample"))
+        s["title"] = td[0] if td else None
+        s["description"] = td[1] if td else None
 
     if human_readable_age:
         for s in samples:
