@@ -45,11 +45,16 @@ WHERE NOT child IN cluster
 WITH DISTINCT child
 ORDER BY child.name
 LIMIT 300
+// has_children (synonym-transparent): anchor the grandchild match on the bound
+// nodes of each child's MAPS_TO cluster. The old `(gc)-[...]->(x) WHERE x IN
+// ccluster` left x unbound, so it scanned EVERY hierarchy edge in the graph per
+// child (brain: 18s). Anchoring on `c` makes it a pointer chase (brain: ~0.1s).
 OPTIONAL MATCH (child)-[:MAPS_TO*0..2]-(cc:Term)
 WITH child, collect(DISTINCT cc) AS ccluster
-OPTIONAL MATCH (gc:Term)-[:SUBCLASS_OF|PART_OF]->(x)
-WHERE x IN ccluster
-RETURN child.name AS name, count(DISTINCT gc) > 0 AS has_children
+UNWIND ccluster AS c
+OPTIONAL MATCH (gc:Term)-[:SUBCLASS_OF|PART_OF]->(c)
+WITH child, count(gc) AS gcount
+RETURN child.name AS name, gcount > 0 AS has_children
 ORDER BY name
 """
 
