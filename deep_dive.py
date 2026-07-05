@@ -45,16 +45,11 @@ WHERE NOT child IN cluster
 WITH DISTINCT child
 ORDER BY child.name
 LIMIT 300
-// has_children (synonym-transparent): anchor the grandchild match on the bound
-// nodes of each child's MAPS_TO cluster. The old `(gc)-[...]->(x) WHERE x IN
-// ccluster` left x unbound, so it scanned EVERY hierarchy edge in the graph per
-// child (brain: 18s). Anchoring on `c` makes it a pointer chase (brain: ~0.1s).
-OPTIONAL MATCH (child)-[:MAPS_TO*0..2]-(cc:Term)
-WITH child, collect(DISTINCT cc) AS ccluster
-UNWIND ccluster AS c
-OPTIONAL MATCH (gc:Term)-[:SUBCLASS_OF|PART_OF]->(c)
-WITH child, count(gc) AS gcount
-RETURN child.name AS name, gcount > 0 AS has_children
+// has_children is precomputed once by ingest_has_children.py (synonym-transparent,
+// truthful: true iff expanding the node returns >=1 child), so we just read it
+// instead of walking each child's synonym cluster at query time. coalesce guards
+// nodes ingested after the last precompute run — re-run the script to refresh.
+RETURN child.name AS name, coalesce(child.has_children, false) AS has_children
 ORDER BY name
 """
 
