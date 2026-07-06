@@ -2569,6 +2569,7 @@ def _get_country_scoped_filters(country: str, organism: str | None = None) -> di
 @limiter.limit("20/minute")
 def get_global_contributions(
     request: Request,
+    response: Response,
     organism: str | None = Query(
         None, description="Filter by dominant scientific name"
     ),
@@ -2590,6 +2591,9 @@ def get_global_contributions(
             )
         else:
             data = _get_global_contributions_cached()
+            # 2.3MB gzipped, changes only on reindex — let the edge serve it so
+            # every visitor stops re-downloading it from origin (was cf DYNAMIC).
+            response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
     except Exception:
         logger.exception("Database error in get_global_contributions")
         raise HTTPException(500, "Internal server error")
@@ -8141,7 +8145,12 @@ app = combined_app
 
 
 def _prewarm_caches() -> None:
-    for warm in (_ensure_spelling_loaded, _get_atlas_payloads):
+    for warm in (
+        _ensure_spelling_loaded,
+        _get_atlas_payloads,
+        _get_global_contributions_cached,  # 17s cold build — never let a user pay it
+        _get_global_contributions_filters,
+    ):
         try:
             warm()
         except Exception:
