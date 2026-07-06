@@ -505,14 +505,20 @@ def build_search_results(
         direction = "DESC" if order == "desc" else "ASC"
         if sortby == "citations":
             sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
-            join_clause = " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+            join_clause = (
+                " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+            )
         elif sortby == "journal":
             sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
-            join_clause = " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+            join_clause = (
+                " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
+            )
         else:  # year
             sort_expr = "COALESCE(paged.updated_at::date, '1970-01-01'::date)"
             join_clause = ""
-        order_by = f"ORDER BY {sort_expr} {direction} NULLS LAST, paged.accession {direction}"
+        order_by = (
+            f"ORDER BY {sort_expr} {direction} NULLS LAST, paged.accession {direction}"
+        )
     else:
         join_clause = ""
         order_by = "ORDER BY paged.rank DESC, paged.accession DESC"
@@ -536,8 +542,11 @@ def build_search_results(
         + "SELECT paged.accession, paged.title, paged.summary, paged.updated_at,\n"
         + "       paged.organisms, paged.countries, paged.rank, paged.source,\n"
         + "       paged.total_count, paged.instrument_models, paged.library_strategies\n"
-        + "FROM paged" + join_clause + "\n"
-        + order_by + "\n"
+        + "FROM paged"
+        + join_clause
+        + "\n"
+        + order_by
+        + "\n"
         + "OFFSET COALESCE(%(offset)s::bigint, 0)\n"
         + "LIMIT 200;"
     )
@@ -3141,6 +3150,21 @@ _global_contributions_available_cols: set[str] = set()
 
 def _build_global_contributions_template(available_cols: set[str]) -> str:
     """Build the template, omitting MODE()/SELECT for columns not in PG."""
+    base_cols = [
+        "ROUND(latitude::numeric, 2) AS lat",
+        "ROUND(longitude::numeric, 2) AS lng",
+        "source",
+        "n_experiments",
+        "n_samples",
+        "country",
+        "country_code",
+        "city",
+        "state",
+        "place_name",
+        "short_label",
+        "center_name",
+        "dominant_scientific_name",
+    ]
     mode_lines = [
         "MODE() WITHIN GROUP (ORDER BY country) AS country",
         "MODE() WITHIN GROUP (ORDER BY country_code) AS country_code",
@@ -3157,6 +3181,7 @@ def _build_global_contributions_template(available_cols: set[str]) -> str:
     ]
     for col in _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS:
         if col in available_cols:
+            base_cols.append(col)
             mode_lines.append(f"MODE() WITHIN GROUP (ORDER BY {col}) AS {col}")
             select_cols.append(f"a.{col}")
         else:
@@ -3165,14 +3190,22 @@ def _build_global_contributions_template(available_cols: set[str]) -> str:
     mode_lines.append("MODE() WITHIN GROUP (ORDER BY center_name) AS center_name")
     select_cols.extend(["a.short_label", "a.center_name"])
 
+    base_block = ",\n        ".join(base_cols)
     mode_block = ",\n        ".join(mode_lines)
     select_block = ", ".join(select_cols)
 
     return f"""
-WITH location_agg AS (
+WITH filtered AS MATERIALIZED (
     SELECT
-        ROUND(latitude::numeric, 2) AS lat,
-        ROUND(longitude::numeric, 2) AS lng,
+        {base_block}
+    FROM unified_metadata
+    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+      AND __WHERE__
+),
+location_agg AS (
+    SELECT
+        lat,
+        lng,
         COUNT(*) AS n_projects,
         COALESCE(SUM(n_experiments), 0)::bigint AS n_experiments,
         COALESCE(SUM(n_samples), 0)::bigint AS n_samples,
@@ -3181,25 +3214,21 @@ WITH location_agg AS (
         COUNT(*) FILTER (WHERE source = 'arrayexpress') AS n_ae,
         COUNT(*) FILTER (WHERE source = 'ena') AS n_ena,
         {mode_block}
-    FROM unified_metadata
-    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-      AND __WHERE__
+    FROM filtered
     GROUP BY 1, 2
 ),
 organism_ranked AS (
     SELECT
-        ROUND(latitude::numeric, 2) AS lat,
-        ROUND(longitude::numeric, 2) AS lng,
+        lat,
+        lng,
         dominant_scientific_name AS organism,
         COUNT(*) AS cnt,
         ROW_NUMBER() OVER (
-            PARTITION BY ROUND(latitude::numeric, 2), ROUND(longitude::numeric, 2)
+            PARTITION BY lat, lng
             ORDER BY COUNT(*) DESC
         ) AS rn
-    FROM unified_metadata
-    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-      AND __WHERE__
-      AND dominant_scientific_name IS NOT NULL
+    FROM filtered
+    WHERE dominant_scientific_name IS NOT NULL
     GROUP BY 1, 2, dominant_scientific_name
 ),
 organism_top5 AS (
@@ -3257,8 +3286,7 @@ def build_global_contributions_sql(
         params.append(address_type)
     where = " AND ".join(conditions)
     sql = _GLOBAL_CONTRIBUTIONS_TEMPLATE.replace("__WHERE__", where)
-    # __WHERE__ appears in 2 CTEs, so each param placeholder is duplicated
-    return sql, params * 2
+    return sql, params
 
 
 def init_global_contributions_schema(pg_conn):
@@ -3286,15 +3314,21 @@ def _build_global_contributions_filters_sql(available_cols: set[str]) -> str:
         if col in available_cols:
             ctes.append((f"{col}_opts", col, col, ""))
 
-    cte_parts = []
+    base_cols = ", ".join(col for _, col, _, _ in ctes)
+    cte_parts = [
+        "base AS MATERIALIZED (\n"
+        f"    SELECT {base_cols}\n"
+        "    FROM unified_metadata\n"
+        "    WHERE latitude IS NOT NULL AND longitude IS NOT NULL\n"
+        ")"
+    ]
     select_parts = []
     for cte_name, col, kind, limit in ctes:
         cte_parts.append(
             f"{cte_name} AS (\n"
             f"    SELECT {col} AS value, COUNT(*) AS count\n"
-            f"    FROM unified_metadata\n"
+            f"    FROM base\n"
             f"    WHERE {col} IS NOT NULL\n"
-            f"      AND latitude IS NOT NULL AND longitude IS NOT NULL\n"
             f"    GROUP BY 1 ORDER BY count DESC\n"
             f"    {limit}\n"
             f")"
@@ -3336,55 +3370,61 @@ def build_country_filters_sql(
     """
     cols = _global_contributions_available_cols or {"place_type", "address_type"}
 
-    ctes_cfg: list[tuple[str, str, str, str, bool]] = [
-        ("organism_opts", "dominant_scientific_name", "organism", "LIMIT 200", False),
-        ("assay_l1_opts", "dominant_assay_l1", "assay_l1", "", True),
-        ("assay_l2_opts", "dominant_assay_l2", "assay_l2", "", True),
+    ctes_cfg: list[tuple[str, str, str, str, str]] = [
+        (
+            "organism_opts",
+            "dominant_scientific_name",
+            "organism",
+            "LIMIT 200",
+            "country_base",
+        ),
+        ("assay_l1_opts", "dominant_assay_l1", "assay_l1", "", "scoped_base"),
+        ("assay_l2_opts", "dominant_assay_l2", "assay_l2", "", "scoped_base"),
     ]
     for col in _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS:
         if col in cols:
-            ctes_cfg.append((f"{col}_opts", col, col, "", True))
+            ctes_cfg.append((f"{col}_opts", col, col, "", "scoped_base"))
 
-    organism_clause = "      AND dominant_scientific_name = %s\n" if organism else ""
+    facet_cols = ", ".join(dict.fromkeys(col for _, col, _, _, _ in ctes_cfg).keys())
+    params: list = [country]
+    scoped_where = ""
+    if organism:
+        scoped_where = "WHERE dominant_scientific_name = %s"
+        params.append(organism)
 
-    params: list = []
-    cte_parts = []
+    cte_parts = [
+        "country_base AS MATERIALIZED (\n"
+        f"    SELECT {facet_cols}\n"
+        "    FROM unified_metadata\n"
+        "    WHERE latitude IS NOT NULL AND longitude IS NOT NULL\n"
+        "      AND country = %s\n"
+        "),\n"
+        "scoped_base AS MATERIALIZED (\n"
+        "    SELECT *\n"
+        "    FROM country_base\n"
+        f"    {scoped_where}\n"
+        ")"
+    ]
     select_parts = []
 
-    for cte_name, col, kind, limit, use_organism in ctes_cfg:
-        extra = organism_clause if use_organism else ""
+    for cte_name, col, kind, limit, source in ctes_cfg:
         cte_parts.append(
             f"{cte_name} AS (\n"
             f"    SELECT {col} AS value, COUNT(*) AS count\n"
-            f"    FROM unified_metadata\n"
+            f"    FROM {source}\n"
             f"    WHERE {col} IS NOT NULL\n"
-            f"      AND latitude IS NOT NULL AND longitude IS NOT NULL\n"
-            f"      AND country = %s\n"
-            + extra
-            + f"    GROUP BY 1 ORDER BY count DESC\n"
+            f"    GROUP BY 1 ORDER BY count DESC\n"
             f"    {limit}\n"
             f")"
         )
-        params.append(country)
-        if use_organism and organism:
-            params.append(organism)
         select_parts.append(f"SELECT '{kind}' AS kind, value, count FROM {cte_name}")
-
-    totals_where = "country = %s"
-    params_for_totals = [country]
-    if organism:
-        totals_where += " AND dominant_scientific_name = %s"
-        params_for_totals.append(organism)
 
     cte_parts.append(
         f"totals AS (\n"
         f"    SELECT COUNT(*) AS count\n"
-        f"    FROM unified_metadata\n"
-        f"    WHERE latitude IS NOT NULL AND longitude IS NOT NULL\n"
-        f"      AND {totals_where}\n"
+        f"    FROM scoped_base\n"
         f")"
     )
-    params.extend(params_for_totals)
     select_parts.append("SELECT 'total' AS kind, NULL AS value, count FROM totals")
 
     sql = (

@@ -201,6 +201,10 @@ MAX_BULK_ACCESSIONS = 100
 MAX_COUNTRY_ACCESSIONS = 50_000
 MAX_METADATA_ROWS = 200_000
 _MAX_CROSSTAB_CACHE_ENTRIES = 200
+_MAX_GLOBAL_CONTRIBUTION_QUERY_CACHE_ENTRIES = 200
+_MAX_COUNTRY_FILTERS_CACHE_ENTRIES = 500
+_MAX_COUNTRY_ACCESSIONS_CACHE_ENTRIES = 100
+_STATS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
 
 
 def _require_bulk_limit(accessions: list) -> None:
@@ -293,12 +297,6 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
-# Enriched per-sample facets (from ontology_samples_v4) aggregated per project and
-# baked into the map tiles as ;-joined columns, so the map sidebar can offer the
-# same multi-select filtering it does for countries. Keep this list small — every
-# column here is force-loaded with each tile the frontend downloads, and gets its
-# own distinct-values sidecar JSON. Bump _MAP_ASSET_REV when changing it so clients
-# rebuild.
 MAP_FILTER_COLUMNS = ["organism", "tissue", "disease", "assay"]
 MAP_FILTER_LABELS = {
     "organism": "Organism",
@@ -307,10 +305,6 @@ MAP_FILTER_LABELS = {
     "assay": "Assay",
 }
 
-# Dominant value per facet per project: mode() = the most frequent non-empty
-# sample value (NULL when the project has no enriched samples). Each project
-# therefore carries one tissue, one disease, etc. — what the study is mostly
-# about — rather than the union. Returns a scalar; map_assets handles it.
 _MAP_ENRICHED_AGG = ",\n        ".join(
     f"mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
     f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '') AS {c}"
@@ -318,13 +312,6 @@ _MAP_ENRICHED_AGG = ",\n        ".join(
 )
 _MAP_ENRICHED_COLS = "".join(f",\n    e.{c}" for c in MAP_FILTER_COLUMNS)
 
-# Map points: every plottable dataset across the three sources shares one 2D
-# coordinate space and one (hierarchical) cluster space. coords_2d is NULL for
-# alias rows (not embedded), so we filter those out. `clusters` is the per-dataset
-# jsonb of layer-wise memberships ({"cluster_l3": 307, ...}); a missing layer key
-# means the dataset is noise at that layer. Enriched facets are LEFT JOINed per
-# project (study_accession == canonical map accession), each reduced to its
-# dominant sample value; projects with no enriched samples get NULL (no facet).
 MAP_POINTS_SQL = f"""
 WITH combined AS (
     SELECT accession, coords_2d, countries_iso AS countries, clusters
@@ -357,18 +344,12 @@ WHERE array_length(coords_2d, 1) >= 2
 ORDER BY combined.accession;
 """
 
-# One label per cluster per layer, at the cluster centroid (same coordinate space
-# as coords_2d). size = member count, used for label priority / font scaling.
 CLUSTER_LABELS_SQL = """
 SELECT level, cluster_id, label, size, centroid_x, centroid_y
 FROM cluster_labels
 ORDER BY level, cluster_id;
 """
 
-# Labels for one layer within a viewport, biggest-first. Powers the dynamic
-# /map/labels endpoint — the frontend asks for just the layer matching the
-# current zoom and just the on-screen bbox, so only a few hundred labels are ever
-# sent/rendered instead of the whole (potentially many-thousand) label set.
 CLUSTER_LABELS_BBOX_SQL = """
 SELECT cluster_id, label, size, centroid_x, centroid_y
 FROM cluster_labels
@@ -408,6 +389,12 @@ _organism_totals_cache_lock = threading.Lock()
 _organism_totals_cache: dict[str, dict] = {}  # cache_key -> {data, built_at}
 _global_contributions_cache_lock = threading.Lock()
 _global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
+_global_contributions_query_cache_lock = threading.Lock()
+_global_contributions_query_cache: dict[tuple, dict] = {}
+_country_filters_cache_lock = threading.Lock()
+_country_filters_cache: dict[tuple, dict] = {}
+_country_accessions_cache_lock = threading.Lock()
+_country_accessions_cache: dict[tuple, dict] = {}
 _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
 _source_totals_cache_lock = threading.Lock()
@@ -432,9 +419,6 @@ def _configure_connection(conn) -> None:
 pool = ConnectionPool(
     os.environ["DATABASE_URL"],
     min_size=4,
-    # ponytail: fewer, busier connections warm their per-connection plan cache;
-    # 100 connections each needed prepare_threshold hits before caching, so most
-    # never did. prepare_threshold=2 warms plans after 2 hits instead of 5.
     max_size=20,
     timeout=10,
     kwargs={"autocommit": True, "prepare_threshold": 2},
@@ -643,11 +627,6 @@ def _accession_source(acc: str) -> str | None:
 
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     """Batch-lookup publications and center names, merge into result rows.
-
-    Adds the full `publications` JSONB array plus top-level convenience fields
-    from the primary (most-cited) publication: pmid, publication_title,
-    journal, doi, citation_count, authors.
-
     Always sets `center_name` from unified_metadata.
     For studies without publication authors, falls back to center_name.
     """
@@ -773,8 +752,6 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
 def _fetch_geo_series_samples(
     cur, accession: str, source: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
-    # ponytail: always ORDER BY in SQL for deterministic pages; LIMIT/OFFSET only
-    # when paginating, so huge series don't fetch+sort every row in Python.
     if source == "arrayexpress":
         sql = AE_EXPERIMENT_SAMPLES_SQL.rstrip().rstrip(";")
         sql += "\nORDER BY COALESCE(ena_run, ena_experiment, source_name)"
@@ -833,9 +810,6 @@ def _fetch_study_experiments(
     if limit is None:
         cur.execute(sql, (study,))
         return cur.fetchall()
-    # ponytail: huge studies (100k+ experiments) can't be fully fetched + sliced
-    # in Python without timing out, so paginate in SQL. ENA already ORDERs via
-    # DISTINCT ON; SRA needs an explicit deterministic ORDER BY.
     base = sql.rstrip().rstrip(";")
     paged = base + (
         "\nLIMIT %s OFFSET %s" if is_ena else "\nORDER BY accession\nLIMIT %s OFFSET %s"
@@ -870,12 +844,7 @@ def _fetch_sample(cur, accession: str) -> dict | None:
 
 
 def _fetch_samples_batch(cur, accessions) -> dict[str, dict]:
-    """Batch equivalent of _fetch_sample: SRA first, ENA fallback for misses.
-
-    Returns a map keyed by the *input* accession (what experiments reference
-    via samples[0]/_sample_acc), collapsing what used to be 1-2 round-trips
-    per sample into 2 queries total.
-    """
+    """Batch equivalent of _fetch_sample: SRA first, ENA fallback for misses."""
     accs = list(dict.fromkeys(a for a in accessions if a))
     if not accs:
         return {}
@@ -1625,6 +1594,33 @@ def _build_growth_data() -> dict:
 _GROWTH_CACHE_TTL = 7 * 24 * 3600  # 7 days in seconds
 
 
+def _normalize_stat_filter(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _get_bounded_cache_entry(cache: dict, key: tuple, ttl: float):
+    entry = cache.get(key)
+    if entry and (time.time() - entry["built_at"]) < ttl:
+        return entry["data"]
+    return None
+
+
+def _set_bounded_cache_entry(
+    cache: dict, key: tuple, data, max_entries: int, ttl: float
+) -> None:
+    now = time.time()
+    stale = [k for k, v in cache.items() if now - v["built_at"] >= ttl]
+    for k in stale:
+        del cache[k]
+    if len(cache) >= max_entries and key not in cache:
+        oldest = min(cache, key=lambda k: cache[k]["built_at"])
+        del cache[oldest]
+    cache[key] = {"data": data, "built_at": now}
+
+
 def _get_growth_data() -> dict:
     with _growth_cache_lock:
         now = time.time()
@@ -1845,6 +1841,12 @@ def purge_cache(request: Request):
         _global_contributions_cache["ready"] = False
     with _global_contributions_filters_cache_lock:
         _global_contributions_filters_cache["ready"] = False
+    with _global_contributions_query_cache_lock:
+        _global_contributions_query_cache.clear()
+    with _country_filters_cache_lock:
+        _country_filters_cache.clear()
+    with _country_accessions_cache_lock:
+        _country_accessions_cache.clear()
     with _organism_growth_cache_lock:
         _organism_growth_cache.clear()
     with _organisms_list_cache_lock:
@@ -2466,6 +2468,35 @@ def _get_global_contributions_cached() -> list[dict]:
         return data
 
 
+def _get_filtered_global_contributions_cached(
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    assay_l2: str | None = None,
+    place_type: str | None = None,
+    address_type: str | None = None,
+) -> list[dict]:
+    key = (organism, assay_l1, assay_l2, place_type, address_type)
+    with _global_contributions_query_cache_lock:
+        cached = _get_bounded_cache_entry(
+            _global_contributions_query_cache, key, _GROWTH_CACHE_TTL
+        )
+        if cached is not None:
+            return cached
+
+    data = _query_global_contributions(
+        organism, assay_l1, assay_l2, place_type, address_type
+    )
+    with _global_contributions_query_cache_lock:
+        _set_bounded_cache_entry(
+            _global_contributions_query_cache,
+            key,
+            data,
+            _MAX_GLOBAL_CONTRIBUTION_QUERY_CACHE_ENTRIES,
+            _GROWTH_CACHE_TTL,
+        )
+    return data
+
+
 _global_contributions_filters_cache_lock = threading.Lock()
 _global_contributions_filters_cache: dict = {
     "ready": False,
@@ -2521,6 +2552,14 @@ def _get_global_contributions_filters() -> dict:
 
 def _get_country_scoped_filters(country: str, organism: str | None = None) -> dict:
     """Return filter options scoped to a specific country (and optionally organism)."""
+    key = (country, organism)
+    with _country_filters_cache_lock:
+        cached = _get_bounded_cache_entry(
+            _country_filters_cache, key, _GROWTH_CACHE_TTL
+        )
+        if cached is not None:
+            return cached
+
     sql, params = build_country_filters_sql(country, organism=organism)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2552,6 +2591,14 @@ def _get_country_scoped_filters(country: str, organism: str | None = None) -> di
         elif kind == "address_type":
             filters["address_type"].append(entry)
 
+    with _country_filters_cache_lock:
+        _set_bounded_cache_entry(
+            _country_filters_cache,
+            key,
+            filters,
+            _MAX_COUNTRY_FILTERS_CACHE_ENTRIES,
+            _GROWTH_CACHE_TTL,
+        )
     return filters
 
 
@@ -2562,7 +2609,7 @@ def _get_country_scoped_filters(country: str, organism: str | None = None) -> di
         "Return aggregated project/experiment/sample counts per geographic location "
         "(latitude/longitude rounded to 2 decimal places) from the unified_metadata table. "
         "Includes source breakdown (GEO/SRA/ArrayExpress/ENA), city, country, and top 5 organisms "
-        "per location. Unfiltered results are cached for 7 days; filtered requests run fresh."
+        "per location. Unfiltered and filtered results are cached for 7 days."
     ),
     operation_id="get_global_contributions",
 )
@@ -2583,21 +2630,25 @@ def get_global_contributions(
     ),
 ):
     t0 = time.perf_counter()
+    organism = _normalize_stat_filter(organism)
+    assay_l1 = _normalize_stat_filter(assay_l1)
+    assay_l2 = _normalize_stat_filter(assay_l2)
+    place_type = _normalize_stat_filter(place_type)
+    address_type = _normalize_stat_filter(address_type)
     has_filters = organism or assay_l1 or assay_l2 or place_type or address_type
     try:
         if has_filters:
-            data = _query_global_contributions(
+            data = _get_filtered_global_contributions_cached(
                 organism, assay_l1, assay_l2, place_type, address_type
             )
         else:
             data = _get_global_contributions_cached()
-            # 2.3MB gzipped, changes only on reindex — let the edge serve it so
-            # every visitor stops re-downloading it from origin (was cf DYNAMIC).
             response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
     except Exception:
         logger.exception("Database error in get_global_contributions")
         raise HTTPException(500, "Internal server error")
 
+    response.headers["Cache-Control"] = _STATS_CACHE_CONTROL
     return {
         "locations": data,
         "total": len(data),
@@ -2611,13 +2662,14 @@ def get_global_contributions(
     description=(
         "Return distinct values for organism, assay_l1, and assay_l2 filters, "
         "ordered by count descending. When country is provided, counts are scoped "
-        "to that country (not cached). Without country, results are cached for 7 days."
+        "to that country. Global and country-scoped results are cached for 7 days."
     ),
     operation_id="get_global_contribution_filters",
 )
 @limiter.limit("20/minute")
 def get_global_contribution_filters(
     request: Request,
+    response: Response,
     country: str | None = Query(
         None, description="Scope filter counts to this country"
     ),
@@ -2627,6 +2679,8 @@ def get_global_contribution_filters(
     ),
 ):
     t0 = time.perf_counter()
+    country = _normalize_stat_filter(country)
+    organism = _normalize_stat_filter(organism)
     try:
         if country:
             filters = _get_country_scoped_filters(country, organism=organism)
@@ -2636,10 +2690,42 @@ def get_global_contribution_filters(
         logger.exception("Database error in get_global_contribution_filters")
         raise HTTPException(500, "Internal server error")
 
+    response.headers["Cache-Control"] = _STATS_CACHE_CONTROL
     return {
         **filters,
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
+
+
+def _get_country_accessions_text(
+    country: str, organism: str | None = None, assay_l2: str | None = None
+) -> str:
+    key = (country, organism, assay_l2, MAX_COUNTRY_ACCESSIONS)
+    with _country_accessions_cache_lock:
+        cached = _get_bounded_cache_entry(
+            _country_accessions_cache, key, _GROWTH_CACHE_TTL
+        )
+        if cached is not None:
+            return cached
+
+    sql, params = build_country_accessions_sql(
+        country, organism=organism, assay_l2=assay_l2, limit=MAX_COUNTRY_ACCESSIONS
+    )
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    text = "\n".join(r[0] for r in rows if r[0])
+
+    with _country_accessions_cache_lock:
+        _set_bounded_cache_entry(
+            _country_accessions_cache,
+            key,
+            text,
+            _MAX_COUNTRY_ACCESSIONS_CACHE_ENTRIES,
+            _GROWTH_CACHE_TTL,
+        )
+    return text
 
 
 @api_app.get(
@@ -2660,18 +2746,20 @@ def get_country_accessions(
     organism: str | None = Query(None, description="Filter by organism"),
     assay_l2: str | None = Query(None, description="Filter by assay type"),
 ):
-    sql, params = build_country_accessions_sql(
-        country, organism=organism, assay_l2=assay_l2, limit=MAX_COUNTRY_ACCESSIONS
-    )
+    country = _normalize_stat_filter(country)
+    organism = _normalize_stat_filter(organism)
+    assay_l2 = _normalize_stat_filter(assay_l2)
+    if not country:
+        raise HTTPException(400, "country is required")
+
     try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+        text = _get_country_accessions_text(
+            country, organism=organism, assay_l2=assay_l2
+        )
     except Exception:
         logger.exception("Database error in get_country_accessions")
         raise HTTPException(500, "Internal server error")
-    return "\n".join(r[0] for r in rows if r[0])
+    return PlainTextResponse(text, headers={"Cache-Control": _STATS_CACHE_CONTROL})
 
 
 @api_app.get(
@@ -3511,14 +3599,8 @@ def _compute_search_facets(
                     tsql, tparams = build_search_total_over_matched(**filters)
                     cur.execute(tsql, tparams)
                     total = cur.fetchone()["total"]
-                    # Facets: best-effort. A timeout rolls back only this savepoint
-                    # (the total, already fetched, is unaffected); the temp table
-                    # lives in the outer transaction.
                     try:
                         with conn.transaction():
-                            # ponytail: cap pathological broad-term faceting (e.g.
-                            # "human") so it degrades to {} instead of hanging. Bump
-                            # if real queries start losing facets.
                             cur.execute("SET LOCAL statement_timeout = 10000")
                             fsql, fparams = build_search_facets_over_matched(**filters)
                             cur.execute(fsql, fparams)
@@ -6046,7 +6128,6 @@ def get_common_name_by_scientific_name(
 @limiter.limit("100/minute")
 def get_common_names_by_scientific_names(
     request: Request,
-    # ponytail: 200 cap matches the facet top-N; the UI never asks for more.
     scientific_name: list[str] = Query(..., min_length=1, max_length=200),
 ):
     names = sorted({n.strip().lower() for n in scientific_name if n.strip()})
@@ -7381,8 +7462,6 @@ def _resolve_enrichment_accession(cur, accession: str) -> str:
 
 
 def _exec_enriched_samples(cur, sql, accession, limit, offset) -> list[dict]:
-    # ponytail: huge studies (100k+ samples) can't fetch every enriched row per
-    # request, so paginate in SQL. Each query already ORDERs BY sample.
     if limit is None:
         cur.execute(sql, (accession,))
     else:
@@ -7422,8 +7501,6 @@ def _fetch_project_enriched(
     returned (used by the experiment/run-scoped endpoints); pagination is
     ignored in that case since those callers need the full set to filter.
     """
-    # Scoped callers filter in Python and need every row; the public endpoint
-    # paginates in SQL.
     page_limit = None if sample_filter is not None else limit
 
     # PRJ* accessions are keyed under their GSE/SRP in the enrichment tables.
@@ -8148,7 +8225,7 @@ def _prewarm_caches() -> None:
     for warm in (
         _ensure_spelling_loaded,
         _get_atlas_payloads,
-        _get_global_contributions_cached,  # 17s cold build — never let a user pay it
+        _get_global_contributions_cached,
         _get_global_contributions_filters,
     ):
         try:
