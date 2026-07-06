@@ -213,6 +213,12 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
     if not normalized_query:
         return []
 
+    # Glue a detached sc/sn assay prefix up front ("sc rna"/"sc-rna" -> "scrna") so
+    # the pieces are never matched as separate terms. Otherwise "sc rna" expands
+    # "sc" and "rna" independently and their cross-product buries the real scrna
+    # cluster past the variant cap. Allowlisted stems only (see _SC_GLUE_RE).
+    normalized_query = _glue_sc_prefix(normalized_query)
+
     # Separate "seq" suffix if attached to another word
     separated_query = re.sub(
         r"\b([a-zA-Z0-9]+)(seq)\b",
@@ -225,12 +231,6 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
     queries_to_expand = [normalized_query]
     if separated_query.lower() != normalized_query.lower():
         queries_to_expand.append(separated_query)
-
-    # Glue a detached sc/sn assay prefix ("sc rna seq" -> "scrna seq") as an extra
-    # form. Union only — the original stays, so a non-matching glue costs nothing.
-    glued_query = _glue_sc_prefix(separated_query)
-    if glued_query.lower() not in {q.lower() for q in queries_to_expand}:
-        queries_to_expand.append(glued_query)
 
     all_variants: list[str] = []
 

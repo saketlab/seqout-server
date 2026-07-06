@@ -975,7 +975,11 @@ all_matches AS (
            50.0::float8 AS rank, 'arrayexpress'::text AS source, 13 AS priority,
            COALESCE(e.alias, e.accession) AS dedup_key
     FROM arrayexpress_experiments e
-    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    CROSS JOIN LATERAL jsonb_array_elements(
+        -- ponytail: organizations is a JSONB 'null' scalar on many rows; guard
+        CASE WHEN jsonb_typeof(e.organizations) = 'array'
+             THEN e.organizations ELSE '[]'::jsonb END
+    ) AS org
     WHERE org->>'name' ILIKE '%%' || %s || '%%'
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
@@ -1521,7 +1525,9 @@ expanded AS (
     SELECT
         (n->>'accession')::text AS accession,
         COALESCE((n->>'distance')::float, (n->>'score')::float, 0.0) AS distance
-    FROM base, jsonb_array_elements(base.neighbors) AS n
+    -- ponytail: neighbors is jsonb[] (a Postgres array), not a jsonb array,
+    -- so use unnest(); jsonb_array_elements() errors on this type
+    FROM base, unnest(base.neighbors) AS n
     ORDER BY 2 ASC
     LIMIT %(limit)s
 )
@@ -1727,7 +1733,11 @@ all_matches AS (
     SELECT DISTINCT e.accession,
            50.0::float8 AS rank, 'arrayexpress'::text AS source, 3 AS priority
     FROM arrayexpress_experiments e
-    CROSS JOIN LATERAL jsonb_array_elements(e.organizations) AS org
+    CROSS JOIN LATERAL jsonb_array_elements(
+        -- ponytail: organizations is a JSONB 'null' scalar on many rows; guard
+        CASE WHEN jsonb_typeof(e.organizations) = 'array'
+             THEN e.organizations ELSE '[]'::jsonb END
+    ) AS org
     WHERE org->>'name' ILIKE '%%' || %s || '%%'
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) >= %s::int)
       AND (%s::int IS NULL OR EXTRACT(YEAR FROM e.release_date) <= %s::int)
@@ -2834,7 +2844,10 @@ FROM sra_run_download_links dl,
              MAX(a->>'url') FILTER (
                  WHERE a->>'url' LIKE 's3://%%'
              ) AS s3_url
-         FROM jsonb_array_elements(f->'alternatives') AS a
+         FROM jsonb_array_elements(
+                  CASE WHEN jsonb_typeof(f->'alternatives') = 'array'
+                       THEN f->'alternatives' ELSE '[]'::jsonb END
+              ) AS a
      ) alt
 WHERE dl.study_accession IN (SELECT acc FROM candidates)
   AND f->>'supertype' = 'Original'
