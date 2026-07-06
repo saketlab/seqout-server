@@ -1,5 +1,9 @@
 """SQL queries for pysradb-server"""
 
+import math
+
+_EARTH_RADIUS_KM = 6371.0088
+
 STUDY_PUBLICATIONS_BATCH_SQL = """
 SELECT accession, publications
 FROM study_publications
@@ -1766,6 +1770,46 @@ LIMIT %s;
 """
 
 
+def _geo_radius_bounds(
+    lat: float, lng: float, radius_km: float
+) -> dict[str, float | bool]:
+    angular_radius = radius_km / _EARTH_RADIUS_KM
+    lat_delta = math.degrees(angular_radius)
+    lat_min = max(-90.0, lat - lat_delta)
+    lat_max = min(90.0, lat + lat_delta)
+
+    if (
+        radius_km >= (math.pi * _EARTH_RADIUS_KM / 2)
+        or lat_min <= -90.0
+        or lat_max >= 90.0
+        or abs(math.cos(math.radians(lat))) < 1e-12
+    ):
+        return {
+            "lat_min": lat_min,
+            "lat_max": lat_max,
+            "all_longitudes": True,
+        }
+
+    lng_delta = math.degrees(
+        math.asin(min(1.0, math.sin(angular_radius) / math.cos(math.radians(lat))))
+    )
+    lng_min = lng - lng_delta
+    lng_max = lng + lng_delta
+    crosses_antimeridian = lng_min < -180.0 or lng_max > 180.0
+    if crosses_antimeridian:
+        lng_min = ((lng_min + 180.0) % 360.0) - 180.0
+        lng_max = ((lng_max + 180.0) % 360.0) - 180.0
+
+    return {
+        "lat_min": lat_min,
+        "lat_max": lat_max,
+        "lng_min": lng_min,
+        "lng_max": lng_max,
+        "all_longitudes": False,
+        "crosses_antimeridian": crosses_antimeridian,
+    }
+
+
 def _build_geo_cte(params, assay_l1=None, assay_l2=None, **geo):
     """Return a CTE string for geo_accessions from unified_metadata, or None."""
     conditions = []
@@ -1797,14 +1841,36 @@ def _build_geo_cte(params, assay_l1=None, assay_l2=None, **geo):
         conditions.append("postcode = %(geo_postcode)s")
         params["geo_postcode"] = geo["geo_postcode"]
     if geo.get("geo_lat") is not None and geo.get("geo_lng") is not None:
-        params["geo_lat"] = geo["geo_lat"]
-        params["geo_lng"] = geo["geo_lng"]
+        geo_lat = float(geo["geo_lat"])
+        geo_lng = float(geo["geo_lng"])
+        params["geo_lat"] = geo_lat
+        params["geo_lng"] = geo_lng
+        conditions.append("latitude BETWEEN -90 AND 90")
+        conditions.append("longitude BETWEEN -180 AND 180")
         if geo.get("geo_radius_km"):
-            params["geo_radius_km"] = geo["geo_radius_km"]
+            geo_radius_km = float(geo["geo_radius_km"])
+            bounds = _geo_radius_bounds(geo_lat, geo_lng, geo_radius_km)
+            params["geo_radius_km"] = geo_radius_km
+            params["geo_lat_min"] = bounds["lat_min"]
+            params["geo_lat_max"] = bounds["lat_max"]
+            conditions.append("latitude BETWEEN %(geo_lat_min)s AND %(geo_lat_max)s")
+            if not bounds["all_longitudes"]:
+                params["geo_lng_min"] = bounds["lng_min"]
+                params["geo_lng_max"] = bounds["lng_max"]
+                if bounds["crosses_antimeridian"]:
+                    conditions.append(
+                        "(longitude >= %(geo_lng_min)s OR longitude <= %(geo_lng_max)s)"
+                    )
+                else:
+                    conditions.append(
+                        "longitude BETWEEN %(geo_lng_min)s AND %(geo_lng_max)s"
+                    )
             conditions.append(
-                "(6371 * acos(LEAST(1.0, cos(radians(%(geo_lat)s)) * cos(radians(latitude))"
-                " * cos(radians(longitude) - radians(%(geo_lng)s))"
-                " + sin(radians(%(geo_lat)s)) * sin(radians(latitude))))) <= %(geo_radius_km)s"
+                "(2 * 6371.0088 * asin(sqrt(LEAST(1.0,"
+                " power(sin(radians(latitude - %(geo_lat)s) / 2), 2)"
+                " + cos(radians(%(geo_lat)s)) * cos(radians(latitude))"
+                " * power(sin(radians(longitude - %(geo_lng)s) / 2), 2)"
+                ")))) <= %(geo_radius_km)s"
             )
         else:
             conditions.append(
@@ -2343,9 +2409,10 @@ SELECT
     accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
-OFFSET COALESCE(%s::bigint, 0)
+OFFSET COALESCE(%(offset)s::bigint, 0)
 LIMIT 200;"""
 
+    params["offset"] = None
     return sql, params
 
 
@@ -2859,6 +2926,21 @@ ORDER BY dl.experiment_accession, dl.run_accession;
 # ---------------------------------------------------------------------------
 # Growth stats: monthly counts per database
 # ---------------------------------------------------------------------------
+
+DATABASE_GROWTH_MONTHLY_SQL = """
+SELECT db, TO_CHAR(month, 'YYYY-MM') AS month, count
+FROM database_growth_monthly
+WHERE metric = %s
+  AND (%s::text IS NULL OR db = %s::text)
+ORDER BY db, month;
+"""
+
+DATABASE_VOLUME_GROWTH_MONTHLY_SQL = """
+SELECT db, TO_CHAR(month, 'YYYY-MM') AS month, count
+FROM database_volume_growth_monthly
+WHERE %s::text IS NULL OR db = %s::text
+ORDER BY db, month;
+"""
 
 # -- Projects mode (studies/series per month) --
 

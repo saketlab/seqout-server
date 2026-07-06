@@ -103,6 +103,9 @@ GENERATED ALWAYS AS (
 CREATE INDEX IF NOT EXISTS ae_experiments_fts_idx ON arrayexpress_experiments USING GIN(tsv);
 CREATE INDEX IF NOT EXISTS ae_experiments_accession_upper_idx ON arrayexpress_experiments (UPPER(accession));
 CREATE INDEX IF NOT EXISTS ae_experiments_organisms_idx ON arrayexpress_experiments USING GIN(organisms);
+CREATE INDEX IF NOT EXISTS idx_ae_experiments_growth_release_accession
+  ON arrayexpress_experiments (release_date, accession)
+  WHERE release_date IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ae_samples_experiment_idx ON arrayexpress_samples (experiment_accession);
 CREATE INDEX IF NOT EXISTS ae_samples_ena_experiment_idx ON arrayexpress_samples (UPPER(ena_experiment));
 CREATE INDEX IF NOT EXISTS ae_samples_ena_run_idx ON arrayexpress_samples (UPPER(ena_run));

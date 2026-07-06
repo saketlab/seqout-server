@@ -237,6 +237,10 @@ CREATE INDEX IF NOT EXISTS idx_ena_exp_country ON ena_experiments (country);
 CREATE INDEX IF NOT EXISTS idx_geo_series_published_at ON geo_series (published_at);
 CREATE INDEX IF NOT EXISTS idx_sra_studies_published_at ON sra_studies (published_at);
 CREATE INDEX IF NOT EXISTS idx_ae_experiments_release_date ON arrayexpress_experiments (release_date);
+CREATE INDEX IF NOT EXISTS idx_ae_experiments_growth_release_accession
+  ON arrayexpress_experiments (release_date, accession)
+  WHERE release_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ae_samples_experiment_idx ON arrayexpress_samples (experiment_accession);
 CREATE INDEX IF NOT EXISTS idx_geo_samples_published_at ON geo_samples (published_at);
 CREATE INDEX IF NOT EXISTS idx_ena_experiments_first_public ON ena_experiments (first_public);
 

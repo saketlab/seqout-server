@@ -75,6 +75,8 @@ from queries import (
     GEO_SERIES_NEIGHBORS_COORDS_SQL,
     GEO_SERIES_SAMPLES_SQL,
     GLOBAL_CONTRIBUTIONS_FILTERS_SQL,
+    DATABASE_GROWTH_MONTHLY_SQL,
+    DATABASE_VOLUME_GROWTH_MONTHLY_SQL,
     GROWTH_BASES_ENA_SQL,
     GROWTH_BYTES_SRA_FASTQ_SQL,
     GROWTH_BYTES_SRA_SRA_SQL,
@@ -381,7 +383,7 @@ _atlas_cache = {
     "labels_etag": "",
 }
 _growth_cache_lock = threading.Lock()
-_growth_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_growth_cache: dict[tuple[str, str | None], dict] = {}
 _MAX_ORGANISM_CACHE_ENTRIES = 500
 _organism_growth_cache_lock = threading.Lock()
 _organism_growth_cache: dict[str, dict] = {}  # key -> {data, built_at}
@@ -1735,36 +1737,91 @@ def _serve_map_file(version: str, rel_path: str) -> FileResponse:
     )
 
 
-def _build_growth_data() -> dict:
-    """Run all growth queries in one connection and return nested dict."""
-    queries = {
-        "projects": {
-            "geo": GROWTH_PROJECTS_GEO_SQL,
-            "sra": GROWTH_PROJECTS_SRA_SQL,
-            "arrayexpress": GROWTH_PROJECTS_AE_SQL,
-            "ena": GROWTH_PROJECTS_ENA_SQL,
-        },
-        "experiments": {
-            "geo": GROWTH_EXPERIMENTS_GEO_SQL,
-            "sra": GROWTH_EXPERIMENTS_SRA_SQL,
-            "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
-            "ena": GROWTH_EXPERIMENTS_ENA_SQL,
-        },
-        "bases": {
-            "ena": GROWTH_BASES_ENA_SQL,
-            "sra_fastq_bytes": GROWTH_BYTES_SRA_FASTQ_SQL,
-            "sra_sra_bytes": GROWTH_BYTES_SRA_SRA_SQL,
-        },
-    }
-    data = {}
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            for mode, dbs in queries.items():
-                data[mode] = {}
-                for db_name, sql in dbs.items():
-                    cur.execute(sql)
-                    data[mode][db_name] = cur.fetchall()
+_GROWTH_SQL_BY_MODE = {
+    "projects": {
+        "geo": GROWTH_PROJECTS_GEO_SQL,
+        "sra": GROWTH_PROJECTS_SRA_SQL,
+        "arrayexpress": GROWTH_PROJECTS_AE_SQL,
+        "ena": GROWTH_PROJECTS_ENA_SQL,
+    },
+    "experiments": {
+        "geo": GROWTH_EXPERIMENTS_GEO_SQL,
+        "sra": GROWTH_EXPERIMENTS_SRA_SQL,
+        "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
+        "ena": GROWTH_EXPERIMENTS_ENA_SQL,
+    },
+    "bases": {
+        "ena": GROWTH_BASES_ENA_SQL,
+        "sra_fastq_bytes": GROWTH_BYTES_SRA_FASTQ_SQL,
+        "sra_sra_bytes": GROWTH_BYTES_SRA_SRA_SQL,
+    },
+}
+
+
+def _growth_relation_name(mode: str) -> str | None:
+    if mode in {"projects", "experiments"}:
+        return "database_growth_monthly"
+    if mode == "bases":
+        return "database_volume_growth_monthly"
+    return None
+
+
+def _growth_relation_exists(conn, mode: str) -> bool:
+    relation_name = _growth_relation_name(mode)
+    if relation_name is None:
+        return False
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT to_regclass(%s) IS NOT NULL AS available",
+            (f"public.{relation_name}",),
+        )
+        row = cur.fetchone()
+    return bool(row and row["available"])
+
+
+def _fetch_growth_relation(conn, mode: str, db: str | None = None) -> dict[str, list]:
+    data = _empty_growth_series(mode, db)
+    if mode == "bases":
+        sql = DATABASE_VOLUME_GROWTH_MONTHLY_SQL
+        params = (db, db)
+    else:
+        sql = DATABASE_GROWTH_MONTHLY_SQL
+        params = (mode, db, db)
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        for row in cur.fetchall():
+            data.setdefault(row["db"], []).append(
+                {"month": row["month"], "count": row["count"]}
+            )
     return data
+
+
+def _empty_growth_series(mode: str, db: str | None = None) -> dict[str, list]:
+    if db:
+        return {db: []}
+    return {db_name: [] for db_name in _GROWTH_SQL_BY_MODE.get(mode, {})}
+
+
+def _build_growth_data(mode: str, db: str | None = None) -> dict:
+    """Run only the requested growth query and return {db: rows}."""
+    db_queries = _GROWTH_SQL_BY_MODE.get(mode)
+    if db_queries is None:
+        return {}
+    if db and db not in db_queries:
+        return {db: []}
+
+    with pool.connection() as conn:
+        if _growth_relation_exists(conn, mode):
+            return _fetch_growth_relation(conn, mode, db)
+
+        selected_queries = {db: db_queries[db]} if db else db_queries
+        data = {}
+        with conn.cursor(row_factory=dict_row) as cur:
+            for db_name, sql in selected_queries.items():
+                cur.execute(sql)
+                data[db_name] = cur.fetchall()
+        return data
 
 
 _GROWTH_CACHE_TTL = 7 * 24 * 3600  # 7 days in seconds
@@ -1797,20 +1854,33 @@ def _set_bounded_cache_entry(
     cache[key] = {"data": data, "built_at": now}
 
 
-def _get_growth_data() -> dict:
+def _get_growth_data(mode: str, db: str | None = None) -> dict:
+    cache_key = (mode, db)
+    full_mode_key = (mode, None)
+    now = time.time()
+    with _growth_cache_lock:
+        if db is not None:
+            full_entry = _growth_cache.get(full_mode_key)
+            if full_entry and (now - full_entry["built_at"]) < _GROWTH_CACHE_TTL:
+                return {db: full_entry["data"].get(db, [])}
+
+        entry = _growth_cache.get(cache_key)
+        if entry and (now - entry["built_at"]) < _GROWTH_CACHE_TTL:
+            return entry["data"]
+
+    data = _build_growth_data(mode, db)
+
     with _growth_cache_lock:
         now = time.time()
-        if (
-            _growth_cache["ready"]
-            and (now - _growth_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _growth_cache["data"]
-
-        data = _build_growth_data()
-        _growth_cache["ready"] = True
-        _growth_cache["data"] = data
-        _growth_cache["built_at"] = now
-        return data
+        stale = [
+            key
+            for key, entry in _growth_cache.items()
+            if now - entry["built_at"] >= _GROWTH_CACHE_TTL
+        ]
+        for key in stale:
+            del _growth_cache[key]
+        _growth_cache[cache_key] = {"data": data, "built_at": now}
+    return data
 
 
 def _replace_query_hyphens(q: str) -> str:
@@ -2010,7 +2080,7 @@ def purge_cache(request: Request):
         _map_assets_state["ready"] = False
         _MAP_CURRENT_FILE.unlink(missing_ok=True)
     with _growth_cache_lock:
-        _growth_cache["ready"] = False
+        _growth_cache.clear()
     with _spelling_cache_lock:
         _spelling_cache["ready"] = False
     with _global_contributions_cache_lock:
@@ -2318,16 +2388,10 @@ def get_growth_stats(
 ):
     t0 = time.perf_counter()
     try:
-        all_data = _get_growth_data()
+        series = _get_growth_data(mode, db)
     except Exception:
         logger.exception("Database error in get_growth_stats")
         raise HTTPException(500, "Internal server error")
-
-    mode_data = all_data.get(mode, {})
-    if db:
-        series = {db: mode_data.get(db, [])}
-    else:
-        series = mode_data
 
     return {
         "mode": mode,
@@ -2424,11 +2488,11 @@ def get_organism_growth(
     # For percentage mode, compute organism / total * 100 per month per db
     if mode == "percentage":
         try:
-            growth_data = _get_growth_data()
+            growth_data = _get_growth_data("experiments")
         except Exception:
             logger.exception("Database error fetching total growth for percentage")
             raise HTTPException(500, "Internal server error")
-        total_exp = growth_data.get("experiments", {})
+        total_exp = growth_data
 
         result_series = {}
         dbs = [db] if db else ["geo", "sra", "arrayexpress", "ena"]
