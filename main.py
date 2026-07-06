@@ -1815,6 +1815,11 @@ def _build_growth_data(mode: str, db: str | None = None) -> dict:
         if _growth_relation_exists(conn, mode):
             return _fetch_growth_relation(conn, mode, db)
 
+        if mode == "bases":
+            raise HTTPException(
+                503, "Volume growth data is being prepared; retry shortly."
+            )
+
         selected_queries = {db: db_queries[db]} if db else db_queries
         data = {}
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2389,6 +2394,8 @@ def get_growth_stats(
     t0 = time.perf_counter()
     try:
         series = _get_growth_data(mode, db)
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Database error in get_growth_stats")
         raise HTTPException(500, "Internal server error")

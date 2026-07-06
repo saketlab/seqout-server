@@ -447,6 +447,12 @@ PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${
 PGPASSWORD="${DB_PASSWORD}" psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "REFRESH MATERIALIZED VIEW CONCURRENTLY platform_growth_projects_monthly;" 2>/dev/null || true
 
 echo ""
+echo "Building database growth relations (projects/experiments + data volume)..."
+# Volume build scans sra_run_download_links twice (~47 GB) — expect minutes.
+bash "$(dirname "$0")/create_database_growth_matview.sh"
+bash "$(dirname "$0")/create_database_volume_growth_matview.sh"
+
+echo ""
 echo "=== Setup Complete ==="
 echo "Tables created successfully."
 echo ""
