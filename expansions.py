@@ -132,6 +132,21 @@ def _cross_multiply_variants(
 # Split a glued "seq" suffix off a word: atacseq -> atac seq, chipseq -> chip seq.
 _SEQ_RE = re.compile(r"\b([a-z0-9]+)(seq)\b", re.IGNORECASE)
 
+# Glue a detached single-cell (sc) / single-nucleus (sn) prefix back onto its
+# assay stem, so "sc rna seq" / "sc-rna" resolve to the graph's glued form
+# "scrna". Allowlisted stems ONLY — "sc 1" (cell line) and "sc a" (gene) must stay
+# untouched, so this can't just glue any "sc <word>". Add a stem here to cover it.
+_SC_GLUE_RE = re.compile(
+    r"\bsc[-_ ](rna|atac|dna|chip|bs|mt|rb|trio)\b|\bsn[-_ ](rna|mc|drop)\b",
+    re.IGNORECASE,
+)
+
+
+def _glue_sc_prefix(text: str) -> str:
+    return _SC_GLUE_RE.sub(
+        lambda m: "sc" + m.group(1) if m.group(1) else "sn" + m.group(2), text
+    )
+
 
 def _graph_norm(phrase: str) -> str:
     """Normalise a phrase to how Term.name is stored in the graph.
@@ -139,10 +154,11 @@ def _graph_norm(phrase: str) -> str:
     Term.name is lowercase with -/_/ turned into spaces, and ontologies write
     e.g. "ATAC-seq" as "atac seq". Users may type "atac-seq" or "atacseq" — both
     must resolve to "atac seq". So: split a glued "seq", turn -/_/ into spaces,
-    lowercase, and collapse whitespace.
+    lowercase, glue a detached sc/sn assay prefix, and collapse whitespace.
     """
     p = _SEQ_RE.sub(r"\1 \2", phrase)  # atacseq -> atac seq
     p = re.sub(r"[-_/]", " ", p).lower()  # atac-seq -> atac seq
+    p = _glue_sc_prefix(p)  # sc rna seq -> scrna seq
     p = re.sub(r"\s+", " ", p).strip()
     return p
 
@@ -210,6 +226,12 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
     if separated_query.lower() != normalized_query.lower():
         queries_to_expand.append(separated_query)
 
+    # Glue a detached sc/sn assay prefix ("sc rna seq" -> "scrna seq") as an extra
+    # form. Union only — the original stays, so a non-matching glue costs nothing.
+    glued_query = _glue_sc_prefix(separated_query)
+    if glued_query.lower() not in {q.lower() for q in queries_to_expand}:
+        queries_to_expand.append(glued_query)
+
     all_variants: list[str] = []
 
     for q in queries_to_expand:
@@ -262,3 +284,19 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
         all_variants.extend(chunk_variants)
 
     return _dedupe(all_variants)[:_MAX_QUERY_VARIANTS]
+
+
+if __name__ == "__main__":
+    # ponytail: normalization self-check (no DB needed) — the risky part is the
+    # allowlist glue not firing on genes/cell lines.
+    assert _glue_sc_prefix("sc rna seq") == "scrna seq"
+    assert _glue_sc_prefix("sc-rna") == "scrna"
+    assert _glue_sc_prefix("sn rna seq") == "snrna seq"
+    assert _glue_sc_prefix("sc atac") == "scatac"
+    assert _glue_sc_prefix("sc 1") == "sc 1"  # numeric cell line untouched
+    assert _glue_sc_prefix("sc a") == "sc a"  # stem not allowlisted
+    assert _glue_sc_prefix("disc rna") == "disc rna"  # no mid-word false match
+    assert _graph_norm("SC-RNA-seq") == "scrna seq"
+    assert _graph_norm("sc rna") == "scrna"
+    assert _graph_norm("sc 1") == "sc 1"
+    print("ok")
