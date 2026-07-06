@@ -1613,7 +1613,7 @@ SELECT
     NULL AS samples_ref,
     ae.study_type AS series_type,
     CASE
-        WHEN ae.external_links IS NOT NULL THEN
+        WHEN jsonb_typeof(ae.external_links) = 'array' THEN
             (SELECT jsonb_agg(
                 jsonb_build_object(
                     '@type',
@@ -1665,7 +1665,10 @@ SELECT
         'country', aeg.geo_country,
         'place_name', aeg.geo_place_name
      ))
-     FROM jsonb_array_elements(ae.organizations) AS org
+     FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(ae.organizations) = 'array'
+                   THEN ae.organizations ELSE '[]'::jsonb END
+          ) AS org
      LEFT JOIN arrayexpress_geocode aeg ON aeg.organization = org->>'name'
     ) AS center
 FROM arrayexpress_experiments ae
