@@ -6,6 +6,46 @@ FROM study_publications
 WHERE accession = ANY(%s);
 """
 
+# All pmids from each repo's own project table, batched over an accession set
+# (the project's own accession plus its aliases). Per-repo columns are the
+# authoritative pmid source (unified_metadata is under-populated for AE). Emits
+# one (accession, pmid) row per pmid so studies with several publications keep
+# them all — geo_series.pubmed_id is a text[] and is unnested; the rest are
+# scalar text. UNION dedupes; ORDER BY gives a stable (earliest-first) order.
+PMID_VARIANT_BATCH_SQL = """
+SELECT accession, pmid FROM (
+    SELECT accession, unnest(pubmed_id) AS pmid
+        FROM geo_series WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id_pysradb
+        FROM geo_series WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id_pysradb
+        FROM sra_studies WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT study_accession, pubmed_id_pysradb
+        FROM ena_studies WHERE study_accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id
+        FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id_pysradb
+        FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+) t
+WHERE pmid IS NOT NULL AND pmid <> ''
+ORDER BY accession, pmid;
+"""
+
+# Rich publication details by pmid, for pmids resolved from the variant tables
+# that never made it into study_publications.
+PUBMED_BY_PMIDS_BATCH_SQL = """
+SELECT pmid, title, journal, doi, pub_date, authors, issn, citation_count,
+       journal_h_index, journal_i10_index, journal_2yr_mean_citedness,
+       journal_cited_by_count, journal_works_count
+FROM pubmed_metadata
+WHERE pmid = ANY(%(pmids)s);
+"""
+
 SUBMITTER_BATCH_SQL = """
 SELECT canonical_accession AS accession, center_name AS submitter, country_code,
        is_single_cell, single_cell_modality

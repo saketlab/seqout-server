@@ -136,6 +136,8 @@ from queries import (
     STUDIES_BY_PMID_SQL,
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
+    PMID_VARIANT_BATCH_SQL,
+    PUBMED_BY_PMIDS_BATCH_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
@@ -625,18 +627,145 @@ def _accession_source(acc: str) -> str | None:
     return None
 
 
+def _normalize_aliases(alias) -> list[str]:
+    """Normalise a project's `alias` (string, list, or Postgres/JSON array
+    text) into a deduped, upper-cased list of accessions."""
+    if not alias:
+        return []
+    if isinstance(alias, (list, tuple)):
+        items = list(alias)
+    elif isinstance(alias, str):
+        s = alias.strip()
+        if s.startswith("{") and s.endswith("}"):
+            items = [x.strip().strip('"') for x in s[1:-1].split(",")]
+        elif s.startswith("["):
+            try:
+                items = json.loads(s)
+            except Exception:
+                items = [s]
+        else:
+            items = [s]
+    else:
+        return []
+    out: list[str] = []
+    for it in items:
+        if isinstance(it, str) and it.strip():
+            out.append(it.strip().upper())
+    return list(dict.fromkeys(out))
+
+
+def _rich_pub(pmid: str, m: dict) -> dict:
+    """A full publication entry from a pubmed_metadata row."""
+    pub_date = m.get("pub_date")
+    if hasattr(pub_date, "isoformat"):
+        pub_date = pub_date.isoformat()
+    elif pub_date is not None:
+        pub_date = str(pub_date)
+    return {
+        "pmid": pmid,
+        "title": m.get("title"),
+        "journal": m.get("journal"),
+        "doi": m.get("doi"),
+        "pub_date": pub_date,
+        "authors": m.get("authors"),
+        "issn": m.get("issn"),
+        "citation_count": m.get("citation_count"),
+        "journal_h_index": m.get("journal_h_index"),
+        "journal_i10_index": m.get("journal_i10_index"),
+        "journal_2yr_mean_citedness": m.get("journal_2yr_mean_citedness"),
+        "journal_cited_by_count": m.get("journal_cited_by_count"),
+        "journal_works_count": m.get("journal_works_count"),
+    }
+
+
+def _flat_pub(pmid: str | None, flat_row: dict | None) -> dict | None:
+    """A publication entry from the project's own flat publication_* columns
+    (ArrayExpress) and/or a bare pmid the frontend enriches from NCBI. None
+    when there's nothing to show."""
+    title = doi = authors = None
+    if flat_row is not None:
+        title = flat_row.get("publication_title")
+        doi = flat_row.get("publication_doi")
+        if isinstance(doi, str):
+            doi = (
+                re.sub(r"^https?://(dx\.)?doi\.org/", "", doi.strip(), flags=re.I)
+                or None
+            )
+        authors = flat_row.get("publication_authors")
+    if pmid is None and not title and not doi:
+        return None
+    return {
+        "pmid": pmid,
+        "title": title,
+        "journal": None,
+        "doi": doi,
+        "pub_date": None,
+        "authors": authors,
+        "citation_count": None,
+    }
+
+
+def _build_publications(
+    pmids: list[str], pubmed_map: dict[str, dict], flat_row: dict | None
+) -> list[dict] | None:
+    """One entry per resolved pmid (all of them, so multi-publication studies
+    show every paper). Each pmid: rich details from pubmed_metadata → flat
+    columns / pmid-only stub. When there are no pmids, fall back to a
+    flat-columns-only entry. Returns None when there's nothing to show.
+
+    flat_row (the project's own row) is only applied when there's a single
+    pmid, so its one publication's title never bleeds onto sibling pmids.
+    """
+    out: list[dict] = []
+    single = len(pmids) <= 1
+    for pmid in pmids:
+        pmid = str(pmid)
+        m = pubmed_map.get(pmid)
+        pub = _rich_pub(pmid, m) if m else _flat_pub(pmid, flat_row if single else None)
+        if pub:
+            out.append(pub)
+    if not out:
+        stub = _flat_pub(None, flat_row)
+        if stub:
+            out.append(stub)
+    return out or None
+
+
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     """Batch-lookup publications and center names, merge into result rows.
-    Always sets `center_name` from unified_metadata.
-    For studies without publication authors, falls back to center_name.
+
+    One uniform resolver for every project type. Per row, the linked
+    publication is resolved over candidate accessions — the project's own
+    accession first, then its aliases (so a project inherits its linked
+    archive's publication when it has none of its own). For each candidate:
+    study_publications → pmid (the repo's own pubmed_id / pubmed_id_pysradb
+    columns) → pubmed_metadata details / flat columns / pmid-only stub.
+    Always sets `center_name` from unified_metadata (own accession).
     """
     if not rows:
         return rows
     accessions = [r["accession"] for r in rows if r.get("accession")]
     if not accessions:
         return rows
-    cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (accessions,))
+
+    # Candidate accessions per row: own accession first, then aliases.
+    row_candidates: dict[str, list[str]] = {}
+    all_cands: set[str] = set()
+    for r in rows:
+        acc = r.get("accession")
+        if not acc:
+            continue
+        cands = [acc] + [
+            a for a in _normalize_aliases(r.get("alias")) if a and a != acc
+        ]
+        row_candidates[acc] = cands
+        all_cands.update(cands)
+    candidate_list = list(all_cands)
+
+    cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (candidate_list,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
+
+    # center_name / submitter stay keyed on the row's own accession.
     cur.execute(SUBMITTER_BATCH_SQL, {"acc": accessions})
     sub_map = {}
     for r in cur.fetchall():
@@ -646,8 +775,35 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             "is_single_cell": r["is_single_cell"],
             "single_cell_modality": r["single_cell_modality"],
         }
+
+    # pmid per candidate from each repo's own project table (pubmed_id /
+    # pubmed_id_pysradb) — the authoritative source across all repos.
+    cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": candidate_list})
+    cand_pmids: dict[str, list[str]] = {}
+    for r in cur.fetchall():
+        cand_pmids.setdefault(r["accession"], []).append(str(r["pmid"]))
+
+    all_pmids = sorted({p for lst in cand_pmids.values() for p in lst})
+    pubmed_map: dict[str, dict] = {}
+    if all_pmids:
+        cur.execute(PUBMED_BY_PMIDS_BATCH_SQL, {"pmids": all_pmids})
+        pubmed_map = {r["pmid"]: r for r in cur.fetchall()}
+
     for row in rows:
-        pubs = pub_map.get(row["accession"])
+        acc = row.get("accession")
+        pubs = None
+        for i, cand in enumerate(row_candidates.get(acc, [acc] if acc else [])):
+            sp = pub_map.get(cand)
+            if sp:
+                pubs = sp
+                break
+            # flat publication_* columns only exist on the project's own row.
+            built = _build_publications(
+                cand_pmids.get(cand, []), pubmed_map, row if i == 0 else None
+            )
+            if built:
+                pubs = built
+                break
         row["publications"] = pubs
         if pubs and len(pubs) > 0:
             primary = pubs[0]
@@ -657,7 +813,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["doi"] = primary.get("doi")
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
-        meta = sub_map.get(row["accession"], {})
+        meta = sub_map.get(acc, {})
         row["center_name"] = meta.get("submitter")
         row["country_code"] = meta.get("country_code")
         row["is_single_cell"] = meta.get("is_single_cell")
@@ -665,6 +821,26 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         if not row.get("authors") and row.get("center_name"):
             row["authors"] = row["center_name"]
     return rows
+
+
+def _project_publications(accession: str, cur) -> list[dict]:
+    """Linked publications for one accession via the uniform resolver, so
+    server-side consumers (e.g. /cite) match what the project page shows."""
+    accession = accession.upper()
+    if accession.startswith("E-"):
+        sql = PROJECT_AE_SQL
+    elif accession.startswith("G"):
+        sql = PROJECT_GEO_SQL
+    elif accession.startswith("PRJ"):
+        sql = PROJECT_ENA_SQL
+    else:
+        sql = PROJECT_SRA_SQL
+    cur.execute(sql, (accession,))
+    row = cur.fetchone()
+    if not row:
+        return []
+    _enrich_with_publications([row], cur)
+    return row.get("publications") or []
 
 
 def _pub_to_bibtex(pub: dict, accession: str) -> str:
@@ -7049,16 +7225,14 @@ def get_project_cite(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, ([accession],))
-                row = cur.fetchone()
+                pubs = _project_publications(accession, cur)
     except Exception:
         logger.exception("Database error in get_project_cite")
         raise HTTPException(500, "Internal server error")
 
-    if not row or not row.get("publications"):
+    if not pubs:
         raise HTTPException(404, f"No publications found for {accession}")
 
-    pubs = row["publications"]
     # Sort by PMID ascending (smallest = earliest/original)
     pubs_sorted = sorted(pubs, key=lambda p: int(p.get("pmid") or 0))
 
