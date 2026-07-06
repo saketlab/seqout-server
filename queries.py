@@ -2776,7 +2776,12 @@ SELECT
     COUNT(*) OVER()                   AS total_bams,
     COALESCE(SUM((f->>'size')::bigint) OVER(), 0)::text AS total_bam_bytes
 FROM sra_run_download_links dl,
-     jsonb_array_elements(dl.ncbi_files) AS f,
+     -- ponytail: ncbi_files can be a JSONB 'null' scalar, not an array; guard so
+     -- jsonb_array_elements doesn't raise "cannot extract elements from a scalar"
+     jsonb_array_elements(
+         CASE WHEN jsonb_typeof(dl.ncbi_files) = 'array'
+              THEN dl.ncbi_files ELSE '[]'::jsonb END
+     ) AS f,
      LATERAL (
          SELECT
              MAX(a->>'url') FILTER (
