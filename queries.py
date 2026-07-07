@@ -1031,19 +1031,16 @@ SELECT
     coords_3d,
     neighbors,
     organisms,
-    (SELECT string_agg(DISTINCT contributor_name, ', ' ORDER BY contributor_name)
+    -- The name lives in the `person` column; the rows are duplicated across
+    -- re-ingest batches, so dedup by name and keep author order via first-seen id.
+    (SELECT string_agg(person, ', ' ORDER BY min_id)
      FROM (
-        SELECT btrim(COALESCE(
-            to_jsonb(c)->>'contributor',
-            to_jsonb(c)->>'contributor_name',
-            to_jsonb(c)->>'contact_name',
-            to_jsonb(c)->>'name',
-            to_jsonb(c)->>'author'
-        )) AS contributor_name
+        SELECT btrim(person) AS person, MIN(id::bigint) AS min_id
         FROM geo_contributors c
         WHERE c.accession = geo_series.accession
+          AND person IS NOT NULL AND btrim(person) <> ''
+        GROUP BY btrim(person)
      ) contributors
-     WHERE contributor_name IS NOT NULL AND contributor_name <> ''
     ) AS geo_contributor_authors,
     (SELECT jsonb_agg(DISTINCT jsonb_build_object(
         'organization', c.organization,
