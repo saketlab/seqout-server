@@ -409,6 +409,14 @@ _sitemap_counts_cache_lock = threading.Lock()
 _sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _enriched_crosstab_cache_lock = threading.Lock()
 _enriched_crosstab_cache: dict = {}
+# Broad-query facet cache: materializing the FTS match set is the cold-start cost
+# (up to ~68s for "cancer"). Once a broad query (total >= threshold) is computed we
+# keep its facets in-process with no expiry until /cache/purge clears it. Narrow
+# queries are never stored, so memory stays bounded to the few broad terms.
+_BROAD_SEARCH_MIN_TOTAL = 5000
+_MAX_BROAD_FACETS_CACHE_ENTRIES = 500
+_broad_facets_cache_lock = threading.Lock()
+_broad_facets_cache: dict[tuple, dict] = {}
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
@@ -2114,6 +2122,8 @@ def purge_cache(request: Request):
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
         _enriched_crosstab_cache.clear()
+    with _broad_facets_cache_lock:
+        _broad_facets_cache.clear()
     return {"message": "All caches purged."}
 
 
@@ -3894,8 +3904,34 @@ def search_facets(
     year_to: int | None = Query(None, ge=1900, le=2100),
 ):
     t0 = time.perf_counter()
+    nq = _replace_query_hyphens(q)
+    cache_key = (
+        nq,
+        db,
+        organism,
+        tuple(sorted(country or [])),
+        tuple(sorted(library_strategy or [])),
+        tuple(sorted(instrument_model or [])),
+        tuple(sorted(platform or [])),
+        tuple(sorted(journal or [])),
+        multi_platform,
+        year_from,
+        year_to,
+    )
+    with _broad_facets_cache_lock:
+        cached = _get_bounded_cache_entry(
+            _broad_facets_cache, cache_key, float("inf")
+        )
+    if cached is not None:
+        response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+        return {
+            "facets": cached["facets"],
+            "total": cached["total"],
+            "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+        }
+
     facets, total = _compute_search_facets(
-        _replace_query_hyphens(q),
+        nq,
         db,
         organism=organism,
         country=country,
@@ -3914,6 +3950,17 @@ def search_facets(
         # Filter-specific counts still cache (URL includes the filters), just with
         # a lower hit rate than the bare query.
         response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+        # Broad queries are the expensive cold-start ones — pin them in-process
+        # until /cache/purge so the first slow hit is the only slow hit.
+        if total >= _BROAD_SEARCH_MIN_TOTAL:
+            with _broad_facets_cache_lock:
+                _set_bounded_cache_entry(
+                    _broad_facets_cache,
+                    cache_key,
+                    {"facets": facets, "total": total},
+                    _MAX_BROAD_FACETS_CACHE_ENTRIES,
+                    float("inf"),
+                )
     else:
         response.headers["Cache-Control"] = "no-store"
     return {
