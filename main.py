@@ -3822,7 +3822,10 @@ def search(
                         "original_query": original_q,
                         "corrected_query": corrected_q,
                         "original_total": total_for_suggest,
-                        "mode": "augmented" if extras else "replaced",
+                        # Based on orig_results, not extras: the original DID
+                        # match (augmented) even if every match also appears in
+                        # the corrected page and dedups out of the extras block.
+                        "mode": "augmented" if orig_results else "replaced",
                         "extra_results": extras or None,
                     }
             else:
@@ -3994,6 +3997,45 @@ def search_facets(
         year_from=year_from,
         year_to=year_to,
     )
+    # Mirror /search's auto-correction: when the original query is a low-result
+    # typo, swap in the corrected query's facets + total so the header count and
+    # the sidebar agree with the auto-corrected result list (which /search
+    # already returns for the corrected term). Cached below under the original
+    # cache_key so repeat typo searches stay fast. Only when unfiltered: /search's
+    # filtered path (_search_filtered) doesn't auto-correct, so correcting facets
+    # under an active filter would desync the count/rail from the result list.
+    has_filter = bool(
+        organism
+        or country
+        or library_strategy
+        or instrument_model
+        or platform
+        or journal
+        or multi_platform
+        or year_from is not None
+        or year_to is not None
+    )
+    if not has_filter and total is not None and total <= _SUGGESTION_THRESHOLD:
+        _suggestions = _get_suggestions(nq)
+        _corrected_q = (
+            _suggestions[0]["corrected_query"] if _suggestions else None
+        )
+        if _corrected_q and _corrected_q != nq:
+            c_facets, c_total = _compute_search_facets(
+                _corrected_q,
+                db,
+                organism=organism,
+                country=country,
+                library_strategy=library_strategy,
+                instrument_model=instrument_model,
+                platform=platform,
+                journal=journal,
+                multi_platform=multi_platform,
+                year_from=year_from,
+                year_to=year_to,
+            )
+            if c_total:
+                facets, total = c_facets, c_total
     # Only cache a complete response. A timeout degrades to {facets:{}, total:null};
     # caching that for a week would pin the wrong total (e.g. the loaded-page count)
     # on every later search of this query, so leave it uncached to allow a retry.
