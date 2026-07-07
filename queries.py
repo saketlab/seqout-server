@@ -3708,10 +3708,14 @@ SELECT
 
 LAST_UPDATED_SQL = """
 SELECT
-    (SELECT MAX(updated_at)::timestamptz FROM geo_series) AS geo,
-    (SELECT MAX(published_at)::timestamptz FROM sra_submissions) AS sra,
-    (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments) AS arrayexpress,
-    (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies) AS ena;
+    (SELECT MAX(updated_at)::timestamptz FROM geo_series
+        WHERE updated_at::timestamptz <= now()) AS geo,
+    (SELECT MAX(published_at)::timestamptz FROM sra_submissions
+        WHERE published_at::timestamptz <= now()) AS sra,
+    (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments
+        WHERE release_date::timestamptz <= now()) AS arrayexpress,
+    (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies
+        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS ena;
 """
 
 ENRICHED_STAT_COLUMNS = [
