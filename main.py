@@ -3777,7 +3777,58 @@ def search(
         total_for_suggest = len(result.get("results", []))
     if total_for_suggest <= _SUGGESTION_THRESHOLD:
         suggestions = _get_suggestions(original_q)
-        if suggestions:
+        corrected_q = suggestions[0]["corrected_query"] if suggestions else None
+        if corrected_q and corrected_q != original_q:
+            # Auto-run the corrected query instead of only suggesting it. Call the
+            # undecorated function (search.__wrapped__) so this internal re-run
+            # doesn't re-enter the rate limiter. Recursion terminates: the
+            # corrected term is in-vocab so it doesn't re-correct.
+            corrected = search.__wrapped__(
+                request, q=corrected_q, cursor_rank=cursor_rank,
+                cursor_acc=cursor_acc, cursor_sort=cursor_sort, offset=offset,
+                db=db, sortby=sortby, order=order, organism=organism,
+                country=country, library_strategy=library_strategy,
+                instrument_model=instrument_model, platform=platform,
+                journal=journal, multi_platform=multi_platform,
+                year_from=year_from, year_to=year_to,
+            )
+            orig_results = result.get("results", [])
+            if corrected.get("results"):
+                # Corrected results become the paginated stream so offset paging
+                # stays clean; the few literal-typo matches (orig_results) ride in
+                # the correction payload and the client renders them as a separate
+                # page-1 block instead of shifting the 200-row server windows.
+                result["results"] = corrected["results"]
+                result["total"] = corrected.get("total")
+                result["next_cursor"] = corrected.get("next_cursor")
+                # Banner + extras only on the first page; deeper pages are just
+                # the paginated corrected stream. Use explicit None checks so a
+                # legitimate cursor_rank/offset of 0 isn't read as "no cursor".
+                first_page = (
+                    offset is None
+                    and cursor_rank is None
+                    and cursor_acc is None
+                    and cursor_sort is None
+                )
+                if first_page:
+                    # Drop literal-typo matches that also appear in the corrected
+                    # page so they don't render twice (extras block + main list).
+                    corrected_accs = {r["accession"] for r in corrected["results"]}
+                    extras = [
+                        r for r in orig_results
+                        if r["accession"] not in corrected_accs
+                    ]
+                    result["correction"] = {
+                        "original_query": original_q,
+                        "corrected_query": corrected_q,
+                        "original_total": total_for_suggest,
+                        "mode": "augmented" if extras else "replaced",
+                        "extra_results": extras or None,
+                    }
+            else:
+                # Correction didn't help either; fall back to the suggestion link.
+                result["suggestions"] = suggestions
+        elif suggestions:
             result["suggestions"] = suggestions
 
     return result
