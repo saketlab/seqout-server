@@ -1042,6 +1042,18 @@ SELECT
         GROUP BY btrim(person)
      ) contributors
     ) AS geo_contributor_authors,
+    -- Distinct contributor organizations in author order ('GEO' is the
+    -- repository marker, not a real org, so drop it).
+    (SELECT string_agg(organization, ', ' ORDER BY min_id)
+     FROM (
+        SELECT btrim(organization) AS organization, MIN(id::bigint) AS min_id
+        FROM geo_contributors c
+        WHERE c.accession = geo_series.accession
+          AND organization IS NOT NULL
+          AND btrim(organization) NOT IN ('', 'GEO')
+        GROUP BY btrim(organization)
+     ) orgs
+    ) AS geo_contributor_orgs,
     (SELECT jsonb_agg(DISTINCT jsonb_build_object(
         'organization', c.organization,
         'department', c.department,

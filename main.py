@@ -4099,16 +4099,20 @@ def get_project(
                 row = cur.fetchone()
                 if row:
                     geo_contributor_authors = row.pop("geo_contributor_authors", None)
+                    geo_contributor_orgs = row.pop("geo_contributor_orgs", None)
                     _enrich_with_publications([row], cur)
                     # Prefer publication authors (fuller names + correct order)
                     # set by _enrich_with_publications; fall back to GEO
-                    # contributors only when there's no linked publication.
+                    # contributors only when there's no linked publication. When
+                    # we do use the contributors table, also surface its org list.
                     if (
                         is_geo_project
                         and geo_contributor_authors
                         and not row.get("authors")
                     ):
                         row["authors"] = geo_contributor_authors
+                        if geo_contributor_orgs:
+                            row["contributor_orgs"] = geo_contributor_orgs
                     # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP, not the PRJ.
                     enrich_acc = accession
                     if accession.startswith("PRJ"):
