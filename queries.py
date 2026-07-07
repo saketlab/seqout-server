@@ -57,6 +57,15 @@ FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
 
+# Authoritative author list for a GEO series: geo_series.contributors is a plain
+# text[] written at ingest in author order (uniqueness not guaranteed, so dedup
+# on read). Used as the author fallback when a series has no linked publication.
+GEO_SERIES_CONTRIBUTORS_BATCH_SQL = """
+SELECT accession, contributors
+FROM geo_series
+WHERE accession = ANY(%(acc)s) AND contributors IS NOT NULL;
+"""
+
 GEO_SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS core_q,
@@ -1031,29 +1040,6 @@ SELECT
     coords_3d,
     neighbors,
     organisms,
-    -- The name lives in the `person` column; the rows are duplicated across
-    -- re-ingest batches, so dedup by name and keep author order via first-seen id.
-    (SELECT string_agg(person, ', ' ORDER BY min_id)
-     FROM (
-        SELECT btrim(person) AS person, MIN(id::bigint) AS min_id
-        FROM geo_contributors c
-        WHERE c.accession = geo_series.accession
-          AND person IS NOT NULL AND btrim(person) <> ''
-        GROUP BY btrim(person)
-     ) contributors
-    ) AS geo_contributor_authors,
-    -- Distinct contributor organizations in author order ('GEO' is the
-    -- repository marker, not a real org, so drop it).
-    (SELECT string_agg(organization, ', ' ORDER BY min_id)
-     FROM (
-        SELECT btrim(organization) AS organization, MIN(id::bigint) AS min_id
-        FROM geo_contributors c
-        WHERE c.accession = geo_series.accession
-          AND organization IS NOT NULL
-          AND btrim(organization) NOT IN ('', 'GEO')
-        GROUP BY btrim(organization)
-     ) orgs
-    ) AS geo_contributor_orgs,
     (SELECT jsonb_agg(DISTINCT jsonb_build_object(
         'organization', c.organization,
         'department', c.department,

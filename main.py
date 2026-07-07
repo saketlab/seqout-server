@@ -143,6 +143,7 @@ from queries import (
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
+    GEO_SERIES_CONTRIBUTORS_BATCH_SQL,
     STUDY_RUNS_SUMMARY_SQL,
     STUDY_SAMPLES_SRA_SQL,
     SUBMITTER_BATCH_SQL,
@@ -775,6 +776,14 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (candidate_list,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
 
+    # geo_series.contributors (author names, in order) for the GEO rows — the
+    # author fallback when a series has no linked publication.
+    geo_accs = [a for a in accessions if a.startswith("GSE")]
+    contrib_map: dict[str, list] = {}
+    if geo_accs:
+        cur.execute(GEO_SERIES_CONTRIBUTORS_BATCH_SQL, {"acc": geo_accs})
+        contrib_map = {r["accession"]: r["contributors"] for r in cur.fetchall()}
+
     # center_name / submitter stay keyed on the row's own accession.
     cur.execute(SUBMITTER_BATCH_SQL, {"acc": accessions})
     sub_map = {}
@@ -828,7 +837,17 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         row["country_code"] = meta.get("country_code")
         row["is_single_cell"] = meta.get("is_single_cell")
         row["single_cell_modality"] = meta.get("single_cell_modality")
-        if not row.get("authors") and row.get("center_name"):
+        # Prefer real publication authors; otherwise use geo_series.contributors
+        # (dedup preserving order — ingest may repeat names) over the center_name
+        # fallback. Orgs are unchanged: center_name already carries them.
+        names = list(
+            dict.fromkeys(n for n in (contrib_map.get(acc) or []) if n and n.strip())
+        )
+        if names and (
+            not row.get("authors") or row.get("authors") == row.get("center_name")
+        ):
+            row["authors"] = ", ".join(names)
+        elif not row.get("authors") and row.get("center_name"):
             row["authors"] = row["center_name"]
     return rows
 
@@ -4081,12 +4100,10 @@ def get_project(
     accession = accession.upper()
     params = (accession,)
 
-    is_geo_project = False
     if accession.startswith("E-"):
         sql = PROJECT_AE_SQL
     elif accession.startswith("G"):
         sql = PROJECT_GEO_SQL
-        is_geo_project = True
     elif accession.startswith("PRJ"):
         sql = PROJECT_ENA_SQL
     else:
@@ -4098,24 +4115,10 @@ def get_project(
                 cur.execute(sql, params)
                 row = cur.fetchone()
                 if row:
-                    geo_contributor_authors = row.pop("geo_contributor_authors", None)
-                    geo_contributor_orgs = row.pop("geo_contributor_orgs", None)
+                    # _enrich_with_publications resolves authors (publication →
+                    # geo_series.contributors → center_name) uniformly for every
+                    # project type.
                     _enrich_with_publications([row], cur)
-                    # Prefer real publication authors (fuller names + correct
-                    # order) set by _enrich_with_publications; fall back to GEO
-                    # contributors otherwise. _enrich fills authors with the
-                    # center_name fallback when the pub has no author string, so
-                    # treat authors==center_name as "no real authors" too. When
-                    # using contributors, also surface the org list.
-                    pub_authors = row.get("authors")
-                    if (
-                        is_geo_project
-                        and geo_contributor_authors
-                        and (not pub_authors or pub_authors == row.get("center_name"))
-                    ):
-                        row["authors"] = geo_contributor_authors
-                        if geo_contributor_orgs:
-                            row["contributor_orgs"] = geo_contributor_orgs
                     # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP, not the PRJ.
                     enrich_acc = accession
                     if accession.startswith("PRJ"):
