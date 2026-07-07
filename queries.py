@@ -353,16 +353,22 @@ all_matches AS (
     FROM ena_studies_search, q
     WHERE tsv @@ q.match_q
 ),
+-- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
+-- dedup_key (the SRA study carries the GSE as its alias); deduping first can
+-- keep the higher-ranked SRA twin, and then a `source = 'geo'` filter would
+-- delete the GEO row entirely, undercounting the scoped total. Filtering first
+-- dedups only within the requested source (accessions are unique there, so no
+-- double-count is reintroduced); the unified db IS NULL path is unchanged.
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
         accession, title, summary, updated_at, organisms, countries,
         instrument_models, library_strategies, platforms, source, rank
     FROM all_matches
+    WHERE (%(db)s::text IS NULL OR source = %(db)s)
     ORDER BY dedup_key, rank DESC
 ),
 matched AS (
     SELECT * FROM deduped
-    WHERE (%(db)s::text IS NULL OR source = %(db)s)
 )
 """
 
