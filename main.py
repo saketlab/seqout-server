@@ -4101,14 +4101,17 @@ def get_project(
                     geo_contributor_authors = row.pop("geo_contributor_authors", None)
                     geo_contributor_orgs = row.pop("geo_contributor_orgs", None)
                     _enrich_with_publications([row], cur)
-                    # Prefer publication authors (fuller names + correct order)
-                    # set by _enrich_with_publications; fall back to GEO
-                    # contributors only when there's no linked publication. When
-                    # we do use the contributors table, also surface its org list.
+                    # Prefer real publication authors (fuller names + correct
+                    # order) set by _enrich_with_publications; fall back to GEO
+                    # contributors otherwise. _enrich fills authors with the
+                    # center_name fallback when the pub has no author string, so
+                    # treat authors==center_name as "no real authors" too. When
+                    # using contributors, also surface the org list.
+                    pub_authors = row.get("authors")
                     if (
                         is_geo_project
                         and geo_contributor_authors
-                        and not row.get("authors")
+                        and (not pub_authors or pub_authors == row.get("center_name"))
                     ):
                         row["authors"] = geo_contributor_authors
                         if geo_contributor_orgs:
