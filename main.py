@@ -113,10 +113,12 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     PUBLICATION_BY_DOI_SQL,
+    AUTHOR_INSTITUTE_FACETS_SQL,
     PUBLICATION_BY_PMID_SQL,
     RELATED_SQL,
     RUN_DOWNLOAD_SQL,
     SAMPLE_SQL,
+    SEARCH_AUTHOR_PROJECTS_SQL,
     SEARCH_AUTHORS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
@@ -3809,13 +3811,24 @@ def search(
             # doesn't re-enter the rate limiter. Recursion terminates: the
             # corrected term is in-vocab so it doesn't re-correct.
             corrected = search.__wrapped__(
-                request, q=corrected_q, cursor_rank=cursor_rank,
-                cursor_acc=cursor_acc, cursor_sort=cursor_sort, offset=offset,
-                db=db, sortby=sortby, order=order, organism=organism,
-                country=country, library_strategy=library_strategy,
-                instrument_model=instrument_model, platform=platform,
-                journal=journal, multi_platform=multi_platform,
-                year_from=year_from, year_to=year_to,
+                request,
+                q=corrected_q,
+                cursor_rank=cursor_rank,
+                cursor_acc=cursor_acc,
+                cursor_sort=cursor_sort,
+                offset=offset,
+                db=db,
+                sortby=sortby,
+                order=order,
+                organism=organism,
+                country=country,
+                library_strategy=library_strategy,
+                instrument_model=instrument_model,
+                platform=platform,
+                journal=journal,
+                multi_platform=multi_platform,
+                year_from=year_from,
+                year_to=year_to,
             )
             orig_results = result.get("results", [])
             if corrected.get("results"):
@@ -3840,8 +3853,7 @@ def search(
                     # page so they don't render twice (extras block + main list).
                     corrected_accs = {r["accession"] for r in corrected["results"]}
                     extras = [
-                        r for r in orig_results
-                        if r["accession"] not in corrected_accs
+                        r for r in orig_results if r["accession"] not in corrected_accs
                     ]
                     result["correction"] = {
                         "original_query": original_q,
@@ -3998,9 +4010,7 @@ def search_facets(
         year_to,
     )
     with _broad_facets_cache_lock:
-        cached = _get_bounded_cache_entry(
-            _broad_facets_cache, cache_key, float("inf")
-        )
+        cached = _get_bounded_cache_entry(_broad_facets_cache, cache_key, float("inf"))
     if cached is not None:
         response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
         return {
@@ -4042,9 +4052,7 @@ def search_facets(
     )
     if not has_filter and total is not None and total <= _SUGGESTION_THRESHOLD:
         _suggestions = _get_suggestions(nq)
-        _corrected_q = (
-            _suggestions[0]["corrected_query"] if _suggestions else None
-        )
+        _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
             c_facets, c_total = _compute_search_facets(
                 _corrected_q,
@@ -7136,6 +7144,79 @@ def search_by_author(
     return {"q": q, "total": len(rows), "results": rows}
 
 
+_ERE_SPECIAL = re.compile(r"([.^$*+?()\[\]{}|\\])")
+
+
+# GEO's organizations array mixes real affiliations with platform vendors and a
+# "GEO" marker; these are dropped so the institute facet reflects institutes.
+_INSTITUTE_NOISE = {"geo", "illumina inc.", "illumina", "pacific biosciences"}
+
+
+def _author_name_regex(q: str) -> str | None:
+    """First+last regex for pubmed_metadata.authors ("Given [Middle] Surname",
+    comma-separated), tolerant of middle tokens so "Michael Wang" matches
+    "Michael X Wang". Returns None for an empty/whitespace query."""
+    tokens = [t for t in q.split() if t]
+    if not tokens:
+        return None
+    esc = [_ERE_SPECIAL.sub(r"\\\1", t) for t in tokens]
+    if len(esc) >= 2:
+        body = f"{esc[0]}( [^,]*)? {esc[-1]}"
+    else:
+        body = f"([^,]* )?{esc[0]}"
+    return f"(^|, ){body}(,|$)"
+
+
+@api_app.get(
+    "/author/projects",
+    summary="All projects by an author across GEO, SRA, ArrayExpress, and ENA",
+    description=(
+        "Given a person's name, find every dataset they authored across all four "
+        "databases. Matches the name (first + last, tolerant of middle initials) "
+        "against publication author lists, then resolves the linked studies. Returns "
+        "project rows compatible with the search result cards. Only studies linked "
+        "to a PubMed publication are findable."
+    ),
+    operation_id="search_author_projects",
+)
+@limiter.limit("20/minute")
+def search_author_projects(
+    request: Request,
+    q: str = Query(..., min_length=3, max_length=100),
+    limit: int = Query(default=200, ge=1, le=200),
+):
+    regex = _author_name_regex(q)
+    if regex is None:
+        return {"q": q, "total": 0, "results": []}
+    noise = sorted(_INSTITUTE_NOISE)
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SEARCH_AUTHOR_PROJECTS_SQL, {"re": regex, "limit": limit})
+                rows = cur.fetchall()
+                _enrich_with_publications(rows, cur)
+                # Facet counts over the full match set, not just this page.
+                cur.execute(AUTHOR_INSTITUTE_FACETS_SQL, {"re": regex, "noise": noise})
+                institutes = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in search_author_projects")
+        raise HTTPException(500, "Internal server error")
+    total = rows[0].pop("full_total", len(rows)) if rows else 0
+    for r in rows[1:]:
+        r.pop("full_total", None)
+
+    # Clean each card's institute string: drop noise, dedup orgs per project.
+    for r in rows:
+        seen: dict[str, str] = {}
+        for part in (r.get("institute") or "").split(";"):
+            name = part.strip()
+            if name and name.lower() not in _INSTITUTE_NOISE:
+                seen.setdefault(name.lower(), name)
+        r["institute"] = "; ".join(seen.values()) or None
+
+    return {"q": q, "total": total, "results": rows, "institutes": institutes}
+
+
 @api_app.get(
     "/publication",
     summary="Find a publication and all linked datasets",
@@ -8620,10 +8701,10 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(AnalyticsMiddleware)
 # combined_app.add_middleware(
-#   CORSMiddleware,
-#   allow_origins=["*"],
-#   allow_methods=["GET", "OPTIONS"],
-#   allow_headers=["*"],
+#    CORSMiddleware,
+#    allow_origins=["*"],
+#    allow_methods=["GET", "OPTIONS"],
+#    allow_headers=["*"],
 # )
 
 app = combined_app

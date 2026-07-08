@@ -1611,6 +1611,101 @@ GROUP BY m.pmid, m.title, m.journal, m.doi, m.pub_date, m.authors, m.citation_co
 ORDER BY m.citation_count DESC NULLS LAST;
 """
 
+# Reverse-resolve an author's pmids to projects via per-source pubmed_id columns
+# (cross_ref_pubmed is empty). Needs the pubmed_id indexes to be fast.
+# Shared CTE for the author-projects result list and its institute facet, so the
+# facet aggregates over the full matched set (not just the returned page).
+_AUTHOR_PROJECTS_CTE = """
+WITH pm AS MATERIALIZED (
+    SELECT pmid FROM pubmed_metadata WHERE authors ~* %(re)s
+),
+u AS (
+    -- @> uses the GIN index on the text[] column; unnest ... IN would seq-scan.
+    -- institute: best-effort affiliation per source, shown per card + summarized.
+    -- GEO stores it as organizations text[]; noise (incl. "GEO") is filtered by
+    -- the _INSTITUTE_NOISE blocklist downstream, not here.
+    SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
+           array_to_string(gs.organizations, '; ') AS institute
+      FROM geo_series gs JOIN pm ON gs.pubmed_id @> ARRAY[pm.pmid]
+    UNION ALL
+    SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
+           array_to_string(gs.organizations, '; ')
+      FROM geo_series gs
+     WHERE gs.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    -- GEO contributor names, findable even with no linked publication.
+    SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
+           array_to_string(gs.organizations, '; ')
+      FROM geo_series gs
+     WHERE geo_contrib_text(gs.contributors) ~* %(re)s
+    UNION ALL
+    -- SRA center_project_name / ENA center_name are submitting-center metadata
+    -- (often a sequencing vendor, e.g. "Illumina Inc."), not an author
+    -- affiliation — leave institute NULL rather than mislead.
+    SELECT s.accession, s.title, s.abstract, s.updated_at, s.published_at,
+           NULL::text
+      FROM sra_studies s
+     WHERE s.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT es.study_accession, es.study_title, es.study_description,
+           es.last_updated, es.first_public, NULL::text
+      FROM ena_studies es
+     WHERE es.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    -- Split the OR into two arms: a single "col1 IN (..) OR col2 IN (..)" forces
+    -- a seq scan over all ~60k AE rows; two arms each hit their own index.
+    SELECT ae.accession, ae.title, ae.description,
+           ae.release_date, ae.release_date,
+           COALESCE(NULLIF(ae.contact_affiliation, ''), NULLIF(ae.organizations_text, ''))
+      FROM arrayexpress_experiments ae
+     WHERE ae.pubmed_id IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT ae.accession, ae.title, ae.description,
+           ae.release_date, ae.release_date,
+           COALESCE(NULLIF(ae.contact_affiliation, ''), NULLIF(ae.organizations_text, ''))
+      FROM arrayexpress_experiments ae
+     WHERE ae.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+),
+-- Dedup by accession; full_total is the real count before LIMIT.
+d AS (
+    SELECT DISTINCT ON (accession) accession, title, summary, updated_at,
+           published_at, institute
+      FROM u
+     ORDER BY accession
+)
+"""
+
+SEARCH_AUTHOR_PROJECTS_SQL = (
+    _AUTHOR_PROJECTS_CTE
+    + """
+SELECT accession, title, summary, updated_at, published_at,
+       NULLIF(btrim(institute), '') AS institute,
+       count(*) OVER () AS full_total
+FROM d
+ORDER BY published_at DESC NULLS LAST, accession
+LIMIT %(limit)s;
+"""
+)
+
+# Institute facet over the FULL deduped match set. Splits GEO's "; "-joined
+# orgs, drops per-project duplicates and the %(noise)s blocklist, and counts
+# distinct projects per institute (case-insensitive, first-seen casing wins).
+AUTHOR_INSTITUTE_FACETS_SQL = (
+    _AUTHOR_PROJECTS_CTE
+    + """
+SELECT (array_agg(name ORDER BY name))[1] AS name, count(*) AS count
+FROM (
+    SELECT DISTINCT ON (accession, lower(btrim(part)))
+           accession, lower(btrim(part)) AS key, btrim(part) AS name
+      FROM d, unnest(string_to_array(d.institute, ';')) AS part
+     WHERE d.institute IS NOT NULL AND btrim(part) <> ''
+) s
+WHERE key <> ALL(%(noise)s::text[])
+GROUP BY key
+ORDER BY count DESC, name;
+"""
+)
+
 PROJECT_AE_SQL = """
 SELECT
     ae.accession,
