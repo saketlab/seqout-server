@@ -3405,6 +3405,7 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None):
         with pool.connection() as conn:
             q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET LOCAL statement_timeout = '60s'")
                 cur.execute(
                     GEO_SEARCH_SQL,
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
@@ -3466,6 +3467,7 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None):
         with pool.connection() as conn:
             q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET LOCAL statement_timeout = '60s'")
                 cur.execute(
                     SRA_SEARCH_SQL,
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
@@ -3657,6 +3659,7 @@ def search(
                     offset=offset,
                 )
                 with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(sql, params)
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
@@ -3690,6 +3693,7 @@ def search(
             with pool.connection() as conn:
                 q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(
                         AE_SEARCH_SQL,
                         (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
@@ -3722,6 +3726,7 @@ def search(
             with pool.connection() as conn:
                 q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(
                         ENA_SEARCH_SQL,
                         (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
@@ -3755,6 +3760,7 @@ def search(
             with pool.connection() as conn:
                 q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(
                         SEARCH_SQL,
                         (
