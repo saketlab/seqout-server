@@ -26,6 +26,10 @@ SELECT accession, pmid FROM (
     UNION
     SELECT accession, pubmed_id_pysradb
         FROM sra_studies WHERE accession = ANY(%(acc)s)
+        -- pysradb stamps a bogus pmid on private-placeholder mirrors
+        -- (title "GEO accession GSExxx is currently private ..."); ~4k of them.
+        -- Their real study has no publication yet, so drop the spurious pmid.
+        AND title NOT ILIKE 'GEO accession %% is currently private%%'
     UNION
     SELECT study_accession, pubmed_id_pysradb
         FROM ena_studies WHERE study_accession = ANY(%(acc)s)
