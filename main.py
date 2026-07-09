@@ -113,7 +113,6 @@ from queries import (
     PROJECT_GEO_SQL,
     PROJECT_SRA_SQL,
     PUBLICATION_BY_DOI_SQL,
-    AUTHOR_INSTITUTE_FACETS_SQL,
     PUBLICATION_BY_PMID_SQL,
     RELATED_SQL,
     RUN_DOWNLOAD_SQL,
@@ -420,6 +419,15 @@ _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
 _broad_facets_cache: dict[tuple, dict] = {}
+# Author-projects: deterministic per normalized name, and pages get revisited.
+_author_projects_cache_lock = threading.Lock()
+_author_projects_cache: dict[tuple, dict] = {}
+_AUTHOR_PROJECTS_CACHE_TTL = 24 * 3600
+_MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
+# Fetch cap for faceting: the full deduped set is tiny for almost everyone.
+# ponytail: >2000 projects/author is vanishingly rare; total stays exact (window
+# runs pre-LIMIT), only facets would slightly undercount for such an author.
+_AUTHOR_PROJECTS_FETCH_CAP = 2000
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena")
 
 
@@ -2145,6 +2153,8 @@ def purge_cache(request: Request):
         _enriched_crosstab_cache.clear()
     with _broad_facets_cache_lock:
         _broad_facets_cache.clear()
+    with _author_projects_cache_lock:
+        _author_projects_cache.clear()
     return {"message": "All caches purged."}
 
 
@@ -7187,34 +7197,72 @@ def search_author_projects(
 ):
     regex = _author_name_regex(q)
     if regex is None:
-        return {"q": q, "total": 0, "results": []}
-    noise = sorted(_INSTITUTE_NOISE)
+        return {"q": q, "total": 0, "results": [], "institutes": []}
+
+    key = (q.strip().lower(), limit)
+    with _author_projects_cache_lock:
+        cached = _get_bounded_cache_entry(
+            _author_projects_cache, key, _AUTHOR_PROJECTS_CACHE_TTL
+        )
+    if cached is not None:
+        return cached
+
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SEARCH_AUTHOR_PROJECTS_SQL, {"re": regex, "limit": limit})
+                # One CTE run: fetch the full deduped set (capped), then paginate
+                # and facet in Python instead of re-running the CTE for facets.
+                cur.execute(
+                    SEARCH_AUTHOR_PROJECTS_SQL,
+                    {"re": regex, "cap": _AUTHOR_PROJECTS_FETCH_CAP},
+                )
                 rows = cur.fetchall()
-                _enrich_with_publications(rows, cur)
-                # Facet counts over the full match set, not just this page.
-                cur.execute(AUTHOR_INSTITUTE_FACETS_SQL, {"re": regex, "noise": noise})
-                institutes = cur.fetchall()
+                total = rows[0]["full_total"] if rows else 0
+                for r in rows:
+                    r.pop("full_total", None)
+
+                # Clean each card's institute string: drop noise, dedup orgs per project.
+                for r in rows:
+                    seen: dict[str, str] = {}
+                    for part in (r.get("institute") or "").split(";"):
+                        name = part.strip()
+                        if name and name.lower() not in _INSTITUTE_NOISE:
+                            seen.setdefault(name.lower(), name)
+                    r["institute"] = "; ".join(seen.values()) or None
+
+                # Institute facets over the full fetched set (case-insensitive,
+                # first-seen casing wins; each project counts an institute once).
+                facets: dict[str, dict] = {}
+                for r in rows:
+                    if not r["institute"]:
+                        continue
+                    for name in r["institute"].split("; "):
+                        entry = facets.get(name.lower())
+                        if entry:
+                            entry["count"] += 1
+                        else:
+                            facets[name.lower()] = {"name": name, "count": 1}
+                institutes = sorted(
+                    facets.values(), key=lambda e: (-e["count"], e["name"])
+                )
+
+                # Enrich only the page we return, not the whole fetched set.
+                results = rows[:limit]
+                _enrich_with_publications(results, cur)
     except Exception:
         logger.exception("Database error in search_author_projects")
         raise HTTPException(500, "Internal server error")
-    total = rows[0].pop("full_total", len(rows)) if rows else 0
-    for r in rows[1:]:
-        r.pop("full_total", None)
 
-    # Clean each card's institute string: drop noise, dedup orgs per project.
-    for r in rows:
-        seen: dict[str, str] = {}
-        for part in (r.get("institute") or "").split(";"):
-            name = part.strip()
-            if name and name.lower() not in _INSTITUTE_NOISE:
-                seen.setdefault(name.lower(), name)
-        r["institute"] = "; ".join(seen.values()) or None
-
-    return {"q": q, "total": total, "results": rows, "institutes": institutes}
+    result = {"q": q, "total": total, "results": results, "institutes": institutes}
+    with _author_projects_cache_lock:
+        _set_bounded_cache_entry(
+            _author_projects_cache,
+            key,
+            result,
+            _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES,
+            _AUTHOR_PROJECTS_CACHE_TTL,
+        )
+    return result
 
 
 @api_app.get(

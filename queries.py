@@ -1630,7 +1630,10 @@ u AS (
     -- the _INSTITUTE_NOISE blocklist downstream, not here.
     SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
            array_to_string(gs.organizations, '; ') AS institute
-      FROM geo_series gs JOIN pm ON gs.pubmed_id @> ARRAY[pm.pmid]
+      FROM geo_series gs
+     -- Array-overlap against the whole pmid set: one GIN scan, vs a per-pmid
+     -- nested loop (loops=N) with `JOIN pm ON pubmed_id @> ARRAY[pm.pmid]`.
+     WHERE gs.pubmed_id && ARRAY(SELECT pmid FROM pm)
     UNION ALL
     SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
            array_to_string(gs.organizations, '; ')
@@ -1679,6 +1682,9 @@ d AS (
 )
 """
 
+# Full deduped match set (capped). full_total is the real count before the cap
+# (window runs before LIMIT). The handler paginates + computes institute facets
+# in Python from this one result, so the CTE runs once instead of twice.
 SEARCH_AUTHOR_PROJECTS_SQL = (
     _AUTHOR_PROJECTS_CTE
     + """
@@ -1687,26 +1693,7 @@ SELECT accession, title, summary, updated_at, published_at,
        count(*) OVER () AS full_total
 FROM d
 ORDER BY published_at DESC NULLS LAST, accession
-LIMIT %(limit)s;
-"""
-)
-
-# Institute facet over the FULL deduped match set. Splits GEO's "; "-joined
-# orgs, drops per-project duplicates and the %(noise)s blocklist, and counts
-# distinct projects per institute (case-insensitive, first-seen casing wins).
-AUTHOR_INSTITUTE_FACETS_SQL = (
-    _AUTHOR_PROJECTS_CTE
-    + """
-SELECT (array_agg(name ORDER BY name))[1] AS name, count(*) AS count
-FROM (
-    SELECT DISTINCT ON (accession, lower(btrim(part)))
-           accession, lower(btrim(part)) AS key, btrim(part) AS name
-      FROM d, unnest(string_to_array(d.institute, ';')) AS part
-     WHERE d.institute IS NOT NULL AND btrim(part) <> ''
-) s
-WHERE key <> ALL(%(noise)s::text[])
-GROUP BY key
-ORDER BY count DESC, name;
+LIMIT %(cap)s;
 """
 )
 
