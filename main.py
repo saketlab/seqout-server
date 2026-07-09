@@ -3947,19 +3947,22 @@ def _compute_search_facets(
             q_variants = _search_query_variants(q)
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
+                    # Match /search's ceiling so broad-query totals materialize
+                    # instead of dying on the 30s pool default (e.g. "mouse brain").
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     # Single FTS pass: materialize the match set, then reuse it.
                     msql, mparams = build_search_match_temp(
                         q=q, q_variants=q_variants, db=db
                     )
                     cur.execute(msql, mparams)
-                    # Total: cheap count over the materialized set. Runs under the
-                    # default timeout so it stays reliable even when facets are slow.
+                    # Total: cheap count over the materialized set. Computed before
+                    # the facet pass so it survives even if facets time out.
                     tsql, tparams = build_search_total_over_matched(**filters)
                     cur.execute(tsql, tparams)
                     total = cur.fetchone()["total"]
                     try:
                         with conn.transaction():
-                            cur.execute("SET LOCAL statement_timeout = 10000")
+                            cur.execute("SET LOCAL statement_timeout = 60000")
                             fsql, fparams = build_search_facets_over_matched(**filters)
                             cur.execute(fsql, fparams)
                             for r in cur.fetchall():
