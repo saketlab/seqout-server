@@ -354,6 +354,15 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS organism_growth_monthly AS
   FROM ena_experiments e
   JOIN ena_studies es ON es.study_accession = e.study_accession
   WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
+  GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public)
+
+  UNION ALL
+
+  SELECT 'gsa'::text, es.scientific_name,
+         DATE_TRUNC('month', e.first_public), COUNT(*)
+  FROM gsa_experiments e
+  JOIN gsa_studies es ON es.study_accession = e.study_accession
+  WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
   GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ogm_organism_db_month
@@ -394,6 +403,15 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS platform_growth_monthly AS
   WHERE e.first_public IS NOT NULL
     AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
   GROUP BY e.instrument_platform, e.instrument_model, DATE_TRUNC('month', e.first_public)
+
+  UNION ALL
+
+  SELECT 'gsa'::text, e.instrument_platform, e.instrument_model,
+         DATE_TRUNC('month', e.first_public), COUNT(*)
+  FROM gsa_experiments e
+  WHERE e.first_public IS NOT NULL
+    AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
+  GROUP BY e.instrument_platform, e.instrument_model, DATE_TRUNC('month', e.first_public)
 WITH DATA;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pgm_platform_db_month_model
@@ -430,6 +448,15 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS platform_growth_projects_monthly AS
   SELECT 'ena'::text, e.instrument_platform,
          DATE_TRUNC('month', e.first_public), COUNT(DISTINCT e.study_accession)
   FROM ena_experiments e
+  WHERE e.first_public IS NOT NULL
+    AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
+  GROUP BY e.instrument_platform, DATE_TRUNC('month', e.first_public)
+
+  UNION ALL
+
+  SELECT 'gsa'::text, e.instrument_platform,
+         DATE_TRUNC('month', e.first_public), COUNT(DISTINCT e.study_accession)
+  FROM gsa_experiments e
   WHERE e.first_public IS NOT NULL
     AND e.instrument_platform IS NOT NULL AND e.instrument_platform != ''
   GROUP BY e.instrument_platform, DATE_TRUNC('month', e.first_public)

@@ -4,8 +4,10 @@ set -e
 DATABASE_URL=$(grep '^DATABASE_URL=' .env | cut -d= -f2-)
 
 echo "Creating organism_growth_monthly materialized view..."
+# DROP + CREATE so re-running applies definition changes.
 psql "$DATABASE_URL" <<'EOF'
-CREATE MATERIALIZED VIEW IF NOT EXISTS organism_growth_monthly AS
+DROP MATERIALIZED VIEW IF EXISTS organism_growth_monthly;
+CREATE MATERIALIZED VIEW organism_growth_monthly AS
   SELECT 'geo'::text AS db,
          UNNEST(g.organisms) AS organism,
          DATE_TRUNC('month', s.published_at) AS month,
@@ -39,6 +41,15 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS organism_growth_monthly AS
          DATE_TRUNC('month', e.first_public), COUNT(*)
   FROM ena_experiments e
   JOIN ena_studies es ON es.study_accession = e.study_accession
+  WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
+  GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public)
+
+  UNION ALL
+
+  SELECT 'gsa'::text, es.scientific_name,
+         DATE_TRUNC('month', e.first_public), COUNT(*)
+  FROM gsa_experiments e
+  JOIN gsa_studies es ON es.study_accession = e.study_accession
   WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
   GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public);
 

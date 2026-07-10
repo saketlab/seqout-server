@@ -43,6 +43,13 @@ FROM ts_stat('SELECT tsv FROM arrayexpress_experiments')
 WHERE ndoc > 50 AND LENGTH(word) >= 3
 ON CONFLICT (term) DO UPDATE SET frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency);
 
+-- 3b. FTS corpus lexemes from gsa_studies_search
+INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
+SELECT word, 'corpus', ndoc::int, LOWER(word)
+FROM ts_stat('SELECT tsv FROM gsa_studies_search')
+WHERE ndoc > 50 AND LENGTH(word) >= 3
+ON CONFLICT (term) DO UPDATE SET frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency);
+
 -- 4. Organisms (always include, high value)
 INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
 SELECT organism, 'organism', SUM(count)::int, LOWER(organism)

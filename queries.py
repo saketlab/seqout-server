@@ -229,6 +229,51 @@ LIMIT 200;
 """
 
 
+GSA_SEARCH_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
+),
+all_matches AS (
+    -- Full-text search match (priority 4)
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[] AS organisms,
+           ARRAY['China']::text[] AS countries,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source, 4 AS priority,
+           NULL::text[] AS instrument_models,
+           NULL::text[] AS library_strategies
+    FROM gsa_studies_search, q
+    WHERE tsv @@ q.match_q
+),
+counted AS (
+    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
+),
+paged AS (
+    SELECT *
+    FROM counted
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+)
+SELECT
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+FROM paged
+ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
+LIMIT 200;
+"""
+
+
 SEARCH_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('english', %s) AS core_q,
@@ -280,6 +325,21 @@ all_matches AS (
            accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM ena_studies_search, q
     WHERE tsv @@ q.match_q
+
+    UNION ALL
+
+    -- GSA full-text search (organisms via 1:1 PK join to gsa_studies)
+    SELECT gss.accession,
+           COALESCE(gss.study_title, gss.study_name, gss.project_name, gss.accession) AS title,
+           gss.study_description AS summary,
+           COALESCE(gss.last_updated, gss.first_public) AS updated_at,
+           CASE WHEN gs.scientific_name IS NOT NULL THEN ARRAY[gs.scientific_name] ELSE NULL END::text[] AS organisms,
+           ARRAY['China']::text[] AS countries,
+           (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,
+           gss.accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+    FROM gsa_studies_search gss
+    LEFT JOIN gsa_studies gs ON gs.study_accession = gss.accession, q
+    WHERE gss.tsv @@ q.match_q
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
@@ -356,6 +416,21 @@ all_matches AS (
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
     WHERE tsv @@ q.match_q
+    UNION ALL
+    -- organisms come from a 1:1 PK join to gsa_studies (scientific_name, ~99%
+    -- populated) so the organism facet includes GSA; library_strategies/platforms
+    -- stay NULL (per-run aggregation is too costly for the hot path — as with ENA).
+    SELECT gss.accession,
+           COALESCE(gss.study_title, gss.study_name, gss.project_name, gss.accession) AS title,
+           gss.study_description AS summary,
+           COALESCE(gss.last_updated, gss.first_public) AS updated_at,
+           CASE WHEN gs.scientific_name IS NOT NULL THEN ARRAY[gs.scientific_name] ELSE NULL END::text[],
+           ARRAY['China']::text[], NULL::text[], NULL::text[], NULL::text[],
+           'gsa'::text, gss.accession,
+           (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
+    FROM gsa_studies_search gss
+    LEFT JOIN gsa_studies gs ON gs.study_accession = gss.accession, q
+    WHERE gss.tsv @@ q.match_q
 ),
 -- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
 -- dedup_key (the SRA study carries the GSE as its alias); deduping first can
@@ -644,6 +719,15 @@ _ENA_FIELDS = (
     " 100.0::float8 AS rank, 'ena'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
 )
+_GSA_FIELDS = (
+    "es.accession,"
+    " COALESCE(es.study_title, es.study_name, es.project_name, es.accession) AS title,"
+    " es.study_description AS summary,"
+    " COALESCE(es.last_updated, es.first_public) AS updated_at,"
+    " NULL::text[] AS organisms, ARRAY['China']::text[] AS countries,"
+    " 100.0::float8 AS rank, 'gsa'::text AS source,"
+    " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+)
 
 SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
     "gse": (
@@ -680,7 +764,11 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" WHERE ee.run_accession = %(acc)s"
         f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
         f"                   WHERE ss.bioproject_id = ee.study_accession)"
-        f" LIMIT 2"
+        f" UNION ALL "
+        f"SELECT {_GSA_FIELDS} FROM gsa_experiments ee"
+        f" JOIN gsa_studies_search es ON es.accession = ee.study_accession"
+        f" WHERE ee.run_accession = %(acc)s"
+        f" LIMIT 3"
     ),
     "sam": (
         f"(SELECT DISTINCT ON (s.accession) {_SRA_FIELDS} FROM ena_experiments ee"
@@ -694,7 +782,12 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f"   AND NOT EXISTS (SELECT 1 FROM sra_studies ss"
         f"                   WHERE ss.bioproject_id = ee.study_accession)"
         f" ORDER BY es.accession)"
-        f" LIMIT 2"
+        f" UNION ALL "
+        f"(SELECT DISTINCT ON (es.accession) {_GSA_FIELDS} FROM gsa_experiments ee"
+        f" JOIN gsa_studies_search es ON es.accession = ee.study_accession"
+        f" WHERE ee.sample_accession = %(acc)s"
+        f" ORDER BY es.accession)"
+        f" LIMIT 3"
     ),
     "ae": (
         f"SELECT {_AE_FIELDS} FROM arrayexpress_experiments ae"
@@ -709,7 +802,11 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" UNION ALL "
         f"SELECT {_ENA_FIELDS} FROM ena_studies_search es"
         f" WHERE es.accession = %(acc)s"
-        f" LIMIT 3"
+        f" UNION ALL "
+        f"SELECT {_GSA_FIELDS} FROM gsa_studies_search es"
+        f" LEFT JOIN gsa_studies gs ON gs.study_accession = es.accession"
+        f" WHERE es.accession = %(acc)s OR gs.project_name = %(acc)s"
+        f" LIMIT 4"
     ),
 }
 
@@ -1132,6 +1229,28 @@ WHERE es.study_accession = %s
 LIMIT 1;
 """
 
+PROJECT_GSA_SQL = """
+SELECT
+    es.study_accession AS accession,
+    NULL::text AS alias,
+    es.study_title AS title,
+    es.study_description AS abstract,
+    NULL::text AS submission,
+    NULL::text AS study_type,
+    NULL::text AS external_id,
+    NULL::jsonb AS links,
+    NULL::date AS published_at,
+    es.last_updated AS updated_at,
+    NULL::real[] AS coords_2d,
+    NULL::real[] AS coords_3d,
+    NULL::jsonb AS neighbors,
+    NULL::text[] AS organisms,
+    NULL::jsonb AS center
+FROM gsa_studies es
+WHERE es.study_accession = %s
+LIMIT 1;
+"""
+
 STUDY_EXPERIMENTS_SQL = """
 SELECT
     accession,
@@ -1168,6 +1287,28 @@ SELECT DISTINCT ON (e.experiment_accession)
     e.instrument_model,
     NULL::text AS submission
 FROM ena_experiments e
+WHERE e.study_accession = UPPER(%s)
+ORDER BY e.experiment_accession, e.run_accession NULLS LAST;
+"""
+
+GSA_STUDY_EXPERIMENTS_SQL = """
+SELECT DISTINCT ON (e.experiment_accession)
+    e.experiment_accession AS accession,
+    e.experiment_title AS title,
+    NULL::text AS design_description,
+    e.library_layout,
+    e.library_name,
+    e.library_selection,
+    e.library_source,
+    e.library_strategy,
+    CASE
+        WHEN e.sample_accession IS NOT NULL THEN ARRAY[e.sample_accession]::text[]
+        ELSE ARRAY[]::text[]
+    END AS samples,
+    e.instrument_platform AS platform,
+    e.instrument_model,
+    NULL::text AS submission
+FROM gsa_experiments e
 WHERE e.study_accession = UPPER(%s)
 ORDER BY e.experiment_accession, e.run_accession NULLS LAST;
 """
@@ -1227,6 +1368,43 @@ WHERE UPPER(s.sample_accession) = UPPER(%s)
 LIMIT 1;
 """
 
+GSA_SAMPLE_SQL = """
+SELECT
+    s.sample_accession AS accession,
+    s.sample_alias AS alias,
+    s.sample_description AS description,
+    s.sample_title AS title,
+    s.scientific_name,
+    NULL::text AS taxon_id,
+    NULL::text AS external_id,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object('tag', kv.key, 'value', kv.value)
+                ORDER BY kv.key
+            )
+            FROM jsonb_each_text(
+                jsonb_strip_nulls(
+                    to_jsonb(s) - ARRAY[
+                        'sample_accession',
+                        'sample_alias',
+                        'sample_title',
+                        'sample_description',
+                        'scientific_name',
+                        'study_accession'
+                    ]::text[]
+                )
+            ) AS kv
+        ),
+        '[]'::jsonb
+    ) AS attributes_json,
+    NULL::text AS submission,
+    NULL::jsonb AS links
+FROM gsa_samples s
+WHERE UPPER(s.sample_accession) = UPPER(%s)
+LIMIT 1;
+"""
+
 BATCH_SAMPLES_SQL = """
 SELECT
     accession,
@@ -1278,6 +1456,44 @@ SELECT
     s.submission_accession AS submission,
     NULL::jsonb AS links
 FROM ena_samples s
+WHERE UPPER(s.sample_accession) = ANY(%s);
+"""
+
+# Batched GSA fallback for _fetch_samples_batch. Mirrors GSA_SAMPLE_SQL but
+# matches a list (uppercased) via the gsa_samples_accession_upper_idx index.
+BATCH_GSA_SAMPLES_SQL = """
+SELECT
+    s.sample_accession AS accession,
+    s.sample_alias AS alias,
+    s.sample_description AS description,
+    s.sample_title AS title,
+    s.scientific_name,
+    NULL::text AS taxon_id,
+    NULL::text AS external_id,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object('tag', kv.key, 'value', kv.value)
+                ORDER BY kv.key
+            )
+            FROM jsonb_each_text(
+                jsonb_strip_nulls(
+                    to_jsonb(s) - ARRAY[
+                        'sample_accession',
+                        'sample_alias',
+                        'sample_title',
+                        'sample_description',
+                        'scientific_name',
+                        'study_accession'
+                    ]::text[]
+                )
+            ) AS kv
+        ),
+        '[]'::jsonb
+    ) AS attributes_json,
+    NULL::text AS submission,
+    NULL::jsonb AS links
+FROM gsa_samples s
 WHERE UPPER(s.sample_accession) = ANY(%s);
 """
 
@@ -1419,6 +1635,32 @@ ORDER BY e.experiment_accession, e.run_accession NULLS LAST
 LIMIT 1;
 """
 
+# Get a single GSA experiment by accession
+# Caller must pass accession already uppercased
+GSA_EXPERIMENT_SQL = """
+SELECT DISTINCT ON (e.experiment_accession)
+    e.experiment_accession AS accession,
+    e.experiment_title AS title,
+    NULL::text AS design_description,
+    e.library_layout,
+    e.library_name,
+    e.library_selection,
+    e.library_source,
+    e.library_strategy,
+    CASE
+        WHEN e.sample_accession IS NOT NULL THEN ARRAY[e.sample_accession]::text[]
+        ELSE ARRAY[]::text[]
+    END AS samples,
+    e.instrument_platform AS platform,
+    e.instrument_model,
+    NULL::text AS submission,
+    e.study_accession AS study
+FROM gsa_experiments e
+WHERE e.experiment_accession = %s
+ORDER BY e.experiment_accession, e.run_accession NULLS LAST
+LIMIT 1;
+"""
+
 # Get a single GEO sample by accession (GSM)
 # Caller must pass accession already uppercased
 GEO_SAMPLE_SQL = """
@@ -1449,9 +1691,10 @@ SELECT
     dl.ncbi_sra_lite_bytes,
     dl.ncbi_sra_lite_s3_url,
     dl.ncbi_sra_lite_gs_url,
-    ena.run_alias
+    COALESCE(ena.run_alias, gsa.run_alias) AS run_alias
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
 WHERE dl.experiment_accession = %s
 ORDER BY dl.run_accession;
 """
@@ -1461,6 +1704,15 @@ ORDER BY dl.run_accession;
 ENA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT DISTINCT experiment_accession
 FROM ena_experiments
+WHERE sample_accession = %s
+LIMIT 1;
+"""
+
+# Get GSA experiment accession from sample accession
+# Caller must pass accession already uppercased
+GSA_SAMPLE_TO_EXPERIMENT_SQL = """
+SELECT DISTINCT experiment_accession
+FROM gsa_experiments
 WHERE sample_accession = %s
 LIMIT 1;
 """
@@ -1479,6 +1731,15 @@ LIMIT 1;
 ENA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT DISTINCT study_accession AS study
 FROM ena_experiments
+WHERE experiment_accession = %s
+LIMIT 1;
+"""
+
+# Get GSA study accession from experiment accession
+# Caller must pass accession already uppercased
+GSA_EXPERIMENT_TO_STUDY_SQL = """
+SELECT DISTINCT study_accession AS study
+FROM gsa_experiments
 WHERE experiment_accession = %s
 LIMIT 1;
 """
@@ -1587,6 +1848,8 @@ FROM (
     SELECT center_name FROM sra_submissions WHERE center_name IS NOT NULL AND center_name <> ''
     UNION ALL
     SELECT center_name FROM ena_studies     WHERE center_name IS NOT NULL AND center_name <> ''
+    UNION ALL
+    SELECT center_name FROM gsa_studies     WHERE center_name IS NOT NULL AND center_name <> ''
 ) c
 GROUP BY center_name
 ORDER BY count DESC, value
@@ -1658,6 +1921,11 @@ u AS (
            es.last_updated, es.first_public, NULL::text
       FROM ena_studies es
      WHERE es.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT gs.study_accession, gs.study_title, gs.study_description,
+           gs.last_updated, gs.first_public, NULL::text
+      FROM gsa_studies gs
+     WHERE gs.pubmed_id_pysradb IN (SELECT pmid FROM pm)
     UNION ALL
     -- Split the OR into two arms: a single "col1 IN (..) OR col2 IN (..)" forces
     -- a seq scan over all ~60k AE rows; two arms each hit their own index.
@@ -2044,6 +2312,7 @@ def build_structured_search(
     include_sra = source in (None, "all", "sra")
     include_ae = source in (None, "all", "arrayexpress")
     include_ena = source in (None, "all", "ena")
+    include_gsa = source in (None, "all", "gsa")
 
     # Skip sources that cannot satisfy required filters
     if library_strategy:
@@ -2056,9 +2325,11 @@ def build_structured_search(
     if instrument_model:
         include_ae = False
         include_ena = False
+        include_gsa = False
     if multi_platform:
         include_ae = False
         include_ena = False
+        include_gsa = False
 
     # Populate shared params
     if q:
@@ -2415,6 +2686,88 @@ def build_structured_search(
             f" FROM ena_studies es{joins}{from_q}{where}"
         )
 
+    # --- GSA ---
+    if include_gsa:
+        w = []
+        joins = ""
+        if geo_cte:
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = gs.study_accession AND ga.source = 'gsa'"
+        from_q = ", q" if q else ""
+        gsa_tsv = (
+            "to_tsvector('english',"
+            " coalesce(gs.study_title, '') || ' ' ||"
+            " coalesce(gs.study_description, ''))"
+        )
+        if q:
+            w.append(f"{gsa_tsv} @@ q.match_q")
+        if organism:
+            w.append("gs.scientific_name = %(organism)s")
+        if library_strategy or platform or country:
+            ec = ["ge.study_accession = gs.study_accession"]
+            if library_strategy:
+                ec.append("ge.library_strategy = %(library_strategy)s")
+            if platform:
+                ec.append("ge.instrument_platform = %(platform)s")
+            if country:
+                ec.append("ge.country = %(country)s")
+            w.append(
+                "EXISTS (SELECT 1 FROM gsa_experiments ge"
+                " WHERE " + " AND ".join(ec) + ")"
+            )
+        if center:
+            w.append("gs.center_name ILIKE '%%' || %(center)s || '%%'")
+        if year_from is not None:
+            w.append("gs.first_public >= make_date(%(year_from)s, 1, 1)")
+        if year_to is not None:
+            w.append("gs.first_public <= make_date(%(year_to)s, 12, 31)")
+        if published_after:
+            w.append("gs.first_public >= %(published_after)s::date")
+        if published_before:
+            w.append("gs.first_public <= %(published_before)s::date")
+        if sample_tissue:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                " WHERE os.study_accession = gs.study_accession"
+                " AND os.tissue ILIKE %(sample_tissue)s)"
+            )
+        if sample_disease:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                " WHERE os.study_accession = gs.study_accession"
+                " AND os.disease ILIKE %(sample_disease)s)"
+            )
+        if sample_cell_type:
+            w.append(
+                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                " WHERE os.study_accession = gs.study_accession"
+                " AND os.cell_type ILIKE %(sample_cell_type)s)"
+            )
+        if journal:
+            w.append(
+                "EXISTS (SELECT 1 FROM study_publications sp"
+                " WHERE sp.accession = gs.study_accession"
+                " AND sp.publications->0->>'journal' = %(journal)s)"
+            )
+
+        rank = (
+            f"(ts_rank({gsa_tsv}, q.core_q) + ts_rank({gsa_tsv}, q.match_q) * 0.2) * 0.7"
+            if q
+            else "COALESCE(EXTRACT(EPOCH FROM gs.first_public), 0)"
+        )
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        cte_parts.append(
+            f"SELECT gs.study_accession AS accession,"
+            f" gs.study_title AS title,"
+            f" gs.study_description AS summary,"
+            f" gs.first_public AS updated_at,"
+            f" CASE WHEN gs.scientific_name IS NOT NULL"
+            f" THEN ARRAY[gs.scientific_name] END AS organisms,"
+            f" ARRAY['China']::text[] AS countries,"
+            f" {rank} AS rank, 'gsa'::text AS source,"
+            f" gs.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
+            f" FROM gsa_studies gs{joins}{from_q}{where}"
+        )
+
     if not cte_parts:
         return (
             "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
@@ -2571,6 +2924,19 @@ def build_sorted_search_sql(
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,"
             " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM ena_studies_search, q"
+            " WHERE tsv @@ q.match_q"
+        )
+
+    if db in (None, "gsa"):
+        cte_parts.append(
+            "SELECT accession,"
+            " COALESCE(study_title, study_name, project_name, accession) AS title,"
+            " study_description AS summary,"
+            " COALESCE(last_updated, first_public) AS updated_at,"
+            " NULL::text[] AS organisms, ARRAY['China']::text[] AS countries,"
+            " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,"
+            " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            " FROM gsa_studies_search, q"
             " WHERE tsv @@ q.match_q"
         )
 
@@ -2910,9 +3276,10 @@ SELECT
     dl.ncbi_sra_lite_bytes,
     dl.ncbi_sra_lite_s3_url,
     dl.ncbi_sra_lite_gs_url,
-    ena.run_alias
+    COALESCE(ena.run_alias, gsa.run_alias) AS run_alias
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
 WHERE dl.study_accession IN (SELECT acc FROM candidates)
 ORDER BY dl.experiment_accession, dl.run_accession;
 """
@@ -2939,9 +3306,10 @@ SELECT
     dl.ncbi_sra_lite_bytes,
     dl.ncbi_sra_lite_s3_url,
     dl.ncbi_sra_lite_gs_url,
-    ena.run_alias
+    COALESCE(ena.run_alias, gsa.run_alias) AS run_alias
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
 WHERE dl.study_accession IN (SELECT acc FROM candidates)
 ORDER BY dl.experiment_accession, dl.run_accession
 LIMIT 500;
@@ -2969,9 +3337,10 @@ SELECT
     dl.ncbi_sra_lite_bytes,
     dl.ncbi_sra_lite_s3_url,
     dl.ncbi_sra_lite_gs_url,
-    ena.run_alias
+    COALESCE(ena.run_alias, gsa.run_alias) AS run_alias
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
+LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
 WHERE dl.run_accession = %s;
 """
 
@@ -3079,6 +3448,15 @@ GROUP BY DATE_TRUNC('month', first_public)
 ORDER BY month;
 """
 
+GROWTH_PROJECTS_GSA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM gsa_studies
+WHERE first_public IS NOT NULL
+GROUP BY DATE_TRUNC('month', first_public)
+ORDER BY month;
+"""
+
 # -- Experiments mode (samples/experiments per month) --
 
 GROWTH_EXPERIMENTS_GEO_SQL = """
@@ -3114,6 +3492,15 @@ GROWTH_EXPERIMENTS_ENA_SQL = """
 SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
        COUNT(*) AS count
 FROM ena_experiments
+WHERE first_public IS NOT NULL
+GROUP BY DATE_TRUNC('month', first_public)
+ORDER BY month;
+"""
+
+GROWTH_EXPERIMENTS_GSA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM gsa_experiments
 WHERE first_public IS NOT NULL
 GROUP BY DATE_TRUNC('month', first_public)
 ORDER BY month;
@@ -3206,7 +3593,8 @@ PLATFORM_TOTALS_SQL = """
 SELECT platform, SUM(count) AS total,
        SUM(CASE WHEN db = 'geo' THEN count ELSE 0 END) AS geo,
        SUM(CASE WHEN db = 'sra' THEN count ELSE 0 END) AS sra,
-       SUM(CASE WHEN db = 'ena' THEN count ELSE 0 END) AS ena
+       SUM(CASE WHEN db = 'ena' THEN count ELSE 0 END) AS ena,
+       SUM(CASE WHEN db = 'gsa' THEN count ELSE 0 END) AS gsa
 FROM platform_growth_monthly
 GROUP BY platform
 ORDER BY total DESC;
@@ -3455,6 +3843,7 @@ location_agg AS (
         COUNT(*) FILTER (WHERE source = 'sra') AS n_sra,
         COUNT(*) FILTER (WHERE source = 'arrayexpress') AS n_ae,
         COUNT(*) FILTER (WHERE source = 'ena') AS n_ena,
+        COUNT(*) FILTER (WHERE source = 'gsa') AS n_gsa,
         {mode_block}
     FROM filtered
     GROUP BY 1, 2
@@ -3482,7 +3871,7 @@ organism_top5 AS (
 )
 SELECT
     a.lat, a.lng, a.n_projects, a.n_experiments, a.n_samples,
-    a.n_geo, a.n_sra, a.n_ae, a.n_ena,
+    a.n_geo, a.n_sra, a.n_ae, a.n_ena, a.n_gsa,
     {select_block},
     COALESCE(o.top_organisms, '[]'::jsonb) AS top_organisms
 FROM location_agg a
@@ -3699,10 +4088,13 @@ SITEMAP_TABLES = {
         True,
         "experiment_accession >= 'DRX' AND experiment_accession < 'ERY'",
     ),
+    "gsa": ("gsa_studies", "study_accession", False, None),
+    "gsa_exp": ("gsa_experiments", "experiment_accession", True, None),
     "run": ("sra_run_download_links", "run_accession", False, None),
     "geo_sample": ("geo_samples", "accession", False, None),
     "sra_sample": ("sra_samples", "accession", False, None),
     "ena_sample": ("ena_samples", "sample_accession", False, None),
+    "gsa_sample": ("gsa_samples", "sample_accession", False, None),
 }
 
 
@@ -3790,7 +4182,9 @@ SELECT
     {_reltuples('arrayexpress_experiments')} AS arrayexpress_projects,
     {_reltuples('arrayexpress_samples')} AS arrayexpress_samples,
     {_reltuples('ena_studies')} AS ena_projects,
-    {_reltuples('ena_samples')} AS ena_samples;
+    {_reltuples('ena_samples')} AS ena_samples,
+    {_reltuples('gsa_studies')} AS gsa_projects,
+    {_reltuples('gsa_samples')} AS gsa_samples;
 """
 
 LAST_UPDATED_SQL = """
@@ -3802,7 +4196,9 @@ SELECT
     (SELECT MAX(release_date)::timestamptz FROM arrayexpress_experiments
         WHERE release_date::timestamptz <= now()) AS arrayexpress,
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies
-        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS ena;
+        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS ena,
+    (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM gsa_studies
+        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS gsa;
 """
 
 ENRICHED_STAT_COLUMNS = [
