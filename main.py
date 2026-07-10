@@ -155,6 +155,8 @@ from queries import (
     STUDY_RUNS_SQL,
     GEO_SERIES_CONTRIBUTORS_BATCH_SQL,
     STUDY_RUNS_SUMMARY_SQL,
+    GSA_STUDY_RUNS_PREVIEW_SQL,
+    GSA_STUDY_RUNS_SUMMARY_SQL,
     STUDY_SAMPLES_SRA_SQL,
     SUBMITTER_BATCH_SQL,
     build_country_accessions_sql,
@@ -433,6 +435,11 @@ _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
 _broad_facets_cache: dict[tuple, dict] = {}
+# First-page unfiltered results
+_search_results_cache_lock = threading.Lock()
+_search_results_cache: dict[tuple, dict] = {}
+_MAX_SEARCH_RESULTS_CACHE_ENTRIES = 300
+_SEARCH_RESULTS_PAGE = 200  # full page ⇒ broad query worth caching
 # Author-projects: deterministic per normalized name, and pages get revisited.
 _author_projects_cache_lock = threading.Lock()
 _author_projects_cache: dict[tuple, dict] = {}
@@ -473,6 +480,10 @@ neo4j_driver = GraphDatabase.driver(
         os.environ.get("NEO4J_USER", "neo4j"),
         os.environ.get("NEO4J_PASSWORD", ""),
     ),
+    # Fail fast when Neo4j is down
+    connection_timeout=3.0,
+    connection_acquisition_timeout=5.0,
+    max_transaction_retry_time=3.0,
 )
 
 limiter = Limiter(key_func=get_remote_address)
@@ -2046,13 +2057,24 @@ def _try_accession_search(
     }
 
 
+# after a Neo4j failure, skip expansion for the cooldown so an
+# outage costs one timed-out request per window, not one per search.
+_neo4j_expand_circuit = {"open_until": 0.0}
+_NEO4J_EXPAND_COOLDOWN = 30.0
+
+
 def _search_query_variants(q: str) -> list[str]:
-    # Organism scientific/common names now live in the Neo4j graph alongside
-    # every other synonym, so a single expand_terms pass covers them too.
+    # Best-effort synonym expansion via Neo4j; degrade to the raw query on failure.
+    if time.time() < _neo4j_expand_circuit["open_until"]:
+        return [q]
     try:
         return list(dict.fromkeys(expand_terms(neo4j_driver, q)))
     except Exception:
-        logger.debug("Term query expansion failed", exc_info=True)
+        _neo4j_expand_circuit["open_until"] = time.time() + _NEO4J_EXPAND_COOLDOWN
+        logger.warning(
+            "Neo4j term expansion failed; skipping synonyms for %.0fs",
+            _NEO4J_EXPAND_COOLDOWN,
+        )
         return [q]
 
 
@@ -2210,6 +2232,8 @@ def purge_cache(request: Request):
         _enriched_crosstab_cache.clear()
     with _broad_facets_cache_lock:
         _broad_facets_cache.clear()
+    with _search_results_cache_lock:
+        _search_results_cache.clear()
     with _author_projects_cache_lock:
         _author_projects_cache.clear()
     return {"message": "All caches purged."}
@@ -3720,6 +3744,22 @@ def search(
     original_q = _replace_query_hyphens(q)
     q = original_q
 
+    # First-page unfiltered searches are cacheable (filtered/accession returned above).
+    results_cache_key = None
+    if (
+        cursor_rank is None
+        and cursor_acc is None
+        and cursor_sort is None
+        and not offset
+    ):
+        results_cache_key = (q, db, sortby, order)
+        with _search_results_cache_lock:
+            _cached_results = _get_bounded_cache_entry(
+                _search_results_cache, results_cache_key, float("inf")
+            )
+        if _cached_results is not None:
+            return _cached_results
+
     if sortby:
         start = time.perf_counter()
         try:
@@ -3979,6 +4019,16 @@ def search(
         elif suggestions:
             result["suggestions"] = suggestions
 
+    # Pin broad (full-page) results until /cache/purge.
+    if results_cache_key and len(result.get("results", [])) >= _SEARCH_RESULTS_PAGE:
+        with _search_results_cache_lock:
+            _set_bounded_cache_entry(
+                _search_results_cache,
+                results_cache_key,
+                result,
+                _MAX_SEARCH_RESULTS_CACHE_ENTRIES,
+                float("inf"),
+            )
     return result
 
 
@@ -4718,14 +4768,18 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
 def get_study_runs(
     request: Request,
     response: Response,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=rf"^({_STUDY_PREFIX}|CRA|HRA)\d+$"),
 ):
     study = study.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    is_gsa = _is_gsa_study(study)
+    summary_sql = GSA_STUDY_RUNS_SUMMARY_SQL if is_gsa else STUDY_RUNS_SUMMARY_SQL
+    preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
+    params = (study,) if is_gsa else (study, study)
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                cur.execute(summary_sql, params)
                 summary = cur.fetchone()
                 if not summary or summary["total_runs"] == 0:
                     return {
@@ -4736,7 +4790,7 @@ def get_study_runs(
                         "runs": [],
                     }
 
-                cur.execute(STUDY_RUNS_PREVIEW_SQL, (study, study))
+                cur.execute(preview_sql, params)
                 rows = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in get_study_runs")
