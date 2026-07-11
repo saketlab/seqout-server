@@ -7435,7 +7435,10 @@ def _author_name_regex(q: str) -> str | None:
     if len(esc) >= 2:
         body = f"{esc[0]}( [^,]*)? {esc[-1]}"
     else:
-        body = f"([^,]* )?{esc[0]}"
+        # A single token matches a whole word anywhere in the name (given,
+        # middle, or surname), not just the surname — so "saket" finds
+        # "Saket Choudhary". Leading/trailing spaces enforce word boundaries.
+        body = f"([^,]* )?{esc[0]}( [^,]*)?"
     return f"(^|, ){body}(,|$)"
 
 
