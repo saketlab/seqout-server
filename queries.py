@@ -1234,7 +1234,9 @@ SELECT
     es.study_accession AS accession,
     NULL::text AS alias,
     es.project_name AS bioproject_id,
-    es.study_title AS title,
+    -- open GSA (CRA*) studies often leave study_title blank and carry the title
+    -- on the linked BioProject; fall back to it (mirrors the abstract below).
+    COALESCE(NULLIF(es.study_title, ''), p.title) AS title,
     -- prefer the linked BioProject abstract (rich) over the study's own
     -- description, which for GSA-Human is often just a disease/scope phrase.
     COALESCE(NULLIF(p.summary, ''), es.study_description) AS abstract,
