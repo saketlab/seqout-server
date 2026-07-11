@@ -1226,8 +1226,30 @@ SELECT
         WHEN NULLIF(btrim(es.scientific_name), '') IS NOT NULL
         THEN ARRAY[es.scientific_name]
     END::text[] AS organisms,
-    NULL::jsonb AS center
+    NULL::jsonb AS center,
+    -- ENA/DDBJ study hierarchy: a study may nest under an umbrella BioProject
+    -- (parent), and umbrella projects may have many children. Child-of is a
+    -- single cheap join; parent-of is a capped preview + total (needs the
+    -- idx_ena_studies_parent index — a big umbrella has tens of thousands).
+    es.parent_study_accession AS parent_accession,
+    parent.study_title AS parent_title,
+    (
+        SELECT count(*) FROM ena_studies ch
+        WHERE ch.parent_study_accession = es.study_accession
+    ) AS children_total,
+    (
+        SELECT jsonb_agg(c)
+        FROM (
+            SELECT ch.study_accession AS accession, ch.study_title AS title
+            FROM ena_studies ch
+            WHERE ch.parent_study_accession = es.study_accession
+            ORDER BY ch.study_accession
+            LIMIT 24
+        ) c
+    ) AS children
 FROM ena_studies es
+LEFT JOIN ena_studies parent
+    ON parent.study_accession = es.parent_study_accession
 WHERE es.study_accession = %s
 LIMIT 1;
 """
