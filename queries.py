@@ -245,10 +245,10 @@ WITH q AS (
 all_matches AS (
     -- Full-text search match (priority 4)
     SELECT accession,
-           COALESCE(study_title, study_name, project_name, accession) AS title,
-           study_description AS summary,
+           COALESCE(study_title, project_title, study_name, project_name, accession) AS title,
+           COALESCE(study_description, project_summary) AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
-           NULL::text[] AS organisms,
+           organisms,
            ARRAY['China']::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source, 4 AS priority,
            NULL::text[] AS instrument_models,
@@ -328,17 +328,17 @@ all_matches AS (
 
     UNION ALL
 
-    -- GSA full-text search (organisms via 1:1 PK join to gsa_studies)
+    -- GSA full-text search (title/abstract/organism enriched from the BioProject
+    -- and materialized onto gsa_studies_search by transfer.gsa_search)
     SELECT gss.accession,
-           COALESCE(gss.study_title, gss.study_name, gss.project_name, gss.accession) AS title,
-           gss.study_description AS summary,
+           COALESCE(gss.study_title, gss.project_title, gss.study_name, gss.project_name, gss.accession) AS title,
+           COALESCE(gss.study_description, gss.project_summary) AS summary,
            COALESCE(gss.last_updated, gss.first_public) AS updated_at,
-           CASE WHEN gs.scientific_name IS NOT NULL THEN ARRAY[gs.scientific_name] ELSE NULL END::text[] AS organisms,
+           gss.organisms,
            ARRAY['China']::text[] AS countries,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,
            gss.accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
-    FROM gsa_studies_search gss
-    LEFT JOIN gsa_studies gs ON gs.study_accession = gss.accession, q
+    FROM gsa_studies_search gss, q
     WHERE gss.tsv @@ q.match_q
 ),
 deduped AS (
@@ -417,19 +417,19 @@ all_matches AS (
     FROM ena_studies_search, q
     WHERE tsv @@ q.match_q
     UNION ALL
-    -- organisms come from a 1:1 PK join to gsa_studies (scientific_name, ~99%
-    -- populated) so the organism facet includes GSA; library_strategies/platforms
-    -- stay NULL (per-run aggregation is too costly for the hot path — as with ENA).
+    -- title/abstract/organisms enriched from the BioProject and materialized
+    -- onto gsa_studies_search by transfer.gsa_search, so the organism facet
+    -- includes GSA; library_strategies/platforms stay NULL (per-run aggregation
+    -- is too costly for the hot path — as with ENA).
     SELECT gss.accession,
-           COALESCE(gss.study_title, gss.study_name, gss.project_name, gss.accession) AS title,
-           gss.study_description AS summary,
+           COALESCE(gss.study_title, gss.project_title, gss.study_name, gss.project_name, gss.accession) AS title,
+           COALESCE(gss.study_description, gss.project_summary) AS summary,
            COALESCE(gss.last_updated, gss.first_public) AS updated_at,
-           CASE WHEN gs.scientific_name IS NOT NULL THEN ARRAY[gs.scientific_name] ELSE NULL END::text[],
+           gss.organisms,
            ARRAY['China']::text[], NULL::text[], NULL::text[], NULL::text[],
            'gsa'::text, gss.accession,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
-    FROM gsa_studies_search gss
-    LEFT JOIN gsa_studies gs ON gs.study_accession = gss.accession, q
+    FROM gsa_studies_search gss, q
     WHERE gss.tsv @@ q.match_q
 ),
 -- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
@@ -721,10 +721,10 @@ _ENA_FIELDS = (
 )
 _GSA_FIELDS = (
     "es.accession,"
-    " COALESCE(es.study_title, es.study_name, es.project_name, es.accession) AS title,"
-    " es.study_description AS summary,"
+    " COALESCE(es.study_title, es.project_title, es.study_name, es.project_name, es.accession) AS title,"
+    " COALESCE(es.study_description, es.project_summary) AS summary,"
     " COALESCE(es.last_updated, es.first_public) AS updated_at,"
-    " NULL::text[] AS organisms, ARRAY['China']::text[] AS countries,"
+    " es.organisms, ARRAY['China']::text[] AS countries,"
     " 100.0::float8 AS rank, 'gsa'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
 )
@@ -2694,15 +2694,15 @@ def build_structured_search(
 
     if include_gsa:
         w = []
-        joins = ""
+        # LEFT JOIN the enriched search table so q matches the BioProject/sample
+        # text materialized onto gsa_studies_search by transfer.gsa_search, not
+        # just the thin study_title/description. LEFT so non-q filters still see
+        # the ~5.4k studies absent from the search table.
+        joins = " LEFT JOIN gsa_studies_search gss ON gss.accession = gs.study_accession"
         if geo_cte:
-            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = gs.study_accession AND ga.source = 'gsa'"
+            joins += " INNER JOIN geo_accessions ga ON ga.canonical_accession = gs.study_accession AND ga.source = 'gsa'"
         from_q = ", q" if q else ""
-        gsa_tsv = (
-            "to_tsvector('english',"
-            " coalesce(gs.study_title, '') || ' ' ||"
-            " coalesce(gs.study_description, ''))"
-        )
+        gsa_tsv = "gss.tsv"
         if q:
             w.append(f"{gsa_tsv} @@ q.match_q")
         if organism:
@@ -2762,11 +2762,11 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT gs.study_accession AS accession,"
-            f" gs.study_title AS title,"
-            f" gs.study_description AS summary,"
+            f" COALESCE(gs.study_title, gss.project_title, gs.study_name, gs.project_name, gs.study_accession) AS title,"
+            f" COALESCE(gs.study_description, gss.project_summary) AS summary,"
             f" gs.first_public AS updated_at,"
-            f" CASE WHEN gs.scientific_name IS NOT NULL"
-            f" THEN ARRAY[gs.scientific_name] END AS organisms,"
+            f" COALESCE(gss.organisms, CASE WHEN gs.scientific_name IS NOT NULL"
+            f" THEN ARRAY[gs.scientific_name] END) AS organisms,"
             f" ARRAY['China']::text[] AS countries,"
             f" {rank} AS rank, 'gsa'::text AS source,"
             f" gs.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
@@ -2935,10 +2935,10 @@ def build_sorted_search_sql(
     if db in (None, "gsa"):
         cte_parts.append(
             "SELECT accession,"
-            " COALESCE(study_title, study_name, project_name, accession) AS title,"
-            " study_description AS summary,"
+            " COALESCE(study_title, project_title, study_name, project_name, accession) AS title,"
+            " COALESCE(study_description, project_summary) AS summary,"
             " COALESCE(last_updated, first_public) AS updated_at,"
-            " NULL::text[] AS organisms, ARRAY['China']::text[] AS countries,"
+            " organisms, ARRAY['China']::text[] AS countries,"
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,"
             " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM gsa_studies_search, q"
