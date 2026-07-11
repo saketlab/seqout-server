@@ -115,6 +115,7 @@ from queries import (
     PLATFORM_FILTERS_SQL,
     PLATFORM_INSTRUMENTS_SQL,
     PLATFORM_TOTALS_SQL,
+    PRJ_TO_ENA_STUDY_SQL,
     PRJ_TO_GSA_STUDY_SQL,
     PRJ_TO_SRA_STUDY_SQL,
     PRJNA_TO_GEO_SERIES_SQL,
@@ -7331,6 +7332,14 @@ def get_prj_info(
 
                 # GSA (CNCB-NGDC) BioProjects (PRJCA*) resolve to a CRA/HRA study.
                 cur.execute(PRJ_TO_GSA_STUDY_SQL, (prj_accession,))
+                result = cur.fetchone()
+                if result:
+                    return {"project_accession": result["accession"]}
+
+                # ENA (incl. DDBJ mirror) keys some BioProjects by the PRJ
+                # accession itself (no GEO/SRA/GSA study), e.g. assembly-only
+                # projects — the project page IS /p/<PRJ>, so resolve to itself.
+                cur.execute(PRJ_TO_ENA_STUDY_SQL, (prj_accession,))
                 result = cur.fetchone()
                 if result:
                     return {"project_accession": result["accession"]}

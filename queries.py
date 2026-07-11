@@ -1222,7 +1222,10 @@ SELECT
     NULL::real[] AS coords_2d,
     NULL::real[] AS coords_3d,
     NULL::jsonb AS neighbors,
-    NULL::text[] AS organisms,
+    CASE
+        WHEN NULLIF(btrim(es.scientific_name), '') IS NOT NULL
+        THEN ARRAY[es.scientific_name]
+    END::text[] AS organisms,
     NULL::jsonb AS center
 FROM ena_studies es
 WHERE es.study_accession = %s
@@ -1586,6 +1589,16 @@ PRJ_TO_GSA_STUDY_SQL = """
 SELECT accession
 FROM gsa_studies_search
 WHERE project_name = %s
+LIMIT 1;
+"""
+
+# ENA (incl. the DDBJ mirror) stores some BioProjects keyed by the PRJ accession
+# itself (study_accession = PRJNA*/PRJDB*/PRJEB*), with no GEO/SRA/GSA study —
+# e.g. assembly-only projects. The project page is /p/<PRJ>, so resolve to self.
+PRJ_TO_ENA_STUDY_SQL = """
+SELECT study_accession AS accession
+FROM ena_studies
+WHERE study_accession = %s
 LIMIT 1;
 """
 
