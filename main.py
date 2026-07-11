@@ -8940,6 +8940,13 @@ mcp = FastMCP.from_fastapi(
 )
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
+# Beacon v2 router — added to api_app AFTER the MCP app is built from mcp_api_app,
+# so Beacon endpoints are excluded from MCP tool generation (spec §3).
+import beacon as _beacon  # noqa: E402
+
+_beacon.pool = pool
+api_app.include_router(_beacon.beacon_router)
+
 combined_app = FastAPI(
     title="seqout API",
     description="Programmatic access to 1M+ GEO, SRA, ENA & ArrayExpress sequencing projects.",
