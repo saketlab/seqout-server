@@ -1234,7 +1234,7 @@ SELECT
     es.study_accession AS accession,
     NULL::text AS alias,
     es.study_title AS title,
-    es.study_description AS abstract,
+    COALESCE(NULLIF(p.summary, ''), es.study_description) AS abstract,
     NULL::text AS submission,
     NULL::text AS study_type,
     NULL::text AS external_id,
@@ -1250,6 +1250,7 @@ SELECT
     END::text[] AS organisms,
     NULL::jsonb AS center
 FROM gsa_studies es
+LEFT JOIN gsa_projects p ON p.accession = es.project_name
 WHERE es.study_accession = %s
 LIMIT 1;
 """
@@ -2677,7 +2678,6 @@ def build_structured_search(
             f" FROM ena_studies es{joins}{from_q}{where}"
         )
 
-    # --- GSA ---
     if include_gsa:
         w = []
         joins = ""
