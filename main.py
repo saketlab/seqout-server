@@ -689,6 +689,26 @@ def _normalize_aliases(alias) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def _external_id_accessions(external_id) -> list[str]:
+    """Accession-shaped values from a project's external_id cross-links
+    ({"GEO": "GSE..", "SRA": "SRP.."}); tolerates a dict or a JSON string."""
+    if not external_id:
+        return []
+    if isinstance(external_id, str):
+        try:
+            external_id = json.loads(external_id)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(external_id, dict):
+        return []
+    out: list[str] = []
+    for value in external_id.values():
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            if item:
+                out.append(str(item).strip().upper())
+    return out
+
+
 def _rich_pub(pmid: str, m: dict) -> dict:
     """A full publication entry from a pubmed_metadata row."""
     pub_date = m.get("pub_date")
@@ -793,6 +813,13 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         cands = [acc] + [
             a for a in _normalize_aliases(r.get("alias")) if a and a != acc
         ]
+        # Linked archives named in external_id ({"GEO": "GSE..", "SRA": "SRP.."})
+        # lend their publication too, so a PRJ* wrapper — or any project holding a
+        # same-study cross-archive link — inherits the linked study's pub when it
+        # has none of its own. Own accession stays first, so a native pub wins.
+        for linked in _external_id_accessions(r.get("external_id")):
+            if linked and linked != acc and linked not in cands:
+                cands.append(linked)
         row_candidates[acc] = cands
         all_cands.update(cands)
     candidate_list = list(all_cands)
@@ -4207,6 +4234,35 @@ def search_facets(
     }
 
 
+def _graft_linked_project(cur, row: dict, srp: str | None, gse: str | None) -> None:
+    """Fill an ENA project row with data it lacks natively by inheriting it from
+    the SRA study / GEO series it wraps. The similarity graph (coords_3d +
+    neighbors) is built only for SRA/GEO/AE, and supplementary_data is a GEO
+    concept — an ENA (PRJ*) row has neither. Existing values are never
+    overwritten. Cheap: two PK lookups, only for PRJ* pages."""
+    if srp and not (row.get("coords_3d") and row.get("neighbors")):
+        cur.execute(
+            "SELECT coords_3d, neighbors, links FROM sra_studies WHERE accession = %s",
+            (srp,),
+        )
+        if g := cur.fetchone():
+            row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
+            row["neighbors"] = row.get("neighbors") or g["neighbors"]
+            row["links"] = row.get("links") or g["links"]
+    if gse:
+        cur.execute(
+            "SELECT supplementary_data, coords_3d, neighbors"
+            " FROM geo_series WHERE accession = %s",
+            (gse,),
+        )
+        if g := cur.fetchone():
+            row["supplementary_data"] = (
+                row.get("supplementary_data") or g["supplementary_data"]
+            )
+            row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
+            row["neighbors"] = row.get("neighbors") or g["neighbors"]
+
+
 @api_app.get(
     "/project/{accession}",
     summary="Get project",
@@ -4242,11 +4298,10 @@ def get_project(
                 cur.execute(sql, params)
                 row = cur.fetchone()
                 if row:
-                    # _enrich_with_publications resolves authors (publication →
-                    # geo_series.contributors → center_name) uniformly for every
-                    # project type.
-                    _enrich_with_publications([row], cur)
-                    # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP, not the PRJ.
+                    # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP,
+                    # not the PRJ. Resolve FIRST so the linked accession is set in
+                    # external_id before enrichment (below) reads it as a
+                    # publication candidate.
                     enrich_acc = accession
                     if accession.startswith("PRJ"):
                         gse, srp = (r := _resolve_prj(cur, accession))["gse"], r["srp"]
@@ -4256,6 +4311,14 @@ def get_project(
                         if xref and not row.get("external_id"):
                             row["external_id"] = xref
                         enrich_acc = gse or srp or accession
+                        # ENA rows carry no embedding/supplementary of their own;
+                        # inherit the similarity graph + supplementary from the
+                        # linked SRA study / GEO series.
+                        _graft_linked_project(cur, row, srp, gse)
+                    # _enrich_with_publications resolves authors (publication →
+                    # geo_series.contributors → center_name) uniformly for every
+                    # project type.
+                    _enrich_with_publications([row], cur)
                     # Cheap existence probe so the UI can show/hide the Enriched
                     # tab without eagerly loading the heavy enriched payload.
                     cur.execute(
@@ -4718,14 +4781,14 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
 def get_study_runs(
     request: Request,
     response: Response,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study,))
                 summary = cur.fetchone()
                 if not summary or summary["total_runs"] == 0:
                     return {
@@ -4736,7 +4799,7 @@ def get_study_runs(
                         "runs": [],
                     }
 
-                cur.execute(STUDY_RUNS_PREVIEW_SQL, (study, study))
+                cur.execute(STUDY_RUNS_PREVIEW_SQL, (study,))
                 rows = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in get_study_runs")
@@ -4952,14 +5015,14 @@ def get_experiment_runs(
 @limiter.limit("100/minute")
 def get_study_bams(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
     empty = {"total_bams": 0, "total_bam_bytes": "0", "bams": []}
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_BAMS_SQL, (study, study))
+                cur.execute(STUDY_BAMS_SQL, (study,))
                 rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in get_study_bams")
@@ -4993,7 +5056,7 @@ def get_study_bams(
 @limiter.limit("100/minute")
 def download_study_bams_tsv(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
 
@@ -5007,7 +5070,7 @@ def download_study_bams_tsv(
         try:
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(STUDY_BAMS_SQL, (study, study))
+                    cur.execute(STUDY_BAMS_SQL, (study,))
                     while True:
                         rows = cur.fetchmany(500)
                         if not rows:
@@ -5051,7 +5114,7 @@ def download_study_bams_tsv(
 @limiter.limit("100/minute")
 def download_study_runs_tsv(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
 
@@ -5068,7 +5131,7 @@ def download_study_runs_tsv(
         try:
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(STUDY_RUNS_SQL, (study, study))
+                    cur.execute(STUDY_RUNS_SQL, (study,))
                     while True:
                         rows = cur.fetchmany(500)
                         if not rows:
@@ -5116,7 +5179,7 @@ def download_study_runs_tsv(
 @limiter.limit("100/minute")
 def download_study_metadata_csv(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
 ):
     study = study.upper()
 
@@ -5163,7 +5226,7 @@ def download_study_metadata_csv(
                                 all_attr_keys.append(key)
 
                 # 4. Verify runs exist before streaming
-                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study,))
                 summary = cur.fetchone()
                 if not summary or summary["total_runs"] == 0:
                     raise HTTPException(404, f"No runs found for {study}")
@@ -5279,7 +5342,7 @@ def download_study_metadata_csv(
         try:
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(STUDY_RUNS_SQL, (study, study))
+                    cur.execute(STUDY_RUNS_SQL, (study,))
                     while True:
                         rows = cur.fetchmany(500)
                         if not rows:
@@ -5336,7 +5399,7 @@ def get_project_metadata_rows(
                     exp_map, sample_map, sample_attrs = _prepare_study_metadata(
                         cur, accession
                     )
-                    cur.execute(STUDY_RUNS_SQL, (accession, accession))
+                    cur.execute(STUDY_RUNS_SQL, (accession,))
                     rows = []
                     while True:
                         batch = cur.fetchmany(500)
@@ -5871,7 +5934,7 @@ _DOWNLOAD_MODE_REGEX = "|".join(_DOWNLOAD_MODES)
 @limiter.limit("100/minute")
 def get_study_download_manifest(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
     mode: str = Query("fastq", pattern=_DOWNLOAD_MODE_REGEX),
     limit: int = Query(500, ge=1, le=1000),
     cursor: int = Query(0, ge=0),
@@ -5893,9 +5956,9 @@ def get_study_download_manifest(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study, study))
+                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study,))
                 summary = cur.fetchone() or {}
-                cur.execute(STUDY_RUNS_SQL, (study, study))
+                cur.execute(STUDY_RUNS_SQL, (study,))
                 while True:
                     batch = cur.fetchmany(500)
                     if not batch:
@@ -5970,7 +6033,7 @@ def get_study_download_manifest(
 @limiter.limit("200/minute")
 def download_study_script(
     request: Request,
-    study: str = Path(..., pattern=STUDY_REGEX),
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
     mode: str = Path(..., pattern=_DOWNLOAD_MODE_REGEX),
 ):
     study = study.upper()
@@ -5994,7 +6057,7 @@ def download_study_script(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SQL, (study, study))
+                cur.execute(STUDY_RUNS_SQL, (study,))
                 while True:
                     batch = cur.fetchmany(500)
                     if not batch:

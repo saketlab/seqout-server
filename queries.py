@@ -3224,12 +3224,20 @@ ORDER BY i.ord;
 
 # Resolve study_accession(s) used in sra_run_download_links for a given
 # SRP/ERP/DRP accession.
+# Resolve a study/project accession to every accession the download links may be
+# keyed under. Cross-archive links go BOTH ways: an SRP -> its BioProject, and a
+# PRJ* -> the SRA study it wraps (so ENA project pages, addressed by PRJ*, find
+# the FASTQ/BAM rows that live under the SRP). Single %s: the input accession.
 _RESOLVE_DL_STUDY = """
-WITH candidates AS (
-    SELECT %s::text AS acc
+WITH input AS (SELECT %s::text AS acc),
+candidates AS (
+    SELECT acc FROM input
     UNION
-    SELECT bioproject_id FROM sra_studies
-    WHERE accession = %s AND bioproject_id IS NOT NULL
+    SELECT s.bioproject_id FROM sra_studies s, input
+    WHERE s.accession = input.acc AND s.bioproject_id IS NOT NULL
+    UNION
+    SELECT s.accession FROM sra_studies s, input
+    WHERE s.bioproject_id = input.acc
 )
 """
 
