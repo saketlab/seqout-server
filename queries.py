@@ -1577,6 +1577,15 @@ WHERE bioproject_id = %s
 LIMIT 1;
 """
 
+# GSA (CNCB-NGDC) BioProjects (PRJCA*) map to a CRA/HRA study via project_name.
+# Only searchable studies are in gsa_studies_search, matching the search shortcut.
+PRJ_TO_GSA_STUDY_SQL = """
+SELECT accession
+FROM gsa_studies_search
+WHERE project_name = %s
+LIMIT 1;
+"""
+
 # ---------------------------------------------------------------------------
 # Sample detail queries
 # ---------------------------------------------------------------------------
