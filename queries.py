@@ -1233,6 +1233,7 @@ PROJECT_GSA_SQL = """
 SELECT
     es.study_accession AS accession,
     NULL::text AS alias,
+    es.project_name AS bioproject_id,
     es.study_title AS title,
     -- prefer the linked BioProject abstract (rich) over the study's own
     -- description, which for GSA-Human is often just a disease/scope phrase.
