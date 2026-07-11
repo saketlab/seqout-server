@@ -9014,10 +9014,10 @@ mcp = FastMCP.from_fastapi(
 )
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
-#import beacon as _beacon  # noqa: E402
+import beacon as _beacon  # noqa: E402
 
-#_beacon.pool = pool
-# api_app.include_router(_beacon.beacon_router)
+_beacon.pool = pool
+api_app.include_router(_beacon.beacon_router)
 
 combined_app = FastAPI(
     title="seqout API",
