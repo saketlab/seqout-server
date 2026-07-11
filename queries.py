@@ -1234,7 +1234,9 @@ SELECT
     es.study_accession AS accession,
     NULL::text AS alias,
     es.study_title AS title,
-    es.study_description AS abstract,
+    -- prefer the linked BioProject abstract (rich) over the study's own
+    -- description, which for GSA-Human is often just a disease/scope phrase.
+    COALESCE(NULLIF(p.summary, ''), es.study_description) AS abstract,
     NULL::text AS submission,
     NULL::text AS study_type,
     NULL::text AS external_id,
@@ -1244,9 +1246,13 @@ SELECT
     NULL::real[] AS coords_2d,
     NULL::real[] AS coords_3d,
     NULL::jsonb AS neighbors,
-    NULL::text[] AS organisms,
+    CASE
+        WHEN es.scientific_name IS NOT NULL AND es.scientific_name <> ''
+        THEN ARRAY[es.scientific_name]
+    END::text[] AS organisms,
     NULL::jsonb AS center
 FROM gsa_studies es
+LEFT JOIN gsa_projects p ON p.accession = es.project_name
 WHERE es.study_accession = %s
 LIMIT 1;
 """
@@ -1340,10 +1346,7 @@ SELECT
     s.secondary_sample_accession AS external_id,
     COALESCE(
         (
-            SELECT jsonb_agg(
-                jsonb_build_object('tag', kv.key, 'value', kv.value)
-                ORDER BY kv.key
-            )
+            SELECT jsonb_object_agg(kv.key, kv.value)
             FROM jsonb_each_text(
                 jsonb_strip_nulls(
                     to_jsonb(s) - ARRAY[
@@ -1359,7 +1362,7 @@ SELECT
                 )
             ) AS kv
         ),
-        '[]'::jsonb
+        '{}'::jsonb
     ) AS attributes_json,
     s.submission_accession AS submission,
     NULL::jsonb AS links
@@ -1379,10 +1382,7 @@ SELECT
     NULL::text AS external_id,
     COALESCE(
         (
-            SELECT jsonb_agg(
-                jsonb_build_object('tag', kv.key, 'value', kv.value)
-                ORDER BY kv.key
-            )
+            SELECT jsonb_object_agg(kv.key, kv.value)
             FROM jsonb_each_text(
                 jsonb_strip_nulls(
                     to_jsonb(s) - ARRAY[
@@ -1396,7 +1396,7 @@ SELECT
                 )
             ) AS kv
         ),
-        '[]'::jsonb
+        '{}'::jsonb
     ) AS attributes_json,
     NULL::text AS submission,
     NULL::jsonb AS links
@@ -1432,10 +1432,7 @@ SELECT
     s.secondary_sample_accession AS external_id,
     COALESCE(
         (
-            SELECT jsonb_agg(
-                jsonb_build_object('tag', kv.key, 'value', kv.value)
-                ORDER BY kv.key
-            )
+            SELECT jsonb_object_agg(kv.key, kv.value)
             FROM jsonb_each_text(
                 jsonb_strip_nulls(
                     to_jsonb(s) - ARRAY[
@@ -1451,7 +1448,7 @@ SELECT
                 )
             ) AS kv
         ),
-        '[]'::jsonb
+        '{}'::jsonb
     ) AS attributes_json,
     s.submission_accession AS submission,
     NULL::jsonb AS links
@@ -1472,10 +1469,7 @@ SELECT
     NULL::text AS external_id,
     COALESCE(
         (
-            SELECT jsonb_agg(
-                jsonb_build_object('tag', kv.key, 'value', kv.value)
-                ORDER BY kv.key
-            )
+            SELECT jsonb_object_agg(kv.key, kv.value)
             FROM jsonb_each_text(
                 jsonb_strip_nulls(
                     to_jsonb(s) - ARRAY[
@@ -1489,7 +1483,7 @@ SELECT
                 )
             ) AS kv
         ),
-        '[]'::jsonb
+        '{}'::jsonb
     ) AS attributes_json,
     NULL::text AS submission,
     NULL::jsonb AS links
@@ -2686,7 +2680,6 @@ def build_structured_search(
             f" FROM ena_studies es{joins}{from_q}{where}"
         )
 
-    # --- GSA ---
     if include_gsa:
         w = []
         joins = ""
@@ -3323,6 +3316,55 @@ ORDER BY dl.experiment_accession, dl.run_accession
 LIMIT 500;
 """
 )
+
+# GSA runs come from gsa_experiments; download links (fastq only, no sra/ncbi)
+# are LEFT JOINed from sra_run_download_links.
+GSA_STUDY_RUNS_SUMMARY_SQL = """
+SELECT
+    COUNT(*) AS total_runs,
+    COUNT(*) FILTER (WHERE ge.library_layout = 'PAIRED') AS paired_runs,
+    COUNT(*) FILTER (WHERE ge.library_layout = 'SINGLE') AS single_runs,
+    COALESCE(SUM(
+        CASE WHEN dl.fastq_bytes IS NOT NULL AND dl.fastq_bytes != ''
+             THEN (
+                 SELECT SUM(v::bigint)
+                 FROM unnest(string_to_array(dl.fastq_bytes, ';')) AS v
+                 WHERE v ~ '^[0-9]+$'
+             )
+             ELSE 0
+        END
+    ), 0) AS total_fastq_bytes
+FROM gsa_experiments ge
+LEFT JOIN sra_run_download_links dl ON dl.run_accession = ge.run_accession
+WHERE ge.study_accession = %s;
+"""
+
+GSA_STUDY_RUNS_PREVIEW_SQL = """
+SELECT
+    ge.run_accession,
+    ge.experiment_accession,
+    ge.library_layout,
+    dl.fastq_ftp,
+    dl.fastq_bytes,
+    dl.fastq_md5,
+    NULL::text AS sra_ftp,
+    NULL::text AS sra_bytes,
+    NULL::text AS sra_md5,
+    NULL::text AS ncbi_sra_url,
+    NULL::text AS ncbi_sra_url_aws,
+    NULL::text AS ncbi_sra_normalized_url,
+    NULL::bigint AS ncbi_sra_normalized_bytes,
+    NULL::text AS ncbi_sra_lite_url,
+    NULL::bigint AS ncbi_sra_lite_bytes,
+    NULL::text AS ncbi_sra_lite_s3_url,
+    NULL::text AS ncbi_sra_lite_gs_url,
+    ge.run_alias
+FROM gsa_experiments ge
+LEFT JOIN sra_run_download_links dl ON dl.run_accession = ge.run_accession
+WHERE ge.study_accession = %s
+ORDER BY ge.experiment_accession, ge.run_accession
+LIMIT 500;
+"""
 
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
 RUN_DOWNLOAD_SQL = """
