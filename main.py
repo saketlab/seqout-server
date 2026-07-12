@@ -8693,8 +8693,9 @@ def _age_hours_to_human(value: str | None) -> str | None:
 
 MCP_INSTRUCTIONS = """\
 You are connected to seqout, a genomics study search engine covering NCBI
-GEO, SRA/ENA/DDBJ, ArrayExpress, BioProject, publication links, download links,
-and ontology-enriched sample metadata.
+GEO, SRA/ENA/DDBJ, ArrayExpress, GSA (CNCB-NGDC, including GSA-Human),
+BioProject, publication links, download links, and ontology-enriched sample
+metadata.
 
 Your job is to choose the narrowest correct tool, preserve context, and avoid
 making users re-state accessions or filters. Do not guess when an accession can
@@ -8754,11 +8755,19 @@ be classified or resolved by a tool.
 - `PRJ...` BioProject: `get_project` can return ENA PRJ project metadata, but FASTQ
   download tools require a resolved SRP/ERP/DRP study accession. Call
   `resolve_prj_project` first when the user asks for FASTQs/downloads from a PRJ.
+  `PRJCA...` are GSA projects and resolve to CRA/HRA studies.
+- GSA (CNCB-NGDC) accessions: `CRA/HRA...` study, `CRX/HRX...` experiment,
+  `CRR/HRR...` run, `HRS...` sample, `PRJCA...` project (`SAMC...` BioSample).
+  `HR*` are GSA-Human (controlled-access). Use `get_project`,
+  `get_study_experiments`, `get_study_samples`, and `get_study_runs` on a CRA/HRA
+  study just like an SRA study; `get_sample_detail` on HRS/CRX/CRR. GSA rows carry
+  raw run/download links only where the archive publishes them — GSA-Human data is
+  typically access-controlled, so download links may be absent.
 
 ## Search And Cohort Discovery
 
 Use `search_all` for ordinary keyword search across all sources. Pass
-`db=geo|sra|arrayexpress|ena` only when the user restricts the source. Use
+`db=geo|sra|arrayexpress|ena|gsa` only when the user restricts the source. Use
 `sortby=citations|journal|year` with `order=desc|asc` when the user asks for
 most cited, journal-sorted, newest, or oldest results. Results are automatically
 enriched with publication and center fields when available: `publications`,
@@ -8775,7 +8784,7 @@ combine `q` with:
 - `library_strategy`: RNA-Seq, ChIP-Seq, WGS, ATAC-seq, etc.
 - `platform`: platform code such as ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT.
 - `instrument_model`: exact instrument model, such as Illumina NovaSeq 6000.
-- `source=geo|sra|arrayexpress|ena|all` to restrict the archive.
+- `source=geo|sra|arrayexpress|ena|gsa|all` to restrict the archive.
 - `country`, `center`, `journal`, `year_from`, `year_to`.
 - `published_after` and `published_before` as YYYY-MM-DD for exact windows.
 - `assay_l1`, `assay_l2`, `geo_country`, `geo_country_code`,
@@ -8788,9 +8797,9 @@ combine `q` with:
 
 Structured-search caveats:
 - `platform` excludes GEO and ArrayExpress.
-- `instrument_model` excludes ArrayExpress and ENA.
+- `instrument_model` excludes ArrayExpress, ENA, and GSA.
 - `country` excludes ArrayExpress.
-- `multi_platform` is GEO/SRA only.
+- `multi_platform` is GEO/SRA only (excludes ArrayExpress, ENA, GSA).
 - `sample_tissue`, `sample_disease`, and `sample_cell_type` prove at least one
   enriched sample matched; call `get_project_enriched` to inspect which sample(s).
 
@@ -8906,7 +8915,12 @@ PubMed data when available. Use:
   earliest/smallest PMID; `type=all` returns all linked publications; `format=bibtex`
   returns plain BibTeX.
 - `find_publication` for paper-to-datasets lookup by PMID or DOI.
-- `search_by_author` for author-name substring search across linked publications.
+- `search_author_projects` when the user wants every dataset a person authored:
+  it returns project rows (search-card compatible) plus their institutes. Prefer
+  this for "datasets/studies by <name>".
+- `search_by_author` when the user wants the publications themselves: one row per
+  PMID (title, journal, DOI, citations) with the accessions linked to each paper.
+Both only find studies linked to a PubMed publication.
 
 ## Statistics And Discovery
 
@@ -8937,8 +8951,11 @@ PubMed data when available. Use:
   `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
   `get_sample_detail`.
 - `get_clusters`, `get_projects_atlas_v1`, `get_atlas_labels_v1`, `get_map_meta`,
-  `get_map_labels`, `get_map_countries`, and `get_map_tile` serve visualization
-  assets, not conversational answers.
+  `get_map_filter`, `get_map_labels`, `get_map_countries`, and `get_map_tile` serve
+  visualization assets, not conversational answers.
+- `search_facets` and `deep_dive_terms`/`deep_dive_children` power search-page UI
+  widgets (sidebar counts, ontology drilldown). For cohort counts use
+  `search_structured(count_by=...)` instead.
 - `get_geo_series_neighbors_coords` is low-level map/similarity data; use
   `get_project_similar` for conversational similarity.
 - `search_geo` and `search_sra` are redundant; use `search_all` with `db`.
@@ -8952,6 +8969,7 @@ MCP_OPERATION_IDS = {
     "search_suggest",
     "search_structured",
     "search_by_author",
+    "search_author_projects",
     "get_project",
     "get_project_metadata",
     "get_project_metadata_rows",
