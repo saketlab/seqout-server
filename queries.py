@@ -2733,7 +2733,9 @@ def build_structured_search(
         # text materialized onto gsa_studies_search by transfer.gsa_search, not
         # just the thin study_title/description. LEFT so non-q filters still see
         # the ~5.4k studies absent from the search table.
-        joins = " LEFT JOIN gsa_studies_search gss ON gss.accession = gs.study_accession"
+        joins = (
+            " LEFT JOIN gsa_studies_search gss ON gss.accession = gs.study_accession"
+        )
         if geo_cte:
             joins += " INNER JOIN geo_accessions ga ON ga.canonical_accession = gs.study_accession AND ga.source = 'gsa'"
         from_q = ", q" if q else ""

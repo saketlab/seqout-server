@@ -6,6 +6,7 @@ Spec: docs/superpowers/specs/2026-07-10-beacon-v2-metadata-design.md (§5, §6).
 from __future__ import annotations
 
 import json
+import re
 
 ONTOLOGY_FIELDS: dict[str, str] = {
     "disease": "mondo",
@@ -48,6 +49,43 @@ BIOSAMPLE_COLUMNS = (
 
 _SQL_OPS = {"=": "=", "!": "<>", ">": ">", "<": "<", ">=": ">=", "<=": "<="}
 
+# Age is requested as an "alphanumeric" filter carrying an ISO8601 duration value
+# (e.g. EFO:0004847 / PATO:0000011 / "age" with operator ">" value "P70Y"). It
+# resolves against the precomputed ontology_samples_v4.age_days (days), NOT an
+# ontology CURIE — so it must be handled before resolve_filter_id (EFO -> assay).
+_AGE_IDS = {"EFO:0004847", "PATO:0000011", "AGE"}
+_ISO_DUR_RE = re.compile(
+    r"^P(?=\d)(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?"
+    r"(?:(\d+(?:\.\d+)?)W)?(?:(\d+(?:\.\d+)?)D)?$"
+)
+_DAYS_PER_YEAR = 365.25
+_DAYS_PER_MONTH = 365.25 / 12
+_EMBEDDED_OP_RE = re.compile(r"^(<=|>=|!=|!|=|<|>)\s*(.+)$")
+
+
+def _iso8601_duration_to_days(value: str) -> float | None:
+    """ISO8601 duration (P70Y, P6M, P2W, P10D, P70Y6M) -> days; None if unparseable."""
+    m = _ISO_DUR_RE.match(value.strip())
+    if not m or not any(m.groups()):
+        return None
+    y, mo, w, d = (float(g) if g else 0.0 for g in m.groups())
+    return round(y * _DAYS_PER_YEAR + mo * _DAYS_PER_MONTH + w * 7 + d, 3)
+
+
+def _age_clause(f: dict, params: list) -> str:
+    """Build an `age_days <op> <days>` clause; FALSE on a bad operator/value."""
+    raw = str(f.get("value", "")).strip()
+    op_token = f.get("operator")
+    m = _EMBEDDED_OP_RE.match(raw)  # allow ">P70Y" as well as a separate operator
+    if m and not op_token:
+        op_token, raw = m.group(1), m.group(2).strip()
+    op = _SQL_OPS.get("!" if op_token == "!=" else (op_token or "="))
+    days = _iso8601_duration_to_days(raw)
+    if op is None or days is None:
+        return "FALSE"
+    params.append(days)
+    return f"age_days {op} %s"
+
 
 def build_biosample_where(filters: list[dict]) -> tuple[str, list]:
     """Build the WHERE body + params for biosample/individual filtering"""
@@ -55,6 +93,9 @@ def build_biosample_where(filters: list[dict]) -> tuple[str, list]:
     params: list = []
     for f in filters:
         tid = f.get("id", "")
+        if tid.upper() in _AGE_IDS:  # numeric age range; before EFO->assay resolution
+            clauses.append(_age_clause(f, params))
+            continue
         include_desc = f.get("includeDescendantTerms", True)
         fields = resolve_filter_id(tid)
         if fields:  # ontology filter
@@ -138,4 +179,26 @@ if __name__ == "__main__":
 
     w, _ = build_biosample_where([])
     assert w == "TRUE", w
+
+    # age: EFO:0004847 must NOT resolve as an EFO/assay ontology filter
+    w, p = build_biosample_where(
+        [{"id": "EFO:0004847", "operator": ">", "value": "P70Y"}]
+    )
+    assert w == "age_days > %s" and abs(p[0] - 70 * 365.25) < 0.01, (w, p)
+    w, p = build_biosample_where(
+        [{"id": "PATO:0000011", "value": ">P70Y"}]
+    )  # embedded op
+    assert w == "age_days > %s" and abs(p[0] - 25567.5) < 0.01, (w, p)
+    w, p = build_biosample_where([{"id": "age", "operator": "<=", "value": "P6M"}])
+    assert w == "age_days <= %s" and abs(p[0] - 6 * (365.25 / 12)) < 0.01, (w, p)
+    w, p = build_biosample_where(
+        [{"id": "EFO:0004847", "operator": "=", "value": "P70Y6M"}]
+    )
+    assert (
+        w == "age_days = %s" and abs(p[0] - (70 * 365.25 + 6 * 365.25 / 12)) < 0.01
+    ), (w, p)
+    w, _ = build_biosample_where(
+        [{"id": "EFO:0004847", "value": "seventy"}]
+    )  # unparseable
+    assert w == "FALSE", w
     print("OK: build_biosample_where self-checks pass")

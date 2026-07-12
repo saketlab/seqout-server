@@ -423,6 +423,22 @@ def filtering_terms(skip: int = 0, limit: int = 0) -> dict:
         "response": {"filteringTerms": terms, "resources": _ONTOLOGY_RESOURCES},
     }
 
+
+def _dataset_record(source: dict) -> dict:
+    """Map a SOURCES entry to a Beacon dataset (collection) record (id+name required)."""
+    return {
+        "id": source["id"],
+        "name": source["name"],
+        "description": source["description"],
+        "externalUrl": ORGANIZATION["welcomeUrl"],
+    }
+
+
+async def _query_datasets(request: Request, body: dict | None) -> dict:
+    req = await parse_request(request, body)
+    # datasets are the 5 source archives; they carry no ontology facets, so a
+    # sample/biosample filter can't match one. Return an honest empty set rather
+    # than silently ignoring filters and reporting exists=true / all 5.
     if req.filters:
         rows: list = []
     else:
