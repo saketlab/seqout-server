@@ -111,9 +111,9 @@ WHERE first_public IS NOT NULL
 GROUP BY DATE_TRUNC('month', first_public)::date;
 "
 
-run_insert "projects.ddbj" "
+run_insert "projects.dra" "
 INSERT INTO database_growth_monthly_stage(metric, db, month, count)
-SELECT 'projects', 'ddbj', DATE_TRUNC('month', published_at)::date, COUNT(*)::bigint
+SELECT 'projects', 'dra', DATE_TRUNC('month', published_at)::date, COUNT(*)::bigint
 FROM dra_studies
 WHERE published_at IS NOT NULL
 GROUP BY DATE_TRUNC('month', published_at)::date;
@@ -127,9 +127,9 @@ WHERE release_date IS NOT NULL
 GROUP BY DATE_TRUNC('month', release_date)::date;
 "
 
-run_insert "experiments.ddbj" "
+run_insert "experiments.dra" "
 INSERT INTO database_growth_monthly_stage(metric, db, month, count)
-SELECT 'experiments', 'ddbj', DATE_TRUNC('month', s.published_at)::date, COUNT(*)::bigint
+SELECT 'experiments', 'dra', DATE_TRUNC('month', s.published_at)::date, COUNT(*)::bigint
 FROM dra_experiments e
 JOIN dra_studies s ON s.accession = e.study
 WHERE s.published_at IS NOT NULL

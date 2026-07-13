@@ -46,6 +46,7 @@ from queries import (
     AE_QUERY_ACCESSIONS_SQL,
     AE_SEARCH_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
+    BATCH_DRA_SAMPLES_SQL,
     BATCH_ENA_SAMPLES_SQL,
     BATCH_GSA_SAMPLES_SQL,
     BATCH_SAMPLES_SQL,
@@ -467,7 +468,7 @@ _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
 # Fetch cap for faceting: the full deduped set is tiny for almost everyone.
 # total stays exact (the window runs pre-LIMIT); only facets undercount past the cap.
 _AUTHOR_PROJECTS_FETCH_CAP = 2000
-_STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa", "ddbj", "gea")
+_STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa", "dra", "gea")
 
 
 # Per-query ceiling
@@ -1253,7 +1254,7 @@ def _fetch_sample(cur, accession: str) -> dict | None:
 
 
 def _fetch_samples_batch(cur, accessions) -> dict[str, dict]:
-    """Batch equivalent of _fetch_sample: SRA first, then ENA, then GSA fallback."""
+    """Batch equivalent of _fetch_sample: SRA, then ENA, GSA, DDBJ fallbacks."""
     accs = list(dict.fromkeys(a for a in accessions if a))
     if not accs:
         return {}
@@ -1278,6 +1279,15 @@ def _fetch_samples_batch(cur, accessions) -> dict[str, dict]:
         gsa_by_upper = {s["accession"].upper(): s for s in cur.fetchall()}
         for a in missing:
             s = gsa_by_upper.get(a.upper())
+            if s:
+                out[a] = s
+
+    missing = [a for a in accs if a not in out]
+    if missing:
+        cur.execute(BATCH_DRA_SAMPLES_SQL, ([a.upper() for a in missing],))
+        dra_by_upper = {s["accession"].upper(): s for s in cur.fetchall()}
+        for a in missing:
+            s = dra_by_upper.get(a.upper())
             if s:
                 out[a] = s
     return out
@@ -1485,6 +1495,54 @@ def flatten_ae_experiment(cur, accession: str) -> list[dict]:
                 row[key] = attrs.get(key, "-")
             else:
                 row[key] = "-"
+
+        rows.append(row)
+
+    return rows
+
+
+def flatten_gea_experiment(cur, accession: str) -> list[dict]:
+    cur.execute(GEA_EXPERIMENT_SAMPLES_SQL, (accession,))
+    samples = cur.fetchall()
+    if not samples:
+        return []
+
+    attribute_keys = set()
+    for s in samples:
+        attrs = s.get("attributes_json")
+        if attrs and isinstance(attrs, dict):
+            attribute_keys.update(attrs.keys())
+    attribute_keys = sorted(attribute_keys)
+
+    rows = []
+    for s in samples:
+        row = {
+            "Experiment": s.get("experiment_accession") or "-",
+            "Source Name": s.get("source_name") or "-",
+            "Organism": s.get("organism") or "-",
+            "Taxon ID": s.get("taxon_id") or "-",
+            "Organism Part": s.get("organism_part") or "-",
+            "Tissue": s.get("tissue") or "-",
+            "Cell Type": s.get("cell_type") or "-",
+            "Genotype": s.get("genotype") or "-",
+            "Strain": s.get("strain") or "-",
+            "Sex": s.get("sex") or "-",
+            "Age": s.get("age") or "-",
+            "BioSample": s.get("biosample") or "-",
+            "Sample Title": s.get("sample_title") or "-",
+            "Sample Description": s.get("sample_description") or "-",
+            "Library Strategy": s.get("library_strategy") or "-",
+            "Library Source": s.get("library_source") or "-",
+            "Library Selection": s.get("library_selection") or "-",
+            "Library Layout": s.get("library_layout") or "-",
+            "Instrument Model": s.get("instrument_model") or "-",
+            "DRA Experiment": s.get("dra_experiment") or "-",
+            "DRA Run": s.get("dra_run") or "-",
+        }
+
+        attrs = s.get("attributes_json")
+        for key in attribute_keys:
+            row[key] = attrs.get(key, "-") if isinstance(attrs, dict) else "-"
 
         rows.append(row)
 
@@ -1984,7 +2042,7 @@ _GROWTH_SQL_BY_MODE = {
         "arrayexpress": GROWTH_PROJECTS_AE_SQL,
         "ena": GROWTH_PROJECTS_ENA_SQL,
         "gsa": GROWTH_PROJECTS_GSA_SQL,
-        "ddbj": GROWTH_PROJECTS_DRA_SQL,
+        "dra": GROWTH_PROJECTS_DRA_SQL,
         "gea": GROWTH_PROJECTS_GEA_SQL,
     },
     "experiments": {
@@ -1993,7 +2051,7 @@ _GROWTH_SQL_BY_MODE = {
         "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
         "ena": GROWTH_EXPERIMENTS_ENA_SQL,
         "gsa": GROWTH_EXPERIMENTS_GSA_SQL,
-        "ddbj": GROWTH_EXPERIMENTS_DRA_SQL,
+        "dra": GROWTH_EXPERIMENTS_DRA_SQL,
         "gea": GROWTH_EXPERIMENTS_GEA_SQL,
     },
     "bases": {
@@ -2676,7 +2734,7 @@ def get_growth_stats(
     ),
     db: str | None = Query(
         None,
-        pattern="^(geo|sra|arrayexpress|ena|gsa|ddbj|gea|sra_fastq_bytes|sra_sra_bytes)$",
+        pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea|sra_fastq_bytes|sra_sra_bytes)$",
         description="Filter to a single series",
     ),
 ):
@@ -7200,13 +7258,87 @@ def bulk_project_samples_metadata(request: Request, payload: dict):
         raise HTTPException(500, "Internal server error")
 
 
+# no *_QUERY_ACCESSIONS_SQL for these; their search SQL already yields accession,
+# source and updated_at
+_SEARCH_BACKED_DOWNLOAD_DBS = ("ena", "gsa", "dra", "gea")
+
+
+def _download_accessions_from_search(
+    q: str, db: str, year_from: int | None, year_to: int | None
+) -> list[dict]:
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SET LOCAL statement_timeout = '60s'")
+            cur.execute(
+                _SEARCH_SQL_BY_DB[db],
+                (q, _search_query_variants(q), None, None, None, 0),
+            )
+            rows = cur.fetchall()
+
+    kept = []
+    for row in rows:
+        updated = row.get("updated_at")
+        year = updated.year if updated else None
+        if year_from is not None and (year is None or year < year_from):
+            continue
+        if year_to is not None and (year is None or year > year_to):
+            continue
+        kept.append(row)
+    return kept[:MAX_QUERY_DOWNLOAD]
+
+
+def _flatten_by_source(cur, acc: str, source: str) -> tuple[list[dict], str]:
+    # ena/gsa/dra are study-grained like sra
+    if source in ("sra", "ena", "gsa", "dra"):
+        return flatten_sra_study(cur, acc), f"{acc}_experiments.csv"
+    if source == "arrayexpress":
+        return flatten_ae_experiment(cur, acc), f"{acc}_samples.csv"
+    if source == "gea":
+        return flatten_gea_experiment(cur, acc), f"{acc}_samples.csv"
+    return flatten_geo_series(cur, acc), f"{acc}_samples.csv"
+
+
+def _zip_query_results(rows: list[dict]) -> StreamingResponse:
+    if not rows:
+        raise HTTPException(404, "No results found for query")
+
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    for row in rows:
+                        data_rows, name = _flatten_by_source(
+                            cur, row["accession"], row["source"]
+                        )
+                        if not data_rows:
+                            continue
+                        csv_buf = io.StringIO()
+                        writer = csv.DictWriter(
+                            csv_buf, fieldnames=data_rows[0].keys()
+                        )
+                        writer.writeheader()
+                        writer.writerows(data_rows)
+                        zf.writestr(name, csv_buf.getvalue())
+
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=query_metadata.zip"},
+        )
+    except Exception:
+        logger.exception("Error building query download ZIP")
+        raise HTTPException(500, "Internal server error")
+
+
 @api_app.get(
     "/download/query",
     summary="Download metadata by query",
     description=(
         "Generate a ZIP of CSV files for query-matched projects. "
-        "Accepts q, optional db=geo|sra|arrayexpress, and optional updated year filters. "
-        "Results are capped at 100 projects."
+        "Accepts q, optional db=geo|sra|arrayexpress|ena|gsa|dra|gea, and optional "
+        "updated year filters. Results are capped at 100 projects."
     ),
     operation_id="download_by_query",
 )
@@ -7214,7 +7346,7 @@ def bulk_project_samples_metadata(request: Request, payload: dict):
 def download_by_query(
     request: Request,
     q: str = Query(..., min_length=1, max_length=500),
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
     updated_year_from: int | None = Query(None, ge=1900, le=2100),
     updated_year_to: int | None = Query(None, ge=1900, le=2100),
 ):
@@ -7228,6 +7360,16 @@ def download_by_query(
         )
 
     yp = year_params(updated_year_from, updated_year_to)
+
+    if db in _SEARCH_BACKED_DOWNLOAD_DBS:
+        try:
+            rows = _download_accessions_from_search(
+                q, db, updated_year_from, updated_year_to
+            )
+        except Exception:
+            logger.exception("Database error in download_by_query (%s)", db)
+            raise HTTPException(500, "Internal server error")
+        return _zip_query_results(rows)
 
     if db == "geo":
         sql = GEO_QUERY_ACCESSIONS_SQL
@@ -7288,45 +7430,7 @@ def download_by_query(
         logger.exception("Database error in download_by_query")
         raise HTTPException(500, "Internal server error")
 
-    if not rows:
-        raise HTTPException(404, "No results found for query")
-
-    try:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            with pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    for row in rows:
-                        acc = row["accession"]
-                        source = row["source"]
-                        if source == "sra":
-                            data_rows = flatten_sra_study(cur, acc)
-                            name = f"{acc}_experiments.csv"
-                        elif source == "arrayexpress":
-                            data_rows = flatten_ae_experiment(cur, acc)
-                            name = f"{acc}_samples.csv"
-                        else:
-                            data_rows = flatten_geo_series(cur, acc)
-                            name = f"{acc}_samples.csv"
-
-                        if data_rows:
-                            csv_buf = io.StringIO()
-                            writer = csv.DictWriter(
-                                csv_buf, fieldnames=data_rows[0].keys()
-                            )
-                            writer.writeheader()
-                            writer.writerows(data_rows)
-                            zf.writestr(name, csv_buf.getvalue())
-
-        buf.seek(0)
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=query_metadata.zip"},
-        )
-    except Exception:
-        logger.exception("Error in download_by_query")
-        raise HTTPException(500, "Internal server error")
+    return _zip_query_results(rows)
 
 
 @api_app.get(
@@ -8150,7 +8254,8 @@ def get_source_totals(request: Request):
     summary="Most recent record date in the index",
     description=(
         "Return the date of the newest record in the index. With ?db=<source> "
-        "(geo|sra|arrayexpress|ena) returns that source's latest date; without it, "
+        "(geo|sra|arrayexpress|ena|gsa|dra|gea) returns that source's latest date; "
+        "without it, "
         "the overall maximum. Cached for 7 days. Returns {db, last_updated, by_source}."
     ),
     operation_id="get_last_updated",
@@ -8158,7 +8263,7 @@ def get_source_totals(request: Request):
 @limiter.limit("60/minute")
 def get_last_updated(
     request: Request,
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
 ):
     try:
         data = _get_last_updated()
@@ -8883,7 +8988,7 @@ experiments have that link; microarray ones legitimately have no FASTQ.
 ## Search And Cohort Discovery
 
 Use `search_all` for ordinary keyword search across all sources. Pass
-`db=geo|sra|arrayexpress|ena|gsa` only when the user restricts the source. Use
+`db=geo|sra|arrayexpress|ena|gsa|dra|gea` only when the user restricts the source. Use
 `sortby=citations|journal|year` with `order=desc|asc` when the user asks for
 most cited, journal-sorted, newest, or oldest results. Results are automatically
 enriched with publication and center fields when available: `publications`,

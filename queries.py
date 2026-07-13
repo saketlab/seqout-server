@@ -1737,6 +1737,23 @@ FROM gsa_samples s
 WHERE UPPER(s.sample_accession) = ANY(%s);
 """
 
+# last-resort batch fallback; mirrored DDBJ samples are already in sra_samples
+BATCH_DRA_SAMPLES_SQL = """
+SELECT
+    accession,
+    alias,
+    description,
+    title,
+    scientific_name,
+    taxon_id,
+    external_id,
+    attributes_json,
+    submission,
+    links
+FROM dra_samples
+WHERE UPPER(accession) = ANY(%s);
+"""
+
 COMMON_NAME_BY_SCIENTIFIC_NAME_SQL = """
 SELECT
     tax_id,
@@ -4674,8 +4691,8 @@ SELECT
     {_reltuples('ena_samples')} AS ena_samples,
     {_reltuples('gsa_studies')} AS gsa_projects,
     {_reltuples('gsa_samples')} AS gsa_samples,
-    {_reltuples('dra_studies')} AS ddbj_projects,
-    {_reltuples('dra_samples')} AS ddbj_samples,
+    {_reltuples('dra_studies')} AS dra_projects,
+    {_reltuples('dra_samples')} AS dra_samples,
     {_reltuples('gea_experiments')} AS gea_projects,
     {_reltuples('gea_samples')} AS gea_samples;
 """
@@ -4693,7 +4710,7 @@ SELECT
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM gsa_studies
         WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS gsa,
     (SELECT MAX(COALESCE(updated_at, published_at))::timestamptz FROM dra_studies
-        WHERE COALESCE(updated_at, published_at)::timestamptz <= now()) AS ddbj,
+        WHERE COALESCE(updated_at, published_at)::timestamptz <= now()) AS dra,
     (SELECT MAX(COALESCE(updated_at, release_date))::timestamptz FROM gea_experiments
         WHERE COALESCE(updated_at, release_date)::timestamptz <= now()) AS gea;
 """
