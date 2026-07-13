@@ -91,7 +91,9 @@ from queries import (
     GROWTH_BYTES_SRA_FASTQ_SQL,
     GROWTH_BYTES_SRA_SRA_SQL,
     GROWTH_EXPERIMENTS_AE_SQL,
+    GROWTH_EXPERIMENTS_DRA_SQL,
     GROWTH_EXPERIMENTS_ENA_SQL,
+    GROWTH_EXPERIMENTS_GEA_SQL,
     GROWTH_EXPERIMENTS_GEO_SQL,
     GROWTH_EXPERIMENTS_GSA_SQL,
     GROWTH_EXPERIMENTS_SRA_SQL,
@@ -100,7 +102,9 @@ from queries import (
     GROWTH_PLATFORM_PROJECTS_SQL,
     GROWTH_PLATFORM_SQL,
     GROWTH_PROJECTS_AE_SQL,
+    GROWTH_PROJECTS_DRA_SQL,
     GROWTH_PROJECTS_ENA_SQL,
+    GROWTH_PROJECTS_GEA_SQL,
     GROWTH_PROJECTS_GEO_SQL,
     GROWTH_PROJECTS_GSA_SQL,
     GROWTH_PROJECTS_SRA_SQL,
@@ -463,7 +467,7 @@ _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
 # Fetch cap for faceting: the full deduped set is tiny for almost everyone.
 # total stays exact (the window runs pre-LIMIT); only facets undercount past the cap.
 _AUTHOR_PROJECTS_FETCH_CAP = 2000
-_STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa")
+_STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa", "ddbj", "gea")
 
 
 # Per-query ceiling
@@ -1980,6 +1984,8 @@ _GROWTH_SQL_BY_MODE = {
         "arrayexpress": GROWTH_PROJECTS_AE_SQL,
         "ena": GROWTH_PROJECTS_ENA_SQL,
         "gsa": GROWTH_PROJECTS_GSA_SQL,
+        "ddbj": GROWTH_PROJECTS_DRA_SQL,
+        "gea": GROWTH_PROJECTS_GEA_SQL,
     },
     "experiments": {
         "geo": GROWTH_EXPERIMENTS_GEO_SQL,
@@ -1987,6 +1993,8 @@ _GROWTH_SQL_BY_MODE = {
         "arrayexpress": GROWTH_EXPERIMENTS_AE_SQL,
         "ena": GROWTH_EXPERIMENTS_ENA_SQL,
         "gsa": GROWTH_EXPERIMENTS_GSA_SQL,
+        "ddbj": GROWTH_EXPERIMENTS_DRA_SQL,
+        "gea": GROWTH_EXPERIMENTS_GEA_SQL,
     },
     "bases": {
         "ena": GROWTH_BASES_ENA_SQL,
@@ -2668,7 +2676,7 @@ def get_growth_stats(
     ),
     db: str | None = Query(
         None,
-        pattern="^(geo|sra|arrayexpress|ena|gsa|sra_fastq_bytes|sra_sra_bytes)$",
+        pattern="^(geo|sra|arrayexpress|ena|gsa|ddbj|gea|sra_fastq_bytes|sra_sra_bytes)$",
         description="Filter to a single series",
     ),
 ):

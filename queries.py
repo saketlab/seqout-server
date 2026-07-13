@@ -3907,6 +3907,24 @@ GROUP BY DATE_TRUNC('month', first_public)
 ORDER BY month;
 """
 
+GROWTH_PROJECTS_DRA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', published_at), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM dra_studies
+WHERE published_at IS NOT NULL
+GROUP BY DATE_TRUNC('month', published_at)
+ORDER BY month;
+"""
+
+GROWTH_PROJECTS_GEA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', release_date), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM gea_experiments
+WHERE release_date IS NOT NULL
+GROUP BY DATE_TRUNC('month', release_date)
+ORDER BY month;
+"""
+
 # -- Experiments mode (samples/experiments per month) --
 
 GROWTH_EXPERIMENTS_GEO_SQL = """
@@ -3953,6 +3971,27 @@ SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
 FROM gsa_experiments
 WHERE first_public IS NOT NULL
 GROUP BY DATE_TRUNC('month', first_public)
+ORDER BY month;
+"""
+
+GROWTH_EXPERIMENTS_DRA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', s.published_at), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM dra_experiments e
+JOIN dra_studies s ON s.accession = e.study
+WHERE s.published_at IS NOT NULL
+GROUP BY DATE_TRUNC('month', s.published_at)
+ORDER BY month;
+"""
+
+# GEA's sample table is the experiment's assay rows, mirroring arrayexpress_samples.
+GROWTH_EXPERIMENTS_GEA_SQL = """
+SELECT TO_CHAR(DATE_TRUNC('month', e.release_date), 'YYYY-MM') AS month,
+       COUNT(*) AS count
+FROM gea_samples g
+JOIN gea_experiments e ON e.accession = g.experiment_accession
+WHERE e.release_date IS NOT NULL
+GROUP BY DATE_TRUNC('month', e.release_date)
 ORDER BY month;
 """
 
@@ -4634,7 +4673,11 @@ SELECT
     {_reltuples('ena_studies')} AS ena_projects,
     {_reltuples('ena_samples')} AS ena_samples,
     {_reltuples('gsa_studies')} AS gsa_projects,
-    {_reltuples('gsa_samples')} AS gsa_samples;
+    {_reltuples('gsa_samples')} AS gsa_samples,
+    {_reltuples('dra_studies')} AS ddbj_projects,
+    {_reltuples('dra_samples')} AS ddbj_samples,
+    {_reltuples('gea_experiments')} AS gea_projects,
+    {_reltuples('gea_samples')} AS gea_samples;
 """
 
 LAST_UPDATED_SQL = """
@@ -4648,7 +4691,11 @@ SELECT
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM ena_studies
         WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS ena,
     (SELECT MAX(COALESCE(last_updated, first_public))::timestamptz FROM gsa_studies
-        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS gsa;
+        WHERE COALESCE(last_updated, first_public)::timestamptz <= now()) AS gsa,
+    (SELECT MAX(COALESCE(updated_at, published_at))::timestamptz FROM dra_studies
+        WHERE COALESCE(updated_at, published_at)::timestamptz <= now()) AS ddbj,
+    (SELECT MAX(COALESCE(updated_at, release_date))::timestamptz FROM gea_experiments
+        WHERE COALESCE(updated_at, release_date)::timestamptz <= now()) AS gea;
 """
 
 ENRICHED_STAT_COLUMNS = [
