@@ -2243,10 +2243,51 @@ def _ensure_spelling_loaded() -> SymSpell:
         return sym
 
 
+_VOCAB_KNOWN_SQL = """
+SELECT w.word
+FROM unnest(%s::text[]) AS w(word)
+WHERE EXISTS (
+    SELECT 1 FROM search_vocabulary v
+    WHERE v.normalized = lower(w.word)
+       OR v.normalized = btrim(strip(to_tsvector('english', lower(w.word)))::text, '''')
+)
+"""
+
+
+def _known_words(words: list[str]) -> set[str]:
+    """The words the corpus already contains, directly or via their English stem.
+
+    search_vocabulary stores FTS lexemes, so an ordinary word ("single") is absent
+    while its stem ("singl") is present. Matching the stem too is what makes a
+    correctly-spelled word recognisable as real. Without it SymSpell finds the stem
+    one edit away and "corrects" single -> singl, identifies -> identifi,
+    genetic -> generic, rewriting valid queries into nonsense.
+
+    On failure every word is reported known, so a lookup outage suppresses spelling
+    correction rather than mangling the query.
+    """
+    if not words:
+        return set()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_VOCAB_KNOWN_SQL, (words,))
+                return {r["word"].lower() for r in cur.fetchall()}
+    except Exception:
+        logger.warning("vocabulary lookup failed; skipping spelling correction")
+        return {w.lower() for w in words}
+
+
 def _get_suggestions(q: str) -> list[dict]:
     """Return spelling suggestions for a query with few/no FTS results.
 
     Uses the original query so corrections target what the user actually typed.
+
+    Only genuinely misspelled words are corrected: a word the corpus already knows
+    is left alone, however few results the query returned. Suggestions are always
+    single tokens — substituting a multi-word vocabulary term ("Mappin's moa") for
+    one word grows the query, and since a correction differs from its input by
+    definition, the caller's auto-rerun would never reach a fixed point.
     """
     sym = _ensure_spelling_loaded()
     if not sym.words:
@@ -2255,50 +2296,29 @@ def _get_suggestions(q: str) -> list[dict]:
     corrections: list[dict] = []
     correction_map: dict[int, str] = {}  # word index -> suggested term
 
-    fallback_indices: list[int] = []
+    checkable = [w for w in words if 3 <= len(w) <= 50]
+    known = _known_words(checkable)
+
     for i, word in enumerate(words):
         if len(word) < 3 or len(word) > 50:
             continue
         lookup_word = word.lower()
+        if lookup_word in known:
+            continue
         results = sym.lookup(lookup_word, Verbosity.CLOSEST, max_edit_distance=2)
-        if results and results[0].term != lookup_word:
-            corrections.append(
-                {
-                    "original": word,
-                    "suggested": results[0].term,
-                    "distance": results[0].distance,
-                }
-            )
-            correction_map[i] = results[0].term
-        else:
-            fallback_indices.append(i)
-
-    if fallback_indices:
-        try:
-            with pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    for i in fallback_indices[:5]:
-                        word = words[i]
-                        lookup_word = word.lower()
-                        cur.execute(
-                            "SELECT term, similarity(normalized, %s) AS sml "
-                            "FROM search_vocabulary "
-                            "WHERE normalized %% %s "
-                            "ORDER BY sml DESC, frequency DESC LIMIT 1",
-                            (lookup_word, lookup_word),
-                        )
-                        row = cur.fetchone()
-                        if row and row["term"].lower() != lookup_word:
-                            corrections.append(
-                                {
-                                    "original": word,
-                                    "suggested": row["term"],
-                                    "distance": None,
-                                }
-                            )
-                            correction_map[i] = row["term"]
-        except Exception:
-            logger.debug("pg_trgm fallback failed")
+        if not results:
+            continue
+        suggested = results[0].term
+        if suggested == lookup_word or " " in suggested:
+            continue
+        corrections.append(
+            {
+                "original": word,
+                "suggested": suggested,
+                "distance": results[0].distance,
+            }
+        )
+        correction_map[i] = suggested
 
     if not corrections:
         return []
