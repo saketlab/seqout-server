@@ -7,6 +7,23 @@ from collections.abc import Iterable
 
 _MAX_QUERY_VARIANTS = 48
 
+# Postgres' `english` snowball stop-word list, verbatim. Many of these are also
+# HGNC gene aliases ("OF" -> BRIP1, "AN"/"AS"/"AT"/"CAN"/"NOT"/"WAS" -> others), so
+# without this guard a query like "single cell atlas of liver" matches "of" as a gene
+# and cross-multiplies its 22 synonyms into the variant list ("...atlas brip1 liver").
+# plainto_tsquery discards these lexemes anyway, so expanding them is pure cost.
+# Must stay in sync with the FTS config used in queries.py ('english').
+_STOPWORDS = frozenset(
+    """i me my myself we our ours ourselves you your yours yourself yourselves he him his
+    himself she her hers herself it its itself they them their theirs themselves what which
+    who whom this that these those am is are was were be been being have has had having do
+    does did doing a an the and but if or because as until while of at by for with about
+    against between into through during before after above below to from up down in out on
+    off over under again further then once here there when where why how all any both each
+    few more most other some such no nor not only own same so than too very s t can will
+    just don should now""".split()
+)
+
 
 def _dedupe(items: Iterable[str]) -> list[str]:
     seen = set()
@@ -49,12 +66,17 @@ def _generate_candidate_subphrases(words: list[str]) -> list[tuple[str, int, int
 
     Returns a list of (phrase, start_index, end_index) tuples where
     start_index is inclusive and end_index is exclusive.
+
+    Bare stop-words are never candidates (see _STOPWORDS). Multi-word phrases that
+    merely contain one still are — "disease or disorder" is a real term.
     """
     n = len(words)
     candidates = []
     for length in range(n, 0, -1):
         for start in range(n - length + 1):
             phrase = " ".join(words[start : start + length])
+            if length == 1 and phrase.lower() in _STOPWORDS:
+                continue
             candidates.append((phrase, start, start + length))
     return candidates
 
@@ -297,4 +319,11 @@ if __name__ == "__main__":
     assert _graph_norm("SC-RNA-seq") == "scrna seq"
     assert _graph_norm("sc rna") == "scrna"
     assert _graph_norm("sc 1") == "sc 1"
+
+    # stop-words must never be candidates on their own ("of" is an HGNC alias for
+    # BRIP1), but must still be usable inside a longer phrase.
+    phrases = {p for p, _, _ in _generate_candidate_subphrases("atlas of liver".split())}
+    assert "of" not in phrases
+    assert "atlas of liver" in phrases and "atlas of" in phrases
+    assert "liver" in phrases and "atlas" in phrases
     print("ok")
