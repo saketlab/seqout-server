@@ -287,8 +287,6 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
 
 
 if __name__ == "__main__":
-    # ponytail: normalization self-check (no DB needed) — the risky part is the
-    # allowlist glue not firing on genes/cell lines.
     assert _glue_sc_prefix("sc rna seq") == "scrna seq"
     assert _glue_sc_prefix("sc-rna") == "scrna"
     assert _glue_sc_prefix("sn rna seq") == "snrna seq"

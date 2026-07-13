@@ -47,25 +47,25 @@ from queries import (
     AE_SEARCH_SQL,
     ALL_QUERY_ACCESSIONS_SQL,
     BATCH_ENA_SAMPLES_SQL,
+    BATCH_GSA_SAMPLES_SQL,
     BATCH_SAMPLES_SQL,
     BIO_PROJECT_GEO_SERIES_SQL,
     BULK_PROJECT_METADATA_SQL,
-    COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
     COMMON_NAMES_BY_SCIENTIFIC_NAMES_SQL,
+    COMMON_NAME_BY_SCIENTIFIC_NAME_SQL,
+    DATABASE_GROWTH_MONTHLY_SQL,
+    DATABASE_VOLUME_GROWTH_MONTHLY_SQL,
+    DRA_EXPERIMENT_SQL,
+    DRA_EXPERIMENT_TO_STUDY_SQL,
+    DRA_SAMPLE_SQL,
+    DRA_SAMPLE_TO_STUDY_SQL,
+    DRA_SEARCH_SQL,
+    DRA_STUDY_EXPERIMENTS_SQL,
     ENA_EXPERIMENT_SQL,
     ENA_SAMPLE_SQL,
     ENA_SAMPLE_TO_EXPERIMENT_SQL,
     ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
-    BATCH_GSA_SAMPLES_SQL,
-    GSA_EXPERIMENT_SQL,
-    GSA_SAMPLE_SQL,
-    GSA_SAMPLE_TO_EXPERIMENT_SQL,
-    GSA_SEARCH_SQL,
-    GSA_STUDY_EXPERIMENTS_SQL,
-    GROWTH_PROJECTS_GSA_SQL,
-    GROWTH_EXPERIMENTS_GSA_SQL,
-    PROJECT_GSA_SQL,
     ENRICHED_COLUMN_VALUES_SQL,
     ENRICHED_CROSSTAB_COLUMNS,
     ENRICHED_CROSSTAB_SQL,
@@ -77,21 +77,23 @@ from queries import (
     ENRICHED_SUMMARY_SQL,
     ENRICHED_TOP_VALUES_PER_COLUMN,
     EXPERIMENT_RUNS_SQL,
+    GEA_EXPERIMENT_SAMPLES_SQL,
+    GEA_SEARCH_SQL,
     GEO_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SEARCH_SQL,
+    GEO_SERIES_CONTRIBUTORS_BATCH_SQL,
     GEO_SERIES_NEIGHBORS_COORDS_SQL,
     GEO_SERIES_SAMPLES_SQL,
     GLOBAL_CONTRIBUTIONS_FILTERS_SQL,
-    DATABASE_GROWTH_MONTHLY_SQL,
-    DATABASE_VOLUME_GROWTH_MONTHLY_SQL,
     GROWTH_BASES_ENA_SQL,
     GROWTH_BYTES_SRA_FASTQ_SQL,
     GROWTH_BYTES_SRA_SRA_SQL,
     GROWTH_EXPERIMENTS_AE_SQL,
     GROWTH_EXPERIMENTS_ENA_SQL,
     GROWTH_EXPERIMENTS_GEO_SQL,
+    GROWTH_EXPERIMENTS_GSA_SQL,
     GROWTH_EXPERIMENTS_SRA_SQL,
     GROWTH_ORGANISM_SQL,
     GROWTH_PLATFORM_INSTRUMENT_SQL,
@@ -100,7 +102,15 @@ from queries import (
     GROWTH_PROJECTS_AE_SQL,
     GROWTH_PROJECTS_ENA_SQL,
     GROWTH_PROJECTS_GEO_SQL,
+    GROWTH_PROJECTS_GSA_SQL,
     GROWTH_PROJECTS_SRA_SQL,
+    GSA_EXPERIMENT_SQL,
+    GSA_SAMPLE_SQL,
+    GSA_SAMPLE_TO_EXPERIMENT_SQL,
+    GSA_SEARCH_SQL,
+    GSA_STUDY_EXPERIMENTS_SQL,
+    GSA_STUDY_RUNS_PREVIEW_SQL,
+    GSA_STUDY_RUNS_SUMMARY_SQL,
     LAST_UPDATED_SQL,
     LIST_CENTERS_SQL,
     LIST_INSTRUMENT_MODELS_SQL,
@@ -115,27 +125,32 @@ from queries import (
     PLATFORM_FILTERS_SQL,
     PLATFORM_INSTRUMENTS_SQL,
     PLATFORM_TOTALS_SQL,
+    PMID_VARIANT_BATCH_SQL,
+    PRJNA_TO_GEO_SERIES_SQL,
     PRJ_TO_ENA_STUDY_SQL,
     PRJ_TO_GSA_STUDY_SQL,
     PRJ_TO_SRA_STUDY_SQL,
-    PRJNA_TO_GEO_SERIES_SQL,
     PROJECT_AE_SQL,
+    PROJECT_DRA_SQL,
     PROJECT_ENA_SQL,
+    PROJECT_GEA_SQL,
     PROJECT_GEO_SQL,
+    PROJECT_GSA_SQL,
     PROJECT_SRA_SQL,
     PUBLICATION_BY_DOI_SQL,
     PUBLICATION_BY_PMID_SQL,
+    PUBMED_BY_PMIDS_BATCH_SQL,
     RELATED_SQL,
     RUN_DOWNLOAD_SQL,
     SAMPLE_SQL,
-    SEARCH_AUTHOR_PROJECTS_SQL,
     SEARCH_AUTHORS_SQL,
+    SEARCH_AUTHOR_PROJECTS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
-    SITEMAP_BOUND_LOOKUP_SQL,
     SITEMAP_BOUNDS_COUNTS_SQL,
+    SITEMAP_BOUND_LOOKUP_SQL,
     SITEMAP_COUNTS_SQL,
     SITEMAP_KEYSET_SQL,
     SITEMAP_PAGE_SIZE,
@@ -150,15 +165,11 @@ from queries import (
     STUDIES_BY_PMID_SQL,
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
-    PMID_VARIANT_BATCH_SQL,
-    PUBMED_BY_PMIDS_BATCH_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
-    GEO_SERIES_CONTRIBUTORS_BATCH_SQL,
     STUDY_RUNS_SUMMARY_SQL,
-    GSA_STUDY_RUNS_PREVIEW_SQL,
-    GSA_STUDY_RUNS_SUMMARY_SQL,
+    STUDY_SAMPLES_DRA_SQL,
     STUDY_SAMPLES_SRA_SQL,
     SUBMITTER_BATCH_SQL,
     build_country_accessions_sql,
@@ -191,6 +202,8 @@ GEO_SERIES_PATTERN = re.compile(r"^GSE\d+$", re.IGNORECASE)
 GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
 BIOSAMPLE_PATTERN = re.compile(r"^SAM[A-Z]+\d+$", re.IGNORECASE)
 AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
+# "GEAD" is four letters, so E-GEAD-N also matches AE_PATTERN: always test GEA first.
+_GEA_PREFIX = r"[Ee]-[Gg][Ee][Aa][Dd]-"
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
 # GSA (CNCB-NGDC) accessions; PRJCA/SAMC already match PRJ/BIOSAMPLE above.
 GSA_STUDY_PATTERN = re.compile(r"^(CRA|HRA)\d+$", re.IGNORECASE)
@@ -211,7 +224,7 @@ EXPERIMENT_REGEX = rf"^({_EXPERIMENT_PREFIX}|CRX|HRX)\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
 PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|[Ee]-[A-Za-z]{{4}}-)\d+$"
-STUDY_EXPERIMENTS_REGEX = rf"^({_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA)\d+$"
+STUDY_EXPERIMENTS_REGEX = rf"^({_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|{_GEA_PREFIX})\d+$"
 SAMPLE_OR_ENA_REGEX = rf"^({_SAMPLE_PREFIX}|SAM[A-Z]+|HRS)\d+$"
 GEO_SERIES_REGEX = r"^GSE\d+$"
 AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
@@ -448,8 +461,7 @@ _author_projects_cache: dict[tuple, dict] = {}
 _AUTHOR_PROJECTS_CACHE_TTL = 24 * 3600
 _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
 # Fetch cap for faceting: the full deduped set is tiny for almost everyone.
-# ponytail: >2000 projects/author is vanishingly rare; total stays exact (window
-# runs pre-LIMIT), only facets would slightly undercount for such an author.
+# total stays exact (the window runs pre-LIMIT); only facets undercount past the cap.
 _AUTHOR_PROJECTS_FETCH_CAP = 2000
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa")
 
@@ -668,6 +680,8 @@ def _accession_source(acc: str) -> str | None:
     """Classify accession into database source."""
     if acc.startswith("GSE"):
         return "geo"
+    if acc.upper().startswith("E-GEAD-"):
+        return "gea"
     if acc.startswith("E-"):
         return "arrayexpress"
     if STUDY_PATTERN.match(acc):
@@ -916,22 +930,35 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     return rows
 
 
+def _project_sql(accession: str) -> str:
+    """Pick the per-source project query."""
+    if accession.startswith("E-GEAD-"):
+        return PROJECT_GEA_SQL
+    if accession.startswith("E-"):
+        return PROJECT_AE_SQL
+    if accession.startswith("G"):
+        return PROJECT_GEO_SQL
+    if accession.startswith(("CRA", "HRA")):
+        return PROJECT_GSA_SQL
+    if accession.startswith("PRJ"):
+        return PROJECT_ENA_SQL
+    return PROJECT_SRA_SQL
+
+
+def _fetch_project_row(cur, accession: str):
+    """Project row for any source; a DDBJ-exclusive DRP has no sra_studies twin."""
+    cur.execute(_project_sql(accession), (accession,))
+    row = cur.fetchone()
+    if not row and accession.startswith("DRP"):
+        cur.execute(PROJECT_DRA_SQL, (accession,))
+        row = cur.fetchone()
+    return row
+
+
 def _project_publications(accession: str, cur) -> list[dict]:
     """Linked publications for one accession via the uniform resolver, so
     server-side consumers (e.g. /cite) match what the project page shows."""
-    accession = accession.upper()
-    if accession.startswith("E-"):
-        sql = PROJECT_AE_SQL
-    elif accession.startswith("G"):
-        sql = PROJECT_GEO_SQL
-    elif accession.startswith(("CRA", "HRA")):
-        sql = PROJECT_GSA_SQL
-    elif accession.startswith("PRJ"):
-        sql = PROJECT_ENA_SQL
-    else:
-        sql = PROJECT_SRA_SQL
-    cur.execute(sql, (accession,))
-    row = cur.fetchone()
+    row = _fetch_project_row(cur, accession.upper())
     if not row:
         return []
     _enrich_with_publications([row], cur)
@@ -1020,18 +1047,63 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
     }
 
 
+def _transform_gea_sample_to_geo(sample: dict) -> dict:
+    """Transform a DDBJ GEA sample to GEO-compatible format for the frontend."""
+    attrs = sample.get("attributes_json") or {}
+    if isinstance(attrs, str):
+        try:
+            attrs = json.loads(attrs)
+        except json.JSONDecodeError:
+            attrs = {}
+
+    characteristics = [{"@tag": k, "#text": v} for k, v in attrs.items()]
+
+    return {
+        "id": sample.get("id"),
+        # the DRR is the sample's handle on its FASTQ, so prefer it as the accession
+        "accession": sample.get("dra_run")
+        or sample.get("dra_experiment")
+        or sample.get("biosample")
+        or sample.get("source_name"),
+        "title": sample.get("sample_title") or sample.get("source_name"),
+        "description": sample.get("sample_description"),
+        "channel_count": 1,
+        "sample_type": sample.get("library_strategy"),
+        "platform_ref": sample.get("instrument_model"),
+        "organism": sample.get("organism"),
+        "channels": [
+            {
+                "Characteristics": characteristics,
+                "Source": sample.get("source_name"),
+                "Organism": {
+                    "#text": sample.get("organism"),
+                    "@taxid": sample.get("taxon_id") or "",
+                },
+                "Label": sample.get("library_strategy"),
+                "@position": "1",
+            }
+        ],
+        "hybridization_protocol": None,
+        "scan_protocol": None,
+    }
+
+
 def _fetch_geo_series_samples(
     cur, accession: str, source: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
-    if source == "arrayexpress":
-        sql = AE_EXPERIMENT_SAMPLES_SQL.rstrip().rstrip(";")
-        sql += "\nORDER BY COALESCE(ena_run, ena_experiment, source_name)"
+    if source in ("arrayexpress", "gea"):
+        gea = source == "gea"
+        base = GEA_EXPERIMENT_SAMPLES_SQL if gea else AE_EXPERIMENT_SAMPLES_SQL
+        sql = base.rstrip().rstrip(";")
+        if not gea:
+            sql += "\nORDER BY COALESCE(ena_run, ena_experiment, source_name)"
         params: list = [accession]
         if limit is not None:
             sql += "\nLIMIT %s OFFSET %s"
             params += [limit, offset]
         cur.execute(sql, tuple(params))
-        return [_transform_ae_sample_to_geo(s) for s in cur.fetchall()]
+        transform = _transform_gea_sample_to_geo if gea else _transform_ae_sample_to_geo
+        return [transform(s) for s in cur.fetchall()]
     sql = GEO_SERIES_SAMPLES_SQL.rstrip().rstrip(";") + "\nORDER BY s.accession"
     params = [accession]
     if limit is not None:
@@ -1042,7 +1114,13 @@ def _fetch_geo_series_samples(
 
 
 def _count_geo_series_samples(cur, accession: str, source: str) -> int:
-    if source == "arrayexpress":
+    if source == "gea":
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM gea_samples "
+            "WHERE experiment_accession = %s",
+            (accession,),
+        )
+    elif source == "arrayexpress":
         cur.execute(
             "SELECT COUNT(*) AS count FROM arrayexpress_samples "
             "WHERE experiment_accession = %s",
@@ -1077,6 +1155,23 @@ def _is_gsa_study(study: str) -> bool:
     return study.upper().startswith(("CRA", "HRA"))
 
 
+def _is_gea_study(study: str) -> bool:
+    return study.upper().startswith("E-GEAD-")
+
+
+def _is_dra_only_study(cur, study: str) -> bool:
+    """DDBJ-exclusive per the ingest's is_only_ddbj, which checks SRA *and* ENA, by
+    DRP *and* BioProject."""
+    if not study.upper().startswith("DRP"):
+        return False
+    cur.execute(
+        "SELECT is_only_ddbj = 1 AS only_dra FROM dra_studies WHERE accession = %s",
+        (study,),
+    )
+    row = cur.fetchone()
+    return bool(row and row["only_dra"])
+
+
 def _fetch_study_experiments(
     cur, study: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
@@ -1086,6 +1181,9 @@ def _fetch_study_experiments(
     elif _is_ena_study(study):
         sql = ENA_STUDY_EXPERIMENTS_SQL
         ena_style = True
+    elif _is_dra_only_study(cur, study):
+        sql = DRA_STUDY_EXPERIMENTS_SQL
+        ena_style = False
     else:
         sql = STUDY_EXPERIMENTS_SQL
         ena_style = False
@@ -1115,6 +1213,11 @@ def _count_study_experiments(cur, study: str) -> int:
             "FROM ena_experiments WHERE study_accession = UPPER(%s)",
             (study,),
         )
+    elif _is_dra_only_study(cur, study):
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM dra_experiments WHERE study = %s",
+            (study,),
+        )
     else:
         cur.execute(
             "SELECT COUNT(*) AS count FROM sra_experiments WHERE study = %s",
@@ -1135,6 +1238,11 @@ def _fetch_sample(cur, accession: str) -> dict | None:
         return sample
 
     cur.execute(GSA_SAMPLE_SQL, (accession,))
+    sample = cur.fetchone()
+    if sample:
+        return sample
+
+    cur.execute(DRA_SAMPLE_SQL, (accession,))
     return cur.fetchone()
 
 
@@ -3648,11 +3756,7 @@ def search_suggest(
     return result
 
 
-# ---------------------------------------------------------------------------
 # Deep dive: ontology-hierarchy exploration of query terms
-# ---------------------------------------------------------------------------
-# Thin wrappers over deep_dive.py (kept there so the graph logic stays testable
-# without a live Postgres). See deep_dive.py for the graph shape / semantics.
 
 
 @api_app.get(
@@ -3707,12 +3811,24 @@ def deep_dive_children(
     return {"term": term.lower(), "children": children, "took_ms": round(took_ms, 2)}
 
 
+# db= picks a per-source query instead of filtering the unified one; every source
+# with its own search index belongs here.
+_SEARCH_SQL_BY_DB = {
+    "arrayexpress": AE_SEARCH_SQL,
+    "ena": ENA_SEARCH_SQL,
+    "gsa": GSA_SEARCH_SQL,
+    "dra": DRA_SEARCH_SQL,
+    "gea": GEA_SEARCH_SQL,
+}
+
+
 @api_app.get(
     "/search",
     summary="Search all databases",
     description=(
-        "Unified search across GEO, SRA, ArrayExpress, and ENA. "
-        "Optionally restrict by db=geo|sra|arrayexpress|ena. "
+        "Unified search across GEO, SRA, ENA, ArrayExpress, GSA, DDBJ DRA and "
+        "DDBJ GEA. Optionally restrict by "
+        "db=geo|sra|arrayexpress|ena|gsa|dra|gea. "
         "Optionally sort by sortby=citations|journal|year with order=desc(default)|asc. "
         "For default relevance sort, use cursor_rank + cursor_acc for pagination. "
         "For custom sortby, use cursor_sort + cursor_acc for pagination. "
@@ -3729,7 +3845,7 @@ def search(
     cursor_acc: str | None = Query(None),
     cursor_sort: str | None = Query(None),
     offset: int | None = Query(None, ge=0),
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     organism: str | None = Query(None),
@@ -3833,7 +3949,7 @@ def search(
         result = _search_geo_impl(request, q, cursor_rank, cursor_acc, offset)
     elif db == "sra":
         result = _search_sra_impl(request, q, cursor_rank, cursor_acc, offset)
-    elif db == "arrayexpress":
+    elif db in _SEARCH_SQL_BY_DB:
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
@@ -3841,79 +3957,13 @@ def search(
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(
-                        AE_SEARCH_SQL,
-                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
-                    )
-                    rows = cur.fetchall()
-                    _enrich_with_publications(rows, cur)
-        except Exception as e:
-            logger.exception("Database error in search_arrayexpress")
-            raise HTTPException(500, "Internal server error")
-
-        took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
-        result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else {
-                    "rank": rows[-1]["rank"],
-                    "accession": rows[-1]["accession"],
-                }
-            ),
-        }
-    elif db == "ena":
-        start = time.perf_counter()
-        try:
-            with pool.connection() as conn:
-                q_variants = _search_query_variants(q)
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
-                    cur.execute(
-                        ENA_SEARCH_SQL,
+                        _SEARCH_SQL_BY_DB[db],
                         (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                     )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
         except Exception:
-            logger.exception("Database error in search_ena")
-            raise HTTPException(500, "Internal server error")
-
-        took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
-        result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else {
-                    "rank": rows[-1]["rank"],
-                    "accession": rows[-1]["accession"],
-                }
-            ),
-        }
-    elif db == "gsa":
-        start = time.perf_counter()
-        try:
-            with pool.connection() as conn:
-                q_variants = _search_query_variants(q)
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
-                    cur.execute(
-                        GSA_SEARCH_SQL,
-                        (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
-                    )
-                    rows = cur.fetchall()
-                    _enrich_with_publications(rows, cur)
-        except Exception:
-            logger.exception("Database error in search_gsa")
+            logger.exception("Database error in search_%s", db)
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
@@ -4173,7 +4223,7 @@ def search_facets(
     request: Request,
     response: Response,
     q: str = Query(..., min_length=1, max_length=500),
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa)$"),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
     organism: str | None = Query(None),
     country: list[str] | None = Query(None),
     library_strategy: list[str] | None = Query(None),
@@ -4331,24 +4381,11 @@ def get_project(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     accession = accession.upper()
-    params = (accession,)
-
-    if accession.startswith("E-"):
-        sql = PROJECT_AE_SQL
-    elif accession.startswith("G"):
-        sql = PROJECT_GEO_SQL
-    elif accession.startswith(("CRA", "HRA")):
-        sql = PROJECT_GSA_SQL
-    elif accession.startswith("PRJ"):
-        sql = PROJECT_ENA_SQL
-    else:
-        sql = PROJECT_SRA_SQL
 
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
+                row = _fetch_project_row(cur, accession)
                 if row:
                     # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP,
                     # not the PRJ. Resolve FIRST so the linked accession is set in
@@ -4411,6 +4448,12 @@ def get_project_metadata(
         FROM geo_series
         WHERE accession = %s;
         """
+    elif accession.startswith("E-GEAD-"):
+        sql = """
+        SELECT accession, title, description
+        FROM gea_experiments
+        WHERE accession = %s;
+        """
     elif accession.startswith("E-"):
         sql = """
         SELECT accession, title, description
@@ -4445,6 +4488,13 @@ def get_project_metadata(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, (accession,))
                 row = cur.fetchone()
+                if not row and accession.startswith("DRP"):
+                    cur.execute(
+                        "SELECT accession, title, abstract AS description "
+                        "FROM dra_studies WHERE accession = %s",
+                        (accession,),
+                    )
+                    row = cur.fetchone()
     except Exception:
         logger.exception("Database error in get_project_metadata")
         raise HTTPException(500, "Internal server error")
@@ -4515,7 +4565,12 @@ def get_study_samples(
                     if not resolved:
                         raise HTTPException(404, f"No SRA study found for {study}")
                     study = resolved["accession"]
-                cur.execute(STUDY_SAMPLES_SRA_SQL, (study,))
+                if _is_gea_study(study):
+                    cur.execute(GEA_EXPERIMENT_SAMPLES_SQL, (study,))
+                elif _is_dra_only_study(cur, study):
+                    cur.execute(STUDY_SAMPLES_DRA_SQL, (study,))
+                else:
+                    cur.execute(STUDY_SAMPLES_SRA_SQL, (study,))
                 rows = cur.fetchall()
     except HTTPException:
         raise
@@ -5024,6 +5079,9 @@ def get_experiment(
                     experiment = cur.fetchone()
                 if not experiment:
                     cur.execute(GSA_EXPERIMENT_SQL, (accession,))
+                    experiment = cur.fetchone()
+                if not experiment:
+                    cur.execute(DRA_EXPERIMENT_SQL, (accession,))
                     experiment = cur.fetchone()
                 if experiment:
                     cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
@@ -6229,6 +6287,9 @@ def download_study_script(
 
 _SUPP_GEO_SQL = "SELECT supplementary_data FROM geo_series WHERE accession = %s"
 _SUPP_AE_SQL = "SELECT processed_data_files AS supplementary_data FROM arrayexpress_experiments WHERE accession = %s"
+_SUPP_GEA_SQL = (
+    "SELECT data_files AS supplementary_data FROM gea_experiments WHERE accession = %s"
+)
 
 
 def _ftp_to_https(url: str) -> str:
@@ -6286,7 +6347,10 @@ def get_supplementary_files(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     accession = accession.upper()
-    if accession.startswith("E-"):
+    if accession.startswith("E-GEAD-"):
+        sql = _SUPP_GEA_SQL
+        source = "gea"
+    elif accession.startswith("E-"):
         sql = _SUPP_AE_SQL
         source = "arrayexpress"
     elif accession.startswith("G"):
@@ -6347,7 +6411,9 @@ def download_supplementary_script(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     accession = accession.upper()
-    if accession.startswith("E-"):
+    if accession.startswith("E-GEAD-"):
+        sql = _SUPP_GEA_SQL
+    elif accession.startswith("E-"):
         sql = _SUPP_AE_SQL
     elif accession.startswith("G"):
         sql = _SUPP_GEO_SQL
@@ -6851,7 +6917,7 @@ def get_geo_series_samples(
 ):
     accession = accession.upper()
     source = _accession_source(accession)
-    if source not in ["geo", "arrayexpress"]:
+    if source not in ["geo", "arrayexpress", "gea"]:
         raise HTTPException(400, f"Invalid accession format: {accession}")
 
     try:
@@ -7268,12 +7334,18 @@ def get_project_from_accession(
                     # SRX/ERX/DRX experiment - get SRA study directly
                     cur.execute(SRA_EXPERIMENT_TO_STUDY_SQL, (accession,))
                     result = cur.fetchone()
+                    if not result:
+                        cur.execute(DRA_EXPERIMENT_TO_STUDY_SQL, (accession,))
+                        result = cur.fetchone()
                     if result:
                         return {"project_accession": result["study"]}
                 else:
                     # SRS/DRS/ERS sample - find SRA study
                     cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (accession,))
                     result = cur.fetchone()
+                    if not result:
+                        cur.execute(DRA_SAMPLE_TO_STUDY_SQL, (accession,))
+                        result = cur.fetchone()
                     if result:
                         return {"project_accession": result["accession"]}
 
@@ -8693,13 +8765,27 @@ def _age_hours_to_human(value: str | None) -> str | None:
 
 MCP_INSTRUCTIONS = """\
 You are connected to seqout, a genomics study search engine covering NCBI
-GEO, SRA/ENA/DDBJ, ArrayExpress, GSA (CNCB-NGDC, including GSA-Human),
-BioProject, publication links, download links, and ontology-enriched sample
-metadata.
+GEO, SRA/ENA/DDBJ, ArrayExpress, DDBJ GEA, GSA (CNCB-NGDC, including
+GSA-Human), BioProject, publication links, download links, and
+ontology-enriched sample metadata.
 
 Your job is to choose the narrowest correct tool, preserve context, and avoid
 making users re-state accessions or filters. Do not guess when an accession can
 be classified or resolved by a tool.
+
+## DDBJ accessions
+
+DRP/DRX/DRS/DRR are DDBJ DRA and behave exactly like their SRA counterparts --
+use the same project/experiment/sample/run tools. Most DDBJ studies are mirrored
+into SRA/ENA; the ones that are not still resolve, and their FASTQ links point at
+ddbj.nig.ac.jp rather than ENA.
+
+E-GEAD-N is DDBJ GEA, DDBJ's expression archive. Despite the leading "E-" it is
+NOT ArrayExpress -- never route it to an ArrayExpress tool. Treat it like a GEO
+series: `get_project` for metadata, `get_geo_series_samples` for its sample list.
+GEA holds no reads of its own, so its FASTQs come from the linked DRA study, which
+`get_project` returns in `alias` (the same way a GSE links to its SRP). Sequencing
+experiments have that link; microarray ones legitimately have no FASTQ.
 
 ## Critical Routing Rules
 

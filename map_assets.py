@@ -205,8 +205,6 @@ def build_assets(
 
 
 if __name__ == "__main__":
-    # ponytail: self-check the pure logic (translation, noise handling, csv shape)
-    # without running the heavy quadfeather tiler.
     import tempfile
 
     assert cluster_at({"cluster_l4": 2}, "cluster_l4") == 2

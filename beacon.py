@@ -56,6 +56,11 @@ SOURCES = [
         "name": "CNCB-NGDC GSA",
         "description": "Genome Sequence Archive (China).",
     },
+    {
+        "id": "DDBJ",
+        "name": "DDBJ DRA",
+        "description": "DNA Data Bank of Japan Sequence Read Archive.",
+    },
 ]
 
 _DEFAULT_MODEL = "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main/models/src/beacon-v2-default-model"
@@ -537,10 +542,14 @@ def biosample_record(row: dict) -> dict:
 def _source_of(sample: str) -> str:
     if sample.startswith("GSM"):
         return "GEO"
-    if sample.startswith(("SR", "DR")):
+    if sample.startswith("DR"):
+        return "DDBJ"
+    if sample.startswith("SR"):
         return "SRA"
     if sample.startswith("ER"):
         return "ENA"
+    if sample.startswith(("HRS", "CRS", "SAMC")):
+        return "GSA"
     return "other"
 
 
