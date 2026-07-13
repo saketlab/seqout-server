@@ -10,12 +10,6 @@ FROM study_publications
 WHERE accession = ANY(%s);
 """
 
-# All pmids from each repo's own project table, batched over an accession set
-# (the project's own accession plus its aliases). Per-repo columns are the
-# authoritative pmid source (unified_metadata is under-populated for AE). Emits
-# one (accession, pmid) row per pmid so studies with several publications keep
-# them all — geo_series.pubmed_id is a text[] and is unnested; the rest are
-# scalar text. UNION dedupes; ORDER BY gives a stable (earliest-first) order.
 PMID_VARIANT_BATCH_SQL = """
 SELECT accession, pmid FROM (
     SELECT accession, unnest(pubmed_id) AS pmid
@@ -39,6 +33,15 @@ SELECT accession, pmid FROM (
     UNION
     SELECT accession, pubmed_id_pysradb
         FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id_pysradb
+        FROM dra_studies WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id
+        FROM gea_experiments WHERE accession = ANY(%(acc)s)
+    UNION
+    SELECT accession, pubmed_id_pysradb
+        FROM gea_experiments WHERE accession = ANY(%(acc)s)
 ) t
 WHERE pmid IS NOT NULL AND pmid <> ''
 ORDER BY accession, pmid;
@@ -61,9 +64,8 @@ FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
 
-# Authoritative author list for a GEO series: geo_series.contributors is a plain
-# text[] written at ingest in author order (uniqueness not guaranteed, so dedup
-# on read). Used as the author fallback when a series has no linked publication.
+# Authoritative author list for a GEO series
+# Used as the author fallback when a series has no linked publication.
 GEO_SERIES_CONTRIBUTORS_BATCH_SQL = """
 SELECT accession, contributors
 FROM geo_series
@@ -88,7 +90,7 @@ all_matches AS (
     SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source, 4 AS priority, instrument_models, library_strategies
     FROM geo_series, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
     -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
@@ -126,7 +128,7 @@ all_matches AS (
     SELECT accession, title, abstract AS summary, updated_at, organisms, countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source, 6 AS priority, instrument_models, library_strategies
     FROM sra_studies, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
     -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
@@ -164,7 +166,7 @@ all_matches AS (
     SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source, 4 AS priority, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
     -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
@@ -209,7 +211,7 @@ all_matches AS (
            NULL::text[] AS instrument_models,
            NULL::text[] AS library_strategies
     FROM ena_studies_search, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
     -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
@@ -254,10 +256,97 @@ all_matches AS (
            NULL::text[] AS instrument_models,
            NULL::text[] AS library_strategies
     FROM gsa_studies_search, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
     -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    SELECT *, NULL::bigint AS total_count FROM all_matches
+),
+paged AS (
+    SELECT *
+    FROM counted
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+)
+SELECT
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+FROM paged
+ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
+LIMIT 200;
+"""
+
+# db=dra. Only the DDBJ-exclusive studies are indexed (see the DRA arm of SEARCH_SQL).
+DRA_SEARCH_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
+),
+all_matches AS (
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[] AS organisms,
+           ARRAY['Japan']::text[] AS countries,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'dra'::text AS source, 4 AS priority,
+           NULL::text[] AS instrument_models,
+           NULL::text[] AS library_strategies
+    FROM dra_studies_search, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+),
+counted AS (
+    SELECT *, NULL::bigint AS total_count FROM all_matches
+),
+paged AS (
+    SELECT *
+    FROM counted
+    WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
+)
+SELECT
+    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+FROM paged
+ORDER BY rank DESC, accession DESC
+OFFSET COALESCE(%s::bigint, 0)
+LIMIT 200;
+"""
+
+# db=gea. Like ArrayExpress, the tsv lives on the experiment table itself.
+GEA_SEARCH_SQL = """
+WITH q AS (
+    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q
+),
+all_matches AS (
+    SELECT accession,
+           title,
+           description AS summary,
+           release_date AS updated_at,
+           CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
+                THEN ARRAY[organism] END::text[] AS organisms,
+           ARRAY['Japan']::text[] AS countries,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gea'::text AS source, 4 AS priority,
+           NULL::text[] AS instrument_models,
+           NULL::text[] AS library_strategies
+    FROM gea_experiments, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+),
+counted AS (
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -293,7 +382,7 @@ all_matches AS (
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,
            accession AS dedup_key, instrument_models, library_strategies
     FROM geo_series, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
     UNION ALL
 
@@ -302,7 +391,7 @@ all_matches AS (
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,
            COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies
     FROM sra_studies s, q
-    WHERE s.tsv @@ q.match_q
+    WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
 
     UNION ALL
 
@@ -311,7 +400,7 @@ all_matches AS (
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,
            COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
     UNION ALL
 
@@ -324,7 +413,7 @@ all_matches AS (
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,
            accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM ena_studies_search, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
     UNION ALL
 
@@ -339,7 +428,33 @@ all_matches AS (
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,
            gss.accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM gsa_studies_search gss, q
-    WHERE gss.tsv @@ q.match_q
+    WHERE (gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
+
+    UNION ALL
+
+    -- dra_studies_search holds only the DDBJ-exclusive studies (is_only_ddbj = 1)
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[] AS organisms, ARRAY['Japan']::text[] AS countries,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'dra'::text AS source,
+           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+    FROM dra_studies_search, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+
+    UNION ALL
+
+    -- GEA (DDBJ E-GEAD) full-text search. Like ArrayExpress the tsv lives on the
+    -- experiment table itself; organism is a single column, not an array.
+    SELECT accession, title, description AS summary, release_date AS updated_at,
+           CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
+                THEN ARRAY[organism] END::text[] AS organisms,
+           ARRAY['Japan']::text[] AS countries,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gea'::text AS source,
+           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+    FROM gea_experiments, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
@@ -366,12 +481,6 @@ LIMIT 200;
 """
 
 
-# Match set shared by the result list and the sidebar facets: one UNION across
-# the four sources + alias-dedup, carrying every column a result row, filter, or
-# facet branch needs — so the filtered result list and the facet counts always
-# agree (same dedup, same ISO country codes, same filter clauses). GEO↔SRA
-# mirrors share an alias, so the dedup is load-bearing: without it those rows
-# double-count.
 _SEARCH_MATCH_CTE = """
 WITH q AS (
     SELECT plainto_tsquery('english', %(q)s) AS core_q,
@@ -391,21 +500,21 @@ all_matches AS (
            platforms, 'geo'::text AS source, accession AS dedup_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,
            s.organisms, s.countries, s.instrument_models, s.library_strategies,
            s.platforms, 'sra'::text, COALESCE(s.alias, s.accession),
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
-    WHERE s.tsv @@ q.match_q
+    WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
     UNION ALL
     SELECT accession, title, description AS summary, release_date AS updated_at,
            organisms, countries, NULL::text[], NULL::text[], NULL::text[],
            'arrayexpress'::text, COALESCE(alias, accession),
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     SELECT accession,
            COALESCE(study_title, study_name, project_name, accession) AS title,
@@ -415,7 +524,7 @@ all_matches AS (
            'ena'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
-    WHERE tsv @@ q.match_q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     -- title/abstract/organisms enriched from the BioProject and materialized
     -- onto gsa_studies_search by transfer.gsa_search, so the organism facet
@@ -430,7 +539,30 @@ all_matches AS (
            'gsa'::text, gss.accession,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
     FROM gsa_studies_search gss, q
-    WHERE gss.tsv @@ q.match_q
+    WHERE (gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
+    UNION ALL
+    -- DRA: the twin holds only DDBJ-exclusive studies, so a mirrored DRP cannot
+    -- double-count against its SRA/ENA row. No organism facet -- dra_studies keeps
+    -- organism on its samples, same as ENA.
+    SELECT accession,
+           COALESCE(study_title, study_name, project_name, accession) AS title,
+           study_description AS summary,
+           COALESCE(last_updated, first_public) AS updated_at,
+           NULL::text[], ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
+           'dra'::text, accession,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
+    FROM dra_studies_search, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    UNION ALL
+    -- GEA: organism is a single column, wrapped so it joins the organism facet.
+    SELECT accession, title, description AS summary, release_date AS updated_at,
+           CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
+                THEN ARRAY[organism] END::text[],
+           ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
+           'gea'::text, accession,
+           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
+    FROM gea_experiments, q
+    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 -- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
 -- dedup_key (the SRA study carries the GSE as its alias); deduping first can
@@ -719,6 +851,24 @@ _ENA_FIELDS = (
     " 100.0::float8 AS rank, 'ena'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
 )
+_DRA_FIELDS = (
+    "ds.accession,"
+    " COALESCE(ds.study_title, ds.study_name, ds.project_name, ds.accession) AS title,"
+    " ds.study_description AS summary,"
+    " COALESCE(ds.last_updated, ds.first_public) AS updated_at,"
+    " NULL::text[] AS organisms, ARRAY['Japan']::text[] AS countries,"
+    " 100.0::float8 AS rank, 'dra'::text AS source,"
+    " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+)
+_GEA_FIELDS = (
+    "ge.accession, ge.title, ge.description AS summary,"
+    " ge.release_date AS updated_at,"
+    " CASE WHEN NULLIF(btrim(ge.organism), '') IS NOT NULL"
+    " THEN ARRAY[ge.organism] END::text[] AS organisms,"
+    " ARRAY['Japan']::text[] AS countries,"
+    " 100.0::float8 AS rank, 'gea'::text AS source,"
+    " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+)
 _GSA_FIELDS = (
     "es.accession,"
     " COALESCE(es.study_title, es.project_title, es.study_name, es.project_name, es.accession) AS title,"
@@ -737,8 +887,14 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f"SELECT {_GEO_FIELDS} FROM geo_series g"
         f" WHERE g.samples_ref @> ARRAY[%(acc)s] LIMIT 1"
     ),
+    # A pattern match resolving to nothing returns empty, never full-text search.
+    # DDBJ-exclusive DRPs need their own arm; dra_studies_search holds exactly those.
     "srp": (
-        f"SELECT {_SRA_FIELDS} FROM sra_studies s WHERE s.accession = %(acc)s LIMIT 1"
+        f"SELECT {_SRA_FIELDS} FROM sra_studies s WHERE s.accession = %(acc)s"
+        f" UNION ALL "
+        f"SELECT {_DRA_FIELDS} FROM dra_studies_search ds"
+        f" WHERE ds.accession = %(acc)s"
+        f" LIMIT 2"
     ),
     "srx": (
         f"SELECT {_SRA_FIELDS} FROM sra_experiments e"
@@ -789,9 +945,14 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" ORDER BY es.accession)"
         f" LIMIT 3"
     ),
+    # without this arm every E-GEAD accession is a silent zero
     "ae": (
         f"SELECT {_AE_FIELDS} FROM arrayexpress_experiments ae"
-        f" WHERE UPPER(ae.accession) = %(acc)s LIMIT 1"
+        f" WHERE UPPER(ae.accession) = %(acc)s"
+        f" UNION ALL "
+        f"SELECT {_GEA_FIELDS} FROM gea_experiments ge"
+        f" WHERE UPPER(ge.accession) = %(acc)s"
+        f" LIMIT 2"
     ),
     "prj": (
         f"SELECT {_SRA_FIELDS} FROM sra_studies s"
@@ -1096,7 +1257,7 @@ all_matches AS (
            COALESCE(e.alias, e.accession) AS dedup_key
     FROM arrayexpress_experiments e
     CROSS JOIN LATERAL jsonb_array_elements(
-        -- ponytail: organizations is a JSONB 'null' scalar on many rows; guard
+        -- organizations is a JSONB 'null' scalar on many rows
         CASE WHEN jsonb_typeof(e.organizations) = 'array'
              THEN e.organizations ELSE '[]'::jsonb END
     ) AS org
@@ -1207,6 +1368,36 @@ LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
 WHERE s.accession = %s;
 """
 
+# DDBJ-exclusive studies only -- a mirrored DRP is served by PROJECT_SRA_SQL.
+# Shaped like PROJECT_SRA_SQL so the SRA project page renders it unchanged.
+PROJECT_DRA_SQL = """
+SELECT
+    d.accession,
+    d.alias,
+    d.title,
+    d.abstract,
+    d.submission,
+    d.study_type,
+    d.external_id,
+    d.links,
+    d.published_at,
+    d.updated_at,
+    NULL AS coords_2d,
+    NULL AS coords_3d,
+    NULL AS neighbors,
+    (SELECT array_agg(DISTINCT sm.scientific_name)
+     FROM dra_experiments e
+     JOIN dra_samples sm ON sm.accession = ANY (e.samples)
+     WHERE e.study = d.accession
+       AND sm.scientific_name IS NOT NULL) AS organisms,
+    jsonb_build_object(
+        'organization', COALESCE(sub.center_name, d.center_name)
+    ) AS center
+FROM dra_studies d
+LEFT JOIN dra_submissions sub ON sub.accession = d.submission
+WHERE d.accession = %s;
+"""
+
 PROJECT_ENA_SQL = """
 SELECT
     es.study_accession AS accession,
@@ -1300,6 +1491,25 @@ SELECT
     instrument_model,
     submission
 FROM sra_experiments
+WHERE study = %s;
+"""
+
+# dra_experiments mirrors sra_experiments column for column (shared INSDC schema).
+DRA_STUDY_EXPERIMENTS_SQL = """
+SELECT
+    accession,
+    title,
+    design_description,
+    library_layout,
+    library_name,
+    library_selection,
+    library_source,
+    library_strategy,
+    samples,
+    platform,
+    instrument_model,
+    submission
+FROM dra_experiments
 WHERE study = %s;
 """
 
@@ -1484,8 +1694,6 @@ FROM ena_samples s
 WHERE UPPER(s.sample_accession) = ANY(%s);
 """
 
-# Batched GSA fallback for _fetch_samples_batch. Mirrors GSA_SAMPLE_SQL but
-# matches a list (uppercased) via the gsa_samples_accession_upper_idx index.
 BATCH_GSA_SAMPLES_SQL = """
 SELECT
     s.sample_accession AS accession,
@@ -1800,6 +2008,69 @@ ORDER BY s.accession
 LIMIT 1000;
 """
 
+STUDY_SAMPLES_DRA_SQL = """
+SELECT DISTINCT
+    s.accession,
+    s.title,
+    s.scientific_name,
+    s.taxon_id,
+    s.alias
+FROM dra_samples s
+JOIN dra_experiments e ON s.accession = ANY(e.samples)
+WHERE e.study = %s
+ORDER BY s.accession
+LIMIT 1000;
+"""
+
+DRA_SAMPLE_SQL = """
+SELECT
+    accession,
+    alias,
+    title,
+    description,
+    scientific_name,
+    taxon_id,
+    external_id,
+    attributes_json,
+    submission,
+    links
+FROM dra_samples
+WHERE accession = %s;
+"""
+
+DRA_EXPERIMENT_SQL = """
+SELECT
+    accession,
+    title,
+    design_description,
+    library_layout,
+    library_name,
+    library_selection,
+    library_source,
+    library_strategy,
+    samples,
+    platform,
+    instrument_model,
+    study,
+    submission
+FROM dra_experiments
+WHERE accession = %s;
+"""
+
+DRA_EXPERIMENT_TO_STUDY_SQL = """
+SELECT study
+FROM dra_experiments
+WHERE accession = %s
+LIMIT 1;
+"""
+
+DRA_SAMPLE_TO_STUDY_SQL = """
+SELECT DISTINCT e.study AS accession
+FROM dra_experiments e
+WHERE e.samples @> ARRAY[%s]
+LIMIT 1;
+"""
+
 # Publication -> studies reverse lookup.
 STUDIES_BY_PMID_SQL = """
 SELECT DISTINCT accession, source
@@ -1822,10 +2093,6 @@ WHERE LOWER(doi) = LOWER(%s)
 LIMIT 1;
 """
 
-# Similar studies via the precomputed neighbors JSONB (2D embedding nearest neighbors).
-# Looks up the source accession in geo_series OR sra_studies, then enriches each
-# neighbor with title/organisms/source from whichever archive owns it.
-# Params: %(acc)s (source accession), %(limit)s (neighbor count).
 SIMILAR_STUDIES_SQL = """
 WITH base AS (
     SELECT neighbors FROM geo_series   WHERE accession = %(acc)s
@@ -1836,8 +2103,7 @@ expanded AS (
     SELECT
         (n->>'accession')::text AS accession,
         COALESCE((n->>'distance')::float, (n->>'score')::float, 0.0) AS distance
-    -- ponytail: neighbors is jsonb[] (a Postgres array), not a jsonb array,
-    -- so use unnest(); jsonb_array_elements() errors on this type
+    -- neighbors is jsonb[] (a Postgres array), not a jsonb array: jsonb_array_elements() errors on it
     FROM base, unnest(base.neighbors) AS n
     ORDER BY 2 ASC
     LIMIT %(limit)s
@@ -1920,9 +2186,6 @@ ORDER BY m.citation_count DESC NULLS LAST;
 """
 
 # Reverse-resolve an author's pmids to projects via per-source pubmed_id columns
-# (cross_ref_pubmed is empty). Needs the pubmed_id indexes to be fast.
-# Shared CTE for the author-projects result list and its institute facet, so the
-# facet aggregates over the full matched set (not just the returned page).
 _AUTHOR_PROJECTS_CTE = """
 WITH pm AS MATERIALIZED (
     SELECT pmid FROM pubmed_metadata WHERE authors ~* %(re)s
@@ -2093,6 +2356,70 @@ FROM arrayexpress_experiments ae
 WHERE ae.accession = %s;
 """
 
+PROJECT_GEA_SQL = """
+SELECT
+    g.accession,
+    g.title,
+    g.description AS summary,
+    g.protocols_description AS overall_design,
+    CASE WHEN NULLIF(btrim(g.organism), '') IS NOT NULL
+         THEN ARRAY[g.organism] END AS organisms,
+    NULL AS coords_2d,
+    NULL AS coords_3d,
+    NULL AS neighbors,
+    CASE WHEN COALESCE(NULLIF(g.pubmed_id, ''), NULLIF(g.pubmed_id_pysradb, '')) IS NOT NULL
+         THEN ARRAY[COALESCE(NULLIF(g.pubmed_id, ''), g.pubmed_id_pysradb)]
+    END AS pubmed_id,
+    NULL AS samples_ref,
+    g.study_type AS series_type,
+    NULL AS relation,
+    g.data_files AS supplementary_data,
+    g.release_date AS published_at,
+    g.updated_at,
+    (SELECT array_agg(DISTINCT d.accession)
+     FROM dra_studies d
+     WHERE d.bioproject_id = g.bioproject) AS alias,
+    g.bioproject,
+    g.experimental_factors,
+    g.experimental_factor_types,
+    CASE WHEN NULLIF(btrim(g.contact_affiliation), '') IS NOT NULL
+         THEN jsonb_build_array(jsonb_build_object(
+                  'organization', g.contact_affiliation))
+    END AS center
+FROM gea_experiments g
+WHERE g.accession = %s;
+"""
+
+GEA_EXPERIMENT_SAMPLES_SQL = """
+SELECT
+    id,
+    experiment_accession,
+    source_name,
+    organism,
+    taxon_id,
+    organism_part,
+    tissue,
+    cell_type,
+    genotype,
+    strain,
+    sex,
+    age,
+    biosample,
+    sample_title,
+    sample_description,
+    library_strategy,
+    library_source,
+    library_selection,
+    library_layout,
+    instrument_model,
+    dra_experiment,
+    dra_run,
+    attributes_json
+FROM gea_samples
+WHERE experiment_accession = %s
+ORDER BY id
+"""
+
 AE_EXPERIMENT_SAMPLES_SQL = """
 SELECT
     id,
@@ -2146,7 +2473,7 @@ all_matches AS (
            50.0::float8 AS rank, 'arrayexpress'::text AS source, 3 AS priority
     FROM arrayexpress_experiments e
     CROSS JOIN LATERAL jsonb_array_elements(
-        -- ponytail: organizations is a JSONB 'null' scalar on many rows; guard
+        -- organizations is a JSONB 'null' scalar on many rows
         CASE WHEN jsonb_typeof(e.organizations) = 'array'
              THEN e.organizations ELSE '[]'::jsonb END
     ) AS org
@@ -2933,7 +3260,7 @@ def build_sorted_search_sql(
             " ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,"
             " accession AS dedup_key, instrument_models, library_strategies"
             " FROM geo_series, q"
-            " WHERE tsv @@ q.match_q"
+            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if db in (None, "sra"):
@@ -2943,7 +3270,7 @@ def build_sorted_search_sql(
             " (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,"
             " COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
             " FROM sra_studies s, q"
-            " WHERE s.tsv @@ q.match_q"
+            " WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)"
         )
 
     if db in (None, "arrayexpress"):
@@ -2953,7 +3280,7 @@ def build_sorted_search_sql(
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,"
             " COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM arrayexpress_experiments, q"
-            " WHERE tsv @@ q.match_q"
+            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if db in (None, "ena"):
@@ -2966,7 +3293,7 @@ def build_sorted_search_sql(
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,"
             " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM ena_studies_search, q"
-            " WHERE tsv @@ q.match_q"
+            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if db in (None, "gsa"):
@@ -2979,7 +3306,7 @@ def build_sorted_search_sql(
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,"
             " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM gsa_studies_search, q"
-            " WHERE tsv @@ q.match_q"
+            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if not cte_parts:
@@ -3270,6 +3597,9 @@ ORDER BY i.ord;
 # keyed under. Cross-archive links go BOTH ways: an SRP -> its BioProject, and a
 # PRJ* -> the SRA study it wraps (so ENA project pages, addressed by PRJ*, find
 # the FASTQ/BAM rows that live under the SRP). Single %s: the input accession.
+# The same two hops run against dra_studies, since a DDBJ-exclusive DRP is absent
+# from sra_studies. E-GEAD needs a third: it names only a BioProject, whose reads
+# live in the DRA study wrapping it.
 _RESOLVE_DL_STUDY = """
 WITH input AS (SELECT %s::text AS acc),
 candidates AS (
@@ -3280,6 +3610,18 @@ candidates AS (
     UNION
     SELECT s.accession FROM sra_studies s, input
     WHERE s.bioproject_id = input.acc
+    UNION
+    SELECT d.bioproject_id FROM dra_studies d, input
+    WHERE d.accession = input.acc AND d.bioproject_id IS NOT NULL
+    UNION
+    SELECT d.accession FROM dra_studies d, input
+    WHERE d.bioproject_id = input.acc
+    UNION
+    SELECT d.accession
+    FROM gea_experiments g
+    JOIN dra_studies d ON d.bioproject_id = g.bioproject
+    CROSS JOIN input
+    WHERE g.accession = input.acc
 )
 """
 
@@ -3463,8 +3805,7 @@ SELECT
     COUNT(*) OVER()                   AS total_bams,
     COALESCE(SUM((f->>'size')::bigint) OVER(), 0)::text AS total_bam_bytes
 FROM sra_run_download_links dl,
-     -- ponytail: ncbi_files can be a JSONB 'null' scalar, not an array; guard so
-     -- jsonb_array_elements doesn't raise "cannot extract elements from a scalar"
+     -- ncbi_files can be a JSONB 'null' scalar, not an array
      jsonb_array_elements(
          CASE WHEN jsonb_typeof(dl.ncbi_files) = 'array'
               THEN dl.ncbi_files ELSE '[]'::jsonb END
