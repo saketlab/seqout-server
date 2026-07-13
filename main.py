@@ -911,7 +911,9 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
         meta = sub_map.get(acc, {})
-        row["center_name"] = meta.get("submitter")
+        # unified_metadata has no GSA rows, so don't let a missing submitter erase
+        # a center_name the per-source project query already supplied.
+        row["center_name"] = meta.get("submitter") or row.get("center_name")
         row["country_code"] = meta.get("country_code")
         row["is_single_cell"] = meta.get("is_single_cell")
         row["single_cell_modality"] = meta.get("single_cell_modality")

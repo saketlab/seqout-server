@@ -1469,7 +1469,17 @@ SELECT
         WHEN es.scientific_name IS NOT NULL AND es.scientific_name <> ''
         THEN ARRAY[es.scientific_name]
     END::text[] AS organisms,
-    NULL::jsonb AS center
+    -- GSA records a single submitting person, not an author roster; the linked
+    -- BioProject carries them along with the organisation. Both live on the join
+    -- below and were previously discarded.
+    CASE WHEN NULLIF(btrim(p.submitter), '') IS NOT NULL
+         THEN ARRAY[p.submitter]
+    END::text[] AS authors,
+    NULLIF(btrim(p.submitting_org), '') AS center_name,
+    CASE WHEN NULLIF(btrim(p.submitting_org), '') IS NOT NULL
+         THEN jsonb_build_array(jsonb_build_object(
+                  'organization', p.submitting_org))
+    END AS center
 FROM gsa_studies es
 LEFT JOIN gsa_projects p ON p.accession = es.project_name
 WHERE es.study_accession = %s
