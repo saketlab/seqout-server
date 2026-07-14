@@ -1942,6 +1942,20 @@ def _compute_map_version(rows: list[dict]) -> str:
     return h.hexdigest()[:16]
 
 
+def _assets_complete(version_dir: pathlib.Path) -> bool:
+    """Every file build_assets produces, present. The manifest alone isn't enough:
+    a build that dies between the JSON sidecars and the tiles (or the other way
+    round) leaves a dir that looks built, and the map then 404s on countries.json
+    forever — the version hash is stable, so nothing ever triggers a retry."""
+    if not (version_dir / "tiles" / "manifest.feather").exists():
+        return False
+    if not (version_dir / "countries.json").exists():
+        return False
+    return all(
+        (version_dir / "filter" / f"{col}.json").exists() for col in MAP_FILTER_COLUMNS
+    )
+
+
 def _prune_old_map_versions(keep: str) -> None:
     """Remove stale map-asset version dirs, keeping only `keep`. Best-effort, so
     disk holds at most one version. Leaves the CURRENT pointer and any in-progress
@@ -1977,7 +1991,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         if (
             cached_rev == _MAP_ASSET_REV
             and _MAP_ID_RE.match(cached)
-            and (_MAP_ASSETS_DIR / cached / "tiles" / "manifest.feather").exists()
+            and _assets_complete(_MAP_ASSETS_DIR / cached)
         ):
             version_dir = _MAP_ASSETS_DIR / cached
             _prune_old_map_versions(cached)
@@ -1989,13 +2003,17 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         bake_levels = levels[:_COLOR_LAYER_COUNT]
         version = _compute_map_version(rows)
         version_dir = _MAP_ASSETS_DIR / version
-        manifest = version_dir / "tiles" / "manifest.feather"
 
-        if not manifest.exists():
+        if not _assets_complete(version_dir):
             import map_assets  # lazy: pulls in pyarrow / quadfeather
 
             _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-            tmp_dir = _MAP_ASSETS_DIR / f"{version}.tmp"
+            # Per-process temp dir: _map_assets_lock is in-process only, so with
+            # several workers a shared "{version}.tmp" races — one worker renames it
+            # into place while another is still writing to that path, and the loser
+            # then rebuilds only the tail of the build (tiles, no countries.json)
+            # and rmtrees the winner's complete dir on top of it.
+            tmp_dir = _MAP_ASSETS_DIR / f"{version}.{os.getpid()}.tmp"
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info(
                 "Building map assets (version=%s, color layers=%s)...",
@@ -2005,10 +2023,13 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             map_assets.build_assets(
                 rows, bake_levels, tmp_dir, filter_columns=MAP_FILTER_COLUMNS
             )
-            if version_dir.exists():
+            # Another worker may have finished the same build meanwhile — keep theirs.
+            if _assets_complete(version_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
                 shutil.rmtree(version_dir, ignore_errors=True)
-            os.replace(tmp_dir, version_dir)
-            logger.info("Built map assets at %s", version_dir)
+                os.replace(tmp_dir, version_dir)
+                logger.info("Built map assets at %s", version_dir)
 
         _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         _MAP_CURRENT_FILE.write_text(f"{_MAP_ASSET_REV}:{version}")
