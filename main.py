@@ -1924,10 +1924,11 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 _MAP_ASSET_REV = "8"
 
 # How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
-# by the frontend for point coloring and for the cluster picker's filter. Must cover
-# the frontend's color window (COLOR_LAYER_MAX in the map engine) *and* the coarsest
-# layer, which is the one the picker lists — so: all of them.
-_COLOR_LAYER_COUNT = 5
+# by the frontend for point coloring and for the cluster picker's filter. The picker
+# lists the COARSEST baked layer (seqout-map.tsx picks the last level present in the
+# tile columns), so this must cover every level or the coarse ones are advertised in
+# /map/meta but silently unusable. Leiden ships 8: cluster_l0 (70348) … cluster_l7 (23).
+_COLOR_LAYER_COUNT = 8
 
 
 def _compute_map_version(rows: list[dict]) -> str:
