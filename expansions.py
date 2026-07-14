@@ -322,7 +322,9 @@ if __name__ == "__main__":
 
     # stop-words must never be candidates on their own ("of" is an HGNC alias for
     # BRIP1), but must still be usable inside a longer phrase.
-    phrases = {p for p, _, _ in _generate_candidate_subphrases("atlas of liver".split())}
+    phrases = {
+        p for p, _, _ in _generate_candidate_subphrases("atlas of liver".split())
+    }
     assert "of" not in phrases
     assert "atlas of liver" in phrases and "atlas of" in phrases
     assert "liver" in phrases and "atlas" in phrases

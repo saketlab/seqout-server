@@ -51,7 +51,26 @@ CREATE MATERIALIZED VIEW organism_growth_monthly AS
   FROM gsa_experiments e
   JOIN gsa_studies es ON es.study_accession = e.study_accession
   WHERE e.first_public IS NOT NULL AND es.scientific_name IS NOT NULL
-  GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public);
+  GROUP BY es.scientific_name, DATE_TRUNC('month', e.first_public)
+
+  UNION ALL
+
+  SELECT 'dra'::text, s.scientific_name,
+         DATE_TRUNC('month', st.published_at), COUNT(*)
+  FROM dra_experiments e
+  JOIN dra_studies st ON st.accession = e.study
+  JOIN dra_samples s ON s.accession = ANY(e.samples)
+  WHERE st.published_at IS NOT NULL AND s.scientific_name IS NOT NULL
+  GROUP BY s.scientific_name, DATE_TRUNC('month', st.published_at)
+
+  UNION ALL
+
+  SELECT 'gea'::text, g.organism,
+         DATE_TRUNC('month', ex.release_date), COUNT(*)
+  FROM gea_samples g
+  JOIN gea_experiments ex ON ex.accession = g.experiment_accession
+  WHERE ex.release_date IS NOT NULL AND g.organism IS NOT NULL AND g.organism != ''
+  GROUP BY g.organism, DATE_TRUNC('month', ex.release_date);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ogm_organism_db_month
   ON organism_growth_monthly(organism, db, month);
