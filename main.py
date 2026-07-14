@@ -116,6 +116,7 @@ from queries import (
     GSA_STUDY_EXPERIMENTS_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
     GSA_STUDY_RUNS_SUMMARY_SQL,
+    GSA_SUBMITTER_BATCH_SQL,
     LAST_UPDATED_SQL,
     LIST_CENTERS_SQL,
     LIST_INSTRUMENT_MODELS_SQL,
@@ -867,6 +868,14 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         cur.execute(GEO_SERIES_CONTRIBUTORS_BATCH_SQL, {"acc": geo_accs})
         contrib_map = {r["accession"]: r["contributors"] for r in cur.fetchall()}
 
+    # GSA rows: unified_metadata has none, so their submitter/org come off the
+    # linked BioProject — the same place the project page reads them.
+    gsa_accs = [a for a in accessions if a[:3] in ("CRA", "HRA")]
+    gsa_map: dict[str, dict] = {}
+    if gsa_accs:
+        cur.execute(GSA_SUBMITTER_BATCH_SQL, {"acc": gsa_accs})
+        gsa_map = {r["accession"]: r for r in cur.fetchall()}
+
     # center_name / submitter stay keyed on the row's own accession.
     cur.execute(SUBMITTER_BATCH_SQL, {"acc": accessions})
     sub_map = {}
@@ -916,9 +925,14 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["authors"] = primary.get("authors")
             row["citation_count"] = primary.get("citation_count")
         meta = sub_map.get(acc, {})
+        gsa = gsa_map.get(acc, {})
         # unified_metadata has no GSA rows, so don't let a missing submitter erase
         # a center_name the per-source project query already supplied.
-        row["center_name"] = meta.get("submitter") or row.get("center_name")
+        row["center_name"] = (
+            meta.get("submitter") or gsa.get("center_name") or row.get("center_name")
+        )
+        if not row.get("authors") and gsa.get("submitter_person"):
+            row["authors"] = gsa["submitter_person"]
         row["country_code"] = meta.get("country_code")
         row["is_single_cell"] = meta.get("is_single_cell")
         row["single_cell_modality"] = meta.get("single_cell_modality")

@@ -64,6 +64,17 @@ FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
 
+# GSA's submitter/org live on the linked BioProject, not unified_metadata (which
+# has no GSA rows) — same join GSA_PROJECT_SQL uses, batched for result rows.
+GSA_SUBMITTER_BATCH_SQL = """
+SELECT es.study_accession AS accession,
+       NULLIF(btrim(p.submitter), '') AS submitter_person,
+       NULLIF(btrim(p.submitting_org), '') AS center_name
+FROM gsa_studies es
+JOIN gsa_projects p ON p.accession = es.project_name
+WHERE es.study_accession = ANY(%(acc)s);
+"""
+
 # Authoritative author list for a GEO series
 # Used as the author fallback when a series has no linked publication.
 GEO_SERIES_CONTRIBUTORS_BATCH_SQL = """
