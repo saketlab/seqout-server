@@ -1921,7 +1921,7 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 # Bump when the asset-generation logic (tile columns) changes, so the version hash
 # moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "8"
+_MAP_ASSET_REV = "9"
 
 # How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
 # by the frontend for point coloring and for the cluster picker's filter. The picker
