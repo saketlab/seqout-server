@@ -2098,12 +2098,52 @@ WHERE e.samples @> ARRAY[%s]
 LIMIT 1;
 """
 
-# Publication -> studies reverse lookup.
-STUDIES_BY_PMID_SQL = """
-SELECT DISTINCT accession, source
-FROM cross_ref_pubmed
-WHERE pubmed_id = %s
-ORDER BY source, accession;
+# Inverse of _enrich_with_publications(): a pmid can live only in a repo's own column.
+PROJECTS_BY_PMID_SQL = """
+WITH linked AS (
+    SELECT accession,
+           CASE WHEN source = 'ae' THEN 'arrayexpress' ELSE source END AS source,
+           'study_publications' AS via
+    FROM study_publications
+    WHERE publications @> %(pmid_json)s::jsonb
+    UNION
+    SELECT accession, 'geo', 'geo_series.pubmed_id'
+    FROM geo_series
+    WHERE pubmed_id @> ARRAY[%(pmid)s]::text[] OR pubmed_id_pysradb = %(pmid)s
+    UNION
+    SELECT accession, 'sra', 'sra_studies.pubmed_id_pysradb'
+    FROM sra_studies
+    WHERE pubmed_id_pysradb = %(pmid)s
+      -- same private-placeholder guard as PMID_VARIANT_BATCH_SQL
+      AND title NOT ILIKE 'GEO accession %% is currently private%%'
+    UNION
+    SELECT study_accession, 'ena', 'ena_studies.pubmed_id_pysradb'
+    FROM ena_studies WHERE pubmed_id_pysradb = %(pmid)s
+    UNION
+    SELECT accession, 'arrayexpress', 'arrayexpress_experiments.pubmed_id'
+    FROM arrayexpress_experiments
+    WHERE pubmed_id = %(pmid)s OR pubmed_id_pysradb = %(pmid)s
+    UNION
+    SELECT accession, 'dra', 'dra_studies.pubmed_id_pysradb'
+    FROM dra_studies WHERE pubmed_id_pysradb = %(pmid)s
+    UNION
+    SELECT accession, 'gea', 'gea_experiments.pubmed_id'
+    FROM gea_experiments
+    WHERE pubmed_id = %(pmid)s OR pubmed_id_pysradb = %(pmid)s
+)
+SELECT l.accession, l.source, l.via,
+       COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title)
+           AS title,
+       COALESCE(g.published_at, s.published_at, ae.release_date, en.first_public,
+                d.published_at, ge.release_date) AS published_at
+FROM linked l
+LEFT JOIN geo_series               g  ON g.accession        = l.accession
+LEFT JOIN sra_studies              s  ON s.accession        = l.accession
+LEFT JOIN arrayexpress_experiments ae ON ae.accession       = l.accession
+LEFT JOIN ena_studies              en ON en.study_accession = l.accession
+LEFT JOIN dra_studies              d  ON d.accession        = l.accession
+LEFT JOIN gea_experiments          ge ON ge.accession       = l.accession
+ORDER BY l.source, l.accession;
 """
 
 PUBLICATION_BY_PMID_SQL = """
@@ -4100,7 +4140,9 @@ SELECT platform, SUM(count) AS total,
        SUM(CASE WHEN db = 'geo' THEN count ELSE 0 END) AS geo,
        SUM(CASE WHEN db = 'sra' THEN count ELSE 0 END) AS sra,
        SUM(CASE WHEN db = 'ena' THEN count ELSE 0 END) AS ena,
-       SUM(CASE WHEN db = 'gsa' THEN count ELSE 0 END) AS gsa
+       SUM(CASE WHEN db = 'gsa' THEN count ELSE 0 END) AS gsa,
+       SUM(CASE WHEN db = 'dra' THEN count ELSE 0 END) AS dra,
+       SUM(CASE WHEN db = 'gea' THEN count ELSE 0 END) AS gea
 FROM platform_growth_monthly
 GROUP BY platform
 ORDER BY total DESC;

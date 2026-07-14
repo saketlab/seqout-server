@@ -167,7 +167,7 @@ from queries import (
     SRA_SAMPLE_TO_EXPERIMENT_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
-    STUDIES_BY_PMID_SQL,
+    PROJECTS_BY_PMID_SQL,
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
@@ -2784,7 +2784,7 @@ def get_organism_growth(
     ),
     db: str | None = Query(
         None,
-        pattern="^(geo|sra|arrayexpress|ena|gsa)$",
+        pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$",
         description="Filter to a single database",
     ),
 ):
@@ -2802,13 +2802,7 @@ def get_organism_growth(
 
     if all_series is None:
         try:
-            all_series = {
-                "geo": [],
-                "sra": [],
-                "arrayexpress": [],
-                "ena": [],
-                "gsa": [],
-            }
+            all_series = {db_name: [] for db_name in _STATS_SOURCES}
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(GROWTH_ORGANISM_SQL, (organism,))
@@ -2856,7 +2850,7 @@ def get_organism_growth(
         total_exp = growth_data
 
         result_series = {}
-        dbs = [db] if db else ["geo", "sra", "arrayexpress", "ena", "gsa"]
+        dbs = [db] if db else list(_STATS_SOURCES)
         for db_name in dbs:
             org_rows = all_series.get(db_name, [])
             # Build lookup: month -> total count
@@ -2956,11 +2950,7 @@ def get_organism_totals(
             org_map[name] = {
                 "organism": name,
                 "common_name": row.get("common_name"),
-                "geo": 0,
-                "sra": 0,
-                "arrayexpress": 0,
-                "ena": 0,
-                "gsa": 0,
+                **{db_name: 0 for db_name in _STATS_SOURCES},
                 "total": 0,
             }
         org_map[name][row["db"]] = row["count"]
@@ -3473,6 +3463,8 @@ def get_platform_totals(request: Request):
             "sra": r["sra"],
             "ena": r["ena"],
             "gsa": r["gsa"],
+            "dra": r["dra"],
+            "gea": r["gea"],
         }
         for r in rows
     ]
@@ -7315,9 +7307,7 @@ def _zip_query_results(rows: list[dict]) -> StreamingResponse:
                         if not data_rows:
                             continue
                         csv_buf = io.StringIO()
-                        writer = csv.DictWriter(
-                            csv_buf, fieldnames=data_rows[0].keys()
-                        )
+                        writer = csv.DictWriter(csv_buf, fieldnames=data_rows[0].keys())
                         writer.writeheader()
                         writer.writerows(data_rows)
                         zf.writestr(name, csv_buf.getvalue())
@@ -7755,11 +7745,14 @@ def search_author_projects(
 
 @api_app.get(
     "/publication",
-    summary="Find a publication and all linked datasets",
+    summary="Find a publication and all linked projects",
     description=(
-        "Reverse lookup from a publication (PMID or DOI) to every linked dataset "
-        "accession across GEO, SRA, ArrayExpress, and ENA. Provide either pmid or "
-        "doi as a query parameter."
+        "Reverse lookup from a publication (PMID or DOI) to every project linked to "
+        "it across GEO, SRA, ArrayExpress, ENA, DRA, and GEA. Provide either pmid or "
+        "doi as a query parameter. Each project carries `via`, naming the table the "
+        "link came from — the inverse of how a project page resolves its publication. "
+        "Returns {..publication fields.., projects: [{accession, source, title, "
+        "published_at, via}], total_projects}."
     ),
     operation_id="find_publication",
 )
@@ -7779,16 +7772,26 @@ def find_publication(
                 else:
                     cur.execute(PUBLICATION_BY_DOI_SQL, (doi,))
                 pub = cur.fetchone()
-                studies = []
+                projects = []
                 if pub:
-                    cur.execute(STUDIES_BY_PMID_SQL, (pub["pmid"],))
-                    studies = cur.fetchall()
+                    cur.execute(
+                        PROJECTS_BY_PMID_SQL,
+                        {
+                            "pmid": pub["pmid"],
+                            "pmid_json": json.dumps([{"pmid": pub["pmid"]}]),
+                        },
+                    )
+                    projects = cur.fetchall()
     except Exception:
         logger.exception("Database error in find_publication")
         raise HTTPException(500, "Internal server error")
     if not pub:
         raise HTTPException(404, "Publication not found")
-    return {**pub, "studies": studies, "total_studies": len(studies)}
+    return {
+        **pub,
+        "projects": projects,
+        "total_projects": len(projects),
+    }
 
 
 @api_app.get(
