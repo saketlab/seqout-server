@@ -1921,12 +1921,13 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 # Bump when the asset-generation logic (tile columns) changes, so the version hash
 # moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "7"
+_MAP_ASSET_REV = "8"
 
-# How many of the finest layers (cluster_l0 …) to bake as categorical columns for
-# point coloring. Must cover the frontend's color window (LABEL_LAYER_MAX + 1 in
-# the map engine — currently l0…l3, so 4).
-_COLOR_LAYER_COUNT = 4
+# How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
+# by the frontend for point coloring and for the cluster picker's filter. Must cover
+# the frontend's color window (COLOR_LAYER_MAX in the map engine) *and* the coarsest
+# layer, which is the one the picker lists — so: all of them.
+_COLOR_LAYER_COUNT = 5
 
 
 def _compute_map_version(rows: list[dict]) -> str:
