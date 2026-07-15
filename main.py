@@ -195,6 +195,10 @@ from queries import (
 
 load_dotenv()
 
+
+ENRICHMENT_ENABLED = False
+
+
 _STUDY_PREFIX = r"[SED]RP"
 _EXPERIMENT_PREFIX = r"[SED]RX"
 _SAMPLE_PREFIX = r"[SED]RS"
@@ -340,7 +344,9 @@ LEFT JOIN country_agg c
  AND c.source = b.source
 ORDER BY b.accession;
 """
-MAP_FILTER_COLUMNS = ["organism", "tissue", "disease", "assay"]
+MAP_FILTER_COLUMNS = (
+    ["organism", "tissue", "disease", "assay"] if ENRICHMENT_ENABLED else []
+)
 MAP_FILTER_LABELS = {
     "organism": "Organism",
     "tissue": "Tissue",
@@ -348,14 +354,15 @@ MAP_FILTER_LABELS = {
     "assay": "Assay",
 }
 
-_MAP_ENRICHED_AGG = ",\n        ".join(
-    f"mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
-    f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '') AS {c}"
-    for c in MAP_FILTER_COLUMNS
-)
-_MAP_ENRICHED_COLS = "".join(f",\n    e.{c}" for c in MAP_FILTER_COLUMNS)
+if MAP_FILTER_COLUMNS:
+    _MAP_ENRICHED_AGG = ",\n        ".join(
+        f"mode() WITHIN GROUP (ORDER BY BTRIM({c}::text)) "
+        f"FILTER (WHERE {c} IS NOT NULL AND BTRIM({c}::text) <> '') AS {c}"
+        for c in MAP_FILTER_COLUMNS
+    )
+    _MAP_ENRICHED_COLS = "".join(f",\n    e.{c}" for c in MAP_FILTER_COLUMNS)
 
-MAP_POINTS_SQL = f"""
+    MAP_POINTS_SQL = f"""
 WITH combined AS (
     SELECT accession, coords_2d, countries_iso AS countries, clusters
     FROM geo_series WHERE coords_2d IS NOT NULL
@@ -380,6 +387,33 @@ SELECT
     clusters{_MAP_ENRICHED_COLS}
 FROM combined
 LEFT JOIN enriched_agg e ON e.accession = combined.accession
+WHERE array_length(coords_2d, 1) >= 2
+  AND coords_2d[1] IS NOT NULL
+  AND coords_2d[2] IS NOT NULL
+  AND combined.accession ~ '^[A-Za-z]+\\d+$'
+ORDER BY combined.accession;
+"""
+else:
+    _MAP_ENRICHED_AGG = ""
+    _MAP_ENRICHED_COLS = ""
+    MAP_POINTS_SQL = """
+WITH combined AS (
+    SELECT accession, coords_2d, countries_iso AS countries, clusters
+    FROM geo_series WHERE coords_2d IS NOT NULL
+    UNION ALL
+    SELECT accession, coords_2d, countries, clusters
+    FROM sra_studies WHERE coords_2d IS NOT NULL
+    UNION ALL
+    SELECT accession, coords_2d, countries, clusters
+    FROM arrayexpress_experiments WHERE coords_2d IS NOT NULL
+)
+SELECT
+    combined.accession,
+    coords_2d[1]::real AS x,
+    coords_2d[2]::real AS y,
+    countries,
+    clusters
+FROM combined
 WHERE array_length(coords_2d, 1) >= 2
   AND coords_2d[1] IS NOT NULL
   AND coords_2d[2] IS NOT NULL
@@ -1935,7 +1969,7 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 # Bump when the asset-generation logic (tile columns) changes, so the version hash
 # moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "9"
+_MAP_ASSET_REV = "10-enrichment" if ENRICHMENT_ENABLED else "10-no-enrichment"
 
 # How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
 # by the frontend for point coloring and for the cluster picker's filter. The picker
@@ -2052,9 +2086,19 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
         return version, version_dir
 
 
+def _current_map_version() -> str | None:
+    try:
+        cached_rev, _, cached = _MAP_CURRENT_FILE.read_text().strip().partition(":")
+    except OSError:
+        return None
+    if cached_rev != _MAP_ASSET_REV or not _MAP_ID_RE.match(cached):
+        return None
+    return cached
+
+
 def _serve_map_file(version: str, rel_path: str) -> FileResponse:
-    """Serve a file from a map version dir, guarding against path traversal."""
-    if not _MAP_ID_RE.match(version):
+    """Serve a file from the current map version dir, guarding against stale URLs."""
+    if not _MAP_ID_RE.match(version) or _current_map_version() != version:
         raise HTTPException(404, "Not found")
     base = (_MAP_ASSETS_DIR / version).resolve()
     target = (base / rel_path).resolve()
@@ -4525,22 +4569,27 @@ def get_project(
                     # geo_series.contributors → center_name) uniformly for every
                     # project type.
                     _enrich_with_publications([row], cur)
-                    # Cheap existence probe so the UI can show/hide the Enriched
-                    # tab without eagerly loading the heavy enriched payload.
-                    cur.execute(
-                        "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
-                        " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
-                        " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
-                        " AS has_enriched",
-                        (enrich_acc, enrich_acc, enrich_acc),
-                    )
-                    row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
+                    if ENRICHMENT_ENABLED:
+                        # Cheap existence probe so the UI can show/hide the Enriched
+                        # tab without eagerly loading the heavy enriched payload.
+                        cur.execute(
+                            "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
+                            " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
+                            " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
+                            " AS has_enriched",
+                            (enrich_acc, enrich_acc, enrich_acc),
+                        )
+                        row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
+                    else:
+                        row["has_enriched"] = False
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
 
     if row:
-        response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+        response.headers["Cache-Control"] = (
+            _PROJECT_CACHE_CONTROL if ENRICHMENT_ENABLED else "no-store"
+        )
     return row
 
 
@@ -7969,6 +8018,11 @@ def search_structured(
     if geo_radius_km is not None and geo_lat is None:
         raise HTTPException(400, "geo_radius_km requires geo_lat and geo_lng")
 
+    if not ENRICHMENT_ENABLED and any(
+        [sample_tissue, sample_disease, sample_cell_type]
+    ):
+        raise HTTPException(403, "Enriched sample filters are temporarily disabled")
+
     q_variants = None
     if q:
         with pool.connection() as conn:
@@ -9291,6 +9345,60 @@ MCP_OPERATION_IDS = {
     "bulk_project_samples_metadata",
 }
 
+ENRICHMENT_OPERATION_IDS = {
+    "get_enriched_stats",
+    "get_enriched_crosstab",
+    "get_enriched_column",
+    "get_project_enriched",
+    "get_experiment_enriched",
+    "get_run_enriched",
+}
+
+if not ENRICHMENT_ENABLED:
+    MCP_OPERATION_IDS -= ENRICHMENT_OPERATION_IDS
+    api_app.router.routes[:] = [
+        route
+        for route in api_app.router.routes
+        if getattr(route, "operation_id", None) not in ENRICHMENT_OPERATION_IDS
+    ]
+
+MCP_INSTRUCTIONS_ACTIVE = MCP_INSTRUCTIONS
+if not ENRICHMENT_ENABLED:
+    MCP_INSTRUCTIONS_ACTIVE += """
+
+## Disabled
+
+Enriched metadata tools and filters are unavailable.
+"""
+
+
+_ENRICHMENT_DISABLED_PATHS = (
+    re.compile(r"^/project/[^/]+/enriched/?$", re.IGNORECASE),
+    re.compile(r"^/experiment/[^/]+/enriched/?$", re.IGNORECASE),
+    re.compile(r"^/run/[^/]+/enriched/?$", re.IGNORECASE),
+    re.compile(r"^/stats/enriched(?:/.*)?$", re.IGNORECASE),
+    re.compile(r"^/beacon(?:/.*)?$", re.IGNORECASE),
+)
+
+
+def _request_path_without_root(path: str) -> str:
+    if path.startswith("/api/"):
+        return path[4:]
+    return path
+
+
+class EnrichmentDisabledMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not ENRICHMENT_ENABLED:
+            path = _request_path_without_root(request.url.path)
+            if any(pattern.match(path) for pattern in _ENRICHMENT_DISABLED_PATHS):
+                return JSONResponse(
+                    {"detail": "Not Found"},
+                    status_code=404,
+                    headers={"Cache-Control": "no-store"},
+                )
+        return await call_next(request)
+
 mcp_api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 mcp_api_app.state.limiter = limiter
 mcp_api_app.router.routes.extend(
@@ -9302,14 +9410,15 @@ mcp_api_app.router.routes.extend(
 mcp = FastMCP.from_fastapi(
     app=mcp_api_app,
     name="seqout MCP",
-    instructions=MCP_INSTRUCTIONS,
+    instructions=MCP_INSTRUCTIONS_ACTIVE,
 )
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
-import beacon as _beacon  # noqa: E402
+if ENRICHMENT_ENABLED:
+    import beacon as _beacon  # noqa: E402
 
-_beacon.pool = pool
-api_app.include_router(_beacon.beacon_router)
+    _beacon.pool = pool
+    api_app.include_router(_beacon.beacon_router)
 
 combined_app = FastAPI(
     title="seqout API",
@@ -9320,6 +9429,7 @@ combined_app = FastAPI(
 )
 combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+combined_app.add_middleware(EnrichmentDisabledMiddleware)
 combined_app.add_middleware(AnalyticsMiddleware)
 # combined_app.add_middleware(
 #    CORSMiddleware,
