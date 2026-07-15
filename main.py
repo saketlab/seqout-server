@@ -8486,6 +8486,10 @@ def get_project_enriched(
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
+    # ponytail: enriched full-dataset download disabled for now — the CSV export
+    # was the only unpaginated caller. Uncomment to re-enable bulk download.
+    if limit is None:
+        raise HTTPException(403, "Enriched bulk download is disabled")
     accession = accession.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
