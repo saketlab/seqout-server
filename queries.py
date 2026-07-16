@@ -3845,6 +3845,10 @@ ORDER BY ge.experiment_accession, ge.run_accession
 LIMIT 500;
 """
 
+# Unbounded GSA runs, for the full TSV export. Derived from the preview rather
+# than copied, so the column list can't drift between the two.
+GSA_STUDY_RUNS_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace("\nLIMIT 500;", ";")
+
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
 RUN_DOWNLOAD_SQL = """
 SELECT

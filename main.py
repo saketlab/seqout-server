@@ -115,6 +115,7 @@ from queries import (
     GSA_SEARCH_SQL,
     GSA_STUDY_EXPERIMENTS_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
+    GSA_STUDY_RUNS_SQL,
     GSA_STUDY_RUNS_SUMMARY_SQL,
     GSA_SUBMITTER_BATCH_SQL,
     LAST_UPDATED_SQL,
@@ -5042,7 +5043,8 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     summary="List download links for a study",
     description=(
         "Return FASTQ/SRA download links for runs in an SRA/ENA study. "
-        "Returns summary statistics plus a preview of up to 500 runs; FASTQ "
+        "Returns summary statistics plus a preview of up to 500 runs; pass "
+        "full=true for every run instead (used by the UI's link export). FASTQ "
         "fields are semicolon-joined for paired-end runs. If a paired-layout "
         "run has one ENA FASTQ, fastq_is_interleaved is true and SRA/SRA Lite "
         "conversion should be used. For complete paginated per-file entries, "
@@ -5055,12 +5057,19 @@ def get_study_runs(
     request: Request,
     response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    full: bool = Query(
+        False,
+        description="Return every run rather than the 500-run preview",
+    ),
 ):
     study = study.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     is_gsa = _is_gsa_study(study)
     summary_sql = GSA_STUDY_RUNS_SUMMARY_SQL if is_gsa else STUDY_RUNS_SUMMARY_SQL
-    preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
+    if full:
+        preview_sql = GSA_STUDY_RUNS_SQL if is_gsa else STUDY_RUNS_SQL
+    else:
+        preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
     # Both the GSA SQL and the (single-%s) standard resolve-CTE take one param.
     params = (study,)
     try:
