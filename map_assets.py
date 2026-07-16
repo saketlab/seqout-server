@@ -102,7 +102,7 @@ def _write_points_csv(
     csv_path: pathlib.Path,
     filter_columns: list[str],
 ) -> None:
-    cols = ["x", "y", "accession", "countries", *filter_columns, *levels]
+    cols = ["x", "y", "accession", "source", "countries", *filter_columns, *levels]
     # csv.writer (not hand-rolled) because enriched facet values can contain commas
     # / quotes; pyarrow's CSV reader (quadfeather) parses the RFC4180 quoting back.
     with open(csv_path, "w", newline="") as f:
@@ -113,7 +113,10 @@ def _write_points_csv(
             facets = [";".join(clean_values(r.get(c))) for c in filter_columns]
             clusters = r.get("clusters")
             cids = [str(cluster_at(clusters, lvl)) for lvl in levels]
-            w.writerow([r["x"], r["y"], r["accession"], countries, *facets, *cids])
+            source = r.get("source") or ""
+            w.writerow(
+                [r["x"], r["y"], r["accession"], source, countries, *facets, *cids]
+            )
 
 
 def _layer_dictionaries(rows: list[dict], levels: list[str]) -> dict:
@@ -148,6 +151,9 @@ def _run_quadfeather(
             pa.field("x", pa.float32()),
             pa.field("y", pa.float32()),
             pa.field("accession", pa.utf8()),
+            # source (archive) is dictionary-encoded so deepscatter can color by
+            # it categorically, exactly like the cluster layers.
+            pa.field("source", pa.dictionary(pa.int32(), pa.utf8())),
             pa.field("countries", pa.utf8()),
             *[pa.field(c, pa.utf8()) for c in filter_columns],
             *[pa.field(lvl, pa.dictionary(pa.int32(), pa.utf8())) for lvl in levels],
@@ -196,6 +202,9 @@ def build_assets(
             (filter_dir / f"{col}.json").write_text(json.dumps(vals))
 
     dictionaries = _layer_dictionaries(rows, levels)
+    # shared dictionary for the categorical source column (7 archive strings).
+    source_vals = sorted({r.get("source") for r in rows if r.get("source")})
+    dictionaries["source"] = pa.array(source_vals, type=pa.utf8())
     csv_path = out_dir / "points.csv"
     _write_points_csv(rows, levels, csv_path, filter_columns)
     _run_quadfeather(

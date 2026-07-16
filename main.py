@@ -436,14 +436,32 @@ if MAP_FILTER_COLUMNS:
 
     MAP_POINTS_SQL = f"""
 WITH combined AS (
-    SELECT accession, coords_2d, countries_iso AS countries, clusters
-    FROM geo_series WHERE coords_2d IS NOT NULL
+    SELECT accession, 'geo'::text AS source, coords_2d,
+           countries_iso AS countries, clusters
+    FROM geo_series WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
     UNION ALL
-    SELECT accession, coords_2d, countries, clusters
-    FROM sra_studies WHERE coords_2d IS NOT NULL
+    SELECT accession, 'sra'::text, coords_2d, countries, clusters
+    FROM sra_studies WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
     UNION ALL
-    SELECT accession, coords_2d, countries, clusters
-    FROM arrayexpress_experiments WHERE coords_2d IS NOT NULL
+    SELECT accession, 'arrayexpress'::text, coords_2d, countries, clusters
+    FROM arrayexpress_experiments
+    WHERE coords_2d IS NOT NULL AND accession ~ '^E-[A-Z]{4}-\\d+$'
+    UNION ALL
+    SELECT study_accession AS accession, 'ena'::text, coords_2d,
+           ARRAY[]::text[], clusters
+    FROM ena_studies
+    WHERE coords_2d IS NOT NULL AND study_accession ~ '^[A-Za-z]+\\d+$'
+    UNION ALL
+    SELECT accession, 'dra'::text, coords_2d, ARRAY[]::text[], clusters
+    FROM dra_studies WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
+    UNION ALL
+    SELECT accession, 'gea'::text, coords_2d, ARRAY[]::text[], clusters
+    FROM gea_experiments WHERE coords_2d IS NOT NULL AND accession ~ '^E-GEAD-\\d+$'
+    UNION ALL
+    SELECT study_accession AS accession, 'gsa'::text, coords_2d,
+           ARRAY[]::text[], clusters
+    FROM gsa_studies
+    WHERE coords_2d IS NOT NULL AND study_accession ~ '^[A-Za-z]+\\d+$'
 ),
 enriched_agg AS (
     SELECT study_accession AS accession,
@@ -453,6 +471,7 @@ enriched_agg AS (
 )
 SELECT
     combined.accession,
+    combined.source,
     coords_2d[1]::real AS x,
     coords_2d[2]::real AS y,
     countries,
@@ -462,7 +481,6 @@ LEFT JOIN enriched_agg e ON e.accession = combined.accession
 WHERE array_length(coords_2d, 1) >= 2
   AND coords_2d[1] IS NOT NULL
   AND coords_2d[2] IS NOT NULL
-  AND combined.accession ~ '^[A-Za-z]+\\d+$'
 ORDER BY combined.accession;
 """
 else:
@@ -470,17 +488,36 @@ else:
     _MAP_ENRICHED_COLS = ""
     MAP_POINTS_SQL = """
 WITH combined AS (
-    SELECT accession, coords_2d, countries_iso AS countries, clusters
-    FROM geo_series WHERE coords_2d IS NOT NULL
+    SELECT accession, 'geo'::text AS source, coords_2d,
+           countries_iso AS countries, clusters
+    FROM geo_series WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
     UNION ALL
-    SELECT accession, coords_2d, countries, clusters
-    FROM sra_studies WHERE coords_2d IS NOT NULL
+    SELECT accession, 'sra'::text, coords_2d, countries, clusters
+    FROM sra_studies WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
     UNION ALL
-    SELECT accession, coords_2d, countries, clusters
-    FROM arrayexpress_experiments WHERE coords_2d IS NOT NULL
+    SELECT accession, 'arrayexpress'::text, coords_2d, countries, clusters
+    FROM arrayexpress_experiments
+    WHERE coords_2d IS NOT NULL AND accession ~ '^E-[A-Z]{4}-\\d+$'
+    UNION ALL
+    SELECT study_accession AS accession, 'ena'::text, coords_2d,
+           ARRAY[]::text[], clusters
+    FROM ena_studies
+    WHERE coords_2d IS NOT NULL AND study_accession ~ '^[A-Za-z]+\\d+$'
+    UNION ALL
+    SELECT accession, 'dra'::text, coords_2d, ARRAY[]::text[], clusters
+    FROM dra_studies WHERE coords_2d IS NOT NULL AND accession ~ '^[A-Za-z]+\\d+$'
+    UNION ALL
+    SELECT accession, 'gea'::text, coords_2d, ARRAY[]::text[], clusters
+    FROM gea_experiments WHERE coords_2d IS NOT NULL AND accession ~ '^E-GEAD-\\d+$'
+    UNION ALL
+    SELECT study_accession AS accession, 'gsa'::text, coords_2d,
+           ARRAY[]::text[], clusters
+    FROM gsa_studies
+    WHERE coords_2d IS NOT NULL AND study_accession ~ '^[A-Za-z]+\\d+$'
 )
 SELECT
     combined.accession,
+    combined.source,
     coords_2d[1]::real AS x,
     coords_2d[2]::real AS y,
     countries,
@@ -489,7 +526,6 @@ FROM combined
 WHERE array_length(coords_2d, 1) >= 2
   AND coords_2d[1] IS NOT NULL
   AND coords_2d[2] IS NOT NULL
-  AND combined.accession ~ '^[A-Za-z]+\\d+$'
 ORDER BY combined.accession;
 """
 
@@ -2041,7 +2077,7 @@ _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 # Bump when the asset-generation logic (tile columns) changes, so the version hash
 # moves and clients rebuild without a manual /cache/purge.
-_MAP_ASSET_REV = "10-enrichment" if ENRICHMENT_ENABLED else "10-no-enrichment"
+_MAP_ASSET_REV = "11-source-col" if ENRICHMENT_ENABLED else "11-source-col-no-enrich"
 
 # How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
 # by the frontend for point coloring and for the cluster picker's filter. The picker
