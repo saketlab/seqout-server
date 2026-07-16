@@ -2151,6 +2151,10 @@ deduped AS (
 SELECT l.accession, l.source, l.via,
        COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title)
            AS title,
+       -- dra_studies / gea_experiments have no abstract column to fall back on,
+       -- so those rows come back with a null summary.
+       COALESCE(g.summary, s.abstract, ae.description, en.study_description)
+           AS summary,
        COALESCE(g.published_at, s.published_at, ae.release_date, en.first_public,
                 d.published_at, ge.release_date) AS published_at
 FROM deduped l

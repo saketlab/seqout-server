@@ -7837,7 +7837,7 @@ def search_author_projects(
         "doi as a query parameter. Each project carries `via`, naming the table the "
         "link came from — the inverse of how a project page resolves its publication. "
         "Returns {..publication fields.., projects: [{accession, source, title, "
-        "published_at, via}], total_projects}."
+        "summary, published_at, via, center_name, country_code}], total_projects}."
     ),
     operation_id="find_publication",
 )
@@ -7867,6 +7867,17 @@ def find_publication(
                         },
                     )
                     projects = cur.fetchall()
+                    # Submitting center/country, the same way search enriches its
+                    # rows. unified_metadata has no GSA rows, so a GSA project
+                    # (if one is ever linked) simply gets no center.
+                    accs = [p["accession"] for p in projects if p.get("accession")]
+                    if accs:
+                        cur.execute(SUBMITTER_BATCH_SQL, {"acc": accs})
+                        sub_map = {r["accession"]: r for r in cur.fetchall()}
+                        for p in projects:
+                            meta = sub_map.get(p["accession"], {})
+                            p["center_name"] = meta.get("submitter")
+                            p["country_code"] = meta.get("country_code")
     except Exception:
         logger.exception("Database error in find_publication")
         raise HTTPException(500, "Internal server error")
