@@ -221,8 +221,10 @@ GSA_STUDY_PATTERN = re.compile(r"^(CRA|HRA)\d+$", re.IGNORECASE)
 GSA_RUN_PATTERN = re.compile(r"^(CRR|HRR)\d+$", re.IGNORECASE)
 GSA_EXPERIMENT_PATTERN = re.compile(r"^(CRX|HRX)\d+$", re.IGNORECASE)
 GSA_SAMPLE_PATTERN = re.compile(r"^HRS\d+$", re.IGNORECASE)
+# CRA/HRA are GSA study accessions; they turn up as similarity neighbours, so a
+# project lookup has to accept them like any other archive's project accession.
 PROJECT_PATTERN = re.compile(
-    rf"^(GSE|{_STUDY_PREFIX}|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
+    rf"^(GSE|{_STUDY_PREFIX}|CRA|HRA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
 )
 BULK_PATTERN = re.compile(
     rf"^(GSE|{_STUDY_PREFIX}|PRJNA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
@@ -7365,11 +7367,17 @@ def bulk_project_metadata(request: Request, payload: dict):
         if not isinstance(acc, str):
             raise HTTPException(400, f"Invalid accession type: {type(acc).__name__}")
         normalized = acc.strip().upper()
+        # Skip rather than reject the batch: a known-format accession that isn't
+        # in the DB is already answered by omitting it, so failing the other 99
+        # over one unrecognised prefix only loses data the caller could have had.
         if not PROJECT_PATTERN.match(normalized):
-            raise HTTPException(400, f"Invalid accession format: {acc}")
+            continue
         if normalized not in seen:
             seen.add(normalized)
             validated.append(normalized)
+
+    if not validated:
+        return []
 
     _require_bulk_limit(validated)
 

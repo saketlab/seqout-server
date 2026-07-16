@@ -3667,6 +3667,49 @@ matched AS (
         ae.organisms
     FROM arrayexpress_experiments ae
     JOIN input i ON i.accession = ae.accession
+
+    UNION ALL
+
+    -- GSA title/organisms come off the search table; gsa_studies has neither an
+    -- `accession` nor an `organisms` column (transfer.gsa_search enriches them
+    -- from the BioProject). Same COALESCE ladder search uses, so the graph and
+    -- the result rows agree on a study's name.
+    SELECT
+        gss.accession,
+        COALESCE(gss.study_title, gss.project_title, gss.study_name,
+                 gss.project_name, gss.accession) AS title,
+        COALESCE(gss.study_description, gss.project_summary) AS description,
+        gss.organisms
+    FROM gsa_studies_search gss
+    JOIN input i ON i.accession = gss.accession
+
+    UNION ALL
+
+    -- DDBJ-exclusive studies only: a DRP that SRA mirrors is already covered by
+    -- sra_studies above and would otherwise match twice.
+    SELECT
+        ds.accession,
+        ds.title,
+        ds.abstract AS description,
+        NULL::text[] AS organisms
+    FROM dra_studies ds
+    JOIN input i ON i.accession = ds.accession
+    WHERE ds.is_only_ddbj = 1
+
+    UNION ALL
+
+    -- E-GEAD lives in gea_experiments, not arrayexpress_experiments, and stores
+    -- one organism as text rather than an array.
+    SELECT
+        gea.accession,
+        gea.title,
+        gea.description,
+        CASE
+            WHEN gea.organism IS NULL THEN NULL::text[]
+            ELSE ARRAY[gea.organism]
+        END AS organisms
+    FROM gea_experiments gea
+    JOIN input i ON i.accession = gea.accession
 )
 SELECT
     m.accession,
