@@ -1393,9 +1393,9 @@ SELECT
     d.links,
     d.published_at,
     d.updated_at,
-    NULL AS coords_2d,
-    NULL AS coords_3d,
-    NULL AS neighbors,
+    d.coords_2d,
+    d.coords_3d,
+    d.neighbors,
     (SELECT array_agg(DISTINCT sm.scientific_name)
      FROM dra_experiments e
      JOIN dra_samples sm ON sm.accession = ANY (e.samples)
@@ -1421,9 +1421,12 @@ SELECT
     NULL::jsonb AS links,
     NULL::date AS published_at,
     es.last_updated AS updated_at,
-    NULL::real[] AS coords_2d,
-    NULL::real[] AS coords_3d,
-    NULL::jsonb AS neighbors,
+    -- Most ENA projects have no embedding of their own and inherit one from the
+    -- SRA/GEO study they wrap (_graft_linked_project); the minority that do have
+    -- one must use it, and the graft leaves a populated value alone.
+    es.coords_2d,
+    es.coords_3d,
+    es.neighbors,
     CASE
         WHEN NULLIF(btrim(es.scientific_name), '') IS NOT NULL
         THEN ARRAY[es.scientific_name]
@@ -1473,9 +1476,9 @@ SELECT
     NULL::jsonb AS links,
     NULL::date AS published_at,
     es.last_updated AS updated_at,
-    NULL::real[] AS coords_2d,
-    NULL::real[] AS coords_3d,
-    NULL::jsonb AS neighbors,
+    es.coords_2d,
+    es.coords_3d,
+    es.neighbors,
     CASE
         WHEN es.scientific_name IS NOT NULL AND es.scientific_name <> ''
         THEN ARRAY[es.scientific_name]
@@ -2452,9 +2455,9 @@ SELECT
     g.protocols_description AS overall_design,
     CASE WHEN NULLIF(btrim(g.organism), '') IS NOT NULL
          THEN ARRAY[g.organism] END AS organisms,
-    NULL AS coords_2d,
-    NULL AS coords_3d,
-    NULL AS neighbors,
+    g.coords_2d,
+    g.coords_3d,
+    g.neighbors,
     CASE WHEN COALESCE(NULLIF(g.pubmed_id, ''), NULLIF(g.pubmed_id_pysradb, '')) IS NOT NULL
          THEN ARRAY[COALESCE(NULLIF(g.pubmed_id, ''), g.pubmed_id_pysradb)]
     END AS pubmed_id,
