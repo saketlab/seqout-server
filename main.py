@@ -290,6 +290,78 @@ WITH atlas_base AS (
       AND coords_2d[1] IS NOT NULL
       AND coords_2d[2] IS NOT NULL
       AND accession ~ '^[A-Za-z]+\\d+$'
+
+    UNION ALL
+
+    -- ENA (unique studies not mirrored into SRA/GEO); study_accession is the id.
+    SELECT
+        study_accession AS accession,
+        'ena'::text AS source,
+        'ENA'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        ARRAY[]::text[] AS raw_country_codes,
+        ARRAY[]::text[] AS raw_country_labels
+    FROM ena_studies
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND study_accession ~ '^[A-Za-z]+\\d+$'
+
+    UNION ALL
+
+    -- DRA (DDBJ-native studies).
+    SELECT
+        accession,
+        'dra'::text AS source,
+        'DRA'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        ARRAY[]::text[] AS raw_country_codes,
+        ARRAY[]::text[] AS raw_country_labels
+    FROM dra_studies
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND accession ~ '^[A-Za-z]+\\d+$'
+
+    UNION ALL
+
+    -- GEA (DDBJ expression archive); accessions look like E-GEAD-123 (hyphens).
+    SELECT
+        accession,
+        'gea'::text AS source,
+        'GEA'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        ARRAY[]::text[] AS raw_country_codes,
+        ARRAY[]::text[] AS raw_country_labels
+    FROM gea_experiments
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND accession ~ '^E-GEAD-\\d+$'
+
+    UNION ALL
+
+    -- GSA (China NGDC); study_accession is the id (CRA.../HRA...).
+    SELECT
+        study_accession AS accession,
+        'gsa'::text AS source,
+        'GSA'::text AS archive,
+        coords_2d[1]::double precision AS raw_x,
+        coords_2d[2]::double precision AS raw_y,
+        ARRAY[]::text[] AS raw_country_codes,
+        ARRAY[]::text[] AS raw_country_labels
+    FROM gsa_studies
+    WHERE coords_2d IS NOT NULL
+      AND array_length(coords_2d, 1) >= 2
+      AND coords_2d[1] IS NOT NULL
+      AND coords_2d[2] IS NOT NULL
+      AND study_accession ~ '^[A-Za-z]+\\d+$'
 ),
 country_ranked AS (
     SELECT
