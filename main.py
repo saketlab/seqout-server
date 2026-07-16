@@ -115,6 +115,7 @@ from queries import (
     GSA_SEARCH_SQL,
     GSA_STUDY_EXPERIMENTS_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
+    GSA_STUDY_RUNS_SQL,
     GSA_STUDY_RUNS_SUMMARY_SQL,
     GSA_SUBMITTER_BATCH_SQL,
     LAST_UPDATED_SQL,
@@ -5150,7 +5151,8 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     summary="List download links for a study",
     description=(
         "Return FASTQ/SRA download links for runs in an SRA/ENA study. "
-        "Returns summary statistics plus a preview of up to 500 runs; FASTQ "
+        "Returns summary statistics plus a preview of up to 500 runs; pass "
+        "full=true for every run instead (used by the UI's link export). FASTQ "
         "fields are semicolon-joined for paired-end runs. If a paired-layout "
         "run has one ENA FASTQ, fastq_is_interleaved is true and SRA/SRA Lite "
         "conversion should be used. For complete paginated per-file entries, "
@@ -5163,12 +5165,19 @@ def get_study_runs(
     request: Request,
     response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    full: bool = Query(
+        False,
+        description="Return every run rather than the 500-run preview",
+    ),
 ):
     study = study.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     is_gsa = _is_gsa_study(study)
     summary_sql = GSA_STUDY_RUNS_SUMMARY_SQL if is_gsa else STUDY_RUNS_SUMMARY_SQL
-    preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
+    if full:
+        preview_sql = GSA_STUDY_RUNS_SQL if is_gsa else STUDY_RUNS_SQL
+    else:
+        preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
     # Both the GSA SQL and the (single-%s) standard resolve-CTE take one param.
     params = (study,)
     try:
@@ -7945,7 +7954,7 @@ def search_author_projects(
         "doi as a query parameter. Each project carries `via`, naming the table the "
         "link came from — the inverse of how a project page resolves its publication. "
         "Returns {..publication fields.., projects: [{accession, source, title, "
-        "published_at, via}], total_projects}."
+        "summary, published_at, via, center_name, country_code}], total_projects}."
     ),
     operation_id="find_publication",
 )
@@ -7975,6 +7984,17 @@ def find_publication(
                         },
                     )
                     projects = cur.fetchall()
+                    # Submitting center/country, the same way search enriches its
+                    # rows. unified_metadata has no GSA rows, so a GSA project
+                    # (if one is ever linked) simply gets no center.
+                    accs = [p["accession"] for p in projects if p.get("accession")]
+                    if accs:
+                        cur.execute(SUBMITTER_BATCH_SQL, {"acc": accs})
+                        sub_map = {r["accession"]: r for r in cur.fetchall()}
+                        for p in projects:
+                            meta = sub_map.get(p["accession"], {})
+                            p["center_name"] = meta.get("submitter")
+                            p["country_code"] = meta.get("country_code")
     except Exception:
         logger.exception("Database error in find_publication")
         raise HTTPException(500, "Internal server error")
@@ -8648,10 +8668,6 @@ def get_project_enriched(
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    # ponytail: enriched full-dataset download disabled for now — the CSV export
-    # was the only unpaginated caller. Uncomment to re-enable bulk download.
-    if limit is None:
-        raise HTTPException(403, "Enriched bulk download is disabled")
     accession = accession.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:

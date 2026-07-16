@@ -2151,6 +2151,10 @@ deduped AS (
 SELECT l.accession, l.source, l.via,
        COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title)
            AS title,
+       -- dra_studies / gea_experiments have no abstract column to fall back on,
+       -- so those rows come back with a null summary.
+       COALESCE(g.summary, s.abstract, ae.description, en.study_description)
+           AS summary,
        COALESCE(g.published_at, s.published_at, ae.release_date, en.first_public,
                 d.published_at, ge.release_date) AS published_at
 FROM deduped l
@@ -3840,6 +3844,10 @@ WHERE ge.study_accession = %s
 ORDER BY ge.experiment_accession, ge.run_accession
 LIMIT 500;
 """
+
+# Unbounded GSA runs, for the full TSV export. Derived from the preview rather
+# than copied, so the column list can't drift between the two.
+GSA_STUDY_RUNS_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace("\nLIMIT 500;", ";")
 
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
 RUN_DOWNLOAD_SQL = """
