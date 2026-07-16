@@ -2141,13 +2141,19 @@ WITH linked AS (
     SELECT accession, 'gea', 'gea_experiments.pubmed_id'
     FROM gea_experiments
     WHERE pubmed_id = %(pmid)s OR pubmed_id_pysradb = %(pmid)s
+),
+-- Collapse multiple link rows for the same accession; study_publications wins as via.
+deduped AS (
+    SELECT DISTINCT ON (accession) accession, source, via
+    FROM linked
+    ORDER BY accession, (via <> 'study_publications'), via
 )
 SELECT l.accession, l.source, l.via,
        COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title)
            AS title,
        COALESCE(g.published_at, s.published_at, ae.release_date, en.first_public,
                 d.published_at, ge.release_date) AS published_at
-FROM linked l
+FROM deduped l
 LEFT JOIN geo_series               g  ON g.accession        = l.accession
 LEFT JOIN sra_studies              s  ON s.accession        = l.accession
 LEFT JOIN arrayexpress_experiments ae ON ae.accession       = l.accession
