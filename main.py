@@ -13,7 +13,6 @@ import threading
 import time
 import zipfile
 from datetime import date, datetime
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import geoip2.database
@@ -8517,19 +8516,6 @@ def get_enriched_column(
     }
 
 
-_SEQOUT_HOSTS = {"seqout.org", "www.seqout.org", "localhost", "127.0.0.1"}
-
-
-def _is_seqout_referer(request: Request) -> bool:
-    """Whether the request looks like it came from our own UI.
-
-    Deters hotlinking and casual scraping. Not an authentication boundary —
-    don't put anything behind this that needs a real one.
-    """
-    ref = request.headers.get("origin") or request.headers.get("referer") or ""
-    return urlparse(ref).hostname in _SEQOUT_HOSTS
-
-
 @api_app.get(
     "/project/{accession}/enriched",
     summary="Get ontology-enriched sample metadata",
@@ -8555,16 +8541,7 @@ def get_project_enriched(
     offset: int = Query(0, ge=0),
 ):
     accession = accession.upper()
-    if limit is None:
-        # Unpaginated = the full enriched dump (what the CSV export fetches).
-        # Our own UI only.
-        if not _is_seqout_referer(request):
-            raise HTTPException(403, "Enriched bulk download is disabled")
-        # Must not enter the shared CDN cache: it keys on URL, so a cached dump
-        # would be served to anonymous clients without ever reaching the check.
-        response.headers["Cache-Control"] = "private, no-store"
-    else:
-        response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
