@@ -114,6 +114,7 @@ from queries import (
     GSA_SAMPLE_TO_EXPERIMENT_SQL,
     GSA_SEARCH_SQL,
     GSA_STUDY_EXPERIMENTS_SQL,
+    GSA_STUDY_RUNS_FIND_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
     GSA_STUDY_RUNS_SQL,
     GSA_STUDY_RUNS_SUMMARY_SQL,
@@ -174,6 +175,7 @@ from queries import (
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
+    STUDY_RUNS_FIND_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
@@ -5218,6 +5220,49 @@ def get_study_runs(
         "total_fastq_bytes": summary["total_fastq_bytes"],
         "runs": rows,
     }
+
+
+_RUN_FIND_LIMIT = 500
+
+
+@api_app.get(
+    "/project/{study}/runs/find",
+    summary="Find runs in a study by run/experiment accession",
+    description=(
+        "Search every run in a study by run and/or experiment accession "
+        "(case-insensitive substring), not just the 500-run preview. Backs the "
+        "runs grid's column filter so it stays correct on large studies. Returns "
+        "up to 500 matches; `capped` is true when more exist."
+    ),
+    operation_id="find_study_runs",
+)
+@limiter.limit("100/minute")
+def find_study_runs(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    run: str = Query("", description="Run-accession substring"),
+    experiment: str = Query("", description="Experiment-accession substring"),
+):
+    study = study.upper()
+    # Accessions are uppercase; cap length so a filter can't smuggle a huge LIKE.
+    run = run.strip().upper()[:64]
+    experiment = experiment.strip().upper()[:64]
+    if not run and not experiment:
+        return {"runs": [], "capped": False}
+
+    is_gsa = _is_gsa_study(study)
+    find_sql = GSA_STUDY_RUNS_FIND_SQL if is_gsa else STUDY_RUNS_FIND_SQL
+    params = (study, run, run, experiment, experiment)
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(find_sql, params)
+                rows = _annotate_run_downloads(cur.fetchall())
+    except Exception:
+        logger.exception("Database error in find_study_runs")
+        raise HTTPException(500, "Internal server error")
+
+    return {"runs": rows, "capped": len(rows) >= _RUN_FIND_LIMIT}
 
 
 @api_app.get(

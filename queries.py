@@ -3993,6 +3993,36 @@ LIMIT 500;
 # than copied, so the column list can't drift between the two.
 GSA_STUDY_RUNS_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace("\nLIMIT 500;", ";")
 
+# Server-side run/experiment-accession filter for the runs grid. The grid only
+# holds a 500-run preview, so its client-side column filter can't see a run past
+# position 500; these run the same lookup across every run in the study.
+#
+# Exact match, not substring: run_accession (PK) and experiment_accession are
+# plain btrees that only accelerate equality, and a leading-wildcard ILIKE
+# seq-scans the whole study -- 68s on a 2.7M-run study. Accessions are stored
+# uppercase, so the caller uppercases the input. An empty string matches all, so
+# run-only or experiment-only both work. Derived from the preview SQL by
+# injecting the filters before ORDER BY, so the column list and FASTQ-fallback
+# logic can never drift from the unfiltered grid.
+# Params: (study, run, run, experiment, experiment). Capped at the preview's 500.
+_RUN_FIND_FILTERS = (
+    "  AND (%s = '' OR dl.run_accession = %s)\n"
+    "  AND (%s = '' OR dl.experiment_accession = %s)\n"
+)
+STUDY_RUNS_FIND_SQL = STUDY_RUNS_PREVIEW_SQL.replace(
+    "WHERE dl.study_accession IN (SELECT acc FROM candidates)\n",
+    "WHERE dl.study_accession IN (SELECT acc FROM candidates)\n" + _RUN_FIND_FILTERS,
+)
+
+_GSA_RUN_FIND_FILTERS = (
+    "  AND (%s = '' OR ge.run_accession = %s)\n"
+    "  AND (%s = '' OR ge.experiment_accession = %s)\n"
+)
+GSA_STUDY_RUNS_FIND_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace(
+    "WHERE ge.study_accession = %s\n",
+    "WHERE ge.study_accession = %s\n" + _GSA_RUN_FIND_FILTERS,
+)
+
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
 RUN_DOWNLOAD_SQL = f"""
 SELECT
