@@ -135,6 +135,7 @@ from queries import (
     PMID_VARIANT_BATCH_SQL,
     PRJNA_TO_GEO_SERIES_SQL,
     PRJ_TO_ENA_STUDY_SQL,
+    SUBMISSION_TO_STUDIES_SQL,
     PRJ_TO_GSA_STUDY_SQL,
     PRJ_TO_SRA_STUDY_SQL,
     PROJECT_AE_SQL,
@@ -236,6 +237,8 @@ SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
 EXPERIMENT_REGEX = rf"^({_EXPERIMENT_PREFIX}|CRX|HRX)\d+$"
 GEO_SAMPLE_REGEX = r"^GSM\d+$"
 PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
+# SRA/ENA/DDBJ submission accession (SRA######, ERA######, DRA######).
+SUBMISSION_REGEX = r"^[SED]RA\d+$"
 PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|[Ee]-[A-Za-z]{{4}}-)\d+$"
 STUDY_EXPERIMENTS_REGEX = rf"^({_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|{_GEA_PREFIX})\d+$"
 SAMPLE_OR_ENA_REGEX = rf"^({_SAMPLE_PREFIX}|SAM[A-Z]+|HRS)\d+$"
@@ -7766,6 +7769,48 @@ def get_prj_info(
     except Exception as e:
         logger.exception("Database error in get_prj_info")
         raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/submission/{submission}",
+    summary="Resolve a submission accession to its studies",
+    description=(
+        "List the SRA/ENA/DDBJ studies (SRP/ERP/DRP) filed under a submission "
+        "accession (SRA######, ERA######, DRA######). Usually one, sometimes many."
+    ),
+    operation_id="resolve_submission_studies",
+)
+@limiter.limit("100/minute")
+def get_submission_studies(
+    request: Request,
+    submission: str = Path(..., pattern=SUBMISSION_REGEX),
+):
+    submission = submission.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(SUBMISSION_TO_STUDIES_SQL, (submission, submission))
+                studies = [
+                    {
+                        "accession": r["accession"],
+                        "source": "sra",
+                        "title": r["title"],
+                        "summary": r["abstract"],
+                        "published_at": (
+                            r["published_at"].isoformat()
+                            if r["published_at"]
+                            else None
+                        ),
+                    }
+                    for r in cur.fetchall()
+                ]
+    except Exception:
+        logger.exception("Database error in get_submission_studies")
+        raise HTTPException(500, "Internal server error")
+
+    if not studies:
+        raise HTTPException(404, f"No studies found for submission {submission}")
+    return {"submission": submission, "studies": studies}
 
 
 _KIND_INFO = {

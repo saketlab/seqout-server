@@ -1873,6 +1873,25 @@ WHERE study_accession = %s
 LIMIT 1;
 """
 
+# Studies belonging to an SRA/ENA/DDBJ submission accession (SRA######, ERA######,
+# DRA######). Most submissions wrap a single study, but some batch thousands, so
+# this returns a list. The submission is recorded two ways: directly on the study
+# (sra_studies.submission), and on the experiments of studies that carry no
+# submission of their own (sra_experiments.submission -> study); UNION covers both.
+# %s is bound twice.
+SUBMISSION_TO_STUDIES_SQL = """
+WITH studies AS (
+    SELECT accession FROM sra_studies WHERE submission = %s
+    UNION
+    SELECT study AS accession FROM sra_experiments
+    WHERE submission = %s AND study IS NOT NULL
+)
+SELECT s.accession, s.title, s.abstract, s.published_at
+FROM studies st
+JOIN sra_studies s ON s.accession = st.accession
+ORDER BY s.published_at DESC NULLS LAST, s.accession;
+"""
+
 # ---------------------------------------------------------------------------
 # Sample detail queries
 # ---------------------------------------------------------------------------
