@@ -5069,6 +5069,10 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     urls = _split_semicolon_values(ftp)
     sizes = _split_semicolon_values(bytes_)
     checksums = _split_semicolon_values(md5s)
+    # fastq_filenames is positional with urls. It only differs from the URL
+    # basename for NCBI originals, whose object keys carry a version suffix
+    # (..._R1_001.fastq.gz.1) that the actual file does not have.
+    names = _split_semicolon_values(row.get("fastq_filenames"))
 
     run = row["run_accession"]
     exp = row.get("experiment_accession") or "unknown"
@@ -5119,7 +5123,9 @@ def _split_fastq_fields(row: dict, study: str) -> list[dict]:
     if urls:
         results = []
         for i, url in enumerate(urls):
-            filename = url.rsplit("/", 1)[-1] if "/" in url else url
+            filename = names[i] if i < len(names) else ""
+            if not filename:
+                filename = url.rsplit("/", 1)[-1] if "/" in url else url
             normalized_url = _normalize_download_url(url)
             results.append(
                 {

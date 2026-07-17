@@ -1960,16 +1960,89 @@ WHERE s.accession = %s
 LIMIT 1;
 """
 
+# ENA only mirrors runs that NCBI normalised into an .sra object. A run whose
+# submitter uploaded originals that were never normalised therefore has no
+# fastq_ftp at all, even though its original fastq.gz files are already listed in
+# ncbi_files -- so the page offered nothing to download while holding the links
+# (SRP567218: 44 runs, 0 files shown, 192 present).
+#
+# Only entries carrying a direct https url qualify. The rest are reachable solely
+# via "Use Cloud Data Delivery" s3 alternatives, which are requester-pays and not
+# a link we can hand a user; those runs keep showing no FASTQ, which is honest.
+#
+# Every query reading fastq_ftp off sra_run_download_links needs this, or the
+# same run gains files on one page and stays empty on another.
+_ORIGINAL_FASTQ_JOIN = """
+LEFT JOIN LATERAL (
+    SELECT
+        string_agg(x.url,      ';' ORDER BY x.filename) AS fastq_ftp,
+        string_agg(x.size,     ';' ORDER BY x.filename) AS fastq_bytes,
+        string_agg(x.md5,      ';' ORDER BY x.filename) AS fastq_md5,
+        string_agg(x.filename, ';' ORDER BY x.filename) AS fastq_filenames
+    FROM (
+        SELECT f->>'filename' AS filename,
+               f->>'url'      AS url,
+               f->>'size'     AS size,
+               f->>'md5'      AS md5
+        FROM jsonb_array_elements(
+                 -- ncbi_files can be a JSONB 'null' scalar, not an array
+                 CASE WHEN jsonb_typeof(dl.ncbi_files) = 'array'
+                      THEN dl.ncbi_files ELSE '[]'::jsonb END
+             ) AS f
+        WHERE f->>'supertype' = 'Original'
+          AND f->>'semantic_name' = 'fastq'
+          AND COALESCE(f->>'url', '') LIKE 'https://%%'
+          AND COALESCE(f->>'size', '') ~ '^[0-9]+$'
+          AND COALESCE(f->>'filename', '') <> ''
+    ) x
+) orig ON NULLIF(dl.fastq_ftp, '') IS NULL
+"""
+
+# All four switch on fastq_ftp together, never column-by-column: the lists are
+# positional, so taking urls from ENA and bytes from ncbi_files would silently
+# mis-pair them. A run with ENA FASTQ is left exactly as it was.
+_FASTQ_FTP_EXPR = (
+    "CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL "
+    "THEN dl.fastq_ftp ELSE orig.fastq_ftp END"
+)
+_FASTQ_BYTES_EXPR = (
+    "CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL "
+    "THEN dl.fastq_bytes ELSE orig.fastq_bytes END"
+)
+_FASTQ_MD5_EXPR = (
+    "CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL "
+    "THEN dl.fastq_md5 ELSE orig.fastq_md5 END"
+)
+
+# NCBI's object keys carry a version suffix the real file does not have
+# (..._R1_001.fastq.gz.1), so a name taken from the URL is wrong for ~92% of the
+# fallback entries. ncbi_files already stores the true filename; use it.
+#
+# Total by construction, never NULL where fastq_ftp is set: the ENA arm is just
+# the URL basename, which is byte-for-byte what callers derived themselves, so
+# reading this column can never change an ENA run's name. ORDINALITY keeps that
+# arm in url order; the fallback arm shares the aggregate's ORDER BY. Do not
+# strip the suffix by regex instead -- names like YCS122B_control.1.fastq.gz end
+# in a numeric component legitimately, and would be corrupted.
+_FASTQ_FILENAMES_EXPR = """
+CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL
+     THEN (SELECT string_agg(split_part(u, '/', -1), ';' ORDER BY ord)
+           FROM unnest(string_to_array(dl.fastq_ftp, ';'))
+                WITH ORDINALITY AS t(u, ord))
+     ELSE orig.fastq_filenames END
+"""
+
 # Get runs for a specific experiment accession
 # Caller must pass accession already uppercased
-EXPERIMENT_RUNS_SQL = """
+EXPERIMENT_RUNS_SQL = f"""
 SELECT
     dl.run_accession,
     dl.experiment_accession,
     dl.library_layout,
-    dl.fastq_ftp,
-    dl.fastq_bytes,
-    dl.fastq_md5,
+    {_FASTQ_FTP_EXPR} AS fastq_ftp,
+    {_FASTQ_BYTES_EXPR} AS fastq_bytes,
+    {_FASTQ_MD5_EXPR} AS fastq_md5,
+    {_FASTQ_FILENAMES_EXPR} AS fastq_filenames,
     dl.sra_ftp,
     dl.sra_bytes,
     dl.sra_md5,
@@ -1985,6 +2058,7 @@ SELECT
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
 LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
+{_ORIGINAL_FASTQ_JOIN}
 WHERE dl.experiment_accession = %s
 ORDER BY dl.run_accession;
 """
@@ -3761,36 +3835,38 @@ candidates AS (
 
 STUDY_RUNS_SUMMARY_SQL = (
     _RESOLVE_DL_STUDY
-    + """
+    + f"""
 SELECT
     COUNT(*) AS total_runs,
-    COUNT(*) FILTER (WHERE library_layout = 'PAIRED') AS paired_runs,
-    COUNT(*) FILTER (WHERE library_layout = 'SINGLE') AS single_runs,
+    COUNT(*) FILTER (WHERE dl.library_layout = 'PAIRED') AS paired_runs,
+    COUNT(*) FILTER (WHERE dl.library_layout = 'SINGLE') AS single_runs,
     COALESCE(SUM(
-        CASE WHEN fastq_bytes IS NOT NULL AND fastq_bytes != ''
+        CASE WHEN {_FASTQ_BYTES_EXPR} IS NOT NULL AND {_FASTQ_BYTES_EXPR} != ''
              THEN (
                  SELECT SUM(v::bigint)
-                 FROM unnest(string_to_array(fastq_bytes, ';')) AS v
+                 FROM unnest(string_to_array({_FASTQ_BYTES_EXPR}, ';')) AS v
                  WHERE v ~ '^[0-9]+$'
              )
              ELSE 0
         END
     ), 0) AS total_fastq_bytes
-FROM sra_run_download_links
-WHERE study_accession IN (SELECT acc FROM candidates);
+FROM sra_run_download_links dl
+{_ORIGINAL_FASTQ_JOIN}
+WHERE dl.study_accession IN (SELECT acc FROM candidates);
 """
 )
 
 STUDY_RUNS_SQL = (
     _RESOLVE_DL_STUDY
-    + """
+    + f"""
 SELECT
     dl.run_accession,
     dl.experiment_accession,
     dl.library_layout,
-    dl.fastq_ftp,
-    dl.fastq_bytes,
-    dl.fastq_md5,
+    {_FASTQ_FTP_EXPR} AS fastq_ftp,
+    {_FASTQ_BYTES_EXPR} AS fastq_bytes,
+    {_FASTQ_MD5_EXPR} AS fastq_md5,
+    {_FASTQ_FILENAMES_EXPR} AS fastq_filenames,
     dl.sra_ftp,
     dl.sra_bytes,
     dl.sra_md5,
@@ -3806,6 +3882,7 @@ SELECT
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
 LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
+{_ORIGINAL_FASTQ_JOIN}
 WHERE dl.study_accession IN (SELECT acc FROM candidates)
 ORDER BY dl.experiment_accession, dl.run_accession;
 """
@@ -3813,14 +3890,15 @@ ORDER BY dl.experiment_accession, dl.run_accession;
 
 STUDY_RUNS_PREVIEW_SQL = (
     _RESOLVE_DL_STUDY
-    + """
+    + f"""
 SELECT
     dl.run_accession,
     dl.experiment_accession,
     dl.library_layout,
-    dl.fastq_ftp,
-    dl.fastq_bytes,
-    dl.fastq_md5,
+    {_FASTQ_FTP_EXPR} AS fastq_ftp,
+    {_FASTQ_BYTES_EXPR} AS fastq_bytes,
+    {_FASTQ_MD5_EXPR} AS fastq_md5,
+    {_FASTQ_FILENAMES_EXPR} AS fastq_filenames,
     dl.sra_ftp,
     dl.sra_bytes,
     dl.sra_md5,
@@ -3836,6 +3914,7 @@ SELECT
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
 LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
+{_ORIGINAL_FASTQ_JOIN}
 WHERE dl.study_accession IN (SELECT acc FROM candidates)
 ORDER BY dl.experiment_accession, dl.run_accession
 LIMIT 500;
@@ -3896,15 +3975,16 @@ LIMIT 500;
 GSA_STUDY_RUNS_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace("\nLIMIT 500;", ";")
 
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
-RUN_DOWNLOAD_SQL = """
+RUN_DOWNLOAD_SQL = f"""
 SELECT
     dl.run_accession,
     dl.experiment_accession,
     dl.study_accession,
     dl.library_layout,
-    dl.fastq_ftp,
-    dl.fastq_bytes,
-    dl.fastq_md5,
+    {_FASTQ_FTP_EXPR} AS fastq_ftp,
+    {_FASTQ_BYTES_EXPR} AS fastq_bytes,
+    {_FASTQ_MD5_EXPR} AS fastq_md5,
+    {_FASTQ_FILENAMES_EXPR} AS fastq_filenames,
     dl.sra_ftp,
     dl.sra_bytes,
     dl.sra_md5,
@@ -3920,6 +4000,7 @@ SELECT
 FROM sra_run_download_links dl
 LEFT JOIN ena_experiments ena ON ena.run_accession = dl.run_accession
 LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
+{_ORIGINAL_FASTQ_JOIN}
 WHERE dl.run_accession = %s;
 """
 
