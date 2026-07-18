@@ -628,6 +628,14 @@ _DEFAULT_STATEMENT_TIMEOUT = "30s"
 
 def _configure_connection(conn) -> None:
     conn.execute(f"SET statement_timeout = '{_DEFAULT_STATEMENT_TIMEOUT}'")
+    # Force custom (per-value) plans. The pool auto-prepares statements
+    # (prepare_threshold=2), and after a few executions Postgres switches an
+    # array-contains lookup like `samples @> ARRAY[$1]` to a GENERIC plan that
+    # can't estimate selectivity without the value -> seq scan of a 40M-row
+    # table -> 30s timeout (this is what made SRS/DRS/ERS sample pages hang).
+    # Re-planning per execute costs <1ms and keeps the GIN index in play; the
+    # parse savings of the prepared statement are retained.
+    conn.execute("SET plan_cache_mode = force_custom_plan")
 
 
 pool = ConnectionPool(
@@ -7007,9 +7015,13 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
 @limiter.limit("100/minute")
 def get_sample_detail(
     request: Request,
+    response: Response,
     accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
 ):
     accession = accession.upper()
+    # Sample/experiment metadata is effectively immutable; let the CDN serve
+    # repeat loads instead of re-running the resolve chain each time.
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:

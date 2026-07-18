@@ -1629,7 +1629,10 @@ SELECT
     s.submission_accession AS submission,
     NULL::jsonb AS links
 FROM ena_samples s
-WHERE UPPER(s.sample_accession) = UPPER(%s)
+-- sample_accession is uppercase for every row and callers uppercase the input,
+-- so match the column directly and hit the ena_samples_pkey; the UPPER() wrap
+-- would force the redundant functional index instead.
+WHERE s.sample_accession = %s
 LIMIT 1;
 """
 
@@ -1681,8 +1684,8 @@ FROM sra_samples
 WHERE accession = ANY(%s);
 """
 
-# Batched ENA fallback for _fetch_samples_batch. Mirrors ENA_SAMPLE_SQL but
-# matches a list (uppercased) via the ena_samples_accession_upper_idx index.
+# Batched ENA fallback for _fetch_samples_batch. Mirrors ENA_SAMPLE_SQL and
+# matches an (already-uppercased) list on the plain ena_samples_pkey.
 BATCH_ENA_SAMPLES_SQL = """
 SELECT
     s.sample_accession AS accession,
@@ -1715,7 +1718,7 @@ SELECT
     s.submission_accession AS submission,
     NULL::jsonb AS links
 FROM ena_samples s
-WHERE UPPER(s.sample_accession) = ANY(%s);
+WHERE s.sample_accession = ANY(%s);
 """
 
 BATCH_GSA_SAMPLES_SQL = """
