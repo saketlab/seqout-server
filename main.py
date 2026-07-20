@@ -6633,7 +6633,30 @@ def download_study_script(
 
 
 _SUPP_GEO_SQL = "SELECT supplementary_data FROM geo_series WHERE accession = %s"
-_SUPP_AE_SQL = "SELECT processed_data_files AS supplementary_data FROM arrayexpress_experiments WHERE accession = %s"
+# Processed archives (processed_data_files) plus the raw-data archive held in each
+# sample's comment[arrayexpress ftp file] attribute — show every available file.
+_SUPP_AE_SQL = """
+    SELECT (
+        COALESCE(
+            CASE WHEN jsonb_typeof(ae.processed_data_files) = 'array'
+                  AND jsonb_array_length(ae.processed_data_files) > 0
+                 THEN ae.processed_data_files END,
+            '[]'::jsonb
+        )
+        ||
+        COALESCE(
+            (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+                'url', s.attributes_json->>'comment[arrayexpress ftp file]',
+                'path', regexp_replace(s.attributes_json->>'comment[arrayexpress ftp file]', '^.*/', '')
+             ))
+             FROM arrayexpress_samples s
+             WHERE s.experiment_accession = ae.accession
+               AND s.attributes_json ? 'comment[arrayexpress ftp file]'),
+            '[]'::jsonb
+        )
+    ) AS supplementary_data
+    FROM arrayexpress_experiments ae WHERE ae.accession = %s
+"""
 _SUPP_GEA_SQL = (
     "SELECT data_files AS supplementary_data FROM gea_experiments WHERE accession = %s"
 )

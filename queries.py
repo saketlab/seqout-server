@@ -2492,20 +2492,28 @@ SELECT
             FROM jsonb_array_elements(ae.external_links) AS link)
         ELSE NULL
     END AS relation,
-    -- AE stores the raw-data archive only inside each sample's attributes as
-    -- comment[arrayexpress ftp file] (same experiment-level file repeated across
-    -- samples); fall back to it when processed_data_files is empty.
-    COALESCE(
-        CASE WHEN jsonb_typeof(ae.processed_data_files) = 'array'
-              AND jsonb_array_length(ae.processed_data_files) > 0
-             THEN ae.processed_data_files END,
-        (SELECT jsonb_agg(DISTINCT jsonb_build_object(
-            'url', s.attributes_json->>'comment[arrayexpress ftp file]',
-            'path', regexp_replace(s.attributes_json->>'comment[arrayexpress ftp file]', '^.*/', '')
-         ))
-         FROM arrayexpress_samples s
-         WHERE s.experiment_accession = ae.accession
-           AND s.attributes_json ? 'comment[arrayexpress ftp file]')
+    -- AE stores processed archives in processed_data_files and the raw-data
+    -- archive inside each sample's comment[arrayexpress ftp file] attribute (one
+    -- experiment-level file repeated across samples). Show both, not either/or.
+    NULLIF(
+        COALESCE(
+            CASE WHEN jsonb_typeof(ae.processed_data_files) = 'array'
+                  AND jsonb_array_length(ae.processed_data_files) > 0
+                 THEN ae.processed_data_files END,
+            '[]'::jsonb
+        )
+        ||
+        COALESCE(
+            (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+                'url', s.attributes_json->>'comment[arrayexpress ftp file]',
+                'path', regexp_replace(s.attributes_json->>'comment[arrayexpress ftp file]', '^.*/', '')
+             ))
+             FROM arrayexpress_samples s
+             WHERE s.experiment_accession = ae.accession
+               AND s.attributes_json ? 'comment[arrayexpress ftp file]'),
+            '[]'::jsonb
+        ),
+        '[]'::jsonb
     ) AS supplementary_data,
     ae.release_date AS published_at,
     ae.release_date AS updated_at,
