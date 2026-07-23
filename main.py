@@ -31,6 +31,7 @@ from fastmcp import FastMCP
 from neo4j import GraphDatabase
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -254,6 +255,38 @@ MAX_QUERY_DOWNLOAD = 100
 
 MAX_BULK_ACCESSIONS = 100
 MAX_COUNTRY_ACCESSIONS = 50_000
+
+_CONVERT_DB_PATTERN = "^(geo|sra|ena|dra|arrayexpress|gsa|gea|bioproject)$"
+
+
+class AccessionsRequest(BaseModel):
+    """Body for bulk metadata endpoints."""
+
+    accessions: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Accessions to look up.",
+        examples=[["GSE164073", "SRP301518", "PRJNA688734"]],
+    )
+
+
+class ConvertRequest(BaseModel):
+    """Body for POST /convert (batch accession conversion)."""
+
+    accessions: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Any accessions (run/sample/experiment/project, any archive).",
+        examples=[["GSM4996084", "SRR13333614", "E-MTAB-8142"]],
+    )
+    db: str | None = Field(
+        None,
+        pattern=_CONVERT_DB_PATTERN,
+        description="Optional target archive; adds a flat `targets` list per input.",
+        examples=["sra"],
+    )
+
+
 MAX_METADATA_ROWS = 200_000
 _MAX_CROSSTAB_CACHE_ENTRIES = 200
 _MAX_GLOBAL_CONTRIBUTION_QUERY_CACHE_ENTRIES = 200
@@ -669,9 +702,7 @@ api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 api_app.state.limiter = limiter
 
 
-# ---------
 # Analytics
-# ---------
 
 _geoip_reader = None
 _geoip_lock = threading.Lock()
@@ -2060,7 +2091,6 @@ def _get_labels_config() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # Map assets (deepscatter tiles + countries.json; labels served live via /map/labels)
 #
 # The frontend map is powered by deepscatter, which needs a quadtree of Arrow
@@ -2070,7 +2100,6 @@ def _get_labels_config() -> dict:
 # so a restart with unchanged data reuses the existing tiles instead of
 # rebuilding. Generation is heavy (pyarrow + quadfeather), so the builder module
 # is imported lazily inside _ensure_map_assets.
-# ---------------------------------------------------------------------------
 _MAP_ASSETS_DIR = pathlib.Path(
     os.environ.get(
         "MAP_ASSETS_DIR",
@@ -3624,9 +3653,7 @@ def list_organisms(
     }
 
 
-# ---
 # Platform display names
-# ---
 _PLATFORM_DISPLAY_NAMES: dict[str, str] = {}
 _platform_csv = os.path.join(os.path.dirname(__file__), "data", "platforms.csv")
 if os.path.exists(_platform_csv):
@@ -7364,10 +7391,8 @@ def get_geo_series_neighbors_coords(
     operation_id="bulk_metadata",
 )
 @limiter.limit("10/minute")
-def bulk_metadata(request: Request, payload: dict):
-    accessions = payload.get("accessions", [])
-    if not accessions:
-        raise HTTPException(400, "No accessions provided")
+def bulk_metadata(request: Request, payload: AccessionsRequest):
+    accessions = payload.accessions
 
     validated = []
     for acc in accessions:
@@ -7445,10 +7470,8 @@ def bulk_metadata(request: Request, payload: dict):
     operation_id="bulk_project_metadata",
 )
 @limiter.limit("30/minute")
-def bulk_project_metadata(request: Request, payload: dict):
-    accessions = payload.get("accessions", [])
-    if not accessions:
-        raise HTTPException(400, "No accessions provided")
+def bulk_project_metadata(request: Request, payload: AccessionsRequest):
+    accessions = payload.accessions
 
     validated = []
     seen = set()
@@ -7490,10 +7513,8 @@ def bulk_project_metadata(request: Request, payload: dict):
     ),
     operation_id="bulk_project_samples_metadata",
 )
-def bulk_project_samples_metadata(request: Request, payload: dict):
-    accessions = payload.get("accessions", [])
-    if not accessions:
-        raise HTTPException(400, "No accessions provided")
+def bulk_project_samples_metadata(request: Request, payload: AccessionsRequest):
+    accessions = payload.accessions
 
     validated = []
     for acc in accessions:
@@ -7748,38 +7769,13 @@ def get_project_from_accession(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                if GEO_SAMPLE_PATTERN.match(accession):
-                    # GSM sample - find GEO series
-                    cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (accession,))
-                    result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["accession"]}
-                elif EXPERIMENT_PATTERN.match(accession):
-                    # SRX/ERX/DRX experiment - get SRA study directly
-                    cur.execute(SRA_EXPERIMENT_TO_STUDY_SQL, (accession,))
-                    result = cur.fetchone()
-                    if not result:
-                        cur.execute(DRA_EXPERIMENT_TO_STUDY_SQL, (accession,))
-                        result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["study"]}
-                else:
-                    # SRS/DRS/ERS sample - find SRA study
-                    cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (accession,))
-                    result = cur.fetchone()
-                    if not result:
-                        cur.execute(DRA_SAMPLE_TO_STUDY_SQL, (accession,))
-                        result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["accession"]}
-
-                # If no result found
-                raise HTTPException(404, f"No project found for accession {accession}")
-    except HTTPException:
-        raise
-    except Exception as e:
+                project = _resolve_to_project(cur, accession)
+    except Exception:
         logger.exception("Database error in get_project_from_accession")
         raise HTTPException(500, "Internal server error")
+    if not project:
+        raise HTTPException(404, f"No project found for accession {accession}")
+    return {"project_accession": project}
 
 
 @api_app.get(
@@ -7807,48 +7803,13 @@ def get_prj_info(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                if prj_accession.upper().startswith("PRJNA"):
-                    # PRJNA: search geo_series first, then sra_studies
-                    cur.execute(PRJNA_TO_GEO_SERIES_SQL, (prj_accession,))
-                    result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["accession"]}
-
-                    # If not found in geo_series, search sra_studies
-                    cur.execute(PRJ_TO_SRA_STUDY_SQL, (prj_accession,))
-                    result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["accession"]}
-                else:
-                    # PRJDA, PRJEB, etc.: search only sra_studies
-                    cur.execute(PRJ_TO_SRA_STUDY_SQL, (prj_accession,))
-                    result = cur.fetchone()
-                    if result:
-                        return {"project_accession": result["accession"]}
-
-                # GSA (CNCB-NGDC) BioProjects (PRJCA*) resolve to a CRA/HRA study.
-                cur.execute(PRJ_TO_GSA_STUDY_SQL, (prj_accession,))
-                result = cur.fetchone()
-                if result:
-                    return {"project_accession": result["accession"]}
-
-                # ENA (incl. DDBJ mirror) keys some BioProjects by the PRJ
-                # accession itself (no GEO/SRA/GSA study), e.g. assembly-only
-                # projects — the project page IS /p/<PRJ>, so resolve to itself.
-                cur.execute(PRJ_TO_ENA_STUDY_SQL, (prj_accession,))
-                result = cur.fetchone()
-                if result:
-                    return {"project_accession": result["accession"]}
-
-                # If no result found
-                raise HTTPException(
-                    404, f"No project found for PRJ accession {prj_accession}"
-                )
-    except HTTPException:
-        raise
-    except Exception as e:
+                project = _resolve_prj_to_project(cur, prj_accession)
+    except Exception:
         logger.exception("Database error in get_prj_info")
         raise HTTPException(500, "Internal server error")
+    if not project:
+        raise HTTPException(404, f"No project found for PRJ accession {prj_accession}")
+    return {"project_accession": project}
 
 
 @api_app.get(
@@ -7877,9 +7838,7 @@ def get_submission_studies(
                         "title": r["title"],
                         "summary": r["abstract"],
                         "published_at": (
-                            r["published_at"].isoformat()
-                            if r["published_at"]
-                            else None
+                            r["published_at"].isoformat() if r["published_at"] else None
                         ),
                     }
                     for r in cur.fetchall()
@@ -8146,6 +8105,312 @@ def find_publication(
     }
 
 
+def _execute_structured(sql: str, params: dict, count_by: str | None) -> dict:
+    """Run a build_structured_search() (sql, params) and shape the response.
+
+    Shared by /search/structured and /search/nl.
+    """
+    start = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET LOCAL statement_timeout = '30s'")
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                if not count_by:
+                    _enrich_with_publications(rows, cur)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "canceling statement" in err_msg or "timeout" in err_msg:
+            logger.warning("structured search timed out: %s", params)
+            raise HTTPException(
+                504,
+                "Query timed out. Try narrowing your search with more filters, "
+                "adding a text query (q=), or restricting to a single source.",
+            )
+        logger.exception("Database error in structured search")
+        raise HTTPException(500, "Internal server error")
+
+    took_ms = (time.perf_counter() - start) * 1000
+
+    if count_by:
+        return {
+            "count_by": count_by,
+            "total_buckets": len(rows),
+            "took_ms": round(took_ms, 2),
+            "buckets": rows,
+        }
+
+    total = rows[0]["total_count"] if rows else 0
+    return {
+        "results": rows,
+        "total": total,
+        "took_ms": round(took_ms, 2),
+        "next_cursor": (
+            None
+            if not rows
+            else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
+        ),
+    }
+
+
+_NL_STRATEGY = {
+    "transcriptome": "RNA-Seq",
+    "transcriptomic": "RNA-Seq",
+    "transcriptomics": "RNA-Seq",
+    "rna-seq": "RNA-Seq",
+    "rnaseq": "RNA-Seq",
+    "rna seq": "RNA-Seq",
+    "gene expression": "RNA-Seq",
+    "scrna": "RNA-Seq",
+    "single cell rna": "RNA-Seq",
+    "chip-seq": "ChIP-Seq",
+    "chipseq": "ChIP-Seq",
+    "chip seq": "ChIP-Seq",
+    "atac-seq": "ATAC-seq",
+    "atacseq": "ATAC-seq",
+    "atac seq": "ATAC-seq",
+    "atac": "ATAC-seq",
+    "methylation": "Bisulfite-Seq",
+    "bisulfite": "Bisulfite-Seq",
+    "wgbs": "Bisulfite-Seq",
+    "methylome": "Bisulfite-Seq",
+    "whole exome": "WXS",
+    "exome": "WXS",
+    "wxs": "WXS",
+    "whole genome": "WGS",
+    "wgs": "WGS",
+    "genome sequencing": "WGS",
+    "mirna-seq": "miRNA-Seq",
+    "mirna": "miRNA-Seq",
+    "microrna": "miRNA-Seq",
+    "ncrna": "ncRNA-Seq",
+    "hi-c": "Hi-C",
+    "hic": "Hi-C",
+    "clip-seq": "CLIP-Seq",
+    "clip seq": "CLIP-Seq",
+    "rip-seq": "RIP-Seq",
+    "amplicon": "AMPLICON",
+    "16s": "AMPLICON",
+    "mnase": "MNase-Seq",
+    "dnase": "DNase-Hypersensitivity",
+    "rad-seq": "RAD-Seq",
+    "radseq": "RAD-Seq",
+}
+
+# Unmatched organisms fall through to free-text q and are found by FTS.
+_NL_ORGANISM = {
+    "human": "Homo sapiens",
+    "homo sapiens": "Homo sapiens",
+    "mouse": "Mus musculus",
+    "mice": "Mus musculus",
+    "murine": "Mus musculus",
+    "mus musculus": "Mus musculus",
+    "rat": "Rattus norvegicus",
+    "rattus": "Rattus norvegicus",
+    "zebrafish": "Danio rerio",
+    "danio": "Danio rerio",
+    "fruit fly": "Drosophila melanogaster",
+    "drosophila": "Drosophila melanogaster",
+    "c. elegans": "Caenorhabditis elegans",
+    "c elegans": "Caenorhabditis elegans",
+    "caenorhabditis": "Caenorhabditis elegans",
+    "yeast": "Saccharomyces cerevisiae",
+    "saccharomyces": "Saccharomyces cerevisiae",
+    "arabidopsis": "Arabidopsis thaliana",
+    "thale cress": "Arabidopsis thaliana",
+    "e. coli": "Escherichia coli",
+    "e coli": "Escherichia coli",
+    "escherichia": "Escherichia coli",
+    "cow": "Bos taurus",
+    "bovine": "Bos taurus",
+    "bos taurus": "Bos taurus",
+    "pig": "Sus scrofa",
+    "sus scrofa": "Sus scrofa",
+    "chicken": "Gallus gallus",
+    "gallus": "Gallus gallus",
+    "rhesus": "Macaca mulatta",
+    "macaque": "Macaca mulatta",
+    "macaca": "Macaca mulatta",
+}
+
+_NL_SOURCE = {
+    "arrayexpress": "arrayexpress",
+    "array express": "arrayexpress",
+    "geo": "geo",
+    "ena": "ena",
+    "sra": "sra",
+    "gsa": "gsa",
+    "ddbj": "sra",
+}
+
+_NL_STOPWORDS = frozenset(
+    "a an the all any some for from of in on to and or with data dataset datasets "
+    "study studies i need want fetch find get show me looking published release "
+    "released between during over samples sample experiment experiments project "
+    "projects sequencing seq please give want that this these those about".split()
+)
+
+
+# Longest phrase first so "chip-seq" wins over "chip".
+def _compile_nl_phrases(mapping: dict) -> list[tuple]:
+    return [
+        (re.compile(rf"(?<!\w){re.escape(p)}(?!\w)"), p, v)
+        for p, v in sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
+    ]
+
+
+_NL_STRATEGY_PATS = _compile_nl_phrases(_NL_STRATEGY)
+_NL_ORGANISM_PATS = _compile_nl_phrases(_NL_ORGANISM)
+_NL_SOURCE_PATS = _compile_nl_phrases(_NL_SOURCE)
+
+_NL_Y = r"(?:19|20)\d{2}"
+_NL_RE_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
+_NL_RE_LASTN = re.compile(r"last\s+(\d{1,2})\s+years?")
+_NL_RE_RANGE = re.compile(
+    rf"(?:between|from)\s+({_NL_Y})\s*(?:to|and|-|–|through|until)\s*({_NL_Y})"
+)
+_NL_RE_RANGE_BARE = re.compile(rf"\b({_NL_Y})\s*(?:-|–|to)\s*({_NL_Y})\b")
+_NL_RE_SINGLE = re.compile(rf"(since|after|from|before|until|by|in)\s+({_NL_Y})")
+_NL_RE_YEAR = re.compile(rf"\b{_NL_Y}\b")
+_NL_RE_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _parse_nl_query(text: str, today_year: int) -> dict:
+    """Rule-based natural-language -> structured filters. Pure (no DB/clock).
+
+    Returns {filters: {...}, matched: {...}, q: leftover_text | None}.
+    """
+    low = " " + text.lower() + " "
+    filters: dict = {}
+    matched: dict = {}
+
+    def consume(pats: list[tuple], key: str) -> None:
+        nonlocal low
+        for pat, phrase, value in pats:
+            if pat.search(low):
+                filters[key] = value
+                matched[key] = phrase.strip()
+                low = pat.sub(" ", low)
+                return
+
+    consume(_NL_STRATEGY_PATS, "library_strategy")
+    consume(_NL_ORGANISM_PATS, "organism")
+    consume(_NL_SOURCE_PATS, "source")
+
+    iso = _NL_RE_ISO.findall(low)
+    if iso:
+        low = _NL_RE_ISO.sub(" ", low)
+        iso_sorted = sorted(iso)
+        filters["published_after"] = iso_sorted[0]
+        if len(iso_sorted) > 1:
+            filters["published_before"] = iso_sorted[-1]
+        matched["dates"] = iso_sorted
+    else:
+        m = _NL_RE_LASTN.search(low)
+        rng = _NL_RE_RANGE.search(low) or _NL_RE_RANGE_BARE.search(low)
+        single = _NL_RE_SINGLE.search(low)
+        if m:
+            n = int(m.group(1))
+            filters["year_from"], filters["year_to"] = today_year - n, today_year
+            low = low[: m.start()] + " " + low[m.end() :]
+            matched["dates"] = f"last {n} years"
+        elif rng:
+            a, b = int(rng.group(1)), int(rng.group(2))
+            filters["year_from"], filters["year_to"] = min(a, b), max(a, b)
+            low = low[: rng.start()] + " " + low[rng.end() :]
+            matched["dates"] = f"{min(a, b)}-{max(a, b)}"
+        elif single:
+            kw, yr = single.group(1), int(single.group(2))
+            if kw in ("before", "until", "by"):
+                filters["year_to"] = yr
+            elif kw in ("since", "after", "from"):
+                filters["year_from"] = yr
+            else:  # "in YYYY"
+                filters["year_from"] = filters["year_to"] = yr
+            low = low[: single.start()] + " " + low[single.end() :]
+            matched["dates"] = f"{kw} {yr}"
+        else:
+            yrs = [int(y) for y in _NL_RE_YEAR.findall(low)]
+            if yrs:
+                low = _NL_RE_YEAR.sub(" ", low)
+                if len(yrs) == 1:
+                    filters["year_from"] = filters["year_to"] = yrs[0]
+                    matched["dates"] = yrs[0]
+                else:
+                    filters["year_from"], filters["year_to"] = min(yrs), max(yrs)
+                    matched["dates"] = f"{min(yrs)}-{max(yrs)}"
+
+    tokens = _NL_RE_TOKEN.findall(low)
+    leftover = " ".join(
+        t for t in tokens if len(t) > 1 and t not in _NL_STOPWORDS
+    ).strip()
+    return {"filters": filters, "matched": matched, "q": leftover or None}
+
+
+@api_app.get(
+    "/search/nl",
+    summary="Natural-language search",
+    description=(
+        "Parse a plain-English query into structured filters (organism, "
+        "library_strategy, source, date range) and run the structured search. "
+        "Rule-based, deterministic, no LLM. Unrecognized words become the "
+        "full-text query. The response echoes `parsed` so callers see exactly "
+        "how the sentence was interpreted. Set dry_run=true to parse only. "
+        "Example: 'human transcriptome data published between 2020 and 2022'."
+    ),
+    operation_id="search_nl",
+)
+@limiter.limit("100/minute")
+def search_nl(
+    request: Request,
+    q: str = Query(
+        ..., min_length=1, max_length=500, description="Plain-English query"
+    ),
+    source: str | None = Query(
+        None,
+        pattern="^(geo|sra|arrayexpress|ena|gsa|all)$",
+        description="Override the parsed source",
+    ),
+    cursor_rank: float | None = Query(None),
+    cursor_acc: str | None = Query(None),
+    count_by: str | None = Query(
+        None,
+        pattern="^(year|source|organism|country|library_strategy|instrument_model)$",
+    ),
+    dry_run: bool = Query(False, description="Return parsed filters without querying"),
+):
+    parsed = _parse_nl_query(q, date.today().year)
+    filters = parsed["filters"]
+    if source:
+        filters["source"] = source
+        parsed["matched"]["source"] = source
+    q_text = parsed["q"]
+
+    if dry_run:
+        return {"parsed": parsed}
+
+    if not filters and not q_text:
+        raise HTTPException(
+            400,
+            "Could not extract any organism, assay, date, or search term from the "
+            "query. Try e.g. 'mouse ATAC-seq published in 2021'.",
+        )
+
+    q_variants = _search_query_variants(q_text) if q_text else None
+    sql, params = build_structured_search(
+        q=q_text,
+        q_variants=q_variants,
+        cursor_rank=cursor_rank,
+        cursor_acc=cursor_acc,
+        count_by=count_by,
+        **filters,
+    )
+    result = _execute_structured(sql, params, count_by)
+    result["parsed"] = parsed
+    return result
+
+
 @api_app.get(
     "/search/structured",
     summary="Structured search with filters",
@@ -8153,7 +8418,9 @@ def find_publication(
         "Search across GEO, SRA, ArrayExpress, and ENA with structured filters "
         "(organism, library_strategy, platform, country, center, year range, "
         "journal, instrument_model, assay_l1/assay_l2, geo_* location fields, "
-        "published_after/published_before, multi_platform, and enriched sample "
+        "published_after/published_before (study release date), "
+        "pub_date_after/pub_date_before (linked-paper publication date), "
+        "multi_platform, and enriched sample "
         "filters sample_tissue/sample_disease/sample_cell_type) optionally "
         "combined with full-text search. "
         "At least one of q or a filter parameter is required. "
@@ -8208,6 +8475,20 @@ def search_structured(
         pattern=r"^\d{4}-\d{2}-\d{2}$",
         description="Day-granularity upper bound (YYYY-MM-DD)",
     ),
+    pub_date_after: str | None = Query(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description=(
+            "Linked-paper publication date lower bound (YYYY-MM-DD). Best-effort: "
+            "only studies whose paper has a full day-level pub_date match; "
+            "year/month-only pubs and unlinked studies are excluded."
+        ),
+    ),
+    pub_date_before: str | None = Query(
+        None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Linked-paper publication date upper bound (YYYY-MM-DD)",
+    ),
     sample_tissue: str | None = Query(
         None, description="Filter to studies with samples whose tissue matches (ILIKE)"
     ),
@@ -8220,7 +8501,7 @@ def search_structured(
     ),
     count_by: str | None = Query(
         None,
-        pattern="^(year|source|organism|country)$",
+        pattern="^(year|source|organism|country|library_strategy|instrument_model)$",
         description="Aggregation mode: return bucket counts instead of rows",
     ),
 ):
@@ -8260,6 +8541,8 @@ def search_structured(
             multi_platform,
             published_after,
             published_before,
+            pub_date_after,
+            pub_date_before,
             sample_tissue,
             sample_disease,
             sample_cell_type,
@@ -8270,7 +8553,8 @@ def search_structured(
             "At least one of q, organism, library_strategy, platform, "
             "country, center, year_from, year_to, journal, "
             "instrument_model, assay_l1, assay_l2, multi_platform, "
-            "published_after, published_before, sample_tissue, sample_disease, "
+            "published_after, published_before, pub_date_after, pub_date_before, "
+            "sample_tissue, sample_disease, "
             "sample_cell_type, or a geo_* filter is required",
         )
 
@@ -8325,57 +8609,15 @@ def search_structured(
         multi_platform=multi_platform,
         published_after=published_after,
         published_before=published_before,
+        pub_date_after=pub_date_after,
+        pub_date_before=pub_date_before,
         sample_tissue=sample_tissue,
         sample_disease=sample_disease,
         sample_cell_type=sample_cell_type,
         count_by=count_by,
     )
 
-    start = time.perf_counter()
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET LOCAL statement_timeout = '30s'")
-                cur.execute(sql, params)
-                rows = cur.fetchall()
-                if not count_by:
-                    _enrich_with_publications(rows, cur)
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "canceling statement" in err_msg or "timeout" in err_msg:
-            logger.warning("search_structured timed out: %s", params)
-            raise HTTPException(
-                504,
-                "Query timed out. Try narrowing your search with more filters, "
-                "adding a text query (q=), or restricting to a single source.",
-            )
-        logger.exception("Database error in search_structured")
-        raise HTTPException(500, "Internal server error")
-
-    took_ms = (time.perf_counter() - start) * 1000
-
-    if count_by:
-        return {
-            "count_by": count_by,
-            "total_buckets": len(rows),
-            "took_ms": round(took_ms, 2),
-            "buckets": rows,
-        }
-
-    total = rows[0]["total_count"] if rows else 0
-    return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {
-                "rank": rows[-1]["rank"],
-                "accession": rows[-1]["accession"],
-            }
-        ),
-    }
+    return _execute_structured(sql, params, count_by)
 
 
 @api_app.get(
@@ -8413,6 +8655,182 @@ def get_project_xref(
             unique.append(row)
 
     return {"accession": accession, "xref": unique}
+
+
+# Cross-database links exist only at the project level (cross_ref_* is keyed on
+# GSE/SRP/E-*, never GSM/SRR), so conversion resolves to the project, then fans
+# out to sibling projects via RELATED_SQL.
+MAX_CONVERT_ACCESSIONS = 200
+
+
+def _db_of_accession(acc: str) -> str:
+    """Best-effort archive label from an accession prefix."""
+    a = acc.upper()
+    if a.startswith(("GSE", "GSM", "GPL")):
+        return "geo"
+    if a.startswith("E-GEAD"):
+        return "gea"
+    if a.startswith("E-"):
+        return "arrayexpress"
+    if a.startswith("PRJ"):
+        return "bioproject"
+    if a.startswith(("CRA", "HRA", "CRX", "CRR", "CRS", "PRJC")):
+        return "gsa"
+    if len(a) > 1 and a[1] == "R":
+        return {"S": "sra", "E": "ena", "D": "dra"}.get(a[0], "other")
+    if a.isdigit():
+        return "pubmed"
+    return "other"
+
+
+def _resolve_prj_to_project(cur, prj: str) -> str | None:
+    """PRJ* -> project accession (GEO series, else SRA/GSA/ENA study)."""
+    if prj.upper().startswith("PRJNA"):
+        cur.execute(PRJNA_TO_GEO_SERIES_SQL, (prj,))
+        r = cur.fetchone()
+        if r:
+            return r["accession"]
+    for sql, col in (
+        (PRJ_TO_SRA_STUDY_SQL, "accession"),
+        (PRJ_TO_GSA_STUDY_SQL, "accession"),
+        (PRJ_TO_ENA_STUDY_SQL, "accession"),
+    ):
+        cur.execute(sql, (prj,))
+        r = cur.fetchone()
+        if r:
+            return r["accession"]
+    return None
+
+
+def _exp_to_study(cur, exp: str) -> str | None:
+    """SRA/DDBJ experiment (SRX/ERX/DRX) -> parent study (SRP/ERP/DRP)."""
+    cur.execute(SRA_EXPERIMENT_TO_STUDY_SQL, (exp,))
+    r = cur.fetchone()
+    if not r:
+        cur.execute(DRA_EXPERIMENT_TO_STUDY_SQL, (exp,))
+        r = cur.fetchone()
+    return r["study"] if r else None
+
+
+def _resolve_to_project(cur, acc: str) -> str | None:
+    """Any accession -> its canonical project/study accession (None if unknown).
+
+    Also the single-accession resolver behind resolve_accession_project.
+    """
+    if GEO_SAMPLE_PATTERN.match(acc):
+        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        r = cur.fetchone()
+        return r["accession"] if r else None
+    if EXPERIMENT_PATTERN.match(acc):
+        return _exp_to_study(cur, acc)
+    if SAMPLE_PATTERN.match(acc):
+        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        r = cur.fetchone()
+        if not r:
+            cur.execute(DRA_SAMPLE_TO_STUDY_SQL, (acc,))
+            r = cur.fetchone()
+        return r["accession"] if r else None
+    if RUN_PATTERN.match(acc):
+        cur.execute(
+            "SELECT experiment_accession FROM sra_run_download_links"
+            " WHERE run_accession = %s LIMIT 1",
+            (acc,),
+        )
+        r = cur.fetchone()
+        return _exp_to_study(cur, r["experiment_accession"]) if r else None
+    if PRJ_PATTERN.match(acc):
+        return _resolve_prj_to_project(cur, acc)
+    return acc
+
+
+def _convert_one(cur, raw: str, target_db: str | None) -> dict:
+    acc = raw.strip().upper()
+    classified = _classify_accession_query(acc)
+    if classified is None:
+        return {"input": raw, "valid": False}
+    acc, kind = classified
+    project = _resolve_to_project(cur, acc)
+    out: dict = {
+        "input": raw,
+        "valid": True,
+        "kind": kind,
+        "database": _db_of_accession(acc),
+        "project": project,
+        "related": {},
+    }
+    if not project:
+        return out
+    cur.execute(RELATED_SQL, {"acc": project})
+    grouped: dict[str, list[str]] = {}
+    seen = {project}
+    for row in cur.fetchall():
+        racc = row["accession"]
+        if not racc or racc in seen:
+            continue
+        seen.add(racc)
+        grouped.setdefault(_db_of_accession(racc), []).append(racc)
+    out["related"] = grouped
+    if target_db:
+        out["targets"] = grouped.get(target_db, [])
+    return out
+
+
+@api_app.get(
+    "/convert/{accession}",
+    summary="Convert an accession across databases",
+    description=(
+        "Resolve any accession (run/sample/experiment/project, any archive) to its "
+        "canonical project, then list linked projects in the other archives "
+        "(GEO/SRA/ENA/ArrayExpress/GSA). Cross-database links are project-level; to "
+        "reach runs/experiments/samples in a target archive, call "
+        "/project/{study}/runs|experiments|samples on a returned project. "
+        "Pass db= to also get a flat `targets` list for that archive."
+    ),
+    operation_id="convert_accession",
+)
+@limiter.limit("100/minute")
+def convert_accession(
+    request: Request,
+    accession: str = Path(..., min_length=2, max_length=64),
+    db: str | None = Query(None, pattern=_CONVERT_DB_PATTERN),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                return _convert_one(cur, accession, db)
+    except Exception:
+        logger.exception("Database error in convert_accession")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.post(
+    "/convert",
+    summary="Batch convert accessions across databases",
+    description=(
+        'Batch form of /convert/{accession}. POST {"accessions": [...], '
+        '"db": "sra"}. Each input resolves to its project plus linked projects '
+        f"in other archives. Max {MAX_CONVERT_ACCESSIONS} accessions per request."
+    ),
+    operation_id="convert_accessions",
+)
+@limiter.limit("30/minute")
+def convert_accessions(request: Request, payload: ConvertRequest):
+    if len(payload.accessions) > MAX_CONVERT_ACCESSIONS:
+        raise HTTPException(
+            413,
+            f"Too many accessions: {len(payload.accessions)} "
+            f"(max {MAX_CONVERT_ACCESSIONS})",
+        )
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                results = [
+                    _convert_one(cur, str(a), payload.db) for a in payload.accessions
+                ]
+    except Exception:
+        logger.exception("Database error in convert_accessions")
+        raise HTTPException(500, "Internal server error")
+    return {"total": len(results), "results": results}
 
 
 @api_app.get(
@@ -9368,14 +9786,20 @@ combine `q` with:
 - `instrument_model`: exact instrument model, such as Illumina NovaSeq 6000.
 - `source=geo|sra|arrayexpress|ena|gsa|all` to restrict the archive.
 - `country`, `center`, `journal`, `year_from`, `year_to`.
-- `published_after` and `published_before` as YYYY-MM-DD for exact windows.
+- `published_after` and `published_before` as YYYY-MM-DD filter the study's
+  RELEASE date (when the dataset went public).
+- `pub_date_after` and `pub_date_before` as YYYY-MM-DD filter the linked PAPER's
+  publication date. Best-effort day-level: only studies whose paper has a full
+  day-granularity pub_date match; year/month-only pubs and studies with no linked
+  paper are excluded.
 - `assay_l1`, `assay_l2`, `geo_country`, `geo_country_code`,
   `geo_country_code_iso2`, `geo_city`, `geo_state`, `geo_district`,
   `geo_postcode`, and `geo_lat`/`geo_lng` with optional `geo_radius_km`.
 - `multi_platform=true` for studies with 2+ sequencing platforms.
 - `sample_tissue`, `sample_disease`, `sample_cell_type` for ontology-enriched
   sample filters. These only find studies that have enriched v3 sample metadata.
-- `count_by=year|source|organism|country` for bucket counts instead of rows.
+- `count_by=year|source|organism|country|library_strategy|instrument_model` for
+  bucket counts instead of rows.
 
 Structured-search caveats:
 - `platform` excludes GEO and ArrayExpress.
@@ -9661,6 +10085,7 @@ class EnrichmentDisabledMiddleware(BaseHTTPMiddleware):
                     headers={"Cache-Control": "no-store"},
                 )
         return await call_next(request)
+
 
 mcp_api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 mcp_api_app.state.limiter = limiter

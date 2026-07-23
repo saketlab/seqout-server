@@ -1895,9 +1895,7 @@ JOIN sra_studies s ON s.accession = st.accession
 ORDER BY s.published_at DESC NULLS LAST, s.accession;
 """
 
-# ---------------------------------------------------------------------------
 # Sample detail queries
-# ---------------------------------------------------------------------------
 
 # Get a single SRA experiment by accession (SRX/DRX/ERX)
 # Caller must pass accession already uppercased
@@ -2848,6 +2846,8 @@ def build_structured_search(
     multi_platform=False,
     published_after=None,
     published_before=None,
+    pub_date_after=None,
+    pub_date_before=None,
     sample_tissue=None,
     sample_disease=None,
     sample_cell_type=None,
@@ -2920,6 +2920,10 @@ def build_structured_search(
         params["published_after"] = published_after
     if published_before:
         params["published_before"] = published_before
+    if pub_date_after:
+        params["pub_date_after"] = pub_date_after
+    if pub_date_before:
+        params["pub_date_before"] = pub_date_before
     if sample_tissue:
         params["sample_tissue"] = f"%{sample_tissue}%"
     if sample_disease:
@@ -2950,6 +2954,29 @@ def build_structured_search(
         geo_cte = _build_geo_cte(
             params, assay_l1=assay_l1, assay_l2=assay_l2, **geo_kwargs
         )
+
+    # pub_date is free-text mixed-granularity; only full "YYYY Mon DD" rows are
+    # parseable, so year/month-only pubs and unlinked studies are excluded.
+    def _pub_date_clause(acc_expr: str) -> str:
+        conds = [
+            f"sp.accession = {acc_expr}",
+            "pub->>'pub_date' ~ '^[0-9]{4} [A-Z][a-z]{2} [0-9]{2}$'",
+        ]
+        if pub_date_after:
+            conds.append(
+                "to_date(pub->>'pub_date', 'YYYY Mon DD') >= %(pub_date_after)s::date"
+            )
+        if pub_date_before:
+            conds.append(
+                "to_date(pub->>'pub_date', 'YYYY Mon DD') <= %(pub_date_before)s::date"
+            )
+        return (
+            "EXISTS (SELECT 1 FROM study_publications sp"
+            " CROSS JOIN LATERAL jsonb_array_elements(sp.publications) pub"
+            " WHERE " + " AND ".join(conds) + ")"
+        )
+
+    has_pub_date = bool(pub_date_after or pub_date_before)
 
     # --- GEO ---
     if include_geo:
@@ -2988,6 +3015,8 @@ def build_structured_search(
                 " WHERE sp.accession = g.accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
+        if has_pub_date:
+            w.append(_pub_date_clause("g.accession"))
         if instrument_model:
             w.append("g.instrument_models @> ARRAY[%(instrument_model)s]")
         if multi_platform:
@@ -3068,6 +3097,8 @@ def build_structured_search(
                 " WHERE sp.accession = s.accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
+        if has_pub_date:
+            w.append(_pub_date_clause("s.accession"))
         if instrument_model:
             w.append("s.instrument_models @> ARRAY[%(instrument_model)s]")
         if multi_platform:
@@ -3152,6 +3183,8 @@ def build_structured_search(
                 " WHERE sp.accession = ae.accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
+        if has_pub_date:
+            w.append(_pub_date_clause("ae.accession"))
 
         rank = (
             "(ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7"
@@ -3229,6 +3262,8 @@ def build_structured_search(
                 " WHERE sp.accession = es.study_accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
+        if has_pub_date:
+            w.append(_pub_date_clause("es.study_accession"))
 
         rank = (
             f"(ts_rank({ena_tsv}, q.core_q) + ts_rank({ena_tsv}, q.match_q) * 0.2) * 0.7"
@@ -3312,6 +3347,8 @@ def build_structured_search(
                 " WHERE sp.accession = gs.study_accession"
                 " AND sp.publications->0->>'journal' = %(journal)s)"
             )
+        if has_pub_date:
+            w.append(_pub_date_clause("gs.study_accession"))
 
         rank = (
             f"(ts_rank({gsa_tsv}, q.core_q) + ts_rank({gsa_tsv}, q.match_q) * 0.2) * 0.7"
@@ -3378,6 +3415,8 @@ def build_structured_search(
         "source": "source",
         "organism": "unnest(organisms)",
         "country": "unnest(countries)",
+        "library_strategy": "unnest(library_strategies)",
+        "instrument_model": "unnest(instrument_models)",
     }
     if count_by:
         bucket_expr = _COUNT_BUCKETS.get(count_by)
@@ -3391,7 +3430,8 @@ WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
 ),
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
-        accession, updated_at, organisms, countries, source
+        accession, updated_at, organisms, countries, source,
+        library_strategies, instrument_models
     FROM all_matches
     ORDER BY dedup_key, rank DESC
 )
@@ -4064,9 +4104,7 @@ LEFT JOIN gsa_experiments gsa ON gsa.run_accession = dl.run_accession
 WHERE dl.run_accession = %s;
 """
 
-# ---------------------------------------------------------------------------
 # BAM files: original submitted BAM files from ncbi_files JSONB
-# ---------------------------------------------------------------------------
 
 STUDY_BAMS_SQL = (
     _RESOLVE_DL_STUDY
@@ -4110,9 +4148,7 @@ ORDER BY dl.experiment_accession, dl.run_accession;
 """
 )
 
-# ---------------------------------------------------------------------------
 # Growth stats: monthly counts per database
-# ---------------------------------------------------------------------------
 
 DATABASE_GROWTH_MONTHLY_SQL = """
 SELECT db, TO_CHAR(month, 'YYYY-MM') AS month, count
@@ -4309,9 +4345,7 @@ GROUP BY DATE_TRUNC('month', s.published_at)
 ORDER BY month;
 """
 
-# ---------------------------------------------------------------------------
 # Organism growth: monthly sample/experiment counts filtered by organism
-# ---------------------------------------------------------------------------
 
 GROWTH_ORGANISM_SQL = """
 SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, count
@@ -4320,9 +4354,7 @@ WHERE organism = %s
 ORDER BY db, month;
 """
 
-# ---------------------------------------------------------------------------
 # Platform growth: monthly counts filtered by platform
-# ---------------------------------------------------------------------------
 
 GROWTH_PLATFORM_SQL = """
 SELECT TO_CHAR(month, 'YYYY-MM') AS month, db, SUM(count) AS count
@@ -4462,9 +4494,7 @@ def build_platform_growth_filtered_sql(
     return sql, params
 
 
-# ---------------------------------------------------------------------------
 # List all distinct organisms across databases
-# ---------------------------------------------------------------------------
 
 LIST_ORGANISMS_SQL = """
 SELECT DISTINCT organism
@@ -4483,9 +4513,7 @@ ORDER BY ogm.organism;
 """
 
 
-# ---------------------------------------------------------------------------
 # Organism experiment totals: total experiments per organism per database
-# ---------------------------------------------------------------------------
 
 ORGANISM_TOTALS_SQL = """
 SELECT o.organism, o.db, o.count, cn.common_name
@@ -4530,9 +4558,7 @@ ORDER BY total DESC
 LIMIT %s;
 """
 
-# ---------------------------------------------------------------------------
 # Global contributions: aggregated lat/lng from unified_metadata
-# ---------------------------------------------------------------------------
 
 _GLOBAL_CONTRIBUTIONS_OPTIONAL_COLS = ["place_type", "address_type"]
 _global_contributions_available_cols: set[str] = set()
