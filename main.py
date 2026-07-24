@@ -42,6 +42,11 @@ from user_agents import parse as parse_ua
 
 from deep_dive import fetch_deep_dive_children, fetch_deep_dive_terms
 from expansions import expand_terms
+from grid_filters import (
+    _indexed_accession,
+    _jsonb_any_element,
+    _parse_grid_filters,
+)
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_QUERY_ACCESSIONS_SQL,
@@ -115,7 +120,6 @@ from queries import (
     GSA_SAMPLE_TO_EXPERIMENT_SQL,
     GSA_SEARCH_SQL,
     GSA_STUDY_EXPERIMENTS_SQL,
-    GSA_STUDY_RUNS_FIND_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
     GSA_STUDY_RUNS_SQL,
     GSA_STUDY_RUNS_SUMMARY_SQL,
@@ -176,7 +180,6 @@ from queries import (
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
-    STUDY_RUNS_FIND_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
     STUDY_RUNS_SUMMARY_SQL,
@@ -1298,9 +1301,13 @@ def _transform_gea_sample_to_geo(sample: dict) -> dict:
     }
 
 
-# Accession lookups match at most a handful of rows; the cap is a backstop.
+# A broad `contains` filter can match most of a study, so the row count is
+# capped; the response reports `capped` so the grid can say "500+" rather than
+# present a truncated count as exact.
 _SAMPLE_FIND_LIMIT = 500
 _EXPERIMENT_FIND_LIMIT = 500
+_RUN_FIND_LIMIT = 500
+
 
 # The accession the samples grid displays, per source. These must mirror the
 # "accession" key built by the transforms above — AE/GEA rows have no single
@@ -1309,6 +1316,83 @@ _AE_SAMPLE_ACCESSION_EXPR = "COALESCE(ena_run, ena_experiment, source_name)"
 _GEA_SAMPLE_ACCESSION_EXPR = (
     "COALESCE(dra_run, dra_experiment, biosample, source_name)"
 )
+
+# Grid field -> SQL, per source. Names are unqualified: the find query wraps the
+# list SQL as `SELECT * FROM (...) f`, so they resolve against f. Fields absent
+# here (numeric columns, anything assembled from a second request) simply get
+# no server-side narrowing.
+#
+# GEO keeps its channels in JSONB, and the grid explodes one sample into one row
+# per channel — so those columns ask "any channel matches".
+_GEO_SAMPLE_FILTER_COLUMNS = {
+    "sample": _indexed_accession("accession"),
+    "title": "title",
+    "description": "description",
+    "sampleType": "sample_type",
+    "platform": "platform_ref",
+    "hybridizationProtocol": "hybridization_protocol",
+    "scanProtocol": "scan_protocol",
+    "label": _jsonb_any_element("channels", "e->>'Label'"),
+    "source": _jsonb_any_element("channels", "e->>'Source'"),
+    "molecule": _jsonb_any_element("channels", "e->>'Molecule'"),
+    "organism": _jsonb_any_element("channels", "e->'Organism'->>'#text'"),
+    "channelPosition": _jsonb_any_element("channels", "e->>'@position'"),
+    "labelProtocol": _jsonb_any_element("channels", "e->>'Label-Protocol'"),
+    "extractProtocol": _jsonb_any_element("channels", "e->>'Extract-Protocol'"),
+}
+
+# AE and GEA have no channels column — the transforms synthesise a single
+# channel from flat columns, so the channel fields map straight back to those.
+_AE_SAMPLE_FILTER_COLUMNS = {
+    "sample": _AE_SAMPLE_ACCESSION_EXPR,
+    "title": "COALESCE(sample_title, source_name)",
+    "description": "sample_description",
+    "sampleType": "library_strategy",
+    "organism": "organism",
+    "source": "COALESCE(sample_source_name, source_name)",
+    "label": "library_strategy",
+}
+
+_GEA_SAMPLE_FILTER_COLUMNS = {
+    "sample": _GEA_SAMPLE_ACCESSION_EXPR,
+    "title": "COALESCE(sample_title, source_name)",
+    "description": "sample_description",
+    "sampleType": "library_strategy",
+    "platform": "instrument_model",
+    "organism": "organism",
+    "source": "source_name",
+    "label": "library_strategy",
+}
+
+# The runs preview SQL ends in its own LIMIT 500, so the filter has to go
+# inside its WHERE rather than wrap it — hence the alias-qualified expressions,
+# one map per SQL variant.
+_RUN_FILTER_COLUMNS = {
+    "run_accession": _indexed_accession("dl.run_accession"),
+    "experiment_accession": _indexed_accession("dl.experiment_accession"),
+    "library_layout": "dl.library_layout",
+    "run_alias": "COALESCE(ena.run_alias, gsa.run_alias)",
+}
+
+_GSA_RUN_FILTER_COLUMNS = {
+    "run_accession": _indexed_accession("ge.run_accession"),
+    "experiment_accession": _indexed_accession("ge.experiment_accession"),
+    "library_layout": "ge.library_layout",
+    "run_alias": "ge.run_alias",
+}
+
+_EXPERIMENT_FILTER_COLUMNS = {
+    "accession": _indexed_accession("accession"),
+    "title": "title",
+    "designDescription": "design_description",
+    "library": "library_name",
+    "strategy": "library_strategy",
+    "layout": "library_layout",
+    "platform": "platform",
+    "instrument": "instrument_model",
+    # The grid shows samples[0]; Postgres arrays are 1-indexed.
+    "sample": "samples[1]",
+}
 
 
 def _fetch_geo_series_samples(
@@ -1337,29 +1421,33 @@ def _fetch_geo_series_samples(
 
 
 def _find_geo_series_samples(
-    cur, accession: str, source: str, sample: str
+    cur, accession: str, source: str, filters: str
 ) -> list[dict]:
-    """Exact-accession lookup across every sample in a series/experiment.
+    """Resolve the samples grid's filter model across a whole series.
 
     Same reason as _find_study_experiments: the grid only holds the pages it has
-    scrolled through, so an accession lookup has to run server-side.
+    scrolled through, so its column filters have to run server-side.
     """
     if source == "gea":
-        base, expr = GEA_EXPERIMENT_SAMPLES_SQL, _GEA_SAMPLE_ACCESSION_EXPR
+        base, columns = GEA_EXPERIMENT_SAMPLES_SQL, _GEA_SAMPLE_FILTER_COLUMNS
         transform = _transform_gea_sample_to_geo
     elif source == "arrayexpress":
-        base, expr = AE_EXPERIMENT_SAMPLES_SQL, _AE_SAMPLE_ACCESSION_EXPR
+        base, columns = AE_EXPERIMENT_SAMPLES_SQL, _AE_SAMPLE_FILTER_COLUMNS
         transform = _transform_ae_sample_to_geo
     else:
-        base, expr, transform = GEO_SERIES_SAMPLES_SQL, "accession", None
-    # Case-insensitive: GEO samples are GSM accessions, but AE/GEA fall back to
-    # source_name, which is free text. The candidate set is one series either
-    # way, so losing the index on accession costs nothing here.
+        base, columns, transform = (
+            GEO_SERIES_SAMPLES_SQL,
+            _GEO_SAMPLE_FILTER_COLUMNS,
+            None,
+        )
+    where, params = _parse_grid_filters(filters, columns)
+    if not where:
+        return []
     wrapped = (
         f"SELECT * FROM (\n{base.rstrip().rstrip(';')}\n) f\n"
-        f"WHERE UPPER({expr}) = UPPER(%s)\nLIMIT {_SAMPLE_FIND_LIMIT}"
+        f"WHERE {where}\nLIMIT {_SAMPLE_FIND_LIMIT}"
     )
-    cur.execute(wrapped, (accession, sample))
+    cur.execute(wrapped, (accession, *params))
     rows = cur.fetchall()
     return [transform(s) for s in rows] if transform else rows
 
@@ -1451,20 +1539,23 @@ def _fetch_study_experiments(
     return cur.fetchall()
 
 
-def _find_study_experiments(cur, study: str, accession: str) -> list[dict]:
-    """Exact-accession lookup across every experiment in a study.
+def _find_study_experiments(cur, study: str, filters: str) -> list[dict]:
+    """Resolve the experiments grid's filter model across a whole study.
 
-    The grid pages 20 rows at a time, so its client-side filter cannot see past
+    The grid pages 20 rows at a time, so its client-side filters cannot see past
     what is loaded. Wrapping the same SQL the grid uses keeps the columns — and
-    the per-archive branching — from drifting; every variant exposes the
-    experiment accession as `accession`.
+    the per-archive branching — from drifting; every variant exposes the same
+    output column names.
     """
     sql, _ = _study_experiments_sql(cur, study)
+    where, params = _parse_grid_filters(filters, _EXPERIMENT_FILTER_COLUMNS)
+    if not where:
+        return []
     wrapped = (
         f"SELECT * FROM (\n{sql.rstrip().rstrip(';')}\n) f\n"
-        f"WHERE f.accession = %s\nLIMIT {_EXPERIMENT_FIND_LIMIT}"
+        f"WHERE {where}\nLIMIT {_EXPERIMENT_FIND_LIMIT}"
     )
-    cur.execute(wrapped, (study, accession))
+    cur.execute(wrapped, (study, *params))
     return cur.fetchall()
 
 
@@ -4929,17 +5020,13 @@ def get_study_experiments(
 def find_study_experiments(
     request: Request,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
-    accession: str = Query("", description="Exact experiment accession"),
+    filters: str = Query("", description='Filter model: [{"c","o","v"}, ...]'),
 ):
     study = study.upper()
-    # Accessions are uppercase; cap length so a filter can't smuggle a huge value.
-    accession = accession.strip().upper()[:64]
-    if not accession:
-        return {"experiments": [], "capped": False}
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                rows = _find_study_experiments(cur, study, accession)
+                rows = _find_study_experiments(cur, study, filters)
     except Exception:
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
@@ -5346,17 +5433,13 @@ def get_study_runs(
     }
 
 
-_RUN_FIND_LIMIT = 500
-
-
 @api_app.get(
     "/project/{study}/runs/find",
-    summary="Find runs in a study by run/experiment accession",
+    summary="Find runs in a study by column filter",
     description=(
-        "Search every run in a study by run and/or experiment accession "
-        "(case-insensitive substring), not just the 500-run preview. Backs the "
-        "runs grid's column filter so it stays correct on large studies. Returns "
-        "up to 500 matches; `capped` is true when more exist."
+        "Resolve the runs grid's column filters against every run in a study, "
+        "not just the 500-run preview, so the filters stay correct on large "
+        "studies. Returns up to 500 matches; `capped` is true when more exist."
     ),
     operation_id="find_study_runs",
 )
@@ -5364,23 +5447,29 @@ _RUN_FIND_LIMIT = 500
 def find_study_runs(
     request: Request,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
-    run: str = Query("", description="Run-accession substring"),
-    experiment: str = Query("", description="Experiment-accession substring"),
+    filters: str = Query("", description='Filter model: [{"c","o","v"}, ...]'),
 ):
     study = study.upper()
-    # Accessions are uppercase; cap length so a filter can't smuggle a huge LIKE.
-    run = run.strip().upper()[:64]
-    experiment = experiment.strip().upper()[:64]
-    if not run and not experiment:
+    is_gsa = _is_gsa_study(study)
+    columns = _GSA_RUN_FILTER_COLUMNS if is_gsa else _RUN_FILTER_COLUMNS
+    where, params = _parse_grid_filters(filters, columns)
+    if not where:
         return {"runs": [], "capped": False}
 
-    is_gsa = _is_gsa_study(study)
-    find_sql = GSA_STUDY_RUNS_FIND_SQL if is_gsa else STUDY_RUNS_FIND_SQL
-    params = (study, run, run, experiment, experiment)
+    base = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
+    marker = (
+        "WHERE ge.study_accession = %s\n"
+        if is_gsa
+        else "WHERE dl.study_accession IN (SELECT acc FROM candidates)\n"
+    )
+    # Injected into the WHERE, not wrapped around the query: the preview SQL
+    # carries its own LIMIT 500, and filtering outside it would only ever search
+    # the first 500 runs.
+    find_sql = base.replace(marker, f"{marker}  AND {where}\n", 1)
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(find_sql, params)
+                cur.execute(find_sql, (study, *params))
                 rows = _annotate_run_downloads(cur.fetchall())
     except Exception:
         logger.exception("Database error in find_study_runs")
@@ -7440,19 +7529,16 @@ def get_geo_series_samples(
 def find_geo_series_samples(
     request: Request,
     accession: str = Path(...),
-    sample: str = Query("", description="Exact sample accession"),
+    filters: str = Query("", description='Filter model: [{"c","o","v"}, ...]'),
 ):
     accession = accession.upper()
     source = _accession_source(accession)
     if source not in ["geo", "arrayexpress", "gea"]:
         raise HTTPException(400, f"Invalid accession format: {accession}")
-    sample = sample.strip()[:64]
-    if not sample:
-        return {"samples": [], "capped": False}
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                rows = _find_geo_series_samples(cur, accession, source, sample)
+                rows = _find_geo_series_samples(cur, accession, source, filters)
     except Exception:
         logger.exception("Database error in find_geo_series_samples")
         raise HTTPException(500, "Internal server error")
