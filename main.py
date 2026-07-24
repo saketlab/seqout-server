@@ -1313,9 +1313,7 @@ _RUN_FIND_LIMIT = 500
 # "accession" key built by the transforms above — AE/GEA rows have no single
 # accession column, so the SQL has to rebuild the same COALESCE.
 _AE_SAMPLE_ACCESSION_EXPR = "COALESCE(ena_run, ena_experiment, source_name)"
-_GEA_SAMPLE_ACCESSION_EXPR = (
-    "COALESCE(dra_run, dra_experiment, biosample, source_name)"
-)
+_GEA_SAMPLE_ACCESSION_EXPR = "COALESCE(dra_run, dra_experiment, biosample, source_name)"
 
 # Grid field -> SQL, per source. Names are unqualified: the find query wraps the
 # list SQL as `SELECT * FROM (...) f`, so they resolve against f. Fields absent
