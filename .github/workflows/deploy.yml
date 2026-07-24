@@ -54,7 +54,7 @@ jobs:
             ~/.local/bin/uv sync
 
             # Restart the service
-            sudo systemctl restart sramap-backend
+            sudo systemctl restart seqout-backend
 
             # Health check
             sleep 3
