@@ -1011,6 +1011,34 @@ def _build_publications(
     return out or None
 
 
+def _attach_organism_taxa(row: dict, cur) -> None:
+    """Pair each organism name with its NCBI taxon id.
+
+    The id belongs to the organism, not the study, so it lives once in the
+    organism_taxa table rather than being copied into every project row — see
+    seqout-ingestion/src/backfill/organism_taxa.py. Kept out of the project SQL
+    so a missing table degrades to "no taxids" instead of 500-ing every project
+    page before the lookup has been built.
+    """
+    names = [n for n in (row.get("organisms") or []) if isinstance(n, str) and n]
+    if not names:
+        row["organisms_with_taxa"] = []
+        return
+    taxa: dict[str, str] = {}
+    try:
+        cur.execute(
+            "SELECT name, taxon_id FROM organism_taxa WHERE name = ANY(%s)",
+            (names,),
+        )
+        taxa = {r["name"]: r["taxon_id"] for r in cur.fetchall()}
+    except Exception:
+        # Not built yet, or unreadable — the popover just loses its NCBI half.
+        logger.warning("organism_taxa lookup unavailable", exc_info=True)
+    row["organisms_with_taxa"] = [
+        {"name": n, "taxon_id": taxa.get(n)} for n in names
+    ]
+
+
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     """Batch-lookup publications and center names, merge into result rows.
 
@@ -1422,7 +1450,7 @@ def _fetch_geo_series_samples(
 
 def _find_geo_series_samples(
     cur, accession: str, source: str, filters: str
-) -> list[dict]:
+) -> list[dict] | None:
     """Resolve the samples grid's filter model across a whole series.
 
     Same reason as _find_study_experiments: the grid only holds the pages it has
@@ -1442,7 +1470,7 @@ def _find_geo_series_samples(
         )
     where, params = _parse_grid_filters(filters, columns)
     if not where:
-        return []
+        return None  # nothing server-resolvable; the caller must not narrow
     wrapped = (
         f"SELECT * FROM (\n{base.rstrip().rstrip(';')}\n) f\n"
         f"WHERE {where}\nLIMIT {_SAMPLE_FIND_LIMIT}"
@@ -1539,7 +1567,7 @@ def _fetch_study_experiments(
     return cur.fetchall()
 
 
-def _find_study_experiments(cur, study: str, filters: str) -> list[dict]:
+def _find_study_experiments(cur, study: str, filters: str) -> list[dict] | None:
     """Resolve the experiments grid's filter model across a whole study.
 
     The grid pages 20 rows at a time, so its client-side filters cannot see past
@@ -1550,7 +1578,7 @@ def _find_study_experiments(cur, study: str, filters: str) -> list[dict]:
     sql, _ = _study_experiments_sql(cur, study)
     where, params = _parse_grid_filters(filters, _EXPERIMENT_FILTER_COLUMNS)
     if not where:
-        return []
+        return None  # nothing server-resolvable; the caller must not narrow
     wrapped = (
         f"SELECT * FROM (\n{sql.rstrip().rstrip(';')}\n) f\n"
         f"WHERE {where}\nLIMIT {_EXPERIMENT_FIND_LIMIT}"
@@ -4869,6 +4897,7 @@ def get_project(
                     # geo_series.contributors → center_name) uniformly for every
                     # project type.
                     _enrich_with_publications([row], cur)
+                    _attach_organism_taxa(row, cur)
                     if ENRICHMENT_ENABLED:
                         # Cheap existence probe so the UI can show/hide the Enriched
                         # tab without eagerly loading the heavy enriched payload.
@@ -5030,7 +5059,16 @@ def find_study_experiments(
     except Exception:
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
-    return {"experiments": rows, "capped": len(rows) >= _EXPERIMENT_FIND_LIMIT}
+    # filtered=false means no supplied column maps to SQL here, so an empty
+    # list is "we did not narrow", not "no matches" — the grid must keep showing
+    # its own rows rather than blanking. See the superset rule in grid_filters.
+    if rows is None:
+        return {"experiments": [], "capped": False, "filtered": False}
+    return {
+        "experiments": rows,
+        "capped": len(rows) >= _EXPERIMENT_FIND_LIMIT,
+        "filtered": True,
+    }
 
 
 @api_app.get(
@@ -5454,7 +5492,7 @@ def find_study_runs(
     columns = _GSA_RUN_FILTER_COLUMNS if is_gsa else _RUN_FILTER_COLUMNS
     where, params = _parse_grid_filters(filters, columns)
     if not where:
-        return {"runs": [], "capped": False}
+        return {"runs": [], "capped": False, "filtered": False}
 
     base = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
     marker = (
@@ -5475,7 +5513,7 @@ def find_study_runs(
         logger.exception("Database error in find_study_runs")
         raise HTTPException(500, "Internal server error")
 
-    return {"runs": rows, "capped": len(rows) >= _RUN_FIND_LIMIT}
+    return {"runs": rows, "capped": len(rows) >= _RUN_FIND_LIMIT, "filtered": True}
 
 
 @api_app.get(
@@ -7542,7 +7580,9 @@ def find_geo_series_samples(
     except Exception:
         logger.exception("Database error in find_geo_series_samples")
         raise HTTPException(500, "Internal server error")
-    return {"samples": rows, "capped": len(rows) >= _SAMPLE_FIND_LIMIT}
+    if rows is None:
+        return {"samples": [], "capped": False, "filtered": False}
+    return {"samples": rows, "capped": len(rows) >= _SAMPLE_FIND_LIMIT, "filtered": True}
 
 
 @api_app.get(

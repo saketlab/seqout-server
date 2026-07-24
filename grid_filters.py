@@ -51,17 +51,21 @@ def _indexed_accession(expr: str):
 
 
 def _jsonb_any_element(container: str, path: str):
-    """Match any element of a JSONB array — e.g. any channel of a sample.
+    """Match any element of a `jsonb[]` column — e.g. any channel of a sample.
 
     One DB row can explode into several grid rows (GEO samples become one row
     per channel), so "this sample has a channel that matches" is the right
     server-side question; the grid then narrows to the matching rows.
+
+    Note the column is a Postgres array of jsonb (`jsonb[]`), not a jsonb array,
+    so this unnests rather than calling jsonb_array_elements — the latter cannot
+    coerce jsonb[] and fails at query time.
     """
 
     def build(op: str, value: str) -> tuple[str, list]:
         return (
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements("
-            f"COALESCE({container}::jsonb, '[]'::jsonb)) e "
+            f"EXISTS (SELECT 1 FROM unnest("
+            f"COALESCE({container}, '{{}}'::jsonb[])) e "
             f"WHERE ({path}) ILIKE %s)",
             [_like_value(op, value)],
         )
