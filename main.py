@@ -1298,6 +1298,19 @@ def _transform_gea_sample_to_geo(sample: dict) -> dict:
     }
 
 
+# Accession lookups match at most a handful of rows; the cap is a backstop.
+_SAMPLE_FIND_LIMIT = 500
+_EXPERIMENT_FIND_LIMIT = 500
+
+# The accession the samples grid displays, per source. These must mirror the
+# "accession" key built by the transforms above — AE/GEA rows have no single
+# accession column, so the SQL has to rebuild the same COALESCE.
+_AE_SAMPLE_ACCESSION_EXPR = "COALESCE(ena_run, ena_experiment, source_name)"
+_GEA_SAMPLE_ACCESSION_EXPR = (
+    "COALESCE(dra_run, dra_experiment, biosample, source_name)"
+)
+
+
 def _fetch_geo_series_samples(
     cur, accession: str, source: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
@@ -1306,7 +1319,7 @@ def _fetch_geo_series_samples(
         base = GEA_EXPERIMENT_SAMPLES_SQL if gea else AE_EXPERIMENT_SAMPLES_SQL
         sql = base.rstrip().rstrip(";")
         if not gea:
-            sql += "\nORDER BY COALESCE(ena_run, ena_experiment, source_name)"
+            sql += f"\nORDER BY {_AE_SAMPLE_ACCESSION_EXPR}"
         params: list = [accession]
         if limit is not None:
             sql += "\nLIMIT %s OFFSET %s"
@@ -1321,6 +1334,34 @@ def _fetch_geo_series_samples(
         params += [limit, offset]
     cur.execute(sql, tuple(params))
     return cur.fetchall()
+
+
+def _find_geo_series_samples(
+    cur, accession: str, source: str, sample: str
+) -> list[dict]:
+    """Exact-accession lookup across every sample in a series/experiment.
+
+    Same reason as _find_study_experiments: the grid only holds the pages it has
+    scrolled through, so an accession lookup has to run server-side.
+    """
+    if source == "gea":
+        base, expr = GEA_EXPERIMENT_SAMPLES_SQL, _GEA_SAMPLE_ACCESSION_EXPR
+        transform = _transform_gea_sample_to_geo
+    elif source == "arrayexpress":
+        base, expr = AE_EXPERIMENT_SAMPLES_SQL, _AE_SAMPLE_ACCESSION_EXPR
+        transform = _transform_ae_sample_to_geo
+    else:
+        base, expr, transform = GEO_SERIES_SAMPLES_SQL, "accession", None
+    # Case-insensitive: GEO samples are GSM accessions, but AE/GEA fall back to
+    # source_name, which is free text. The candidate set is one series either
+    # way, so losing the index on accession costs nothing here.
+    wrapped = (
+        f"SELECT * FROM (\n{base.rstrip().rstrip(';')}\n) f\n"
+        f"WHERE UPPER({expr}) = UPPER(%s)\nLIMIT {_SAMPLE_FIND_LIMIT}"
+    )
+    cur.execute(wrapped, (accession, sample))
+    rows = cur.fetchall()
+    return [transform(s) for s in rows] if transform else rows
 
 
 def _count_geo_series_samples(cur, accession: str, source: str) -> int:
@@ -1382,21 +1423,21 @@ def _is_dra_only_study(cur, study: str) -> bool:
     return bool(row and row["only_dra"])
 
 
+def _study_experiments_sql(cur, study: str) -> tuple[str, bool]:
+    """Pick the per-archive experiment SQL. Returns (sql, ena_style)."""
+    if _is_gsa_study(study):
+        return GSA_STUDY_EXPERIMENTS_SQL, True
+    if _is_ena_study(study):
+        return ENA_STUDY_EXPERIMENTS_SQL, True
+    if _is_dra_only_study(cur, study):
+        return DRA_STUDY_EXPERIMENTS_SQL, False
+    return STUDY_EXPERIMENTS_SQL, False
+
+
 def _fetch_study_experiments(
     cur, study: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
-    if _is_gsa_study(study):
-        sql = GSA_STUDY_EXPERIMENTS_SQL
-        ena_style = True
-    elif _is_ena_study(study):
-        sql = ENA_STUDY_EXPERIMENTS_SQL
-        ena_style = True
-    elif _is_dra_only_study(cur, study):
-        sql = DRA_STUDY_EXPERIMENTS_SQL
-        ena_style = False
-    else:
-        sql = STUDY_EXPERIMENTS_SQL
-        ena_style = False
+    sql, ena_style = _study_experiments_sql(cur, study)
     if limit is None:
         cur.execute(sql, (study,))
         return cur.fetchall()
@@ -1407,6 +1448,23 @@ def _fetch_study_experiments(
         else "\nORDER BY accession\nLIMIT %s OFFSET %s"
     )
     cur.execute(paged, (study, limit, offset))
+    return cur.fetchall()
+
+
+def _find_study_experiments(cur, study: str, accession: str) -> list[dict]:
+    """Exact-accession lookup across every experiment in a study.
+
+    The grid pages 20 rows at a time, so its client-side filter cannot see past
+    what is loaded. Wrapping the same SQL the grid uses keeps the columns — and
+    the per-archive branching — from drifting; every variant exposes the
+    experiment accession as `accession`.
+    """
+    sql, _ = _study_experiments_sql(cur, study)
+    wrapped = (
+        f"SELECT * FROM (\n{sql.rstrip().rstrip(';')}\n) f\n"
+        f"WHERE f.accession = %s\nLIMIT {_EXPERIMENT_FIND_LIMIT}"
+    )
+    cur.execute(wrapped, (study, accession))
     return cur.fetchall()
 
 
@@ -4858,6 +4916,37 @@ def get_study_experiments(
 
 
 @api_app.get(
+    "/project/{study}/experiments/find",
+    summary="Find an experiment in a study by accession",
+    description=(
+        "Look up one experiment accession across every experiment in a study, "
+        "not just the page the grid has loaded. Backs the experiments grid's "
+        "accession filter so it stays correct on large studies."
+    ),
+    operation_id="find_study_experiments",
+)
+@limiter.limit("100/minute")
+def find_study_experiments(
+    request: Request,
+    study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    accession: str = Query("", description="Exact experiment accession"),
+):
+    study = study.upper()
+    # Accessions are uppercase; cap length so a filter can't smuggle a huge value.
+    accession = accession.strip().upper()[:64]
+    if not accession:
+        return {"experiments": [], "capped": False}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                rows = _find_study_experiments(cur, study, accession)
+    except Exception:
+        logger.exception("Database error in find_study_experiments")
+        raise HTTPException(500, "Internal server error")
+    return {"experiments": rows, "capped": len(rows) >= _EXPERIMENT_FIND_LIMIT}
+
+
+@api_app.get(
     "/project/{study}/samples",
     summary="List samples for an SRA study",
     description=(
@@ -7335,6 +7424,39 @@ def get_geo_series_samples(
         raise HTTPException(500, "Internal server error")
     response.headers["X-Total-Count"] = str(total)
     return rows
+
+
+@api_app.get(
+    "/geo/series/{accession}/samples/find",
+    summary="Find a sample in a series by accession",
+    description=(
+        "Look up one sample accession across every sample in a GEO series or "
+        "ArrayExpress/GEA experiment, not just the page the grid has loaded. "
+        "Backs the samples grid's accession filter on large series."
+    ),
+    operation_id="find_geo_series_samples",
+)
+@limiter.limit("100/minute")
+def find_geo_series_samples(
+    request: Request,
+    accession: str = Path(...),
+    sample: str = Query("", description="Exact sample accession"),
+):
+    accession = accession.upper()
+    source = _accession_source(accession)
+    if source not in ["geo", "arrayexpress", "gea"]:
+        raise HTTPException(400, f"Invalid accession format: {accession}")
+    sample = sample.strip()[:64]
+    if not sample:
+        return {"samples": [], "capped": False}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                rows = _find_geo_series_samples(cur, accession, source, sample)
+    except Exception:
+        logger.exception("Database error in find_geo_series_samples")
+        raise HTTPException(500, "Internal server error")
+    return {"samples": rows, "capped": len(rows) >= _SAMPLE_FIND_LIMIT}
 
 
 @api_app.get(
