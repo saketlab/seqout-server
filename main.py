@@ -2671,6 +2671,59 @@ def _try_accession_search(
     }
 
 
+# --- Zero-result prefix fallback -------------------------------------------
+# FTS matches whole lexemes, so a query whose LAST word is a partial ("...healthy
+# com") ANDs the lexeme 'com', which no document has (the word stems to
+# 'comparison') -> zero results. When (and only when) a normal search returns
+# nothing, retry with the trailing lexeme turned into a prefix (com:* matches
+# comparison). Normal searches keep exact-word ranking; only the empty case pays
+# the extra query. The replacement keeps a single %s in the same position, so the
+# existing param tuple is reused verbatim.
+def _prefix_core_q(placeholder: str) -> str:
+    return (
+        "(SELECT CASE WHEN t = '' THEN ''::tsquery ELSE (t || ':*')::tsquery END"
+        f" FROM (SELECT plainto_tsquery('english', {placeholder})::text AS t) _pq)"
+        " AS core_q"
+    )
+
+
+# The relevance paths build SQL with positional %s params; the sorted path
+# (build_sorted_search_sql) uses named %(q)s. Same trailing-prefix trick either
+# way — the placeholder stays in the same spot, so the params are reused verbatim.
+_CORE_Q_VARIANTS = (
+    ("plainto_tsquery('english', %s) AS core_q", _prefix_core_q("%s")),
+    ("plainto_tsquery('english', %(q)s) AS core_q", _prefix_core_q("%(q)s")),
+)
+
+
+def _prefix_eligible(q: str) -> bool:
+    # Only worth retrying when the trailing token is a real partial word; a lone
+    # 1-char prefix (c:*) scans too much of the index for too little signal.
+    toks = q.split()
+    return bool(toks) and len(toks[-1]) >= 2
+
+
+def _prefixed_sql(sql: str) -> str | None:
+    for exact, prefix in _CORE_Q_VARIANTS:
+        if exact in sql:
+            return sql.replace(exact, prefix)
+    return None
+
+
+def _run_search(cur, sql: str, params, q: str) -> list:
+    """Execute a search, retrying with a trailing-prefix core_q only if the exact
+    query found nothing (search-as-you-type on the last word). Works for both the
+    relevance and sorted paths (positional and named core_q)."""
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    if not rows and _prefix_eligible(q):
+        psql = _prefixed_sql(sql)
+        if psql is not None:
+            cur.execute(psql, params)
+            rows = cur.fetchall()
+    return rows
+
+
 # after a Neo4j failure, skip expansion for the cooldown so an
 # outage costs one timed-out request per window, not one per search.
 _neo4j_expand_circuit = {"open_until": 0.0}
@@ -4136,11 +4189,12 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None):
             q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '60s'")
-                cur.execute(
+                rows = _run_search(
+                    cur,
                     GEO_SEARCH_SQL,
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
+                    q,
                 )
-                rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
     except Exception as e:
         logger.exception("Database error in search_geo")
@@ -4198,11 +4252,12 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None):
             q_variants = _search_query_variants(q)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '60s'")
-                cur.execute(
+                rows = _run_search(
+                    cur,
                     SRA_SEARCH_SQL,
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
+                    q,
                 )
-                rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
     except Exception as e:
         logger.exception("Database error in search_sra")
@@ -4414,8 +4469,7 @@ def search(
                 )
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
-                    cur.execute(sql, params)
-                    rows = cur.fetchall()
+                    rows = _run_search(cur, sql, params, q)
                     _enrich_with_publications(rows, cur)
         except Exception:
             logger.exception("Database error in search (sorted)")
@@ -4448,11 +4502,12 @@ def search(
                 q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
-                    cur.execute(
+                    rows = _run_search(
+                        cur,
                         _SEARCH_SQL_BY_DB[db],
                         (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
+                        q,
                     )
-                    rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
         except Exception:
             logger.exception("Database error in search_%s", db)
@@ -4482,7 +4537,8 @@ def search(
                 q_variants = _search_query_variants(q)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
-                    cur.execute(
+                    rows = _run_search(
+                        cur,
                         SEARCH_SQL,
                         (
                             q,
@@ -4492,8 +4548,8 @@ def search(
                             cursor_acc,
                             offset,
                         ),
+                        q,
                     )
-                    rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
         except Exception as e:
             logger.exception("Database error in search")
