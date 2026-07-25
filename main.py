@@ -2725,7 +2725,12 @@ def _ensure_spelling_loaded() -> SymSpell:
 _VOCAB_KNOWN_SQL = """
 SELECT w.word
 FROM unnest(%s::text[]) AS w(word)
-WHERE EXISTS (
+-- A word that yields no lexeme is an english stopword (between, with, the):
+-- it is dropped from the tsquery, so it can never be a "typo" to correct.
+-- Treating it as known stops SymSpell mangling it into a rare corpus token
+-- (between -> tween, with -> wit).
+WHERE to_tsvector('english', lower(w.word)) = ''::tsvector
+   OR EXISTS (
     SELECT 1 FROM search_vocabulary v
     WHERE v.normalized = lower(w.word)
        OR v.normalized = btrim(strip(to_tsvector('english', lower(w.word)))::text, '''')
