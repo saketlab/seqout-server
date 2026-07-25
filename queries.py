@@ -527,11 +527,13 @@ all_matches AS (
     FROM arrayexpress_experiments, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
+    -- organisms materialized onto ena_studies_search by transfer.ena_organisms
+    -- (DISTINCT ena_samples.scientific_name), so the organism facet includes ENA.
     SELECT accession,
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
-           NULL::text[], NULL::text[], NULL::text[], NULL::text[], NULL::text[],
+           organisms, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
            'ena'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
@@ -553,22 +555,23 @@ all_matches AS (
     WHERE (gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
     UNION ALL
     -- DRA: the twin holds only DDBJ-exclusive studies, so a mirrored DRP cannot
-    -- double-count against its SRA/ENA row. No organism facet -- dra_studies keeps
-    -- organism on its samples, same as ENA.
+    -- double-count against its SRA/ENA row. organisms materialized onto
+    -- dra_studies_search by transfer.dra_organisms (experiment->sample hop).
     SELECT accession,
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
-           NULL::text[], ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
+           organisms, ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
            'dra'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM dra_studies_search, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
-    -- GEA: organism is a single column, wrapped so it joins the organism facet.
+    -- GEA: per-sample organisms (transfer.gea_organisms) with the single-column
+    -- organism as fallback, so multi-organism studies join the facet fully.
     SELECT accession, title, description AS summary, release_date AS updated_at,
-           CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
-                THEN ARRAY[organism] END::text[],
+           COALESCE(organisms, CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
+                THEN ARRAY[organism] END)::text[],
            ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
            'gea'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
@@ -1485,10 +1488,15 @@ SELECT
     es.coords_2d,
     es.coords_3d,
     es.neighbors,
-    CASE
-        WHEN es.scientific_name IS NOT NULL AND es.scientific_name <> ''
-        THEN ARRAY[es.scientific_name]
-    END::text[] AS organisms,
+    -- Per-sample organism set (transfer.gsa_organisms); fall back to the study
+    -- scientific_name where a study has no samples (no blanking).
+    COALESCE(
+        es.organisms,
+        CASE
+            WHEN es.scientific_name IS NOT NULL AND es.scientific_name <> ''
+            THEN ARRAY[es.scientific_name]
+        END
+    )::text[] AS organisms,
     -- GSA records a single submitting person, not an author roster; the linked
     -- BioProject carries them along with the organisation. Both live on the join
     -- below and were previously discarded.
@@ -2561,8 +2569,13 @@ SELECT
     g.title,
     g.description AS summary,
     g.protocols_description AS overall_design,
-    CASE WHEN NULLIF(btrim(g.organism), '') IS NOT NULL
-         THEN ARRAY[g.organism] END AS organisms,
+    -- Per-sample organism set (transfer.gea_organisms); fall back to the
+    -- experiment-level organism scalar where a study has no samples.
+    COALESCE(
+        g.organisms,
+        CASE WHEN NULLIF(btrim(g.organism), '') IS NOT NULL
+             THEN ARRAY[g.organism] END
+    ) AS organisms,
     g.coords_2d,
     g.coords_3d,
     g.neighbors,
@@ -3309,7 +3322,9 @@ def build_structured_search(
         if q:
             w.append(f"{gsa_tsv} @@ q.match_q")
         if organism:
-            w.append("gs.scientific_name = %(organism)s")
+            # GIN-indexed containment (idx_gsa_studies_organisms_gin); the scalar
+            # scientific_name missed every multi-organism GSA study (1,194).
+            w.append("gs.organisms @> ARRAY[%(organism)s]")
         if library_strategy or platform or country:
             ec = ["ge.study_accession = gs.study_accession"]
             if library_strategy:
@@ -3370,7 +3385,7 @@ def build_structured_search(
             f" COALESCE(gs.study_title, gss.project_title, gs.study_name, gs.project_name, gs.study_accession) AS title,"
             f" COALESCE(gs.study_description, gss.project_summary) AS summary,"
             f" gs.first_public AS updated_at,"
-            f" COALESCE(gss.organisms, CASE WHEN gs.scientific_name IS NOT NULL"
+            f" COALESCE(gs.organisms, CASE WHEN gs.scientific_name IS NOT NULL"
             f" THEN ARRAY[gs.scientific_name] END) AS organisms,"
             f" ARRAY['China']::text[] AS countries,"
             f" {rank} AS rank, 'gsa'::text AS source,"
