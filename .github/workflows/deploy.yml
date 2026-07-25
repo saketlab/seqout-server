@@ -41,26 +41,34 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_PORT || 22 }}
-          # Fail the step on any non-zero command. Without this a failed restart
-          # (e.g. sudo asking for a password) was swallowed and the deploy went
-          # green while the old process kept serving stale code.
           script_stop: true
           script: |
+            set -e
             cd /var/www/sramap/backend
 
-            # Install uv if not present
             if ! command -v uv &> /dev/null; then
               curl -LsSf https://astral.sh/uv/install.sh | sh
               export PATH="$HOME/.local/bin:$PATH"
             fi
 
-            # Sync dependencies
             ~/.local/bin/uv sync
 
-            # Restart the service. -n: never prompt for a password -- if the
-            # NOPASSWD sudoers rule is missing this fails loudly instead of hanging.
+            OLD_PID=$(systemctl show seqout-backend -p MainPID --value)
+
             sudo -n systemctl restart seqout-backend
 
-            # Health check: real failure, no swallow. Retry to let the workers
-            # come up. If the service didn't start, the deploy now fails.
-            curl -f --retry 5 --retry-delay 2 --retry-connrefused http://localhost:8000/
+            for i in $(seq 1 20); do
+              sleep 2
+              curl -fs http://127.0.0.1:8000/ >/dev/null && break
+            done
+
+            curl -fs http://127.0.0.1:8000/ >/dev/null || {
+              echo "::error::backend not answering on :8000 after restart"
+              exit 1
+            }
+
+            NEW_PID=$(systemctl show seqout-backend -p MainPID --value)
+            test "$NEW_PID" != "$OLD_PID" || {
+              echo "::error::seqout-backend still running as PID $OLD_PID; restart did not take"
+              exit 1
+            }
