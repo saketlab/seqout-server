@@ -5148,6 +5148,29 @@ ENRICHED_CROSSTAB_SQL = (
 )
 
 
+def _country_scope_conditions(
+    country: str,
+    organism: str | None = None,
+    assay_l2: str | None = None,
+    alias: str = "",
+) -> tuple[str, list]:
+    """WHERE clause scoping unified_metadata to one country on the map."""
+    q = f"{alias}." if alias else ""
+    conditions = [
+        f"{q}latitude IS NOT NULL",
+        f"{q}longitude IS NOT NULL",
+        f"{q}country = %s",
+    ]
+    params: list = [country]
+    if organism:
+        conditions.append(f"{q}dominant_scientific_name = %s")
+        params.append(organism)
+    if assay_l2:
+        conditions.append(f"{q}dominant_assay_l2 = %s")
+        params.append(assay_l2)
+    return " AND ".join(conditions), params
+
+
 def build_country_accessions_sql(
     country: str,
     organism: str | None = None,
@@ -5155,19 +5178,7 @@ def build_country_accessions_sql(
     limit: int | None = None,
 ) -> tuple[str, list]:
     """Return accessions for a country with optional organism/assay filters."""
-    conditions = [
-        "latitude IS NOT NULL",
-        "longitude IS NOT NULL",
-        "country = %s",
-    ]
-    params: list = [country]
-    if organism:
-        conditions.append("dominant_scientific_name = %s")
-        params.append(organism)
-    if assay_l2:
-        conditions.append("dominant_assay_l2 = %s")
-        params.append(assay_l2)
-    where = " AND ".join(conditions)
+    where, params = _country_scope_conditions(country, organism, assay_l2)
     sql = (
         f"SELECT DISTINCT canonical_accession"
         f" FROM unified_metadata"
@@ -5178,6 +5189,39 @@ def build_country_accessions_sql(
         sql += " LIMIT %s"
         params.append(limit)
     return sql + ";", params
+
+
+def build_country_pis_sql(
+    country: str,
+    organism: str | None = None,
+    assay_l2: str | None = None,
+    limit: int = 200,
+) -> tuple[str, list]:
+    """Rank PIs for a country, PI being the last author of the linked publication.
+
+    `covered_projects` counts the projects with a pmid. count(*) is exact because
+    both join keys are primary keys.
+    """
+    where, params = _country_scope_conditions(country, organism, assay_l2, alias="u")
+    params.append(limit)
+    return (
+        f"""
+SELECT
+    a.pi,
+    count(*) AS n_projects,
+    count(DISTINCT u.pmid) AS n_papers,
+    mode() WITHIN GROUP (ORDER BY u.center_name) AS center_name,
+    sum(count(*)) OVER ()::bigint AS covered_projects
+FROM unified_metadata u
+JOIN pubmed_metadata m ON m.pmid = u.pmid
+CROSS JOIN LATERAL (SELECT btrim(split_part(m.authors, ',', -1)) AS pi) a
+WHERE {where} AND a.pi LIKE '%% %%'
+GROUP BY a.pi
+ORDER BY n_projects DESC, a.pi
+LIMIT %s;
+""",
+        params,
+    )
 
 
 _ENRICHED_SAMPLES_BASE_COLS = [
