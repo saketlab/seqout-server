@@ -1427,10 +1427,16 @@ SELECT
     es.coords_2d,
     es.coords_3d,
     es.neighbors,
-    CASE
-        WHEN NULLIF(btrim(es.scientific_name), '') IS NOT NULL
-        THEN ARRAY[es.scientific_name]
-    END::text[] AS organisms,
+    -- Prefer the per-sample organism set (populated by transfer.ena_organisms);
+    -- fall back to the study-level scientific_name where a study has no samples,
+    -- so this is never worse than the old scalar (no blanking).
+    COALESCE(
+        es.organisms,
+        CASE
+            WHEN NULLIF(btrim(es.scientific_name), '') IS NOT NULL
+            THEN ARRAY[es.scientific_name]
+        END
+    )::text[] AS organisms,
     NULL::jsonb AS center,
     -- ENA/DDBJ study hierarchy: a study may nest under an umbrella BioProject
     -- (parent), and umbrella projects may have many children. Child-of is a
@@ -3215,7 +3221,10 @@ def build_structured_search(
         if q:
             w.append(f"{ena_tsv} @@ q.match_q")
         if organism:
-            w.append("es.scientific_name = %(organism)s")
+            # GIN-indexed array containment (idx_ena_studies_organisms_gin); the
+            # scalar scientific_name only saw the study-level organism and missed
+            # every multi-organism ENA study (44k of them).
+            w.append("es.organisms @> ARRAY[%(organism)s]")
         if library_strategy or platform or country:
             ec = ["ee.study_accession = es.study_accession"]
             if library_strategy:
@@ -3276,8 +3285,8 @@ def build_structured_search(
             f" es.study_title AS title,"
             f" es.study_description AS summary,"
             f" es.first_public AS updated_at,"
-            f" CASE WHEN es.scientific_name IS NOT NULL"
-            f" THEN ARRAY[es.scientific_name] END AS organisms,"
+            f" COALESCE(es.organisms, CASE WHEN es.scientific_name IS NOT NULL"
+            f" THEN ARRAY[es.scientific_name] END) AS organisms,"
             f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
             f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
