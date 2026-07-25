@@ -4735,6 +4735,17 @@ def _compute_search_facets(
                     tsql, tparams = build_search_total_over_matched(**filters)
                     cur.execute(tsql, tparams)
                     total = cur.fetchone()["total"]
+                    # Search-as-you-type: if the exact query matched nothing
+                    # (trailing partial word), rebuild the temp with a prefix
+                    # core_q and recount, so the header count and sidebar agree
+                    # with /search's result list, which does the same fallback.
+                    if not total and _prefix_eligible(q):
+                        pmsql = _prefixed_sql(msql)
+                        if pmsql is not None:
+                            cur.execute("DROP TABLE matched")
+                            cur.execute(pmsql, mparams)
+                            cur.execute(tsql, tparams)
+                            total = cur.fetchone()["total"]
                     try:
                         with conn.transaction():
                             cur.execute("SET LOCAL statement_timeout = 60000")
