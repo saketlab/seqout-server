@@ -41,6 +41,10 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_PORT || 22 }}
+          # Fail the step on any non-zero command. Without this a failed restart
+          # (e.g. sudo asking for a password) was swallowed and the deploy went
+          # green while the old process kept serving stale code.
+          script_stop: true
           script: |
             cd /var/www/sramap/backend
 
@@ -53,9 +57,10 @@ jobs:
             # Sync dependencies
             ~/.local/bin/uv sync
 
-            # Restart the service
-            sudo systemctl restart seqout-backend
+            # Restart the service. -n: never prompt for a password -- if the
+            # NOPASSWD sudoers rule is missing this fails loudly instead of hanging.
+            sudo -n systemctl restart seqout-backend
 
-            # Health check
-            sleep 3
-            curl -f http://localhost:8000/ || echo "Health check pending..."
+            # Health check: real failure, no swallow. Retry to let the workers
+            # come up. If the service didn't start, the deploy now fails.
+            curl -f --retry 5 --retry-delay 2 --retry-connrefused http://localhost:8000/
