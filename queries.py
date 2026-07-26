@@ -512,7 +512,7 @@ all_matches AS (
            'geo'::text AS source, accession AS dedup_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,
            s.organisms, s.countries, s.instrument_models, s.library_strategies,
@@ -520,7 +520,7 @@ all_matches AS (
            'sra'::text, COALESCE(s.alias, s.accession),
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
-    WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
+    WHERE (%(no_q)s OR s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
     UNION ALL
     SELECT accession, title, description AS summary, release_date AS updated_at,
            organisms, countries, NULL::text[], NULL::text[], NULL::text[],
@@ -528,7 +528,7 @@ all_matches AS (
            'arrayexpress'::text, COALESCE(alias, accession),
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     -- organisms materialized onto ena_studies_search by transfer.ena_organisms
     -- (DISTINCT ena_samples.scientific_name), so the organism facet includes ENA.
@@ -541,7 +541,7 @@ all_matches AS (
            'ena'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     -- title/abstract/organisms enriched from the BioProject and materialized
     -- onto gsa_studies_search by transfer.gsa_search, so the organism facet
@@ -557,7 +557,7 @@ all_matches AS (
            'gsa'::text, gss.accession,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
     FROM gsa_studies_search gss, q
-    WHERE (gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
+    WHERE (%(no_q)s OR gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
     UNION ALL
     -- DRA: the twin holds only DDBJ-exclusive studies, so a mirrored DRP cannot
     -- double-count against its SRA/ENA row. organisms materialized onto
@@ -571,7 +571,7 @@ all_matches AS (
            'dra'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM dra_studies_search, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     -- GEA: per-sample organisms (transfer.gea_organisms) with the single-column
     -- organism as fallback, so multi-organism studies join the facet fully.
@@ -583,7 +583,7 @@ all_matches AS (
            'gea'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM gea_experiments, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 -- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
 -- dedup_key (the SRA study carries the GSE as its alias); deduping first can
@@ -726,6 +726,10 @@ def build_search_match_temp(q=None, q_variants=None, db=None):
         + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"
     )
+    # no_q is a SQL literal, not a bind param: "FALSE OR tsv @@ q" folds to
+    # "tsv @@ q" at plan time (keeps the FTS index in generic/prepared plans too),
+    # while "TRUE OR ..." folds to TRUE for the query-less full scan.
+    sql = sql.replace("%(no_q)s", "TRUE" if not q else "FALSE")
     return sql, {"q": q, "q_variants": q_variants, "db": db}
 
 
@@ -867,6 +871,9 @@ def build_search_results(
         + "OFFSET COALESCE(%(offset)s::bigint, 0)\n"
         + "LIMIT 200;"
     )
+    # no_q inlined as a literal so "FALSE OR tsv @@ q" folds to the FTS index
+    # scan at plan time (no bind-param plan surprises); see build_search_match_temp.
+    sql = sql.replace("%(no_q)s", "TRUE" if not q else "FALSE")
     return sql, params
 
 

@@ -29,6 +29,7 @@ from fastapi.responses import (
 )
 from fastmcp import FastMCP
 from neo4j import GraphDatabase
+from psycopg.errors import QueryCanceled
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
@@ -4481,7 +4482,7 @@ _SEARCH_SQL_BY_DB = {
 @limiter.limit("100/minute")
 def search(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=500),
+    q: str | None = Query(None, max_length=500),
     cursor_rank: float | None = Query(None),
     cursor_acc: str | None = Query(None),
     cursor_sort: str | None = Query(None),
@@ -4519,6 +4520,11 @@ def search(
         "date_to": date_to,
     }
     has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
+
+    # q is optional, but only when at least one filter narrows the set -- an
+    # unfiltered, query-less search would materialize the whole corpus.
+    if not q and not has_filter:
+        raise HTTPException(400, "provide a query (q) or at least one filter")
 
     # Sidebar-filtered search: server-side filters, paginated over the same match
     # set as the facets so list and counts agree. Honors sortby (default
@@ -4766,12 +4772,17 @@ def _search_filtered(
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
-    next_cursor)."""
-    q = _replace_query_hyphens(q)
+    next_cursor). q may be empty -- a filter-only (query-less) search."""
+    query_less = not q  # no FTS to narrow -> can scan broadly; bound its runtime
+    q = _replace_query_hyphens(q) if q else ""
     start = time.perf_counter()
     try:
-        with pool.connection() as conn:
-            q_variants = _search_query_variants(q)
+        with pool.connection() as conn, conn.transaction():
+            # SET LOCAL is transaction-scoped, so it auto-resets when this block
+            # ends (even on timeout) and never leaks into the pooled connection.
+            if query_less:
+                conn.execute("SET LOCAL statement_timeout = '60s'")
+            q_variants = _search_query_variants(q) if q else []
             sql, params = build_search_results(
                 q=q,
                 q_variants=q_variants,
@@ -4787,6 +4798,10 @@ def _search_filtered(
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
+    except QueryCanceled:
+        raise HTTPException(
+            504, "query-less search timed out; add a query term or a narrower filter"
+        )
     except Exception:
         logger.exception("Database error in filtered search")
         raise HTTPException(500, "Internal server error")
