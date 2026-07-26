@@ -624,6 +624,8 @@ def _search_filter_clauses(
     multi_platform=False,
     year_from=None,
     year_to=None,
+    date_from=None,
+    date_to=None,
 ):
     """Build sidebar-filter SQL over the `matched` CTE columns.
 
@@ -667,10 +669,17 @@ def _search_filter_clauses(
         params["journal"] = list(journal)
 
     always_clauses = []
-    if year_from is not None:
+    # day-level range wins when given; year_* stays for the structured endpoint.
+    if date_from is not None:
+        always_clauses.append("matched.updated_at::date >= %(date_from)s")
+        params["date_from"] = date_from
+    elif year_from is not None:
         always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) >= %(year_from)s")
         params["year_from"] = year_from
-    if year_to is not None:
+    if date_to is not None:
+        always_clauses.append("matched.updated_at::date <= %(date_to)s")
+        params["date_to"] = date_to
+    elif year_to is not None:
         always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) <= %(year_to)s")
         params["year_to"] = year_to
 

@@ -4404,7 +4404,11 @@ def search(
     multi_platform: bool = Query(False),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
 ):
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(400, "date_from must be <= date_to")
     sidebar_filters = {
         "organism": organism,
         "country": country,
@@ -4415,6 +4419,8 @@ def search(
         "multi_platform": multi_platform,
         "year_from": year_from,
         "year_to": year_to,
+        "date_from": date_from,
+        "date_to": date_to,
     }
     has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
 
