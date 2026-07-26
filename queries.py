@@ -637,7 +637,13 @@ def _search_filter_clauses(
     """
     dim_clauses = {}
     if organism:
-        dim_clauses["organism"] = "matched.organisms @> ARRAY[%(organism)s]"
+        # case-insensitive: unnest so "mus musculus" matches "Mus musculus".
+        # ponytail: per-row unnest over the already-materialized match set; if
+        # this ever gets hot, add a lower(organism) expression index upstream.
+        dim_clauses["organism"] = (
+            "EXISTS (SELECT 1 FROM unnest(matched.organisms) o"
+            " WHERE lower(o) = lower(%(organism)s))"
+        )
         params["organism"] = organism
     if country:
         dim_clauses["country"] = "matched.countries && %(country)s::text[]"
