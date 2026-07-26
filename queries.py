@@ -5212,25 +5212,51 @@ def build_country_pis_sql(
     assay_l2: str | None = None,
     limit: int = 200,
 ) -> tuple[str, list]:
-    """Rank PIs for a country, PI being the last author of the linked publication.
+    """Rank investigators for a country, counting every author of a linked
+    publication. Projects with no linked pmid fall back to their contributor
+    list: GEO series contributors or ArrayExpress authors.
 
-    `covered_projects` counts the projects with a pmid. count(*) is exact because
-    both join keys are primary keys.
+    Authors are unnested, so project/paper counts use DISTINCT. `covered_projects`
+    is the distinct projects that yielded at least one investigator.
     """
     where, params = _country_scope_conditions(country, organism, assay_l2, alias="u")
     params.append(limit)
     return (
         f"""
+WITH proj AS (
+    SELECT u.canonical_accession, u.pmid, u.center_name
+    FROM unified_metadata u
+    WHERE {where}
+),
+authors AS (
+    -- investigators from the linked publication
+    SELECT p.canonical_accession, p.pmid, p.center_name, btrim(a.author) AS pi
+    FROM proj p
+    JOIN pubmed_metadata m ON m.pmid = p.pmid
+    CROSS JOIN LATERAL unnest(string_to_array(m.authors, ',')) AS a(author)
+    UNION ALL
+    -- fallback to GEO contributors when the project has no linked pmid
+    SELECT p.canonical_accession, NULL::text AS pmid, p.center_name, btrim(c.name) AS pi
+    FROM proj p
+    JOIN geo_series g ON g.accession = p.canonical_accession
+    CROSS JOIN LATERAL unnest(g.contributors) AS c(name)
+    WHERE p.pmid IS NULL
+    UNION ALL
+    -- fallback to ArrayExpress authors when the project has no linked pmid
+    SELECT p.canonical_accession, NULL::text AS pmid, p.center_name, btrim(c.name) AS pi
+    FROM proj p
+    JOIN arrayexpress_experiments x ON x.accession = p.canonical_accession
+    CROSS JOIN LATERAL unnest(x.authors) AS c(name)
+    WHERE p.pmid IS NULL
+)
 SELECT
     a.pi,
-    count(*) AS n_projects,
-    count(DISTINCT u.pmid) AS n_papers,
-    mode() WITHIN GROUP (ORDER BY u.center_name) AS center_name,
-    sum(count(*)) OVER ()::bigint AS covered_projects
-FROM unified_metadata u
-JOIN pubmed_metadata m ON m.pmid = u.pmid
-CROSS JOIN LATERAL (SELECT btrim(split_part(m.authors, ',', -1)) AS pi) a
-WHERE {where} AND a.pi LIKE '%% %%'
+    count(DISTINCT a.canonical_accession) AS n_projects,
+    count(DISTINCT a.pmid) AS n_papers,
+    mode() WITHIN GROUP (ORDER BY a.center_name) AS center_name,
+    (SELECT count(DISTINCT canonical_accession) FROM authors) AS covered_projects
+FROM authors a
+WHERE a.pi LIKE '%% %%'
 GROUP BY a.pi
 ORDER BY n_projects DESC, a.pi
 LIMIT %s;

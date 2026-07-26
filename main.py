@@ -3878,8 +3878,9 @@ def _get_country_pis(
     summary="Investigators for a country, ranked by project count",
     description=(
         "Return investigators for a country, ranked by project count descending. "
-        "Each investigator is the last author of a project's linked publication. "
-        "`covered_projects` is the number of projects with a linked PMID. "
+        "An investigator is any author of a project's linked publication, or a "
+        "GEO/ArrayExpress contributor when the project has no linked PMID. "
+        "`covered_projects` is the number of projects with attributable investigators. "
         "Returns {pis, covered_projects, total, took_ms}."
     ),
     operation_id="get_country_pis",
