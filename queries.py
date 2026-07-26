@@ -508,20 +508,23 @@ WITH q AS (
 all_matches AS (
     SELECT accession, title, summary, updated_at, organisms,
            countries_iso AS countries, instrument_models, library_strategies,
-           platforms, 'geo'::text AS source, accession AS dedup_key,
+           platforms, NULL::text[] AS library_sources,
+           'geo'::text AS source, accession AS dedup_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,
            s.organisms, s.countries, s.instrument_models, s.library_strategies,
-           s.platforms, 'sra'::text, COALESCE(s.alias, s.accession),
+           s.platforms, s.library_sources,
+           'sra'::text, COALESCE(s.alias, s.accession),
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
     WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
     UNION ALL
     SELECT accession, title, description AS summary, release_date AS updated_at,
            organisms, countries, NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[],
            'arrayexpress'::text, COALESCE(alias, accession),
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
@@ -534,6 +537,7 @@ all_matches AS (
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
            organisms, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[],
            'ena'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM ena_studies_search, q
@@ -549,6 +553,7 @@ all_matches AS (
            COALESCE(gss.last_updated, gss.first_public) AS updated_at,
            gss.organisms,
            ARRAY['China']::text[], NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[],
            'gsa'::text, gss.accession,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
     FROM gsa_studies_search gss, q
@@ -562,6 +567,7 @@ all_matches AS (
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
            organisms, ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[],
            'dra'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM dra_studies_search, q
@@ -573,6 +579,7 @@ all_matches AS (
            COALESCE(organisms, CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
                 THEN ARRAY[organism] END)::text[],
            ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
+           NULL::text[],
            'gea'::text, accession,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM gea_experiments, q
@@ -587,7 +594,8 @@ all_matches AS (
 deduped AS (
     SELECT DISTINCT ON (dedup_key)
         accession, title, summary, updated_at, organisms, countries,
-        instrument_models, library_strategies, platforms, source, rank
+        instrument_models, library_strategies, platforms, library_sources,
+        source, rank
     FROM all_matches
     WHERE (%(db)s::text IS NULL OR source = %(db)s)
     ORDER BY dedup_key, rank DESC
@@ -618,6 +626,7 @@ def _search_filter_clauses(
     organism=None,
     country=None,
     library_strategy=None,
+    library_source=None,
     instrument_model=None,
     platform=None,
     journal=None,
@@ -653,6 +662,15 @@ def _search_filter_clauses(
             "matched.library_strategies && %(library_strategy)s::text[]"
         )
         params["library_strategy"] = list(library_strategy)
+    if library_source:
+        # case-insensitive multi-value: stored values are UPPERCASE canonical
+        # (GENOMIC, TRANSCRIPTOMIC, ...) but users type any case.
+        dim_clauses["library_source"] = (
+            "EXISTS (SELECT 1 FROM unnest(matched.library_sources) ls"
+            " WHERE lower(ls) = ANY(SELECT lower(x)"
+            " FROM unnest(%(library_source)s::text[]) x))"
+        )
+        params["library_source"] = list(library_source)
     if instrument_model:
         dim_clauses["instrument_model"] = (
             "matched.instrument_models && %(instrument_model)s::text[]"
@@ -705,7 +723,7 @@ def build_search_match_temp(q=None, q_variants=None, db=None):
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + _SEARCH_MATCH_CTE
         + "\nSELECT accession, updated_at, organisms, countries,"
-        + " instrument_models, library_strategies, platforms\n"
+        + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"
     )
     return sql, {"q": q, "q_variants": q_variants, "db": db}
