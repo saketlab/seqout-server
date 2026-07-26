@@ -786,6 +786,13 @@ def build_search_facets_over_matched(**filters):
     return sql, params
 
 
+# Keyset guard for ranked (query-present) paging. cursor_rank NULL => first page.
+_RANK_KEYSET_WHERE = (
+    "    WHERE (%(cursor_rank)s::float8 IS NULL\n"
+    "           OR (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text))\n"
+)
+
+
 def build_search_results(
     q=None,
     q_variants=None,
@@ -840,9 +847,20 @@ def build_search_results(
         order_by = (
             f"ORDER BY {sort_expr} {direction} NULLS LAST, paged.accession {direction}"
         )
+        paged_where = _RANK_KEYSET_WHERE
+    elif not q:
+        # query-less: rank is NULL on every row, so a (rank, accession) keyset
+        # guard is always-true and paging never advances (infinite loop). Page by
+        # accession alone — the real sort order when all ranks are NULL.
+        join_clause = ""
+        order_by = "ORDER BY paged.accession DESC"
+        paged_where = (
+            "    WHERE (%(cursor_acc)s::text IS NULL OR accession < %(cursor_acc)s)\n"
+        )
     else:
         join_clause = ""
         order_by = "ORDER BY paged.rank DESC, paged.accession DESC"
+        paged_where = _RANK_KEYSET_WHERE
 
     sql = (
         _SEARCH_MATCH_CTE
@@ -857,8 +875,7 @@ def build_search_results(
         + "),\n"
         + "paged AS (\n"
         + "    SELECT * FROM counted\n"
-        + "    WHERE (%(cursor_rank)s::float8 IS NULL\n"
-        + "           OR (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text))\n"
+        + paged_where
         + ")\n"
         + "SELECT paged.accession, paged.title, paged.summary, paged.updated_at,\n"
         + "       paged.organisms, paged.countries, paged.rank, paged.source,\n"
