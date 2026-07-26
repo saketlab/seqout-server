@@ -188,6 +188,7 @@ from queries import (
     SUBMITTER_BATCH_SQL,
     build_country_accessions_sql,
     build_country_filters_sql,
+    build_country_pis_sql,
     build_enriched_samples_sql,
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
@@ -295,6 +296,8 @@ _MAX_CROSSTAB_CACHE_ENTRIES = 200
 _MAX_GLOBAL_CONTRIBUTION_QUERY_CACHE_ENTRIES = 200
 _MAX_COUNTRY_FILTERS_CACHE_ENTRIES = 500
 _MAX_COUNTRY_ACCESSIONS_CACHE_ENTRIES = 100
+_MAX_COUNTRY_PIS_CACHE_ENTRIES = 200
+MAX_COUNTRY_PIS = 200
 _STATS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
 
 
@@ -624,6 +627,8 @@ _country_filters_cache_lock = threading.Lock()
 _country_filters_cache: dict[tuple, dict] = {}
 _country_accessions_cache_lock = threading.Lock()
 _country_accessions_cache: dict[tuple, dict] = {}
+_country_pis_cache_lock = threading.Lock()
+_country_pis_cache: dict[tuple, dict] = {}
 _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
 _source_totals_cache_lock = threading.Lock()
@@ -2906,6 +2911,8 @@ def purge_cache(request: Request):
         _country_filters_cache.clear()
     with _country_accessions_cache_lock:
         _country_accessions_cache.clear()
+    with _country_pis_cache_lock:
+        _country_pis_cache.clear()
     with _organism_growth_cache_lock:
         _organism_growth_cache.clear()
     with _organisms_list_cache_lock:
@@ -3818,6 +3825,92 @@ def get_country_accessions(
         logger.exception("Database error in get_country_accessions")
         raise HTTPException(500, "Internal server error")
     return PlainTextResponse(text, headers={"Cache-Control": _STATS_CACHE_CONTROL})
+
+
+def _get_country_pis(
+    country: str, organism: str | None = None, assay_l2: str | None = None
+) -> dict:
+    key = (country, organism, assay_l2)
+    with _country_pis_cache_lock:
+        cached = _get_bounded_cache_entry(_country_pis_cache, key, _GROWTH_CACHE_TTL)
+        if cached is not None:
+            return cached
+
+    sql, params = build_country_pis_sql(
+        country, organism=organism, assay_l2=assay_l2, limit=MAX_COUNTRY_PIS
+    )
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    covered = int(rows[0]["covered_projects"]) if rows else 0
+    data = {
+        "pis": [
+            {
+                "pi": r["pi"],
+                "center_name": (
+                    r["center_name"]
+                    if (r["center_name"] or "").lower() not in _INSTITUTE_NOISE
+                    else None
+                ),
+                "n_projects": r["n_projects"],
+                "n_papers": r["n_papers"],
+            }
+            for r in rows
+        ],
+        "covered_projects": covered,
+    }
+
+    with _country_pis_cache_lock:
+        _set_bounded_cache_entry(
+            _country_pis_cache,
+            key,
+            data,
+            _MAX_COUNTRY_PIS_CACHE_ENTRIES,
+            _GROWTH_CACHE_TTL,
+        )
+    return data
+
+
+@api_app.get(
+    "/stats/global-contributions/pis",
+    summary="Investigators for a country, ranked by project count",
+    description=(
+        "Return investigators for a country, ranked by project count descending. "
+        "Each investigator is the last author of a project's linked publication. "
+        "`covered_projects` is the number of projects with a linked PMID. "
+        "Returns {pis, covered_projects, total, took_ms}."
+    ),
+    operation_id="get_country_pis",
+)
+@limiter.limit("20/minute")
+def get_country_pis(
+    request: Request,
+    response: Response,
+    country: str = Query(..., description="Country name"),
+    organism: str | None = Query(None, description="Filter by organism"),
+    assay_l2: str | None = Query(None, description="Filter by assay type"),
+):
+    t0 = time.perf_counter()
+    country = _normalize_stat_filter(country)
+    organism = _normalize_stat_filter(organism)
+    assay_l2 = _normalize_stat_filter(assay_l2)
+    if not country:
+        raise HTTPException(400, "country is required")
+
+    try:
+        data = _get_country_pis(country, organism=organism, assay_l2=assay_l2)
+    except Exception:
+        logger.exception("Database error in get_country_pis")
+        raise HTTPException(500, "Internal server error")
+
+    response.headers["Cache-Control"] = _STATS_CACHE_CONTROL
+    return {
+        **data,
+        "total": len(data["pis"]),
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
 
 
 @api_app.get(
@@ -10346,6 +10439,7 @@ MCP_OPERATION_IDS = {
     "get_global_contributions",
     "get_global_contribution_filters",
     "get_country_accessions",
+    "get_country_pis",
     "get_project_enriched",
     "get_experiment_enriched",
     "get_run_enriched",
