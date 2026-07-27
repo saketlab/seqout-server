@@ -492,6 +492,27 @@ LIMIT 200;
 """
 
 
+# Structured/boolean queries: reuse SEARCH_SQL verbatim but swap the plainto CTE
+# for a literal to_tsquery on BOTH core_q and match_q (no Neo4j-expanded OR-union
+# -- the user's exact terms only). Derived by string-replace so the 7-source union
+# body can never drift from the normal path. Both %s slots stay, so the positional
+# param tuple is just (tsquery_str, tsquery_str, cursor_rank, cursor_rank, acc, offset).
+SEARCH_STRUCTURED_SQL = SEARCH_SQL.replace(
+    """    SELECT plainto_tsquery('english', %s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q""",
+    """    SELECT to_tsquery('english', %s) AS core_q,
+           to_tsquery('english', %s) AS match_q""",
+)
+
+
 _SEARCH_MATCH_CTE = """
 WITH q AS (
     SELECT plainto_tsquery('english', %(q)s) AS core_q,

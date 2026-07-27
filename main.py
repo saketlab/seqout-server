@@ -30,6 +30,7 @@ from fastapi.responses import (
 from fastmcp import FastMCP
 from neo4j import GraphDatabase
 from psycopg.errors import QueryCanceled
+from psycopg.errors import SyntaxError as PgSyntaxError
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
@@ -162,6 +163,7 @@ from queries import (
     SEARCH_AUTHOR_PROJECTS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
+    SEARCH_STRUCTURED_SQL,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_BOUNDS_COUNTS_SQL,
@@ -202,6 +204,7 @@ from queries import (
     init_global_contributions_filters_sql,
     init_global_contributions_schema,
 )
+from boolean_query import is_boolean_query, to_tsquery_string
 
 load_dotenv()
 
@@ -4578,6 +4581,11 @@ def search(
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
     sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
+    structured: bool = Query(
+        False,
+        description="Force boolean/structured parsing of q even without operators "
+        "(auto-detected otherwise). Uses the exact terms; no ontology expansion.",
+    ),
     organism: str | None = Query(None),
     country: list[str] | None = Query(None),
     library_strategy: list[str] | None = Query(None),
@@ -4632,6 +4640,17 @@ def search(
     original_q = _replace_query_hyphens(q)
     q = original_q
 
+    # Boolean/structured query: ("a" OR "b") (c OR d) e* -> literal to_tsquery, no
+    # Neo4j expansion, no spelling correction. Only the unified relevance path
+    # (no sortby, no db scope) for now; a boolean query with sortby/db falls back
+    # to the ordinary plainto path. tsq == "" means nothing usable survived
+    # translation (e.g. a lone "*"), so treat it as an ordinary query.
+    boolean_tsq = None
+    if not sortby and not db and (structured or is_boolean_query(q)):
+        tsq = to_tsquery_string(q)
+        if tsq:
+            boolean_tsq = tsq
+
     # First-page unfiltered searches are cacheable (filtered/accession returned above).
     results_cache_key = None
     if (
@@ -4648,7 +4667,47 @@ def search(
         if _cached_results is not None:
             return _cached_results
 
-    if sortby:
+    if boolean_tsq is not None:
+        start = time.perf_counter()
+        try:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    # No _run_search: its trailing-prefix fallback rewrites a
+                    # plainto core_q and would corrupt a to_tsquery.
+                    cur.execute(
+                        SEARCH_STRUCTURED_SQL,
+                        (
+                            boolean_tsq,
+                            boolean_tsq,
+                            cursor_rank,
+                            cursor_rank,
+                            cursor_acc,
+                            offset,
+                        ),
+                    )
+                    rows = cur.fetchall()
+                    _enrich_with_publications(rows, cur)
+        except PgSyntaxError:
+            raise HTTPException(400, "could not parse boolean query")
+        except Exception:
+            logger.exception("Database error in search (boolean)")
+            raise HTTPException(500, "Internal server error")
+
+        took_ms = (time.perf_counter() - start) * 1000
+        total = rows[0]["total_count"] if rows else 0
+
+        result = {
+            "results": rows,
+            "total": total,
+            "took_ms": round(took_ms, 2),
+            "next_cursor": (
+                None
+                if not rows
+                else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
+            ),
+        }
+    elif sortby:
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
@@ -4773,7 +4832,9 @@ def search(
     total_for_suggest = result.get("total")
     if total_for_suggest is None:
         total_for_suggest = len(result.get("results", []))
-    if total_for_suggest <= _SUGGESTION_THRESHOLD:
+    # No "did you mean" in boolean mode: the operators are deliberate, so silently
+    # rewriting them would be wrong.
+    if boolean_tsq is None and total_for_suggest <= _SUGGESTION_THRESHOLD:
         suggestions = _get_suggestions(original_q)
         corrected_q = suggestions[0]["corrected_query"] if suggestions else None
         if corrected_q and corrected_q != original_q:
