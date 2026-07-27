@@ -4706,12 +4706,15 @@ def search(
                 organism=organism,
                 country=country,
                 library_strategy=library_strategy,
+                library_source=library_source,
                 instrument_model=instrument_model,
                 platform=platform,
                 journal=journal,
                 multi_platform=multi_platform,
                 year_from=year_from,
                 year_to=year_to,
+                date_from=date_from,
+                date_to=date_to,
             )
             orig_results = result.get("results", [])
             if corrected.get("results"):
