@@ -2678,17 +2678,27 @@ def _try_accession_search(
 
 
 # --- Zero-result prefix fallback -------------------------------------------
-# FTS matches whole lexemes, so a query whose LAST word is a partial ("...healthy
-# com") ANDs the lexeme 'com', which no document has (the word stems to
-# 'comparison') -> zero results. When (and only when) a normal search returns
-# nothing, retry with the trailing lexeme turned into a prefix (com:* matches
-# comparison). Normal searches keep exact-word ranking; only the empty case pays
-# the extra query. The replacement keeps a single %s in the same position, so the
-# existing param tuple is reused verbatim.
+# FTS matches whole lexemes, so a query can AND a lexeme no document holds and
+# return nothing, in two ways: a trailing partial ("...healthy comp" -> 'comp',
+# never indexed because the full word stems to 'comparison'), or a bare
+# non-idempotent stem the user typed directly ("obes" -> query-time stem 'obe',
+# in no document, even though 'obes' -- the stem of obese/obesity -- is itself a
+# stored lexeme). When (and only when) a normal search returns nothing, retry with
+# the offending lexemes turned into prefixes: 'comp:*' matches comparison, 'obe:*'
+# matches obes. Only lexemes ABSENT from the vocabulary are prefixed, so a word
+# that is a real corpus lexeme keeps its exact-word ranking; length>=2 stops a lone
+# 1-char prefix from scanning the whole index. The replacement keeps a single
+# placeholder in the same position, so the existing param tuple is reused verbatim.
 def _prefix_core_q(placeholder: str) -> str:
     return (
-        "(SELECT CASE WHEN t = '' THEN ''::tsquery ELSE (t || ':*')::tsquery END"
-        f" FROM (SELECT plainto_tsquery('english', {placeholder})::text AS t) _pq)"
+        "(SELECT COALESCE(NULLIF(string_agg("
+        "CASE WHEN length(lex) >= 2 AND NOT EXISTS ("
+        "SELECT 1 FROM search_vocabulary v WHERE v.normalized = lex)"
+        " THEN lex || ':*' ELSE lex END, ' & ' ORDER BY ord), ''), '')::tsquery"
+        " FROM (SELECT replace(tok, chr(39), '') AS lex, ord"
+        " FROM regexp_split_to_table("
+        f"plainto_tsquery('english', {placeholder})::text, ' & ')"
+        " WITH ORDINALITY AS t(tok, ord)) lexemes)"
         " AS core_q"
     )
 
@@ -2765,7 +2775,15 @@ def _ensure_spelling_loaded() -> SymSpell:
         try:
             with pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SELECT normalized, frequency FROM search_vocabulary")
+                    # Exclude 'corpus' rows: those are FTS stems ('express',
+                    # 'obes'), which make SymSpell suggest a stem for a typo
+                    # instead of a real word. term_type <> 'corpus' keeps the
+                    # surface words ('expression', 'obese') and facet values;
+                    # see the surface-word blocks in scripts/create_vocabulary.sh.
+                    cur.execute(
+                        "SELECT normalized, frequency FROM search_vocabulary "
+                        "WHERE term_type <> 'corpus'"
+                    )
                     for row in cur:
                         sym.create_dictionary_entry(row["normalized"], row["frequency"])
         except Exception:
@@ -2819,6 +2837,65 @@ def _known_words(words: list[str]) -> set[str]:
         return {w.lower() for w in words}
 
 
+# Tables whose tsv the FTS search covers; used to verify a correction retrieves
+# something before we suggest it. Constant (not user input) so it is safe to
+# interpolate into the probe SQL below.
+_SUGGEST_PROBE_TABLES = (
+    "geo_series",
+    "sra_studies",
+    "arrayexpress_experiments",
+    "gsa_studies_search",
+)
+
+
+def _trigram_suggest(word: str) -> str | None:
+    """Closest single-word surface term by trigram similarity, or None.
+
+    Fallback for words SymSpell cannot reach (3+ edits from any real word). The `%`
+    operator lets the GiST trigram index (idx_vocab_trgm) do the work. Excludes stem
+    rows ('corpus'), the word itself, and multi-word terms (a phrase would grow the
+    query and never reach a rerun fixed point).
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT normalized FROM search_vocabulary "
+                    "WHERE term_type <> 'corpus' AND normalized <> %(w)s "
+                    "AND position(' ' in normalized) = 0 AND normalized %% %(w)s "
+                    "ORDER BY similarity(normalized, %(w)s) DESC, frequency DESC "
+                    "LIMIT 1",
+                    {"w": word},
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+    except Exception:
+        logger.warning("trigram suggestion lookup failed")
+        return None
+
+
+def _corrected_query_matches(q: str) -> bool:
+    """True if q retrieves at least one document in any FTS source (cheap EXISTS).
+
+    Gate for suggestions: a candidate correction is only worth showing (and
+    auto-rerunning) if it actually finds something. This drops bad edit/trigram
+    guesses and stops the caller re-running a dead query. On probe failure we do not
+    block the suggestion — degrade to the pre-verification behaviour.
+    """
+    probe = " OR ".join(
+        f"EXISTS (SELECT 1 FROM {t} WHERE tsv @@ plainto_tsquery('english', %s))"
+        for t in _SUGGEST_PROBE_TABLES
+    )
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {probe}", (q,) * len(_SUGGEST_PROBE_TABLES))  # noqa: S608
+                return bool(cur.fetchone()[0])
+    except Exception:
+        logger.warning("suggestion verification probe failed; skipping check")
+        return True
+
+
 def _get_suggestions(q: str) -> list[dict]:
     """Return spelling suggestions for a query with few/no FTS results.
 
@@ -2829,6 +2906,10 @@ def _get_suggestions(q: str) -> list[dict]:
     single tokens — substituting a multi-word vocabulary term ("Mappin's moa") for
     one word grows the query, and since a correction differs from its input by
     definition, the caller's auto-rerun would never reach a fixed point.
+
+    SymSpell (edit distance <=2) is primary; a trigram neighbour is the fallback for
+    long words it cannot reach. The assembled correction is only returned if it
+    actually retrieves something (_corrected_query_matches).
     """
     sym = _ensure_spelling_loaded()
     if not sym.words:
@@ -2847,17 +2928,21 @@ def _get_suggestions(q: str) -> list[dict]:
         if lookup_word in known:
             continue
         results = sym.lookup(lookup_word, Verbosity.CLOSEST, max_edit_distance=2)
-        if not results:
-            continue
-        suggested = results[0].term
-        if suggested == lookup_word or " " in suggested:
-            continue
+        if results:
+            suggested = results[0].term
+            if suggested == lookup_word:  # already a valid word — leave it alone
+                continue
+            if " " in suggested:  # never grow a token into a multi-word term
+                continue
+            distance = results[0].distance
+        else:
+            # No candidate within 2 edits (typically a long word 3+ errors off).
+            suggested = _trigram_suggest(lookup_word)
+            if not suggested:
+                continue
+            distance = None
         corrections.append(
-            {
-                "original": word,
-                "suggested": suggested,
-                "distance": results[0].distance,
-            }
+            {"original": word, "suggested": suggested, "distance": distance}
         )
         correction_map[i] = suggested
 
@@ -2867,7 +2952,10 @@ def _get_suggestions(q: str) -> list[dict]:
     corrected_words = list(words)
     for i, suggested in correction_map.items():
         corrected_words[i] = suggested
-    return [{"corrected_query": " ".join(corrected_words), "corrections": corrections}]
+    corrected_q = " ".join(corrected_words)
+    if not _corrected_query_matches(corrected_q):
+        return []
+    return [{"corrected_query": corrected_q, "corrections": corrections}]
 
 
 @api_app.get(

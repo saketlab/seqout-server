@@ -50,6 +50,62 @@ FROM ts_stat('SELECT tsv FROM gsa_studies_search')
 WHERE ndoc > 50 AND LENGTH(word) >= 3
 ON CONFLICT (term) DO UPDATE SET frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency);
 
+-- 3c-3f. SURFACE words (real words, not FTS stems) harvested from the same free
+-- text the tsv columns are built from. Blocks 1-3b store STEMS ('express',
+-- 'obes'), which the known-check and prefix fallback need but which pollute
+-- spelling suggestions (a typo "corrects" to a stem, not a word). These blocks
+-- add the real surface forms ('expression', 'obese') so SymSpell/trigram suggest
+-- words. term_type 'text' marks them; a stem that is ALSO a real word (its own
+-- stem, e.g. 'health') is flipped corpus->text so it stays a spell candidate.
+-- SymSpell then loads WHERE term_type <> 'corpus' (see _ensure_spelling_loaded).
+INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
+SELECT word, 'text', cnt, word FROM (
+    SELECT w AS word, count(*) AS cnt FROM (
+        SELECT DISTINCT accession, unnest(regexp_split_to_array(lower(
+            coalesce(title,'') || ' ' || coalesce(summary,'') || ' ' || coalesce(overall_design,'')
+        ), '[^a-z0-9]+')) AS w FROM geo_series
+    ) t WHERE length(w) >= 3 GROUP BY w HAVING count(*) > 50
+) s
+ON CONFLICT (term) DO UPDATE SET
+    frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency),
+    term_type = CASE WHEN search_vocabulary.term_type = 'corpus' THEN 'text' ELSE search_vocabulary.term_type END;
+
+INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
+SELECT word, 'text', cnt, word FROM (
+    SELECT w AS word, count(*) AS cnt FROM (
+        SELECT DISTINCT accession, unnest(regexp_split_to_array(lower(
+            coalesce(title,'') || ' ' || coalesce(abstract,'') || ' ' || coalesce(study_type,'')
+        ), '[^a-z0-9]+')) AS w FROM sra_studies
+    ) t WHERE length(w) >= 3 GROUP BY w HAVING count(*) > 50
+) s
+ON CONFLICT (term) DO UPDATE SET
+    frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency),
+    term_type = CASE WHEN search_vocabulary.term_type = 'corpus' THEN 'text' ELSE search_vocabulary.term_type END;
+
+INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
+SELECT word, 'text', cnt, word FROM (
+    SELECT w AS word, count(*) AS cnt FROM (
+        SELECT DISTINCT accession, unnest(regexp_split_to_array(lower(
+            coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(publication_title,'')
+        ), '[^a-z0-9]+')) AS w FROM arrayexpress_experiments
+    ) t WHERE length(w) >= 3 GROUP BY w HAVING count(*) > 50
+) s
+ON CONFLICT (term) DO UPDATE SET
+    frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency),
+    term_type = CASE WHEN search_vocabulary.term_type = 'corpus' THEN 'text' ELSE search_vocabulary.term_type END;
+
+INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
+SELECT word, 'text', cnt, word FROM (
+    SELECT w AS word, count(*) AS cnt FROM (
+        SELECT DISTINCT accession, unnest(regexp_split_to_array(lower(
+            coalesce(study_title,'') || ' ' || coalesce(study_description,'') || ' ' || coalesce(project_summary,'')
+        ), '[^a-z0-9]+')) AS w FROM gsa_studies_search
+    ) t WHERE length(w) >= 3 GROUP BY w HAVING count(*) > 50
+) s
+ON CONFLICT (term) DO UPDATE SET
+    frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency),
+    term_type = CASE WHEN search_vocabulary.term_type = 'corpus' THEN 'text' ELSE search_vocabulary.term_type END;
+
 -- 4. Organisms (always include, high value)
 INSERT INTO search_vocabulary (term, term_type, frequency, normalized)
 SELECT organism, 'organism', SUM(count)::int, LOWER(organism)
