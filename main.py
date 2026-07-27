@@ -5104,7 +5104,7 @@ def _compute_search_facets(
     summary="Exact sidebar facet counts for a search",
     description=(
         "Exact counts per sidebar filter (organism, country, library_strategy, "
-        "instrument_model, journal) over the FULL match set for a query, so the "
+        "library_source, instrument_model, journal) over the FULL match set for a query, so the "
         "UI can show real totals without paging through every result. Computed "
         "independently of /search so it doesn't block result rendering. "
         "Returns {facets: {name: [{value, count}], ...}, took_ms}."
@@ -5121,6 +5121,7 @@ def search_facets(
     organism: str | None = Query(None),
     country: list[str] | None = Query(None),
     library_strategy: list[str] | None = Query(None),
+    library_source: list[str] | None = Query(None),
     instrument_model: list[str] | None = Query(None),
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
@@ -5134,6 +5135,7 @@ def search_facets(
         organism
         or country
         or library_strategy
+        or library_source
         or instrument_model
         or platform
         or journal
@@ -5157,6 +5159,7 @@ def search_facets(
         organism,
         tuple(sorted(country or [])),
         tuple(sorted(library_strategy or [])),
+        tuple(sorted(library_source or [])),
         tuple(sorted(instrument_model or [])),
         tuple(sorted(platform or [])),
         tuple(sorted(journal or [])),
@@ -5181,6 +5184,7 @@ def search_facets(
         organism=organism,
         country=country,
         library_strategy=library_strategy,
+        library_source=library_source,
         instrument_model=instrument_model,
         platform=platform,
         journal=journal,
@@ -5211,6 +5215,7 @@ def search_facets(
                 organism=organism,
                 country=country,
                 library_strategy=library_strategy,
+                library_source=library_source,
                 instrument_model=instrument_model,
                 platform=platform,
                 journal=journal,

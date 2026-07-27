@@ -653,6 +653,7 @@ _FACET_BRANCHES = (
     ("organism", "value", "matched, unnest(organisms) value"),
     ("country", "value", "matched, unnest(countries) value"),
     ("library_strategy", "value", "matched, unnest(library_strategies) value"),
+    ("library_source", "value", "matched, unnest(library_sources) value"),
     ("instrument_model", "value", "matched, unnest(instrument_models) value"),
     ("platform", "value", "matched, unnest(platforms) value"),
     (
