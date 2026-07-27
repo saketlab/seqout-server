@@ -626,6 +626,25 @@ matched AS (
 )
 """
 
+# Boolean-mode twin of the match CTE, for the facet/count path: literal
+# to_tsquery on both core_q and match_q (no expansion OR-union), so the header
+# total counts the SAME set the boolean result list returns. Derived by
+# string-replace so the union body stays in lockstep with _SEARCH_MATCH_CTE.
+_SEARCH_MATCH_CTE_STRUCTURED = _SEARCH_MATCH_CTE.replace(
+    """    SELECT plainto_tsquery('english', %(q)s) AS core_q,
+           (
+               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
+               FROM (
+                   SELECT plainto_tsquery('english', term) AS term_q
+                   FROM unnest(%(q_variants)s::text[]) AS terms(term)
+                   WHERE btrim(term) <> ''
+               ) parsed_terms
+               WHERE term_q::text <> ''
+           ) AS match_q""",
+    """    SELECT to_tsquery('english', %(q)s) AS core_q,
+           to_tsquery('english', %(q)s) AS match_q""",
+)
+
 # Each sidebar facet, with the column it unnests/derives and the filter-dimension
 # key it represents (so it can be excluded from its own narrowing).
 _FACET_BRANCHES = (
@@ -731,18 +750,22 @@ def _search_filter_clauses(
     return dim_clauses, always_clauses
 
 
-def build_search_match_temp(q=None, q_variants=None, db=None):
+def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
     """CREATE TEMP TABLE `matched` (ON COMMIT DROP) holding the q+db match set,
     deduped. This is the single expensive FTS pass; the count and facet queries
     then read this materialized table, so a slow facet can't kill the total and
     the FTS is never computed twice. Caller must run inside a transaction.
+
+    structured=True: q is already a to_tsquery string (boolean mode); count the
+    literal terms with no expansion, so the total matches the boolean result list.
     """
+    cte = _SEARCH_MATCH_CTE_STRUCTURED if structured else _SEARCH_MATCH_CTE
     # Only the columns the count + facet + filter queries actually read. Notably
     # NOT title/summary (summary holds full abstracts — tens of MB over a broad
     # match) — those exist in the shared CTE for the result-list path, not here.
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
-        + _SEARCH_MATCH_CTE
+        + cte
         + "\nSELECT accession, updated_at, organisms, countries,"
         + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"

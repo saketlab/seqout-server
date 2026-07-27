@@ -4971,7 +4971,7 @@ def _search_filtered(
 
 
 def _compute_search_facets(
-    q: str, db: str | None, **filters
+    q: str, db: str | None, structured_tsq: str | None = None, **filters
 ) -> tuple[dict[str, list[dict]], int | None]:
     """Exact result total and per-filter facet counts for a query.
 
@@ -4988,7 +4988,9 @@ def _compute_search_facets(
     total: int | None = None
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(q)
+            # Boolean mode: count the literal to_tsquery, no Neo4j expansion, so
+            # the header total matches the boolean result list.
+            q_variants = None if structured_tsq else _search_query_variants(q)
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Match /search's ceiling so broad-query totals materialize
@@ -4996,7 +4998,10 @@ def _compute_search_facets(
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     # Single FTS pass: materialize the match set, then reuse it.
                     msql, mparams = build_search_match_temp(
-                        q=q, q_variants=q_variants, db=db
+                        q=structured_tsq or q,
+                        q_variants=q_variants,
+                        db=db,
+                        structured=structured_tsq is not None,
                     )
                     cur.execute(msql, mparams)
                     # Total: cheap count over the materialized set. Computed before
@@ -5008,7 +5013,9 @@ def _compute_search_facets(
                     # (trailing partial word), rebuild the temp with a prefix
                     # core_q and recount, so the header count and sidebar agree
                     # with /search's result list, which does the same fallback.
-                    if not total and _prefix_eligible(q):
+                    # Skipped in boolean mode: the prefix trick rewrites a plainto
+                    # core_q and would corrupt a to_tsquery.
+                    if not structured_tsq and not total and _prefix_eligible(q):
                         pmsql = _prefixed_sql(msql)
                         if pmsql is not None:
                             cur.execute("DROP TABLE matched")
@@ -5052,6 +5059,7 @@ def search_facets(
     response: Response,
     q: str = Query(..., min_length=1, max_length=500),
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
+    structured: bool = Query(False),
     organism: str | None = Query(None),
     country: list[str] | None = Query(None),
     library_strategy: list[str] | None = Query(None),
@@ -5064,9 +5072,29 @@ def search_facets(
 ):
     t0 = time.perf_counter()
     nq = _replace_query_hyphens(q)
+    has_filter = bool(
+        organism
+        or country
+        or library_strategy
+        or instrument_model
+        or platform
+        or journal
+        or multi_platform
+        or year_from is not None
+        or year_to is not None
+    )
+    # Boolean/structured query -> count the literal to_tsquery so the header total
+    # matches the boolean result list. Same gate as /search's boolean path (no db,
+    # no filters); tsq == "" means nothing usable survived, so treat as ordinary.
+    boolean_tsq = None
+    if not db and not has_filter and (structured or is_boolean_query(nq)):
+        _tsq = to_tsquery_string(nq)
+        if _tsq:
+            boolean_tsq = _tsq
     cache_key = (
         nq,
         db,
+        boolean_tsq is not None,
         organism,
         tuple(sorted(country or [])),
         tuple(sorted(library_strategy or [])),
@@ -5090,6 +5118,7 @@ def search_facets(
     facets, total = _compute_search_facets(
         nq,
         db,
+        structured_tsq=boolean_tsq,
         organism=organism,
         country=country,
         library_strategy=library_strategy,
@@ -5107,18 +5136,13 @@ def search_facets(
     # cache_key so repeat typo searches stay fast. Only when unfiltered: /search's
     # filtered path (_search_filtered) doesn't auto-correct, so correcting facets
     # under an active filter would desync the count/rail from the result list.
-    has_filter = bool(
-        organism
-        or country
-        or library_strategy
-        or instrument_model
-        or platform
-        or journal
-        or multi_platform
-        or year_from is not None
-        or year_to is not None
-    )
-    if not has_filter and total is not None and total <= _SUGGESTION_THRESHOLD:
+    # Skipped in boolean mode: operators are deliberate, /search doesn't correct them.
+    if (
+        boolean_tsq is None
+        and not has_filter
+        and total is not None
+        and total <= _SUGGESTION_THRESHOLD
+    ):
         _suggestions = _get_suggestions(nq)
         _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
