@@ -492,13 +492,15 @@ LIMIT 200;
 """
 
 
-# Structured/boolean queries: reuse SEARCH_SQL verbatim but swap the plainto CTE
-# for a literal to_tsquery on BOTH core_q and match_q (no Neo4j-expanded OR-union
-# -- the user's exact terms only). Derived by string-replace so the 7-source union
-# body can never drift from the normal path. Both %s slots stay, so the positional
-# param tuple is just (tsquery_str, tsquery_str, cursor_rank, cursor_rank, acc, offset).
-SEARCH_STRUCTURED_SQL = SEARCH_SQL.replace(
-    """    SELECT plainto_tsquery('english', %s) AS core_q,
+# --- Boolean/structured queries -------------------------------------------------
+# Every FTS path shares one CTE header: plainto_tsquery core_q + a Neo4j-expanded
+# OR-union match_q. Boolean mode swaps that header for a literal to_tsquery on both
+# core_q and match_q (the user's exact terms, no expansion). structured_search_sql()
+# does the swap on ANY search SQL so the 7-source union body never drifts. Two param
+# styles: positional %s (unified/per-source SQL) and named %(q)s (filtered/sorted
+# builders). After the swap both tsquery slots read the same q, so positional params
+# become (tsq, tsq, ...) and named params just need q = tsq (q_variants unused).
+_PLAINTO_HEADER_POS = """    SELECT plainto_tsquery('english', %s) AS core_q,
            (
                SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
                FROM (
@@ -507,10 +509,25 @@ SEARCH_STRUCTURED_SQL = SEARCH_SQL.replace(
                    WHERE btrim(term) <> ''
                ) parsed_terms
                WHERE term_q::text <> ''
-           ) AS match_q""",
-    """    SELECT to_tsquery('english', %s) AS core_q,
-           to_tsquery('english', %s) AS match_q""",
+           ) AS match_q"""
+_TSQUERY_HEADER_POS = """    SELECT to_tsquery('english', %s) AS core_q,
+           to_tsquery('english', %s) AS match_q"""
+_PLAINTO_HEADER_NAMED = _PLAINTO_HEADER_POS.replace("%s", "%(q)s").replace(
+    "unnest(%(q)s::text[])", "unnest(%(q_variants)s::text[])"
 )
+_TSQUERY_HEADER_NAMED = _TSQUERY_HEADER_POS.replace("%s", "%(q)s")
+
+
+def structured_search_sql(sql):
+    """Swap a search SQL's plainto+expansion CTE header for a literal to_tsquery
+    (boolean mode). Handles both positional and named param styles; a no-op if the
+    header isn't present."""
+    return sql.replace(_PLAINTO_HEADER_POS, _TSQUERY_HEADER_POS).replace(
+        _PLAINTO_HEADER_NAMED, _TSQUERY_HEADER_NAMED
+    )
+
+
+SEARCH_STRUCTURED_SQL = structured_search_sql(SEARCH_SQL)
 
 
 _SEARCH_MATCH_CTE = """
@@ -626,24 +643,9 @@ matched AS (
 )
 """
 
-# Boolean-mode twin of the match CTE, for the facet/count path: literal
-# to_tsquery on both core_q and match_q (no expansion OR-union), so the header
-# total counts the SAME set the boolean result list returns. Derived by
-# string-replace so the union body stays in lockstep with _SEARCH_MATCH_CTE.
-_SEARCH_MATCH_CTE_STRUCTURED = _SEARCH_MATCH_CTE.replace(
-    """    SELECT plainto_tsquery('english', %(q)s) AS core_q,
-           (
-               SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
-               FROM (
-                   SELECT plainto_tsquery('english', term) AS term_q
-                   FROM unnest(%(q_variants)s::text[]) AS terms(term)
-                   WHERE btrim(term) <> ''
-               ) parsed_terms
-               WHERE term_q::text <> ''
-           ) AS match_q""",
-    """    SELECT to_tsquery('english', %(q)s) AS core_q,
-           to_tsquery('english', %(q)s) AS match_q""",
-)
+# Boolean-mode twin of the match CTE, for the facet/count path, so the header
+# total counts the SAME set the boolean result list returns.
+_SEARCH_MATCH_CTE_STRUCTURED = structured_search_sql(_SEARCH_MATCH_CTE)
 
 # Each sidebar facet, with the column it unnests/derives and the filter-dimension
 # key it represents (so it can be excluded from its own narrowing).

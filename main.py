@@ -164,6 +164,7 @@ from queries import (
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
     SEARCH_STRUCTURED_SQL,
+    structured_search_sql,
     SIMILAR_STUDIES_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_BOUNDS_COUNTS_SQL,
@@ -4555,6 +4556,18 @@ _SEARCH_SQL_BY_DB = {
 }
 
 
+def _boolean_source_sql(db: str | None) -> str:
+    """The positional-param search SQL for a source (or all sources), for the
+    boolean path to swap into a to_tsquery via structured_search_sql()."""
+    if db is None:
+        return SEARCH_SQL
+    if db == "geo":
+        return GEO_SEARCH_SQL
+    if db == "sra":
+        return SRA_SEARCH_SQL
+    return _SEARCH_SQL_BY_DB[db]
+
+
 @api_app.get(
     "/search",
     summary="Search all databases",
@@ -4622,12 +4635,30 @@ def search(
     if not q and not has_filter:
         raise HTTPException(400, "provide a query (q) or at least one filter")
 
+    # Boolean/structured query: ("a" OR "b") (c OR d) e* -> literal to_tsquery, no
+    # Neo4j expansion, no spelling correction. Works across filters, sort, and db
+    # scope. tsq == "" means nothing usable survived translation (e.g. a lone "*"),
+    # so treat it as an ordinary query.
+    boolean_tsq = None
+    if q and (structured or is_boolean_query(q)):
+        _tsq = to_tsquery_string(_replace_query_hyphens(q))
+        if _tsq:
+            boolean_tsq = _tsq
+
     # Sidebar-filtered search: server-side filters, paginated over the same match
     # set as the facets so list and counts agree. Honors sortby (default
     # relevance) so filtered results order the same as unfiltered.
     if has_filter:
         return _search_filtered(
-            q, db, cursor_rank, cursor_acc, sidebar_filters, offset, sortby, order
+            q,
+            db,
+            cursor_rank,
+            cursor_acc,
+            sidebar_filters,
+            offset,
+            sortby,
+            order,
+            boolean_tsq=boolean_tsq,
         )
 
     # Skip accession shortcut when paging (offset > 0): it returns a fixed small
@@ -4640,17 +4671,6 @@ def search(
     original_q = _replace_query_hyphens(q)
     q = original_q
 
-    # Boolean/structured query: ("a" OR "b") (c OR d) e* -> literal to_tsquery, no
-    # Neo4j expansion, no spelling correction. Only the unified relevance path
-    # (no sortby, no db scope) for now; a boolean query with sortby/db falls back
-    # to the ordinary plainto path. tsq == "" means nothing usable survived
-    # translation (e.g. a lone "*"), so treat it as an ordinary query.
-    boolean_tsq = None
-    if not sortby and not db and (structured or is_boolean_query(q)):
-        tsq = to_tsquery_string(q)
-        if tsq:
-            boolean_tsq = tsq
-
     # First-page unfiltered searches are cacheable (filtered/accession returned above).
     results_cache_key = None
     if (
@@ -4659,7 +4679,7 @@ def search(
         and cursor_sort is None
         and not offset
     ):
-        results_cache_key = (q, db, sortby, order)
+        results_cache_key = (q, db, sortby, order, boolean_tsq is not None)
         with _search_results_cache_lock:
             _cached_results = _get_bounded_cache_entry(
                 _search_results_cache, results_cache_key, float("inf")
@@ -4675,17 +4695,34 @@ def search(
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     # No _run_search: its trailing-prefix fallback rewrites a
                     # plainto core_q and would corrupt a to_tsquery.
-                    cur.execute(
-                        SEARCH_STRUCTURED_SQL,
-                        (
-                            boolean_tsq,
-                            boolean_tsq,
-                            cursor_rank,
-                            cursor_rank,
-                            cursor_acc,
-                            offset,
-                        ),
-                    )
+                    if sortby:
+                        # Sorted paths carry a real total_count (COUNT() OVER) and a
+                        # sort_val cursor; boolean just swaps the CTE header + params.
+                        sql, params = build_sorted_search_sql(
+                            q=boolean_tsq,
+                            q_variants=[boolean_tsq],
+                            sortby=sortby,
+                            order=order,
+                            db=db,
+                            cursor_sort=cursor_sort,
+                            cursor_acc=cursor_acc,
+                            offset=offset,
+                        )
+                        cur.execute(structured_search_sql(sql), params)
+                    else:
+                        # db None -> all sources (SEARCH_SQL); else the source's SQL.
+                        base = _boolean_source_sql(db)
+                        cur.execute(
+                            structured_search_sql(base),
+                            (
+                                boolean_tsq,
+                                boolean_tsq,
+                                cursor_rank,
+                                cursor_rank,
+                                cursor_acc,
+                                offset,
+                            ),
+                        )
                     rows = cur.fetchall()
                     _enrich_with_publications(rows, cur)
         except PgSyntaxError:
@@ -4704,6 +4741,8 @@ def search(
             "next_cursor": (
                 None
                 if not rows
+                else {"sort_value": rows[-1].get("sort_val"), "accession": rows[-1]["accession"]}
+                if sortby
                 else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
             ),
         }
@@ -4920,11 +4959,22 @@ def search(
 
 
 def _search_filtered(
-    q, db, cursor_rank, cursor_acc, filters, offset=None, sortby=None, order="desc"
+    q,
+    db,
+    cursor_rank,
+    cursor_acc,
+    filters,
+    offset=None,
+    sortby=None,
+    order="desc",
+    boolean_tsq=None,
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
-    next_cursor). q may be empty -- a filter-only (query-less) search."""
+    next_cursor). q may be empty -- a filter-only (query-less) search.
+
+    boolean_tsq set -> boolean mode: FTS uses the literal to_tsquery (no Neo4j
+    expansion), so filtered results match the boolean facet counts."""
     query_less = not q  # no FTS to narrow -> can scan broadly; bound its runtime
     q = _replace_query_hyphens(q) if q else ""
     start = time.perf_counter()
@@ -4934,9 +4984,13 @@ def _search_filtered(
             # ends (even on timeout) and never leaks into the pooled connection.
             if query_less:
                 conn.execute("SET LOCAL statement_timeout = '60s'")
-            q_variants = _search_query_variants(q) if q else []
+            if boolean_tsq:
+                fts_q, q_variants = boolean_tsq, [boolean_tsq]
+            else:
+                fts_q = q
+                q_variants = _search_query_variants(q) if q else []
             sql, params = build_search_results(
-                q=q,
+                q=fts_q,
                 q_variants=q_variants,
                 db=db,
                 cursor_rank=cursor_rank,
@@ -4946,10 +5000,14 @@ def _search_filtered(
                 order=order,
                 **filters,
             )
+            if boolean_tsq:
+                sql = structured_search_sql(sql)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 _enrich_with_publications(rows, cur)
+    except PgSyntaxError:
+        raise HTTPException(400, "could not parse boolean query")
     except QueryCanceled:
         raise HTTPException(
             504, "query-less search timed out; add a query term or a narrower filter"
@@ -5084,10 +5142,11 @@ def search_facets(
         or year_to is not None
     )
     # Boolean/structured query -> count the literal to_tsquery so the header total
-    # matches the boolean result list. Same gate as /search's boolean path (no db,
-    # no filters); tsq == "" means nothing usable survived, so treat as ordinary.
+    # matches the boolean result list. Applies with db scope and sidebar filters
+    # too (build_search_match_temp respects db; the total/facet builders apply the
+    # filters). tsq == "" means nothing usable survived, so treat as ordinary.
     boolean_tsq = None
-    if not db and not has_filter and (structured or is_boolean_query(nq)):
+    if structured or is_boolean_query(nq):
         _tsq = to_tsquery_string(nq)
         if _tsq:
             boolean_tsq = _tsq
