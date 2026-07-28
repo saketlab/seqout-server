@@ -5299,6 +5299,30 @@ def build_country_accessions_sql(
     return sql + ";", params
 
 
+# Senior-author attribution: the LAST author of the linked publication, which is
+# the PI by convention. Verified on PMID 35389779 (Yazar et al., Science), whose
+# last author is the corresponding PI.
+#
+# The contributor-list fallback used by _PI_AUTHORS_CTE is deliberately absent
+# here. Measured over 20,192 GEO series that have >=3 contributors AND a linked
+# paper, the LAST GEO contributor is the paper's senior author only 38.5% of the
+# time (the FIRST contributor: 19.4%) -- GEO contributor order is submitter order,
+# not author order. Including those rows would put a wrong name on ~6 of every 10
+# fallback projects, so a PI ranking uses publications only and reports the
+# reduced coverage via covered_projects instead of guessing.
+_PI_SENIOR_AUTHORS_CTE = """
+authors AS (
+    SELECT p.canonical_accession, p.pmid, p.center_name,
+           btrim(
+               (string_to_array(m.authors, ','))[
+                   array_length(string_to_array(m.authors, ','), 1)
+               ]
+           ) AS pi
+    FROM proj p
+    JOIN pubmed_metadata m ON m.pmid = p.pmid
+    WHERE m.authors IS NOT NULL AND btrim(m.authors) <> ''
+)"""
+
 # Investigator attribution, shared by the country ranking and the search ranking
 # so the two can't drift. Expects a preceding `proj` CTE exposing
 # (canonical_accession, pmid, center_name). An investigator is any author of the
@@ -5336,7 +5360,11 @@ SELECT
     count(DISTINCT a.canonical_accession) AS n_projects,
     count(DISTINCT a.pmid) AS n_papers,
     mode() WITHIN GROUP (ORDER BY a.center_name) AS center_name,
-    (SELECT count(DISTINCT canonical_accession) FROM authors) AS covered_projects
+    (SELECT count(DISTINCT canonical_accession) FROM authors) AS covered_projects,
+    -- projects left after country/filters, i.e. the honest denominator for
+    -- covered_projects. Without it a country query reports the *global* match
+    -- count and the coverage ratio looks far worse than it is.
+    (SELECT count(*) FROM proj) AS scoped_projects
 FROM authors a
 WHERE a.pi LIKE '%% %%'
 GROUP BY a.pi
@@ -5371,7 +5399,10 @@ WITH proj AS (
 
 
 def build_search_investigators_sql(
-    limit: int = 50, country: str | None = None, **filters
+    limit: int = 50,
+    country: str | None = None,
+    senior_only: bool = True,
+    **filters,
 ) -> tuple[str, dict]:
     """Rank investigators across the materialized `matched` temp table -- i.e. the
     investigators behind an arbitrary full-text search, not a map region.
@@ -5380,6 +5411,11 @@ def build_search_investigators_sql(
     this field" for any query, instead of forcing a caller to fan out thousands of
     per-project lookups. Reads `matched` (built by build_search_match_temp, so it
     inherits boolean/structured queries and the db scope).
+
+    senior_only (default): rank by the publication's LAST author -- the PI. This
+    is the honest reading of "top investigators"; counting every author instead
+    ranks prolific lab members above the PI who leads them. Pass senior_only=False
+    for the every-contributor tally.
 
     Two joins that look wrong but aren't:
       * unified_metadata is joined on IN (dedup_key, accession). Neither alone is
@@ -5414,7 +5450,7 @@ proj AS (
       ON u.canonical_accession IN (s.dedup_key, s.accession)
     {country_where}
 ),
-{_PI_AUTHORS_CTE}
+{_PI_SENIOR_AUTHORS_CTE if senior_only else _PI_AUTHORS_CTE}
 {_PI_RANK_TAIL.format(limit="%(pi_limit)s")}""",
         params,
     )

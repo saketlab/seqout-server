@@ -5263,17 +5263,28 @@ def search_facets(
         "contributors project by project. "
         "`q` accepts the same syntax as /search, including boolean operators. "
         "`country` is a normalised country name such as 'United States' or "
-        "'China' -- do NOT pass raw facet values like 'USA', which are per-source "
+        "'India' -- do NOT pass raw facet values like 'USA', which are per-source "
         "text and cover only part of the set. "
-        "An investigator is any author of a project's linked publication, or a "
-        "GEO/ArrayExpress contributor when the project has no linked PMID; so "
-        "co-authors rank alongside senior authors, and `center_name` is the "
-        "project's centre, not the person's own affiliation. "
-        "`covered_projects` is how many matched projects had attributable "
-        "investigators -- compare it to `matched_projects` before trusting a "
-        "ranking, since projects with no publication and no contributor list are "
-        "invisible here. "
-        "Returns {investigators, matched_projects, covered_projects, total, took_ms}."
+        "By default this ranks each project's SENIOR author (the last author of "
+        "the linked publication), which is the PI. Projects with no linked "
+        "publication are excluded, because deposit contributor lists are in "
+        "submitter order, not author order, and name the senior author only ~38% "
+        "of the time. Pass senior_only=false to instead count every author and "
+        "contributor -- higher coverage, but prolific lab members then outrank the "
+        "PIs they work for. "
+        "`center_name` is the project's centre, not the person's own affiliation. "
+        "Counts are computed over the COMPLETE match set, not a page, so the "
+        "ranking is exact -- there is no need to page results and tally them "
+        "yourself. `limit` only truncates the returned list. "
+        "Denominators: `matched_projects` is the whole query match, "
+        "`scoped_projects` is what survives country/filters, and "
+        "`covered_projects` is how many of those had an attributable "
+        "investigator. Report scoped_projects and covered_projects when "
+        "summarising, and treat a ranking as weak when coverage is small. "
+        "This counts public data deposits, not papers or funding: a PI who "
+        "publishes using other groups' data will not appear. "
+        "Returns {investigators, matched_projects, scoped_projects, "
+        "covered_projects, senior_only, total, took_ms}."
     ),
     operation_id="get_search_investigators",
 )
@@ -5285,6 +5296,9 @@ def get_search_investigators(
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
     structured: bool = Query(False),
     country: str | None = Query(None, description="Normalised country name"),
+    senior_only: bool = Query(
+        True, description="Rank last authors (PIs). False counts every author."
+    ),
     organism: str | None = Query(None),
     library_strategy: list[str] | None = Query(None),
     library_source: list[str] | None = Query(None),
@@ -5338,7 +5352,10 @@ def get_search_investigators(
                     matched_projects = cur.fetchone()["n"]
 
                     sql, params = build_search_investigators_sql(
-                        limit=limit, country=country, **filters
+                        limit=limit,
+                        country=country,
+                        senior_only=senior_only,
+                        **filters,
                     )
                     cur.execute(sql, params)
                     rows = cur.fetchall()
@@ -5349,6 +5366,7 @@ def get_search_investigators(
         raise HTTPException(500, "Internal server error")
 
     covered = rows[0]["covered_projects"] if rows else 0
+    scoped = rows[0]["scoped_projects"] if rows else 0
     response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
     return {
         "investigators": [
@@ -5361,7 +5379,9 @@ def get_search_investigators(
             for r in rows
         ],
         "matched_projects": matched_projects,
+        "scoped_projects": scoped,
         "covered_projects": covered,
+        "senior_only": senior_only,
         "total": len(rows),
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
