@@ -630,8 +630,12 @@ all_matches AS (
 -- dedups only within the requested source (accessions are unique there, so no
 -- double-count is reintroduced); the unified db IS NULL path is unchanged.
 deduped AS (
+    -- dedup_key is carried through because it IS unified_metadata.canonical_accession
+    -- (COALESCE(alias, accession) for SRA/AE, accession elsewhere). ~170k SRA studies
+    -- are canonicalised to their GSE alias, so joining unified_metadata on `accession`
+    -- would drop them; the investigator ranking joins on dedup_key instead.
     SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, countries,
+        accession, dedup_key, title, summary, updated_at, organisms, countries,
         instrument_models, library_strategies, platforms, library_sources,
         source, rank
     FROM all_matches
@@ -769,7 +773,7 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
-        + "\nSELECT accession, updated_at, organisms, countries,"
+        + "\nSELECT accession, dedup_key, updated_at, organisms, countries,"
         + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"
     )
@@ -5295,28 +5299,11 @@ def build_country_accessions_sql(
     return sql + ";", params
 
 
-def build_country_pis_sql(
-    country: str,
-    organism: str | None = None,
-    assay_l2: str | None = None,
-    limit: int = 200,
-) -> tuple[str, list]:
-    """Rank investigators for a country, counting every author of a linked
-    publication. Projects with no linked pmid fall back to their contributor
-    list: GEO series contributors or ArrayExpress authors.
-
-    Authors are unnested, so project/paper counts use DISTINCT. `covered_projects`
-    is the distinct projects that yielded at least one investigator.
-    """
-    where, params = _country_scope_conditions(country, organism, assay_l2, alias="u")
-    params.append(limit)
-    return (
-        f"""
-WITH proj AS (
-    SELECT u.canonical_accession, u.pmid, u.center_name
-    FROM unified_metadata u
-    WHERE {where}
-),
+# Investigator attribution, shared by the country ranking and the search ranking
+# so the two can't drift. Expects a preceding `proj` CTE exposing
+# (canonical_accession, pmid, center_name). An investigator is any author of the
+# linked publication; projects with no pmid fall back to their contributor list.
+_PI_AUTHORS_CTE = """
 authors AS (
     -- investigators from the linked publication
     SELECT p.canonical_accession, p.pmid, p.center_name, btrim(a.author) AS pi
@@ -5337,7 +5324,13 @@ authors AS (
     JOIN arrayexpress_experiments x ON x.accession = p.canonical_accession
     CROSS JOIN LATERAL unnest(x.authors) AS c(name)
     WHERE p.pmid IS NULL
-)
+)"""
+
+# Ranking tail for _PI_AUTHORS_CTE. Authors are unnested, so project/paper counts
+# use DISTINCT. `covered_projects` is the distinct projects that yielded at least
+# one investigator -- the honest denominator for "how much of the set is attributed".
+# `{limit}` is the caller's placeholder, so positional and named param styles both work.
+_PI_RANK_TAIL = """
 SELECT
     a.pi,
     count(DISTINCT a.canonical_accession) AS n_projects,
@@ -5348,8 +5341,81 @@ FROM authors a
 WHERE a.pi LIKE '%% %%'
 GROUP BY a.pi
 ORDER BY n_projects DESC, a.pi
-LIMIT %s;
-""",
+LIMIT {limit};
+"""
+
+
+def build_country_pis_sql(
+    country: str,
+    organism: str | None = None,
+    assay_l2: str | None = None,
+    limit: int = 200,
+) -> tuple[str, list]:
+    """Rank investigators for a country, counting every author of a linked
+    publication. Projects with no linked pmid fall back to their contributor
+    list: GEO series contributors or ArrayExpress authors.
+    """
+    where, params = _country_scope_conditions(country, organism, assay_l2, alias="u")
+    params.append(limit)
+    return (
+        f"""
+WITH proj AS (
+    SELECT u.canonical_accession, u.pmid, u.center_name
+    FROM unified_metadata u
+    WHERE {where}
+),
+{_PI_AUTHORS_CTE}
+{_PI_RANK_TAIL.format(limit="%s")}""",
+        params,
+    )
+
+
+def build_search_investigators_sql(
+    limit: int = 50, country: str | None = None, **filters
+) -> tuple[str, dict]:
+    """Rank investigators across the materialized `matched` temp table -- i.e. the
+    investigators behind an arbitrary full-text search, not a map region.
+
+    This is the aggregation the per-project tools can't do: it answers "who leads
+    this field" for any query, instead of forcing a caller to fan out thousands of
+    per-project lookups. Reads `matched` (built by build_search_match_temp, so it
+    inherits boolean/structured queries and the db scope).
+
+    Two joins that look wrong but aren't:
+      * unified_metadata is joined on IN (dedup_key, accession). Neither alone is
+        enough -- ~170k SRA studies canonicalise to their GSE alias (dedup_key),
+        while other matched rows are keyed by their own accession. Using both
+        covers 92% of a broad match set vs 75%/89% for either alone.
+      * `country` filters unified_metadata.country, NOT matched.countries. The
+        latter is raw per-source text where 'USA' and 'United States' are distinct
+        values, so an exact filter silently returns a fraction of the real set.
+        u.country is normalised, and matches get_country_pis' semantics.
+
+    Caller must run inside the same transaction that built `matched`.
+    """
+    params: dict = {}
+    dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
+    conds = list(dim_clauses.values()) + always_clauses
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    country_where = ""
+    if country:
+        country_where = " WHERE u.country = %(pi_country)s"
+        params["pi_country"] = country
+    params["pi_limit"] = limit
+    return (
+        f"""
+WITH scoped AS (
+    SELECT accession, dedup_key FROM matched{where}
+),
+proj AS (
+    SELECT DISTINCT u.canonical_accession, u.pmid, u.center_name
+    FROM scoped s
+    JOIN unified_metadata u
+      ON u.canonical_accession IN (s.dedup_key, s.accession)
+    {country_where}
+),
+{_PI_AUTHORS_CTE}
+{_PI_RANK_TAIL.format(limit="%(pi_limit)s")}""",
         params,
     )
 

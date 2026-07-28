@@ -197,6 +197,7 @@ from queries import (
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
     build_search_facets_over_matched,
+    build_search_investigators_sql,
     build_search_match_temp,
     build_search_results,
     build_search_total_over_matched,
@@ -5248,6 +5249,120 @@ def search_facets(
     return {
         "facets": facets,
         "total": total,
+        "took_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
+@api_app.get(
+    "/search/investigators",
+    summary="Rank investigators for a search query",
+    description=(
+        "Rank the investigators behind an arbitrary full-text search, across GEO, "
+        "SRA, ENA, ArrayExpress, GSA, DRA and GEA. Use this for 'who are the top "
+        "people working on X' questions instead of searching and then looking up "
+        "contributors project by project. "
+        "`q` accepts the same syntax as /search, including boolean operators. "
+        "`country` is a normalised country name such as 'United States' or "
+        "'China' -- do NOT pass raw facet values like 'USA', which are per-source "
+        "text and cover only part of the set. "
+        "An investigator is any author of a project's linked publication, or a "
+        "GEO/ArrayExpress contributor when the project has no linked PMID; so "
+        "co-authors rank alongside senior authors, and `center_name` is the "
+        "project's centre, not the person's own affiliation. "
+        "`covered_projects` is how many matched projects had attributable "
+        "investigators -- compare it to `matched_projects` before trusting a "
+        "ranking, since projects with no publication and no contributor list are "
+        "invisible here. "
+        "Returns {investigators, matched_projects, covered_projects, total, took_ms}."
+    ),
+    operation_id="get_search_investigators",
+)
+@limiter.limit("20/minute")
+def get_search_investigators(
+    request: Request,
+    response: Response,
+    q: str = Query(..., min_length=1, max_length=500),
+    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
+    structured: bool = Query(False),
+    country: str | None = Query(None, description="Normalised country name"),
+    organism: str | None = Query(None),
+    library_strategy: list[str] | None = Query(None),
+    library_source: list[str] | None = Query(None),
+    instrument_model: list[str] | None = Query(None),
+    platform: list[str] | None = Query(None),
+    journal: list[str] | None = Query(None),
+    year_from: int | None = Query(None),
+    year_to: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=MAX_COUNTRY_PIS),
+):
+    t0 = time.perf_counter()
+    nq = _replace_query_hyphens(q)
+    if not nq.strip():
+        raise HTTPException(400, "q is required")
+
+    # Same auto-detect as /search, so a boolean query ranks investigators over the
+    # same set the result list would show. No ontology expansion in that mode.
+    boolean_tsq = None
+    if structured or is_boolean_query(nq):
+        if _tsq := to_tsquery_string(nq):
+            boolean_tsq = _tsq
+
+    filters = {
+        "organism": organism,
+        "library_strategy": library_strategy,
+        "library_source": library_source,
+        "instrument_model": instrument_model,
+        "platform": platform,
+        "journal": journal,
+        "year_from": year_from,
+        "year_to": year_to,
+    }
+
+    try:
+        with pool.connection() as conn:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # Broad queries ("single cell" -> 57k projects) need the same
+                    # ceiling as /search/facets; the pool default of 30s is short.
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    msql, mparams = build_search_match_temp(
+                        q=boolean_tsq or nq,
+                        q_variants=(
+                            None if boolean_tsq else _search_query_variants(nq)
+                        ),
+                        db=db,
+                        structured=boolean_tsq is not None,
+                    )
+                    cur.execute(msql, mparams)
+                    cur.execute("SELECT count(*)::int AS n FROM matched")
+                    matched_projects = cur.fetchone()["n"]
+
+                    sql, params = build_search_investigators_sql(
+                        limit=limit, country=country, **filters
+                    )
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+    except PgSyntaxError:
+        raise HTTPException(400, "could not parse boolean query")
+    except Exception:
+        logger.exception("Database error in get_search_investigators")
+        raise HTTPException(500, "Internal server error")
+
+    covered = rows[0]["covered_projects"] if rows else 0
+    response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
+    return {
+        "investigators": [
+            {
+                "name": r["pi"],
+                "n_projects": r["n_projects"],
+                "n_papers": r["n_papers"],
+                "center_name": r["center_name"],
+            }
+            for r in rows
+        ],
+        "matched_projects": matched_projects,
+        "covered_projects": covered,
+        "total": len(rows),
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
 
@@ -10651,6 +10766,7 @@ MCP_OPERATION_IDS = {
     "search_structured",
     "search_by_author",
     "search_author_projects",
+    "get_search_investigators",
     "get_project",
     "get_project_metadata",
     "get_project_metadata_rows",
