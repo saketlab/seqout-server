@@ -9429,13 +9429,68 @@ def search_structured(
     return _execute_structured(sql, params, count_by)
 
 
+def _sequence_bearing(acc: str) -> bool:
+    """Does this accession name a study that can carry FASTQ/raw runs?"""
+    a = acc.upper()
+    return a.startswith(("SRP", "ERP", "DRP")) or a.startswith("PRJ")
+
+
+def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
+    """Sequence-bearing studies reachable from this project's publication.
+
+    Many GEO series carry no SRA cross-reference at all (~180k have a PMID but no
+    alias), yet the paper they belong to does have an SRA study -- so the FASTQs
+    exist and are simply unreachable by following links. Resolving through the
+    shared PMID recovers ~10.7k of those.
+
+    This is an INFERENCE, not a cross-reference: a PMID names a paper, and a paper
+    can describe several studies (one GEO series resolves to 29). Rows are tagged
+    source='pmid' and carry `via_pmid` so callers can label the provenance and,
+    when several come back, let the user choose rather than guessing.
+    """
+    cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": [accession]})
+    pmids = [r["pmid"] for r in cur.fetchall() if r.get("pmid")]
+    if not pmids:
+        return []
+
+    out: list[dict] = []
+    for pmid in dict.fromkeys(pmids):  # de-dup, keep order
+        cur.execute(
+            PROJECTS_BY_PMID_SQL,
+            {"pmid": pmid, "pmid_json": json.dumps([{"pmid": pmid}])},
+        )
+        for row in cur.fetchall():
+            acc = row.get("accession")
+            if not acc or acc in seen or acc == accession:
+                continue
+            if not _sequence_bearing(acc):
+                continue
+            seen.add(acc)
+            out.append(
+                {
+                    "accession": acc,
+                    "link_type": "SRA (via publication)",
+                    "source": "pmid",
+                    "via_pmid": pmid,
+                    "title": row.get("title"),
+                }
+            )
+    return out
+
+
 @api_app.get(
     "/project/{accession}/xref",
     summary="Cross-reference lookup across archives",
     description=(
         "Discover cross-references for a study across GEO, SRA, ArrayExpress and ENA "
         "by following cross-reference links, SRA aliases, and E-GEOD naming conventions. "
-        "Returns {accession: string, xref: [{accession, link_type, source}]}."
+        "When a project has no direct link to a sequence-bearing study, this also "
+        "resolves through its publication (PMID) and returns those with "
+        "source='pmid' and a `via_pmid` field. Those are inferred from a shared "
+        "paper, not declared cross-references, so present them as such -- a paper "
+        "can cover several studies. "
+        "Returns {accession: string, xref: [{accession, link_type, source, "
+        "via_pmid?, title?}]}."
     ),
     operation_id="get_project_xref",
 )
@@ -9450,18 +9505,23 @@ def get_project_xref(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(RELATED_SQL, {"acc": accession})
                 rows = cur.fetchall()
+
+                # Deduplicate by accession (keep first occurrence)
+                seen: set[str] = set()
+                unique = []
+                for row in rows:
+                    acc = row["accession"]
+                    if acc and acc not in seen:
+                        seen.add(acc)
+                        unique.append(row)
+
+                # Only when nothing already links to raw data -- a project with a
+                # real SRA cross-reference needs no inference.
+                if not any(_sequence_bearing(r["accession"]) for r in unique):
+                    unique.extend(_pmid_xref_fallback(cur, accession, seen))
     except Exception:
         logger.exception("Database error in get_project_xref")
         raise HTTPException(500, "Internal server error")
-
-    # Deduplicate by accession (keep first occurrence)
-    seen = set()
-    unique = []
-    for row in rows:
-        acc = row["accession"]
-        if acc and acc not in seen:
-            seen.add(acc)
-            unique.append(row)
 
     return {"accession": accession, "xref": unique}
 
