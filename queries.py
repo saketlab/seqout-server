@@ -1067,6 +1067,12 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" ORDER BY es.accession)"
         f" LIMIT 3"
     ),
+    # E-GEAD now classifies as "gea" and routes here; the union below stays as a
+    # belt-and-suspenders in case an E-GEAD ever reaches the "ae" arm.
+    "gea": (
+        f"SELECT {_GEA_FIELDS} FROM gea_experiments ge"
+        f" WHERE ge.accession = %(acc)s LIMIT 1"
+    ),
     # without this arm every E-GEAD accession is a silent zero
     "ae": (
         f"SELECT {_AE_FIELDS} FROM arrayexpress_experiments ae"

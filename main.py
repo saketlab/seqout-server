@@ -229,6 +229,7 @@ BIOSAMPLE_PATTERN = re.compile(r"^SAM[A-Z]+\d+$", re.IGNORECASE)
 AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
 # "GEAD" is four letters, so E-GEAD-N also matches AE_PATTERN: always test GEA first.
 _GEA_PREFIX = r"[Ee]-[Gg][Ee][Aa][Dd]-"
+GEA_PATTERN = re.compile(rf"^{_GEA_PREFIX}\d+$")
 PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
 # GSA (CNCB-NGDC) accessions; PRJCA/SAMC already match PRJ/BIOSAMPLE above.
 GSA_STUDY_PATTERN = re.compile(r"^(CRA|HRA)\d+$", re.IGNORECASE)
@@ -2625,6 +2626,8 @@ _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (SAMPLE_PATTERN, "srs"),
     (RUN_PATTERN, "srr"),
     (BIOSAMPLE_PATTERN, "sam"),
+    # GEA before AE: E-GEAD-N also matches AE_PATTERN's E-XXXX-N shape.
+    (GEA_PATTERN, "gea"),
     (AE_PATTERN, "ae"),
     (PRJ_PATTERN, "prj"),
     # GSA accessions reuse the shared kinds: CRA/HRA → prj, CRR/HRR → srr,
@@ -8670,6 +8673,7 @@ _KIND_INFO = {
     "srr": {"entity": "run", "database": "sra"},
     "sam": {"entity": "biosample", "database": "biosample"},
     "ae": {"entity": "experiment", "database": "arrayexpress"},
+    "gea": {"entity": "experiment", "database": "gea"},
     "prj": {"entity": "bioproject", "database": "bioproject"},
 }
 # GSA-native accessions (CRA/CRR/CRX, HRA/HRR/HRS/HRX) all start with C or H;
