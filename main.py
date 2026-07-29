@@ -43,7 +43,7 @@ from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
 from deep_dive import fetch_deep_dive_children, fetch_deep_dive_terms
-from expansions import expand_terms
+from expansions import expand_terms, expand_terms_explained
 from grid_filters import (
     _indexed_accession,
     _jsonb_any_element,
@@ -4550,6 +4550,42 @@ def deep_dive_children(
         raise HTTPException(500, "Internal server error")
     took_ms = (time.perf_counter() - start) * 1000
     return {"term": term.lower(), "children": children, "took_ms": round(took_ms, 2)}
+
+
+@api_app.get(
+    "/search/expansion",
+    summary="Synonym expansion used for a query",
+    description=(
+        "Explain the synonym expansion that a plain-keyword search runs: per query "
+        "term, the synonyms that actually reached the search, and how many that term "
+        "has in total (they differ when the variant cap truncates the expansion). "
+        "Structured/boolean queries are not expanded, so chunks is empty for them. "
+        "Returns {query, structured, variants, variant_cap, chunks: [{term, synonyms, total}], took_ms}."
+    ),
+    operation_id="search_expansion",
+)
+@limiter.limit("100/minute")
+def search_expansion(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=500),
+):
+    start = time.perf_counter()
+    if is_boolean_query(q):
+        return {
+            "query": q,
+            "structured": True,
+            "variants": [q],
+            "variant_cap": 0,
+            "chunks": [],
+            "took_ms": 0.0,
+        }
+    try:
+        result = expand_terms_explained(neo4j_driver, q)
+    except Exception:
+        logger.exception("search_expansion failed for q=%r", q)
+        raise HTTPException(500, "Internal server error")
+    took_ms = (time.perf_counter() - start) * 1000
+    return {**result, "structured": False, "took_ms": round(took_ms, 2)}
 
 
 # db= picks a per-source query instead of filtering the unified one; every source

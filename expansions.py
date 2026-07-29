@@ -105,12 +105,16 @@ def _cross_multiply_variants(
     words: list[str],
     matched_chunks: list[tuple[str, int, int]],
     synonym_map: dict[str, list[str]],
-) -> list[str]:
+) -> tuple[list[tuple[str, tuple[str, ...]]], list[list[str]]]:
     """Build query variants by cross-multiplying synonym sets.
 
     For each matched chunk, we have a set of alternatives (the original +
     all synonyms). Unmatched words stay fixed. We produce the Cartesian
     product across independent chunks, capped at _MAX_QUERY_VARIANTS.
+
+    Returns (variants, chunk_alternatives), where each variant is
+    (text, chosen alternative per chunk). The per-chunk choice is what lets
+    expand_terms_explained() report which synonyms survived the cap.
     """
     from itertools import product
 
@@ -128,13 +132,16 @@ def _cross_multiply_variants(
                 alternatives.append(syn)
         chunk_alternatives.append(alternatives)
 
-    # Build ordered slots
+    # Build ordered slots. chunk_slots[chunk_idx] = index of that chunk's slot, so
+    # a product combo can be read back as "which alternative did chunk i take".
     slots: list[list[str]] = []
+    chunk_slots: list[int] = [0] * len(matched_chunks)
     i = 0
     while i < len(words):
         if i in consumed:
             chunk_idx = consumed[i]
             phrase, start, end = matched_chunks[chunk_idx]
+            chunk_slots[chunk_idx] = len(slots)
             slots.append(chunk_alternatives[chunk_idx])
             i = end  # skip past the entire chunk
         else:
@@ -142,13 +149,13 @@ def _cross_multiply_variants(
             i += 1
 
     # Generate Cartesian product, capped
-    variants: list[str] = []
+    variants: list[tuple[str, tuple[str, ...]]] = []
     for combo in product(*slots):
-        variants.append(" ".join(combo))
+        variants.append((" ".join(combo), tuple(combo[s] for s in chunk_slots)))
         if len(variants) >= _MAX_QUERY_VARIANTS:
             break
 
-    return variants
+    return variants, chunk_alternatives
 
 
 # Split a glued "seq" suffix off a word: atacseq -> atac seq, chipseq -> chip seq.
@@ -229,11 +236,20 @@ def extract_graph_terms(neo4j_driver, query: str) -> list[tuple[str, str]]:
     return [(phrase, name) for _, phrase, name in matched]
 
 
-def expand_terms(neo4j_driver, query: str) -> list[str]:
-    """Return query variants using Neo4j graph-based synonym expansion."""
+def _expand_passes(
+    neo4j_driver, query: str
+) -> tuple[list[tuple[str, int, tuple[str, ...]]], list[list[tuple[str, list[str]]]]]:
+    """Run the expansion and keep the bookkeeping the search itself throws away.
+
+    Returns (records, passes):
+      records = [(variant_text, pass_index, alternative chosen per chunk)]
+      passes  = per pass, [(chunk phrase, its alternatives — original first)]
+    A "pass" is one of the (at most two) rewrites of the query we expand: the
+    query as normalised, and the seq-separated form when it differs.
+    """
     normalized_query = " ".join(query.split())
     if not normalized_query:
-        return []
+        return [], []
 
     # Glue a detached sc/sn assay prefix up front ("sc rna"/"sc-rna" -> "scrna") so
     # the pieces are never matched as separate terms. Otherwise "sc rna" expands
@@ -254,12 +270,14 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
     if separated_query.lower() != normalized_query.lower():
         queries_to_expand.append(separated_query)
 
-    all_variants: list[str] = []
+    variant_records: list[tuple[str, int, tuple[str, ...]]] = []
+    passes: list[list[tuple[str, list[str]]]] = []
 
-    for q in queries_to_expand:
+    for pass_idx, q in enumerate(queries_to_expand):
         words = q.split()
         if not words:
-            all_variants.append(q)
+            passes.append([])
+            variant_records.append((q, pass_idx, ()))
             continue
 
         # Step 1: Generate all contiguous sub-phrase candidates
@@ -283,7 +301,8 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
 
         if not matched_chunks:
             # No term found in the graph; keep the query as-is
-            all_variants.append(q)
+            passes.append([])
+            variant_records.append((q, pass_idx, ()))
             continue
 
         # Step 4: Traverse synonym clusters for matched terms
@@ -302,10 +321,74 @@ def expand_terms(neo4j_driver, query: str) -> list[str]:
             synonym_map[term_key] = synonyms
 
         # Step 5: Cross-multiply to produce all variant combinations
-        chunk_variants = _cross_multiply_variants(words, matched_chunks, synonym_map)
-        all_variants.extend(chunk_variants)
+        chunk_variants, chunk_alternatives = _cross_multiply_variants(
+            words, matched_chunks, synonym_map
+        )
+        passes.append(
+            list(zip([p for p, _, _ in matched_chunks], chunk_alternatives))
+        )
+        for variant, choices in chunk_variants:
+            variant_records.append((variant, pass_idx, choices))
 
-    return _dedupe(all_variants)[:_MAX_QUERY_VARIANTS]
+    return variant_records, passes
+
+
+def expand_terms(neo4j_driver, query: str) -> list[str]:
+    """Return query variants using Neo4j graph-based synonym expansion."""
+    records, _ = _expand_passes(neo4j_driver, query)
+    return _dedupe(v for v, _, _ in records)[:_MAX_QUERY_VARIANTS]
+
+
+def expand_terms_explained(neo4j_driver, query: str) -> dict:
+    """Explain the expansion: which synonyms actually reached the search.
+
+    Same code path as expand_terms(), so what this reports is what ran. Only the
+    synonyms that appear in a surviving variant are listed — a chunk whose
+    alternatives fell past the variant cap reports fewer `synonyms` than `total`.
+    Returns {query, variants, variant_cap, chunks: [{term, synonyms, total}]}.
+    """
+    records, passes = _expand_passes(neo4j_driver, query)
+
+    # Replay expand_terms' dedupe+cap, but keep each survivor's chunk choices.
+    seen: set[str] = set()
+    kept: list[tuple[str, int, tuple[str, ...]]] = []
+    for variant, pass_idx, choices in records:
+        key = variant.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((variant, pass_idx, choices))
+        if len(kept) >= _MAX_QUERY_VARIANTS:
+            break
+
+    used: dict[tuple[int, int], set[str]] = {}
+    for _, pass_idx, choices in kept:
+        for chunk_idx, choice in enumerate(choices):
+            used.setdefault((pass_idx, chunk_idx), set()).add(choice.casefold())
+
+    # Merge the two passes on the graph key, so "atacseq" and "atac seq" are one
+    # chunk in the output instead of two near-identical ones.
+    chunks: dict[str, dict] = {}
+    for pass_idx, chunk_list in enumerate(passes):
+        for chunk_idx, (phrase, alternatives) in enumerate(chunk_list):
+            entry = chunks.setdefault(
+                _graph_norm(phrase), {"term": phrase, "synonyms": [], "total": 0}
+            )
+            survived = used.get((pass_idx, chunk_idx), set())
+            have = {s.casefold() for s in entry["synonyms"]}
+            for alt in alternatives[1:]:  # [0] is the user's own wording
+                if alt.casefold() in survived and alt.casefold() not in have:
+                    have.add(alt.casefold())
+                    entry["synonyms"].append(alt)
+            entry["total"] = max(entry["total"], len(alternatives) - 1)
+
+    return {
+        "query": query,
+        "variants": [v for v, _, _ in kept],
+        "variant_cap": _MAX_QUERY_VARIANTS,
+        # total=0 means the term is in the graph but has no synonyms — nothing to show.
+        "chunks": [c for c in chunks.values() if c["total"]],
+    }
 
 
 if __name__ == "__main__":
@@ -328,4 +411,37 @@ if __name__ == "__main__":
     assert "of" not in phrases
     assert "atlas of liver" in phrases and "atlas of" in phrases
     assert "liver" in phrases and "atlas" in phrases
+
+    # Fake graph: nafld has 2 synonyms, liver has 1. Enough to check that
+    # expand_terms and expand_terms_explained agree on what reached the search.
+    class _FakeDriver:
+        vocab = {"nafld": ["masld", "fatty liver"], "liver": ["hepatic"]}
+
+        def execute_query(self, cypher, **kw):
+            if "RETURN candidate" in cypher:
+                found = [c for c in kw["candidates"] if c.lower() in self.vocab]
+                return [{"candidate": c} for c in found], None, None
+            return (
+                [{"term": t, "synonyms": self.vocab.get(t.lower(), [])} for t in kw["terms"]],
+                None,
+                None,
+            )
+
+    d = _FakeDriver()
+    variants = expand_terms(d, "nafld liver")
+    assert variants[0] == "nafld liver"  # user's own wording always runs first
+    assert len(variants) == 6  # 3 alternatives x 2 alternatives
+    exp = expand_terms_explained(d, "nafld liver")
+    assert exp["variants"] == variants
+    assert [c["term"] for c in exp["chunks"]] == ["nafld", "liver"]
+    assert exp["chunks"][0]["synonyms"] == ["masld", "fatty liver"]
+    assert exp["chunks"][0]["total"] == 2
+
+    # Past the cap, only the synonyms that actually made the cut are reported.
+    _MAX_QUERY_VARIANTS = 2
+    exp = expand_terms_explained(d, "nafld liver")
+    assert len(exp["variants"]) == 2  # nafld liver, nafld hepatic
+    assert exp["chunks"][0]["synonyms"] == []  # no nafld synonym reached the search
+    assert exp["chunks"][0]["total"] == 2  # ...but there were 2 to be had
+    assert exp["chunks"][1]["synonyms"] == ["hepatic"]
     print("ok")
