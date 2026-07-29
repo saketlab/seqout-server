@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-_MAX_QUERY_VARIANTS = 48
+_MAX_QUERY_VARIANTS = 100
 
 # Postgres' `english` snowball stop-word list, verbatim. Many of these are also
 # HGNC gene aliases ("OF" -> BRIP1, "AN"/"AS"/"AT"/"CAN"/"NOT"/"WAS" -> others), so
