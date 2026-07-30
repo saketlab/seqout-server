@@ -998,15 +998,29 @@ def _flat_pub(pmid: str | None, flat_row: dict | None) -> dict | None:
     }
 
 
+_CITATION_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"<>]+")
+
+
+def _doi_from_citation(text: str) -> str | None:
+    """Pull a DOI out of free-text citation, trimming trailing sentence
+    punctuation. The paper may be real (reachable via doi.org) even when PubMed
+    has no record of it, so the UI can still offer a link."""
+    m = _CITATION_DOI_RE.search(text or "")
+    if not m:
+        return None
+    return m.group(0).rstrip(".,;:)]}>'\"") or None
+
+
 def _citation_pub(text: str) -> dict:
     """A submitter-provided GEO <Citation> that never resolved to a PMID. Shown
     as-submitted and flagged so the UI can label it (not a verified PubMed link).
+    Any embedded DOI is surfaced so the UI can still link out.
     """
     return {
         "pmid": None,
         "title": None,
         "journal": None,
-        "doi": None,
+        "doi": _doi_from_citation(text),
         "pub_date": None,
         "authors": None,
         "citation_count": None,
