@@ -92,6 +92,7 @@ from queries import (
     GEO_SAMPLE_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SEARCH_SQL,
+    GEO_SERIES_CITATION_BATCH_SQL,
     GEO_SERIES_CONTRIBUTORS_BATCH_SQL,
     GEO_SERIES_NEIGHBORS_COORDS_SQL,
     GEO_SERIES_SAMPLES_SQL,
@@ -997,6 +998,23 @@ def _flat_pub(pmid: str | None, flat_row: dict | None) -> dict | None:
     }
 
 
+def _citation_pub(text: str) -> dict:
+    """A submitter-provided GEO <Citation> that never resolved to a PMID. Shown
+    as-submitted and flagged so the UI can label it (not a verified PubMed link).
+    """
+    return {
+        "pmid": None,
+        "title": None,
+        "journal": None,
+        "doi": None,
+        "pub_date": None,
+        "authors": None,
+        "citation_count": None,
+        "citation": text,
+        "submitter_provided": True,
+    }
+
+
 def _build_publications(
     pmids: list[str], pubmed_map: dict[str, dict], flat_row: dict | None
 ) -> list[dict] | None:
@@ -1096,9 +1114,12 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     # author fallback when a series has no linked publication.
     geo_accs = [a for a in accessions if a.startswith("GSE")]
     contrib_map: dict[str, list] = {}
+    citation_map: dict[str, list] = {}
     if geo_accs:
         cur.execute(GEO_SERIES_CONTRIBUTORS_BATCH_SQL, {"acc": geo_accs})
         contrib_map = {r["accession"]: r["contributors"] for r in cur.fetchall()}
+        cur.execute(GEO_SERIES_CITATION_BATCH_SQL, {"acc": geo_accs})
+        citation_map = {r["accession"]: r["citation"] for r in cur.fetchall()}
 
     # GSA rows: unified_metadata has none, so their submitter/org come off the
     # linked BioProject — the same place the project page reads them.
@@ -1147,6 +1168,13 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             if built:
                 pubs = built
                 break
+        # Last resort: no candidate (own or linked) resolved to a PMID, but the
+        # submitter left a raw <Citation>. Show it as-submitted, flagged — so a
+        # resolved alias PMID above always wins over unverified submitter text.
+        if pubs is None:
+            cites = citation_map.get(acc)
+            if cites:
+                pubs = [_citation_pub(c) for c in cites if c] or None
         row["publications"] = pubs
         if pubs and len(pubs) > 0:
             primary = pubs[0]

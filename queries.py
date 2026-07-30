@@ -10,41 +10,53 @@ FROM study_publications
 WHERE accession = ANY(%s);
 """
 
+# src_rank encodes publication-source precedence within one accession:
+#   0 = the archive's own native pubmed_id (most authoritative)
+#   1 = pubmed_id_citation (DOI resolved from the submitter's <Citation>)
+#   2 = pubmed_id_pysradb (pysradb's SRA->PubMed elink; can be a citing paper)
+# The GROUP BY keeps the lowest rank per (accession, pmid) and ORDER BY makes the
+# lowest-rank pmid sort first, so it becomes publications[0] / the scalar pmid.
 PMID_VARIANT_BATCH_SQL = """
 SELECT accession, pmid FROM (
-    SELECT accession, unnest(pubmed_id) AS pmid
-        FROM geo_series WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id_pysradb
-        FROM geo_series WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id_pysradb
-        FROM sra_studies WHERE accession = ANY(%(acc)s)
-        -- pysradb stamps a bogus pmid on private-placeholder mirrors
-        -- (title "GEO accession GSExxx is currently private ..."); ~4k of them.
-        -- Their real study has no publication yet, so drop the spurious pmid.
-        AND title NOT ILIKE 'GEO accession %% is currently private%%'
-    UNION
-    SELECT study_accession, pubmed_id_pysradb
-        FROM ena_studies WHERE study_accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id
-        FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id_pysradb
-        FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id_pysradb
-        FROM dra_studies WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id
-        FROM gea_experiments WHERE accession = ANY(%(acc)s)
-    UNION
-    SELECT accession, pubmed_id_pysradb
-        FROM gea_experiments WHERE accession = ANY(%(acc)s)
+    SELECT accession, pmid, min(src_rank) AS src_rank FROM (
+        SELECT accession, unnest(pubmed_id) AS pmid, 0 AS src_rank
+            FROM geo_series WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, unnest(pubmed_id_citation), 1
+            FROM geo_series WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id_pysradb, 2
+            FROM geo_series WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id_pysradb, 2
+            FROM sra_studies WHERE accession = ANY(%(acc)s)
+            -- pysradb stamps a bogus pmid on private-placeholder mirrors
+            -- (title "GEO accession GSExxx is currently private ..."); ~4k of them.
+            -- Their real study has no publication yet, so drop the spurious pmid.
+            AND title NOT ILIKE 'GEO accession %% is currently private%%'
+        UNION ALL
+        SELECT study_accession, pubmed_id_pysradb, 2
+            FROM ena_studies WHERE study_accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id, 0
+            FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id_pysradb, 2
+            FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id_pysradb, 2
+            FROM dra_studies WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id, 0
+            FROM gea_experiments WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT accession, pubmed_id_pysradb, 2
+            FROM gea_experiments WHERE accession = ANY(%(acc)s)
+    ) u
+    WHERE pmid IS NOT NULL AND pmid <> ''
+    GROUP BY accession, pmid
 ) t
-WHERE pmid IS NOT NULL AND pmid <> ''
-ORDER BY accession, pmid;
+ORDER BY accession, src_rank, pmid;
 """
 
 # Rich publication details by pmid, for pmids resolved from the variant tables
@@ -81,6 +93,14 @@ GEO_SERIES_CONTRIBUTORS_BATCH_SQL = """
 SELECT accession, contributors
 FROM geo_series
 WHERE accession = ANY(%(acc)s) AND contributors IS NOT NULL;
+"""
+
+# Raw submitter-provided <Citation> text (DOI/URL/free text) for a GEO series.
+# Last-resort publication display when no candidate resolved to a PMID.
+GEO_SERIES_CITATION_BATCH_SQL = """
+SELECT accession, citation
+FROM geo_series
+WHERE accession = ANY(%(acc)s) AND citation IS NOT NULL;
 """
 
 GEO_SEARCH_SQL = """
