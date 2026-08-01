@@ -8756,7 +8756,52 @@ _KIND_INFO = {
 }
 # GSA-native accessions (CRA/CRR/CRX, HRA/HRR/HRS/HRX) all start with C or H;
 # map those first letters to the gsa archive the way S/E/D map to sra/ena/ddbj.
+#
+# This is ONLY valid for accessions whose leading letter really designates the
+# archive: the INSDC [SED]R? shapes and the GSA C/H ones. Do not apply it to any
+# other shape -- see _archive_of_accession.
 _SED_ARCHIVE = {"S": "ncbi-sra", "E": "ena", "D": "ddbj", "C": "gsa", "H": "gsa"}
+
+# Kinds whose archive is fixed by the kind itself, not by any letter.
+_KIND_ARCHIVE = {
+    "gse": "geo",
+    "gsm": "geo",
+    "ae": "arrayexpress",
+    "gea": "gea",
+}
+
+# BioSample encodes its archive in the THIRD letter, not the first: SAMN is
+# NCBI, SAMEA is EBI/ENA, SAMD is DDBJ, SAMC is GSA. Longest prefix first, so
+# SAMEA is tested before SAMD/SAMN could shadow it.
+_SAM_ARCHIVE = (
+    ("SAMEA", "ena"),
+    ("SAMN", "ncbi-sra"),
+    ("SAMD", "ddbj"),
+    ("SAMC", "gsa"),
+)
+
+
+def _archive_of_accession(acc: str, kind: str, database: str | None) -> str | None:
+    """Which physical archive holds this accession.
+
+    `database` says what kind of record it is (sra, biosample, arrayexpress);
+    `archive` says who actually serves it -- SRP310139 and ERP191813 are both
+    `sra` records but live at NCBI and EBI respectively.
+
+    Order matters. The first-letter _SED_ARCHIVE rule is a last resort because
+    plenty of accessions start with one of those letters without meaning it:
+    E-MTAB-/E-GEAD- begin with "E" (for "Experiment", an ArrayExpress naming
+    convention, not ENA), and every SAM* begins with "S" regardless of archive.
+    """
+    if kind in _KIND_ARCHIVE:
+        return _KIND_ARCHIVE[kind]
+    if kind == "sam":
+        for prefix, archive in _SAM_ARCHIVE:
+            if acc.startswith(prefix):
+                return archive
+        return database
+    # INSDC and GSA shapes: the leading letter is the archive designator.
+    return _SED_ARCHIVE.get(acc[0]) or database
 
 
 @api_app.get(
@@ -8786,7 +8831,7 @@ def classify_accession(
         "kind": kind,
         "entity": info.get("entity"),
         "database": info.get("database"),
-        "archive": _SED_ARCHIVE.get(acc[0]) or info.get("database"),
+        "archive": _archive_of_accession(acc, kind, info.get("database")),
     }
 
 
