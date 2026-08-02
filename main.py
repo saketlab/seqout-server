@@ -212,7 +212,7 @@ from boolean_query import is_boolean_query, to_tsquery_string
 load_dotenv()
 
 
-ENRICHMENT_ENABLED = False
+ENRICHMENT_ENABLED = True
 
 
 _STUDY_PREFIX = r"[SED]RP"
