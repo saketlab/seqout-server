@@ -4653,6 +4653,85 @@ def _boolean_source_sql(db: str | None) -> str:
     return _SEARCH_SQL_BY_DB[db]
 
 
+def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
+    """Auto-run the spelling-corrected query when `result` is a low-result typo.
+
+    Mutates and returns `result`: the corrected results become the paginated
+    stream, the literal-typo matches ride along in `correction.extra_results`.
+    Shared by the filtered and unfiltered paths of /search so a sidebar filter
+    doesn't silently turn auto-correction off.
+
+    `rerun` is every parameter of search() except `request` and `q`. It must be
+    COMPLETE: an omitted parameter falls back to search()'s signature default,
+    which is the FastAPI Query() object rather than the value inside it -- and
+    Query(False) is truthy, so a missing flag reads as True.
+    """
+    # No "did you mean" in boolean mode: the operators are deliberate, so silently
+    # rewriting them would be wrong. A query-less (filter-only) search has nothing
+    # to correct.
+    if boolean_tsq is not None or not original_q:
+        return result
+
+    # total is deferred (None) on the unified path now, so fall back to the
+    # first-page row count as the low-result proxy for "did you mean".
+    total_for_suggest = result.get("total")
+    if total_for_suggest is None:
+        total_for_suggest = len(result.get("results", []))
+    if total_for_suggest > _SUGGESTION_THRESHOLD:
+        return result
+
+    suggestions = _get_suggestions(original_q)
+    corrected_q = suggestions[0]["corrected_query"] if suggestions else None
+    if not corrected_q or corrected_q == original_q:
+        if suggestions:
+            result["suggestions"] = suggestions
+        return result
+
+    # Auto-run the corrected query instead of only suggesting it. Call the
+    # undecorated function (search.__wrapped__) so this internal re-run doesn't
+    # re-enter the rate limiter. Recursion terminates: the corrected term is
+    # in-vocab so it doesn't re-correct.
+    corrected = search.__wrapped__(request, q=corrected_q, **rerun)
+    orig_results = result.get("results", [])
+    if not corrected.get("results"):
+        # Correction didn't help either; fall back to the suggestion link.
+        result["suggestions"] = suggestions
+        return result
+
+    # Corrected results become the paginated stream so offset paging stays clean;
+    # the few literal-typo matches (orig_results) ride in the correction payload
+    # and the client renders them as a separate page-1 block instead of shifting
+    # the 200-row server windows.
+    result["results"] = corrected["results"]
+    result["total"] = corrected.get("total")
+    result["next_cursor"] = corrected.get("next_cursor")
+    # Banner + extras only on the first page; deeper pages are just the paginated
+    # corrected stream. Use explicit None checks so a legitimate cursor_rank/offset
+    # of 0 isn't read as "no cursor".
+    first_page = (
+        rerun["offset"] is None
+        and rerun["cursor_rank"] is None
+        and rerun["cursor_acc"] is None
+        and rerun["cursor_sort"] is None
+    )
+    if first_page:
+        # Drop literal-typo matches that also appear in the corrected page so they
+        # don't render twice (extras block + main list).
+        corrected_accs = {r["accession"] for r in corrected["results"]}
+        extras = [r for r in orig_results if r["accession"] not in corrected_accs]
+        result["correction"] = {
+            "original_query": original_q,
+            "corrected_query": corrected_q,
+            "original_total": total_for_suggest,
+            # Based on orig_results, not extras: the original DID match
+            # (augmented) even if every match also appears in the corrected page
+            # and dedups out of the extras block.
+            "mode": "augmented" if orig_results else "replaced",
+            "extra_results": extras or None,
+        }
+    return result
+
+
 @api_app.get(
     "/search",
     summary="Search all databases",
@@ -4715,6 +4794,23 @@ def search(
     }
     has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
 
+    # Everything search() takes except `request` and `q` — what an auto-correction
+    # re-run must replay. Built once so the filtered and unfiltered paths cannot
+    # drift, and assembled from sidebar_filters so no filter can be forgotten (an
+    # omitted parameter would come back as a truthy Query() object; see
+    # _autocorrect_search).
+    rerun = {
+        "structured": structured,
+        "cursor_rank": cursor_rank,
+        "cursor_acc": cursor_acc,
+        "cursor_sort": cursor_sort,
+        "offset": offset,
+        "db": db,
+        "sortby": sortby,
+        "order": order,
+        **sidebar_filters,
+    }
+
     # q is optional, but only when at least one filter narrows the set -- an
     # unfiltered, query-less search would materialize the whole corpus.
     if not q and not has_filter:
@@ -4734,7 +4830,7 @@ def search(
     # set as the facets so list and counts agree. Honors sortby (default
     # relevance) so filtered results order the same as unfiltered.
     if has_filter:
-        return _search_filtered(
+        filtered = _search_filtered(
             q,
             db,
             cursor_rank,
@@ -4744,6 +4840,16 @@ def search(
             sortby,
             order,
             boolean_tsq=boolean_tsq,
+        )
+        # Same auto-correction as the unfiltered path: a typo is still a typo with
+        # a sidebar filter on, and leaving it uncorrected here made the result
+        # count collapse the moment the user touched a filter.
+        return _autocorrect_search(
+            request,
+            filtered,
+            _replace_query_hyphens(q) if q else "",
+            boolean_tsq,
+            rerun,
         )
 
     # Skip accession shortcut when paging (offset > 0): it returns a fixed small
@@ -4951,84 +5057,7 @@ def search(
             ),
         }
 
-    # total is deferred (None) on the unified path now, so fall back to the
-    # first-page row count as the low-result proxy for "did you mean".
-    total_for_suggest = result.get("total")
-    if total_for_suggest is None:
-        total_for_suggest = len(result.get("results", []))
-    # No "did you mean" in boolean mode: the operators are deliberate, so silently
-    # rewriting them would be wrong.
-    if boolean_tsq is None and total_for_suggest <= _SUGGESTION_THRESHOLD:
-        suggestions = _get_suggestions(original_q)
-        corrected_q = suggestions[0]["corrected_query"] if suggestions else None
-        if corrected_q and corrected_q != original_q:
-            # Auto-run the corrected query instead of only suggesting it. Call the
-            # undecorated function (search.__wrapped__) so this internal re-run
-            # doesn't re-enter the rate limiter. Recursion terminates: the
-            # corrected term is in-vocab so it doesn't re-correct.
-            corrected = search.__wrapped__(
-                request,
-                q=corrected_q,
-                cursor_rank=cursor_rank,
-                cursor_acc=cursor_acc,
-                cursor_sort=cursor_sort,
-                offset=offset,
-                db=db,
-                sortby=sortby,
-                order=order,
-                organism=organism,
-                country=country,
-                library_strategy=library_strategy,
-                library_source=library_source,
-                instrument_model=instrument_model,
-                platform=platform,
-                journal=journal,
-                multi_platform=multi_platform,
-                year_from=year_from,
-                year_to=year_to,
-                date_from=date_from,
-                date_to=date_to,
-            )
-            orig_results = result.get("results", [])
-            if corrected.get("results"):
-                # Corrected results become the paginated stream so offset paging
-                # stays clean; the few literal-typo matches (orig_results) ride in
-                # the correction payload and the client renders them as a separate
-                # page-1 block instead of shifting the 200-row server windows.
-                result["results"] = corrected["results"]
-                result["total"] = corrected.get("total")
-                result["next_cursor"] = corrected.get("next_cursor")
-                # Banner + extras only on the first page; deeper pages are just
-                # the paginated corrected stream. Use explicit None checks so a
-                # legitimate cursor_rank/offset of 0 isn't read as "no cursor".
-                first_page = (
-                    offset is None
-                    and cursor_rank is None
-                    and cursor_acc is None
-                    and cursor_sort is None
-                )
-                if first_page:
-                    # Drop literal-typo matches that also appear in the corrected
-                    # page so they don't render twice (extras block + main list).
-                    corrected_accs = {r["accession"] for r in corrected["results"]}
-                    extras = [
-                        r for r in orig_results if r["accession"] not in corrected_accs
-                    ]
-                    result["correction"] = {
-                        "original_query": original_q,
-                        "corrected_query": corrected_q,
-                        "original_total": total_for_suggest,
-                        # Based on orig_results, not extras: the original DID
-                        # match (augmented) even if every match also appears in
-                        # the corrected page and dedups out of the extras block.
-                        "mode": "augmented" if orig_results else "replaced",
-                        "extra_results": extras or None,
-                    }
-            else:
-                # Correction didn't help either; fall back to the suggestion link.
-                result["suggestions"] = suggestions
-        elif suggestions:
-            result["suggestions"] = suggestions
+    result = _autocorrect_search(request, result, original_q, boolean_tsq, rerun)
 
     # Pin broad (full-page) results until /cache/purge.
     if results_cache_key and len(result.get("results", [])) >= _SEARCH_RESULTS_PAGE:
@@ -5114,7 +5143,11 @@ def _search_filtered(
 
 
 def _compute_search_facets(
-    q: str, db: str | None, structured_tsq: str | None = None, **filters
+    q: str,
+    db: str | None,
+    structured_tsq: str | None = None,
+    extra_variants: list[str] | None = None,
+    **filters,
 ) -> tuple[dict[str, list[dict]], int | None]:
     """Exact result total and per-filter facet counts for a query.
 
@@ -5122,6 +5155,11 @@ def _compute_search_facets(
     the total counts it (reliable) and the facets aggregate it (best-effort).
     `filters` narrow each facet by every *other* active filter (exclude-self);
     the total applies all filters.
+
+    `extra_variants` folds another query's expanded variants into this one's, so
+    the materialized set becomes the UNION of the two match sets (match_q is an
+    OR over every variant). That is what makes an auto-corrected search countable:
+    the user sees the corrected results *plus* the literal-typo extras.
 
     Returns ({facet_name: [{value, count}, ...]}, total). The facets degrade to
     {} on a facet-only timeout while the total survives; a hard failure (the FTS
@@ -5133,7 +5171,12 @@ def _compute_search_facets(
         with pool.connection() as conn:
             # Boolean mode: count the literal to_tsquery, no Neo4j expansion, so
             # the header total matches the boolean result list.
-            q_variants = None if structured_tsq else _search_query_variants(q)
+            if structured_tsq:
+                q_variants = None
+            else:
+                q_variants = _search_query_variants(q)
+                if extra_variants:
+                    q_variants = list(dict.fromkeys(q_variants + extra_variants))
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Match /search's ceiling so broad-query totals materialize
@@ -5216,18 +5259,6 @@ def search_facets(
 ):
     t0 = time.perf_counter()
     nq = _replace_query_hyphens(q)
-    has_filter = bool(
-        organism
-        or country
-        or library_strategy
-        or library_source
-        or instrument_model
-        or platform
-        or journal
-        or multi_platform
-        or year_from is not None
-        or year_to is not None
-    )
     # Boolean/structured query -> count the literal to_tsquery so the header total
     # matches the boolean result list. Applies with db scope and sidebar filters
     # too (build_search_match_temp respects db; the total/facet builders apply the
@@ -5278,25 +5309,25 @@ def search_facets(
         year_to=year_to,
     )
     # Mirror /search's auto-correction: when the original query is a low-result
-    # typo, swap in the corrected query's facets + total so the header count and
-    # the sidebar agree with the auto-corrected result list (which /search
-    # already returns for the corrected term). Cached below under the original
-    # cache_key so repeat typo searches stay fast. Only when unfiltered: /search's
-    # filtered path (_search_filtered) doesn't auto-correct, so correcting facets
-    # under an active filter would desync the count/rail from the result list.
+    # typo, swap in the facets + total for what the corrected search actually
+    # shows. /search runs the correction in "augmented" mode -- the corrected
+    # results are the paginated stream AND the literal-typo matches ride along in
+    # correction.extra_results -- so the count must be over the UNION of both
+    # match sets, not the corrected one alone. Hence extra_variants: counting only
+    # the corrected set undercounts the page by however many extras render.
+    # Cached below under the original cache_key so repeat typo searches stay fast.
+    # Applies with an active filter too -- /search's filtered path auto-corrects
+    # through the same _autocorrect_search, so gating this on `not has_filter`
+    # would desync the count from the list the moment a filter went on.
     # Skipped in boolean mode: operators are deliberate, /search doesn't correct them.
-    if (
-        boolean_tsq is None
-        and not has_filter
-        and total is not None
-        and total <= _SUGGESTION_THRESHOLD
-    ):
+    if boolean_tsq is None and total is not None and total <= _SUGGESTION_THRESHOLD:
         _suggestions = _get_suggestions(nq)
         _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
             c_facets, c_total = _compute_search_facets(
                 _corrected_q,
                 db,
+                extra_variants=_search_query_variants(nq),
                 organism=organism,
                 country=country,
                 library_strategy=library_strategy,

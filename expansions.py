@@ -266,9 +266,19 @@ def _expand_passes(
     )
     separated_query = " ".join(separated_query.split())
 
+    # Punctuation at a token boundary is not part of any graph key: "NSCLC," is
+    # not the term "nsclc". Candidate sub-phrases inherit the whole token, so a
+    # single comma misses at every length and switches expansion off for the
+    # entire query. Expanded as an EXTRA pass rather than in place, so a label
+    # that owns its comma ("carcinoma, non small cell lung" — 12% of :Term) still
+    # anchors as typed; whichever form matches wins, and the two merge on dedupe.
+    depunctuated = " ".join(s for w in normalized_query.split() if (s := w.strip(",;")))
+
+    # The query as typed always leads, so variants[0] stays the user's own wording.
     queries_to_expand = [normalized_query]
-    if separated_query.lower() != normalized_query.lower():
-        queries_to_expand.append(separated_query)
+    for extra in (separated_query, depunctuated):
+        if extra and extra.lower() not in {p.lower() for p in queries_to_expand}:
+            queries_to_expand.append(extra)
 
     variant_records: list[tuple[str, int, tuple[str, ...]]] = []
     passes: list[list[tuple[str, list[str]]]] = []
@@ -436,6 +446,17 @@ if __name__ == "__main__":
     assert [c["term"] for c in exp["chunks"]] == ["nafld", "liver"]
     assert exp["chunks"][0]["synonyms"] == ["masld", "fatty liver"]
     assert exp["chunks"][0]["total"] == 2
+
+    # A comma between two concepts must not switch expansion off: "nafld," is not
+    # a graph key, so nothing matched and the query used to run unexpanded.
+    commaed = expand_terms(d, "nafld, liver")
+    assert commaed[0] == "nafld, liver"  # the query as typed still leads
+    assert set(variants) <= set(commaed)  # the depunctuated pass adds the rest
+    assert set(variants) <= set(expand_terms(d, "nafld; liver"))
+    # Only the token boundary is stripped — punctuation inside a token stays, and
+    # a query that is nothing but punctuation adds no pass (and must not crash).
+    assert expand_terms(d, "cd4/cd8") == ["cd4/cd8"]
+    assert expand_terms(d, " , ; ") == [", ;"]
 
     # Past the cap, only the synonyms that actually made the cut are reported.
     _MAX_QUERY_VARIANTS = 2
