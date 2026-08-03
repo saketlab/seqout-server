@@ -51,9 +51,7 @@ from grid_filters import (
 )
 from queries import (
     AE_EXPERIMENT_SAMPLES_SQL,
-    AE_QUERY_ACCESSIONS_SQL,
     AE_SEARCH_SQL,
-    ALL_QUERY_ACCESSIONS_SQL,
     BATCH_DRA_SAMPLES_SQL,
     BATCH_ENA_SAMPLES_SQL,
     BATCH_GSA_SAMPLES_SQL,
@@ -88,7 +86,6 @@ from queries import (
     EXPERIMENT_RUNS_SQL,
     GEA_EXPERIMENT_SAMPLES_SQL,
     GEA_SEARCH_SQL,
-    GEO_QUERY_ACCESSIONS_SQL,
     GEO_SAMPLE_SQL,
     GEO_SAMPLE_TO_SERIES_SQL,
     GEO_SEARCH_SQL,
@@ -177,7 +174,6 @@ from queries import (
     SOURCE_TOTALS_SQL,
     SRA_EXPERIMENT_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
-    SRA_QUERY_ACCESSIONS_SQL,
     SRA_SAMPLE_TO_EXPERIMENT_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
@@ -201,6 +197,7 @@ from queries import (
     build_search_investigators_sql,
     build_search_match_temp,
     build_search_results,
+    strip_result_paging,
     build_search_total_over_matched,
     build_sorted_search_sql,
     build_structured_search,
@@ -263,7 +260,6 @@ AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MAX_QUERY_DOWNLOAD = 100
 
 MAX_BULK_ACCESSIONS = 100
 MAX_COUNTRY_ACCESSIONS = 50_000
@@ -1993,10 +1989,6 @@ def format_df(df: pd.DataFrame | None):
         return grouped_by_srp
     else:
         return {"error": "No dataframe returned"}
-
-
-def year_params(year_from: int | None, year_to: int | None) -> list:
-    return [year_from, year_from, year_to, year_to]
 
 
 def _normalize_to_extent(
@@ -8492,177 +8484,162 @@ def bulk_project_samples_metadata(request: Request, payload: AccessionsRequest):
         raise HTTPException(500, "Internal server error")
 
 
-# no *_QUERY_ACCESSIONS_SQL for these; their search SQL already yields accession,
-# source and updated_at
-_SEARCH_BACKED_DOWNLOAD_DBS = ("ena", "gsa", "dra", "gea")
+# Dataset-level columns only — one row per matching study, no per-sample fan-out.
+_DOWNLOAD_COLUMNS = (
+    "accession",
+    "source",
+    "title",
+    "summary",
+    "updated_at",
+    "organisms",
+    "countries",
+    "instrument_models",
+    "library_strategies",
+)
 
 
-def _download_accessions_from_search(
-    q: str, db: str, year_from: int | None, year_to: int | None
-) -> list[dict]:
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SET LOCAL statement_timeout = '60s'")
-            cur.execute(
-                _SEARCH_SQL_BY_DB[db],
-                (q, _search_query_variants(q), None, None, None, 0),
-            )
-            rows = cur.fetchall()
-
-    kept = []
-    for row in rows:
-        updated = row.get("updated_at")
-        year = updated.year if updated else None
-        if year_from is not None and (year is None or year < year_from):
-            continue
-        if year_to is not None and (year is None or year > year_to):
-            continue
-        kept.append(row)
-    return kept[:MAX_QUERY_DOWNLOAD]
+def _csv_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "; ".join(str(v) for v in value if v is not None)
+    return str(value)
 
 
-def _flatten_by_source(cur, acc: str, source: str) -> tuple[list[dict], str]:
-    # ena/gsa/dra are study-grained like sra
-    if source in ("sra", "ena", "gsa", "dra"):
-        return flatten_sra_study(cur, acc), f"{acc}_experiments.csv"
-    if source == "arrayexpress":
-        return flatten_ae_experiment(cur, acc), f"{acc}_samples.csv"
-    if source == "gea":
-        return flatten_gea_experiment(cur, acc), f"{acc}_samples.csv"
-    return flatten_geo_series(cur, acc), f"{acc}_samples.csv"
+def _stream_results_csv(sql: str, params: dict):
+    """Yield the entire match set as CSV, a row at a time.
 
+    A server-side cursor keeps this process off the materialized result set: a
+    broad query ("cancer") matches ~100k datasets, which the old
+    build-it-all-in-a-BytesIO approach would have held in memory. It fetches in
+    itersize batches rather than cur.stream()'s row-at-a-time protocol, which
+    costs a network round trip per row (measured: 14k rows in 120s over a tunnel).
 
-def _zip_query_results(rows: list[dict]) -> StreamingResponse:
-    if not rows:
-        raise HTTPException(404, "No results found for query")
+    Errors mid-stream can no longer become an HTTP status — the headers are long
+    gone — so they're logged and the CSV simply ends.
+
+    ponytail: holds one pooled connection (max_size=20) for the whole download,
+    so ~20 concurrent big downloads can starve the API. The 20/minute rate limit
+    is the only guard; if that ever bites, give downloads their own small pool.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    def flush() -> str:
+        out = buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+        return out
+
+    writer.writerow(_DOWNLOAD_COLUMNS)
+    yield flush()
 
     try:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            with pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    for row in rows:
-                        data_rows, name = _flatten_by_source(
-                            cur, row["accession"], row["source"]
-                        )
-                        if not data_rows:
-                            continue
-                        csv_buf = io.StringIO()
-                        writer = csv.DictWriter(csv_buf, fieldnames=data_rows[0].keys())
-                        writer.writeheader()
-                        writer.writerows(data_rows)
-                        zf.writestr(name, csv_buf.getvalue())
-
-        buf.seek(0)
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=query_metadata.zip"},
-        )
+        # The pool is autocommit, where SET LOCAL is a silent no-op and a
+        # server-side cursor is destroyed the moment its DECLARE statement ends.
+        # Both need a real transaction.
+        with pool.connection() as conn, conn.transaction():
+            # Bounds the initial query and each FETCH, not the download's total
+            # wall-clock — a 100k-dataset CSV is legitimately slow to ship. Also
+            # lifts the pool's 30s default, which alone would kill a big download.
+            conn.execute("SET LOCAL statement_timeout = '300s'")
+            with conn.cursor(name="download_query", row_factory=dict_row) as cur:
+                cur.itersize = 2000
+                cur.execute(sql, params)
+                for row in cur:
+                    writer.writerow([_csv_cell(row.get(c)) for c in _DOWNLOAD_COLUMNS])
+                    yield flush()
     except Exception:
-        logger.exception("Error building query download ZIP")
-        raise HTTPException(500, "Internal server error")
+        logger.exception("Error streaming query download CSV")
 
 
 @api_app.get(
     "/download/query",
-    summary="Download metadata by query",
+    summary="Download matching datasets as CSV",
     description=(
-        "Generate a ZIP of CSV files for query-matched projects. "
-        "Accepts q, optional db=geo|sra|arrayexpress|ena|gsa|dra|gea, and optional "
-        "updated year filters. Results are capped at 100 projects."
+        "Stream every dataset matching a search as a single CSV (one row per "
+        "dataset: accession, source, title, summary, updated_at, organisms, "
+        "countries, instrument_models, library_strategies). Takes the same "
+        "parameters as /search -- q, db, and the sidebar filters -- so the file "
+        "covers exactly the result set the search returns, with no row cap. "
+        "Sample-level metadata is not included; use /project/{study}/download."
     ),
     operation_id="download_by_query",
 )
 @limiter.limit("20/minute")
 def download_by_query(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=500),
+    q: str | None = Query(None, max_length=500),
     db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
-    updated_year_from: int | None = Query(None, ge=1900, le=2100),
-    updated_year_to: int | None = Query(None, ge=1900, le=2100),
+    structured: bool = Query(False),
+    organism: str | None = Query(None),
+    country: list[str] | None = Query(None),
+    library_strategy: list[str] | None = Query(None),
+    library_source: list[str] | None = Query(None),
+    instrument_model: list[str] | None = Query(None),
+    platform: list[str] | None = Query(None),
+    journal: list[str] | None = Query(None),
+    multi_platform: bool = Query(False),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    updated_year_from: int | None = Query(None, ge=1900, le=2100, deprecated=True),
+    updated_year_to: int | None = Query(None, ge=1900, le=2100, deprecated=True),
 ):
-    if (
-        updated_year_from is not None
-        and updated_year_to is not None
-        and updated_year_from > updated_year_to
-    ):
-        raise HTTPException(
-            400, "updated_year_from must be less than or equal to updated_year_to"
-        )
+    # updated_year_* were this endpoint's own names for the /search year range.
+    year_from = year_from if year_from is not None else updated_year_from
+    year_to = year_to if year_to is not None else updated_year_to
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(400, "year_from must be less than or equal to year_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(400, "date_from must be <= date_to")
 
-    yp = year_params(updated_year_from, updated_year_to)
+    filters = {
+        "organism": organism,
+        "country": country,
+        "library_strategy": library_strategy,
+        "library_source": library_source,
+        "instrument_model": instrument_model,
+        "platform": platform,
+        "journal": journal,
+        "multi_platform": multi_platform,
+        "year_from": year_from,
+        "year_to": year_to,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    # Same rule as /search: a query-less download is only bounded by a filter.
+    if not q and not any(v not in (None, False, []) for v in filters.values()):
+        raise HTTPException(400, "provide a query (q) or at least one filter")
 
-    if db in _SEARCH_BACKED_DOWNLOAD_DBS:
-        try:
-            rows = _download_accessions_from_search(
-                q, db, updated_year_from, updated_year_to
-            )
-        except Exception:
-            logger.exception("Database error in download_by_query (%s)", db)
-            raise HTTPException(500, "Internal server error")
-        return _zip_query_results(rows)
+    # Mirror /search's query handling so the CSV matches the page: boolean
+    # detection, hyphen rewrite, Neo4j synonym expansion, sidebar filters. The
+    # one deliberate omission is spelling auto-correction -- the client sends the
+    # corrected query it is displaying, so correcting again would be a no-op.
+    boolean_tsq = None
+    if q and (structured or is_boolean_query(q)):
+        if _tsq := to_tsquery_string(_replace_query_hyphens(q)):
+            boolean_tsq = _tsq
+    q = _replace_query_hyphens(q) if q else ""
 
-    if db == "geo":
-        sql = GEO_QUERY_ACCESSIONS_SQL
-        params = [q]
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend(yp)
-    elif db == "sra":
-        sql = SRA_QUERY_ACCESSIONS_SQL
-        params = [q]
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        # Submission center name match
-        params.extend([q, *yp])
-        params.extend(yp)
-    elif db == "arrayexpress":
-        sql = AE_QUERY_ACCESSIONS_SQL
-        params = [q]
-        params.extend([q, *yp])
-        params.extend([q, q, *yp])
-        # Organization name match
-        params.extend([q, *yp])
-        params.extend(yp)
+    if boolean_tsq is not None:
+        fts_q, q_variants = boolean_tsq, [boolean_tsq]
     else:
-        sql = ALL_QUERY_ACCESSIONS_SQL
-        params = [q]
-        # GEO: exact, GSM, PRJNA
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        # SRA: exact, SRX, PRJNA alias, SRS sample
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        params.extend([q, *yp])
-        # SRA/ENA center name match
-        params.extend([q, *yp])
-        # GEO FTS, SRA FTS
-        params.extend(yp)
-        params.extend(yp)
-        # AE: exact, ENA match, org match, FTS
-        params.extend([q, *yp])
-        params.extend([q, q, *yp])
-        params.extend([q, *yp])
-        params.extend(yp)
+        fts_q, q_variants = q, (_search_query_variants(q) if q else [])
 
-    params.append(MAX_QUERY_DOWNLOAD)
+    sql, params = build_search_results(q=fts_q, q_variants=q_variants, db=db, **filters)
+    if boolean_tsq is not None:
+        sql = structured_search_sql(sql)
+    sql = strip_result_paging(sql)
 
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql, tuple(params))
-                rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in download_by_query")
-        raise HTTPException(500, "Internal server error")
-
-    return _zip_query_results(rows)
+    return StreamingResponse(
+        _stream_results_csv(sql, params),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="seqout_results.csv"'
+        },
+    )
 
 
 @api_app.get(
@@ -10977,8 +10954,9 @@ Both only find studies linked to a PubMed publication.
 
 ## Tools Not Exposed Or Usually Avoided In MCP
 
-- `bulk_metadata`, `bulk_project_metadata`, and `download_by_query` are binary/bulk
-  REST downloads; direct users to REST or web UI when needed.
+- `bulk_metadata` and `bulk_project_metadata` are binary/bulk REST downloads, and
+  `download_by_query` streams an uncapped dataset-level CSV of a whole search;
+  direct users to REST or web UI when needed.
 - `download_study_runs_tsv`, `download_study_bams_tsv`, `download_study_metadata_csv`,
   and `download_sample_detail_csv` stream TSV/CSV files. Use JSON tools instead:
   `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
