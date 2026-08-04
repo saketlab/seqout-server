@@ -6762,6 +6762,13 @@ def get_project_metadata_rows(
                 if accession.startswith("GSE"):
                     rows = flatten_geo_series(cur, accession)
                     source = "geo"
+                elif accession.startswith("E-GEAD-"):
+                    # Before the E- branch: "GEAD" is four letters, so E-GEAD-N
+                    # also matches ArrayExpress' E-XXXX-N shape (see AE_PATTERN).
+                    # Falling through to the AE flattener returned zero rows for
+                    # all 735 GEA studies.
+                    rows = flatten_gea_experiment(cur, accession)
+                    source = "gea"
                 elif accession.startswith("E-"):
                     rows = flatten_ae_experiment(cur, accession)
                     source = "arrayexpress"
