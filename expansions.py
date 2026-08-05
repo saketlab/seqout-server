@@ -82,11 +82,16 @@ def _generate_candidate_subphrases(words: list[str]) -> list[tuple[str, int, int
 
 
 def _greedy_match(
-    candidates: list[tuple[str, int, int]], existing: set[str]
+    candidates: list[tuple[str, int, int]],
+    existing: set[str],
+    norm_by_phrase: dict[str, str],
 ) -> list[tuple[str, int, int]]:
     """Greedily consume word positions with the longest matching candidates.
 
-    Returns the list of matched (phrase, start, end) tuples.
+    Matching is on the graph key (_graph_norm), never the raw phrase — the graph
+    stores "scrna seq", so "scRNA-seq" only matches once the hyphen is a space.
+
+    Returns the list of matched (phrase, start, end) tuples, phrase as typed.
     """
     consumed: set[int] = set()
     matched: list[tuple[str, int, int]] = []
@@ -95,7 +100,7 @@ def _greedy_match(
         if positions & consumed:
             # Some word positions already consumed by a longer match
             continue
-        if phrase.lower() in existing:
+        if norm_by_phrase[phrase] in existing:
             consumed |= positions
             matched.append((phrase, start, end))
     return matched
@@ -156,8 +161,9 @@ def _cross_multiply_variants(
     for chunk_idx, (phrase, start, end) in enumerate(matched_chunks):
         for pos in range(start, end):
             consumed[pos] = chunk_idx
+        # Keyed by graph key, not raw text — see Step 4 in _expand_passes.
         alternatives = [phrase]
-        for syn in synonym_map.get(phrase.lower(), []):
+        for syn in synonym_map.get(_graph_norm(phrase), []):
             if syn.lower() != phrase.lower():
                 alternatives.append(syn)
         chunk_alternatives.append(alternatives)
@@ -320,11 +326,13 @@ def _expand_passes(
             variant_records.append((q, pass_idx, ()))
             continue
 
-        # Step 1: Generate all contiguous sub-phrase candidates
+        # Step 1: Generate all contiguous sub-phrase candidates. Look them up by
+        # graph key, exactly as extract_graph_terms does — matching on the raw
+        # phrase misses every hyphenated form ("scrna-seq" vs the stored
+        # "scrna seq"), which silently switched expansion off for that chunk.
         candidates = _generate_candidate_subphrases(words)
-        candidate_phrases = list(
-            dict.fromkeys(phrase.lower() for phrase, _, _ in candidates)
-        )
+        norm_by_phrase = {phrase: _graph_norm(phrase) for phrase, _, _ in candidates}
+        candidate_phrases = list(dict.fromkeys(norm_by_phrase.values()))
 
         # Step 2: Batch-check which candidates exist as Term nodes in Neo4j
         existing: set[str] = set()
@@ -337,7 +345,7 @@ def _expand_passes(
             existing.add(record["candidate"].lower())
 
         # Step 3: Greedy longest-first matching
-        matched_chunks = _greedy_match(candidates, existing)
+        matched_chunks = _greedy_match(candidates, existing, norm_by_phrase)
 
         if not matched_chunks:
             # No term found in the graph; keep the query as-is
@@ -345,8 +353,9 @@ def _expand_passes(
             variant_records.append((q, pass_idx, ()))
             continue
 
-        # Step 4: Traverse synonym clusters for matched terms
-        matched_terms = [phrase for phrase, _, _ in matched_chunks]
+        # Step 4: Traverse synonym clusters for matched terms. Keyed by graph key,
+        # so _cross_multiply_variants must look them up the same way.
+        matched_terms = [norm_by_phrase[phrase] for phrase, _, _ in matched_chunks]
         synonym_map: dict[str, list[str]] = {}
 
         cypher = _CYPHER_SYNONYM_CLUSTER
@@ -487,6 +496,17 @@ if __name__ == "__main__":
     # a query that is nothing but punctuation adds no pass (and must not crash).
     assert expand_terms(d, "cd4/cd8") == ["cd4/cd8"]
     assert expand_terms(d, " , ; ") == [", ;"]
+
+    # Candidates are looked up by graph key, so every surface form of an assay
+    # reaches the same node. Regression: the search path used to match on the raw
+    # phrase, so "scrna-seq" missed the stored "scrna seq" and that chunk was
+    # silently left unexpanded while extract_graph_terms still reported it found.
+    d.vocab["scrna seq"] = ["single cell rna sequencing"]
+    for form in ("scrna seq", "scrna-seq", "scrnaseq", "scRNA-seq"):
+        got = expand_terms(d, f"nafld {form}")
+        assert got[0] == f"nafld {form}", form  # typed wording still leads
+        assert any("single cell rna sequencing" in v for v in got), form
+        assert any(v.startswith("masld ") for v in got), form  # nafld still expands
 
     # Fewest substitutions first: the query as typed, then every one-chunk swap,
     # then the combinations. Nothing is lost — an uncapped run is still the full
