@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-_MAX_QUERY_VARIANTS = 100
+_MAX_QUERY_VARIANTS = 200
 
 # Postgres' `english` snowball stop-word list, verbatim. Many of these are also
 # HGNC gene aliases ("OF" -> BRIP1, "AN"/"AS"/"AT"/"CAN"/"NOT"/"WAS" -> others), so
@@ -101,6 +101,36 @@ def _greedy_match(
     return matched
 
 
+def _iter_combos(slots: list[list[str]]):
+    """Yield every combination, ordered by how many slots differ from the query.
+
+    itertools.product spins the LAST slot fastest, so truncating at the variant
+    cap lands inside the FIRST chunk's alternatives and its synonyms never reach
+    the search at all ("axolotl pancreas scrna" -> 0 of 7 axolotl synonyms). Here
+    the query as typed comes first, then every single substitution, then pairs,
+    and so on. Single substitutions alone are sum(len(slot) - 1) variants, so
+    every chunk's synonyms survive any sane cap.
+
+    Single substitutions are also the ones that matter: results are unioned
+    across variants, so a dataset written "ambystoma mexicanum pancreas scRNA-seq"
+    is found by the variant that swaps the organism alone. A combination is only
+    needed when one dataset uses non-canonical wording for two chunks at once.
+
+    Every combination is still yielded exactly once — the substituted positions
+    identify it uniquely — so an uncapped run is the full Cartesian product.
+    """
+    from itertools import combinations, product
+
+    base = tuple(slot[0] for slot in slots)
+    # Fixed words (single alternative) can never be substituted.
+    swappable = [i for i, slot in enumerate(slots) if len(slot) > 1]
+    for k in range(len(swappable) + 1):
+        for positions in combinations(swappable, k):
+            for choice in product(*(slots[p][1:] for p in positions)):
+                swap = dict(zip(positions, choice))
+                yield tuple(swap.get(i, word) for i, word in enumerate(base))
+
+
 def _cross_multiply_variants(
     words: list[str],
     matched_chunks: list[tuple[str, int, int]],
@@ -109,14 +139,14 @@ def _cross_multiply_variants(
     """Build query variants by cross-multiplying synonym sets.
 
     For each matched chunk, we have a set of alternatives (the original +
-    all synonyms). Unmatched words stay fixed. We produce the Cartesian
-    product across independent chunks, capped at _MAX_QUERY_VARIANTS.
+    all synonyms). Unmatched words stay fixed. Every combination across the
+    independent chunks is produced, fewest-substitutions first (see
+    _iter_combos), capped at _MAX_QUERY_VARIANTS.
 
     Returns (variants, chunk_alternatives), where each variant is
     (text, chosen alternative per chunk). The per-chunk choice is what lets
     expand_terms_explained() report which synonyms survived the cap.
     """
-    from itertools import product
 
     # Build an ordered list of "slots": each slot is either a fixed word
     # or a list of alternatives for a matched chunk.
@@ -148,9 +178,9 @@ def _cross_multiply_variants(
             slots.append([words[i]])
             i += 1
 
-    # Generate Cartesian product, capped
+    # Generate every combination, fewest substitutions first, capped
     variants: list[tuple[str, tuple[str, ...]]] = []
-    for combo in product(*slots):
+    for combo in _iter_combos(slots):
         variants.append((" ".join(combo), tuple(combo[s] for s in chunk_slots)))
         if len(variants) >= _MAX_QUERY_VARIANTS:
             break
@@ -458,11 +488,25 @@ if __name__ == "__main__":
     assert expand_terms(d, "cd4/cd8") == ["cd4/cd8"]
     assert expand_terms(d, " , ; ") == [", ;"]
 
-    # Past the cap, only the synonyms that actually made the cut are reported.
-    _MAX_QUERY_VARIANTS = 2
+    # Fewest substitutions first: the query as typed, then every one-chunk swap,
+    # then the combinations. Nothing is lost — an uncapped run is still the full
+    # Cartesian product, just reordered.
+    assert variants[:4] == [
+        "nafld liver",  # 0 substitutions
+        "masld liver",  # 1 — first chunk
+        "fatty liver liver",
+        "nafld hepatic",  # 1 — second chunk
+    ]
+    assert variants[4:] == ["masld hepatic", "fatty liver hepatic"]  # 2
+
+    # Past the cap, only the synonyms that actually made the cut are reported —
+    # but every chunk now gets a turn before any combination is emitted, so the
+    # leading chunk is no longer starved by the trailing ones.
+    _MAX_QUERY_VARIANTS = 4
     exp = expand_terms_explained(d, "nafld liver")
-    assert len(exp["variants"]) == 2  # nafld liver, nafld hepatic
-    assert exp["chunks"][0]["synonyms"] == []  # no nafld synonym reached the search
-    assert exp["chunks"][0]["total"] == 2  # ...but there were 2 to be had
+    assert len(exp["variants"]) == 4
+    assert exp["chunks"][0]["synonyms"] == ["masld", "fatty liver"]  # both, not none
+    assert exp["chunks"][0]["total"] == 2
     assert exp["chunks"][1]["synonyms"] == ["hepatic"]
+    assert exp["chunks"][1]["total"] == 1
     print("ok")
