@@ -2332,6 +2332,9 @@ _PROJECT_CACHE_CONTROL = "public, s-maxage=2592000, stale-while-revalidate=25920
 # Facets only change on reindex; cache hard at the edge so repeat/bot hits on a
 # query are free and the slow first computation is paid at most once per query.
 _SEARCH_FACETS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
+# (query, accession) -> words only changes on reindex, and one query fans out to
+# every result the user opens, so let the edge absorb the repeats.
+_SEARCH_HIGHLIGHT_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
 _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
@@ -4620,6 +4623,132 @@ def search_expansion(
         raise HTTPException(500, "Internal server error")
     took_ms = (time.perf_counter() - start) * 1000
     return {**result, "structured": False, "took_ms": round(took_ms, 2)}
+
+
+# Postgres marks the matching words itself, so the answer stems, expands and
+# tokenises exactly like the search that produced the hit. Delimiters are ones
+# no biomedical abstract contains; MaxFragments=0 headlines the whole field.
+_HEADLINE_OPTS = "StartSel=<<<,StopSel=>>>,HighlightAll=TRUE,MaxFragments=0"
+_HEADLINE_MARK = re.compile(r"<<<(.*?)>>>", re.S)
+_MAX_HEADLINE_WORDS = 100
+
+# The OR-union of every expanded variant, mirroring the search's match_q. NULL
+# when nothing survives (all stop words), which ts_headline would choke on.
+_HEADLINE_SQL = """
+WITH q AS (
+    SELECT (
+        SELECT string_agg('(' || pq::text || ')', ' | ')::tsquery
+        FROM (
+            SELECT plainto_tsquery('english', v) AS pq
+            FROM unnest(%(variants)s::text[]) AS v
+        ) parsed
+        WHERE pq::text <> ''
+    ) AS tsq
+)
+SELECT string_agg(ts_headline('english', t, q.tsq, %(opts)s), ' ')
+FROM unnest(%(texts)s::text[]) AS t, q
+WHERE q.tsq IS NOT NULL
+"""
+
+_HEADLINE_BOOLEAN_SQL = """
+WITH q AS (SELECT to_tsquery('english', %(tsq)s) AS tsq)
+SELECT string_agg(ts_headline('english', t, q.tsq, %(opts)s), ' ')
+FROM unnest(%(texts)s::text[]) AS t, q
+"""
+
+
+# ts_headline marks negated lexemes too, so "cells NOT mouse" would light up the
+# very word the user excluded. Drop the NOT clauses before translating.
+_NOT_CLAUSE = re.compile(r'\bNOT\s+(?:"[^"]*"|\([^()]*\)|[^\s()"]+)')
+
+
+def _headline_words(marked: str | None) -> list[str]:
+    """Distinct lowercased surface words that ts_headline marked."""
+    if not marked:
+        return []
+    seen: dict[str, None] = {}
+    for word in _HEADLINE_MARK.findall(marked):
+        word = word.strip().lower()
+        if word:
+            seen.setdefault(word, None)
+        if len(seen) >= _MAX_HEADLINE_WORDS:
+            break
+    return list(seen)
+
+
+@api_app.get(
+    "/search/highlight",
+    summary="Query words a project's text matched",
+    description=(
+        "Return the surface words in one project's title, summary and overall "
+        "design that the query matched — stemmed, synonym-expanded and tokenised "
+        "by the same Postgres text search the results came from. Intended for "
+        "highlighting the query on a project page arrived at from a search. "
+        "Returns {accession, query, words: [...], took_ms}."
+    ),
+    operation_id="search_highlight",
+)
+@limiter.limit("100/minute")
+def search_highlight(
+    request: Request,
+    response: Response,
+    q: str = Query(..., min_length=1, max_length=500),
+    accession: str = Query(..., pattern=PROJECT_REGEX),
+):
+    start = time.perf_counter()
+    accession = accession.upper()
+
+    empty = {"accession": accession, "query": q, "words": [], "took_ms": 0.0}
+    if is_boolean_query(q):
+        sql, params = (
+            _HEADLINE_BOOLEAN_SQL,
+            {"tsq": to_tsquery_string(_NOT_CLAUSE.sub(" ", q))},
+        )
+        if not params["tsq"]:
+            return empty
+    else:
+        sql, params = _HEADLINE_SQL, {"variants": _search_query_variants(q)}
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = _fetch_project_row(cur, accession)
+                if not row:
+                    raise HTTPException(404, "Project not found")
+                # Column names are already normalised across sources; SRA-side
+                # tables call the description `abstract`.
+                texts = [
+                    t
+                    for t in (
+                        row.get("title"),
+                        row.get("summary") or row.get("abstract"),
+                        row.get("overall_design"),
+                    )
+                    if t
+                ]
+                if not texts:
+                    return empty
+                cur.execute(sql, {**params, "texts": texts, "opts": _HEADLINE_OPTS})
+                marked = (cur.fetchone() or {}).get("string_agg")
+    except HTTPException:
+        raise
+    except PgSyntaxError:
+        # Stripping NOT can leave a dangling operator ("a OR NOT b"). Highlighting
+        # is cosmetic — drop it rather than fail the page.
+        logger.info("search_highlight: unparseable tsquery for q=%r", q)
+        return empty
+    except Exception:
+        logger.exception("search_highlight failed for q=%r acc=%r", q, accession)
+        raise HTTPException(500, "Internal server error")
+
+    response.headers["Cache-Control"] = _SEARCH_HIGHLIGHT_CACHE_CONTROL
+    took_ms = (time.perf_counter() - start) * 1000
+    return {
+        "accession": accession,
+        "query": q,
+        "words": _headline_words(marked),
+        "took_ms": round(took_ms, 2),
+    }
 
 
 # db= picks a per-source query instead of filtering the unified one; every source

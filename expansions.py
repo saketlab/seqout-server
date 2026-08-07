@@ -310,9 +310,16 @@ def _expand_passes(
     # anchors as typed; whichever form matches wins, and the two merge on dedupe.
     depunctuated = " ".join(s for w in normalized_query.split() if (s := w.strip(",;")))
 
+    # A hyphen inside a token hides the words either side of it: candidates come
+    # from whitespace splitting, so "sepsis-associated" is one candidate and only
+    # ever matches a graph term spelled exactly that way — "sepsis" is never
+    # tried, and expansion silently switches off. An extra pass, not in place, so
+    # hyphenated terms the graph does store ("scrna-seq") still anchor as typed.
+    dehyphenated = " ".join(normalized_query.replace("-", " ").split())
+
     # The query as typed always leads, so variants[0] stays the user's own wording.
     queries_to_expand = [normalized_query]
-    for extra in (separated_query, depunctuated):
+    for extra in (separated_query, depunctuated, dehyphenated):
         if extra and extra.lower() not in {p.lower() for p in queries_to_expand}:
             queries_to_expand.append(extra)
 
@@ -373,9 +380,7 @@ def _expand_passes(
         chunk_variants, chunk_alternatives = _cross_multiply_variants(
             words, matched_chunks, synonym_map
         )
-        passes.append(
-            list(zip([p for p, _, _ in matched_chunks], chunk_alternatives))
-        )
+        passes.append(list(zip([p for p, _, _ in matched_chunks], chunk_alternatives)))
         for variant, choices in chunk_variants:
             variant_records.append((variant, pass_idx, choices))
 
@@ -471,7 +476,10 @@ if __name__ == "__main__":
                 found = [c for c in kw["candidates"] if c.lower() in self.vocab]
                 return [{"candidate": c} for c in found], None, None
             return (
-                [{"term": t, "synonyms": self.vocab.get(t.lower(), [])} for t in kw["terms"]],
+                [
+                    {"term": t, "synonyms": self.vocab.get(t.lower(), [])}
+                    for t in kw["terms"]
+                ],
                 None,
                 None,
             )
@@ -496,6 +504,12 @@ if __name__ == "__main__":
     # a query that is nothing but punctuation adds no pass (and must not crash).
     assert expand_terms(d, "cd4/cd8") == ["cd4/cd8"]
     assert expand_terms(d, " , ; ") == [", ;"]
+
+    # A hyphen joining a graph term to a plain word must not switch expansion off:
+    # "nafld-associated" is one whitespace token, so "nafld" was never a candidate.
+    hyphenated = expand_terms(d, "nafld-associated")
+    assert hyphenated[0] == "nafld-associated"  # the query as typed still leads
+    assert "masld associated" in hyphenated
 
     # Candidates are looked up by graph key, so every surface form of an assay
     # reaches the same node. Regression: the search path used to match on the raw
