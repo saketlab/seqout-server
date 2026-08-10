@@ -128,9 +128,9 @@ def get_ingester(
 ) -> Ingester:
     if not isinstance(files, list):
         files = [files]
-    assert (
-        len(set([f.suffix for f in files])) == 1
-    ), "All files must be of the same type"
+    assert len(set([f.suffix for f in files])) == 1, (
+        "All files must be of the same type"
+    )
     if files[0].suffix == ".csv":
         return CSVIngester(files, destructive=destructive, columns=columns)
     if files[0].suffix == ".parquet":

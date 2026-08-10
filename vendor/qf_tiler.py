@@ -1093,9 +1093,9 @@ def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
     #
     # Should this be 4 or 8?
     each_takes = int(m / 4)
-    assert (
-        32 - each_takes
-    ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+    assert (32 - each_takes) > k, (
+        f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+    )
 
     vals = np.zeros(k, np.uint32)
     hashed = hashlib.md5(val).hexdigest()
