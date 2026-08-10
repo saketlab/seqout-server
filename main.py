@@ -151,6 +151,7 @@ from queries import (
     PENTIMENTO_SAMPLE_CELLS_SQL,
     PENTIMENTO_MICROBES_SQL,
     PENTIMENTO_SAMPLES_SQL,
+    PENTIMENTO_SAMPLE_TISSUE_SQL,
     PENTIMENTO_STUDY_SQL,
     PROJECT_AE_SQL,
     PROJECT_DRA_SQL,
@@ -10457,6 +10458,22 @@ def _resolve_pentimento_accession(
     return row["study_accession"] if row else None
 
 
+def _attach_pentimento_labels(cur, study: str, samples: list[dict]) -> None:
+    """Add archive title and enriched tissue to pentimento rows, in place."""
+    accs = [s["sample_accession"] for s in samples if s.get("sample_accession")]
+    if not accs:
+        return
+    titles = _fetch_sample_titles(cur, accs)
+    cur.execute(PENTIMENTO_SAMPLE_TISSUE_SQL, {"acc": study, "samples": accs})
+    tissues: dict[str, str | None] = {}
+    for r in cur.fetchall():
+        tissues.setdefault(r["sample"], r["tissue"])
+    for s in samples:
+        acc = s.get("sample_accession")
+        s["title"] = (titles.get(acc) or (None, None))[0]
+        s["tissue"] = tissues.get(acc)
+
+
 @api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell cell counts, read-derived calls and microbe flags",
@@ -10496,6 +10513,7 @@ def get_project_single_cell(
                     raise HTTPException(404, "Study not in the Pentimento")
                 cur.execute(PENTIMENTO_SAMPLES_SQL, (resolved, limit, offset))
                 samples = cur.fetchall()
+                _attach_pentimento_labels(cur, resolved, samples)
     except HTTPException:
         raise
     except Exception:

@@ -5319,6 +5319,17 @@ ORDER BY sample_accession
 LIMIT %s OFFSET %s;
 """
 
+PENTIMENTO_SAMPLE_TISSUE_SQL = """
+SELECT sample, tissue, 1 AS pri
+FROM ontology_samples_v4
+WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s)
+UNION ALL
+SELECT sample, tissue, 2 AS pri
+FROM enriched_samples_v4
+WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s)
+ORDER BY pri;
+"""
+
 PENTIMENTO_MICROBES_SQL = """
 SELECT r.run_accession, r.gsm_accession, r.sample_accession, r.study_accession,
        r.measurable, r.total_reads,
