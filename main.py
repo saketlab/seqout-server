@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+from collections import defaultdict
 import pathlib
 import re
 import shutil
@@ -28,6 +29,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from neo4j import GraphDatabase
 from psycopg.errors import QueryCanceled
 from psycopg.errors import SyntaxError as PgSyntaxError
@@ -144,6 +146,12 @@ from queries import (
     SUBMISSION_TO_STUDIES_SQL,
     PRJ_TO_GSA_STUDY_SQL,
     PRJ_TO_SRA_STUDY_SQL,
+    PENTIMENTO_RESOLVE_SQL,
+    PENTIMENTO_RESOLVE_GSM_SQL,
+    PENTIMENTO_SAMPLE_CELLS_SQL,
+    PENTIMENTO_MICROBES_SQL,
+    PENTIMENTO_SAMPLES_SQL,
+    PENTIMENTO_STUDY_SQL,
     PROJECT_AE_SQL,
     PROJECT_DRA_SQL,
     PROJECT_ENA_SQL,
@@ -877,9 +885,11 @@ class AnalyticsMiddleware(BaseHTTPMiddleware):
 
 @api_app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    limit = str(getattr(exc.limit, "limit", "")) or "the rate limit"
     return JSONResponse(
         status_code=429,
-        content={"error": "Rate limit exceeded. Please try again later."},
+        content={"error": f"Rate limit exceeded ({limit}). Retry in 60 seconds."},
+        headers={"Retry-After": "60"},
     )
 
 
@@ -1074,9 +1084,7 @@ def _attach_organism_taxa(row: dict, cur) -> None:
     except Exception:
         # Not built yet, or unreadable — the popover just loses its NCBI half.
         logger.warning("organism_taxa lookup unavailable", exc_info=True)
-    row["organisms_with_taxa"] = [
-        {"name": n, "taxon_id": taxa.get(n)} for n in names
-    ]
+    row["organisms_with_taxa"] = [{"name": n, "taxon_id": taxa.get(n)} for n in names]
 
 
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
@@ -1531,8 +1539,7 @@ def _find_geo_series_samples(
 def _count_geo_series_samples(cur, accession: str, source: str) -> int:
     if source == "gea":
         cur.execute(
-            "SELECT COUNT(*) AS count FROM gea_samples "
-            "WHERE experiment_accession = %s",
+            "SELECT COUNT(*) AS count FROM gea_samples WHERE experiment_accession = %s",
             (accession,),
         )
     elif source == "arrayexpress":
@@ -5053,7 +5060,10 @@ def search(
             "next_cursor": (
                 None
                 if not rows
-                else {"sort_value": rows[-1].get("sort_val"), "accession": rows[-1]["accession"]}
+                else {
+                    "sort_value": rows[-1].get("sort_val"),
+                    "accession": rows[-1]["accession"],
+                }
                 if sortby
                 else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
             ),
@@ -5648,12 +5658,47 @@ def _graft_linked_project(cur, row: dict, srp: str | None, gse: str | None) -> N
             row["neighbors"] = row.get("neighbors") or g["neighbors"]
 
 
+_SINGLE_CELL_INLINE_LIMIT = 200
+
+
+def _attach_single_cell_samples(cur, row: dict, accession: str) -> None:
+    resolved = _resolve_pentimento_accession(cur, accession, shallow=True)
+    if not resolved:
+        row["single_cell"] = None
+        return
+    cur.execute(
+        PENTIMENTO_SAMPLE_CELLS_SQL,
+        {"acc": resolved, "limit": _SINGLE_CELL_INLINE_LIMIT},
+    )
+    samples = cur.fetchall()
+    if not samples:
+        row["single_cell"] = None
+        return
+    total = samples[0]["n_samples_total"] or len(samples)
+    for s in samples:
+        del s["n_samples_total"]
+    row["single_cell"] = {
+        "study_accession": resolved,
+        "n_samples_total": total,
+        "truncated": total > len(samples),
+        "samples": samples,
+    }
+
+
 @api_app.get(
     "/project/{accession}",
     summary="Get project",
     description=(
         "Return a GEO series (GSE), SRA study (SRP/DRP/ERP), ENA project (PRJ*), "
-        "or ArrayExpress project (E-*) record by accession."
+        "or ArrayExpress project (E-*) record by accession.\n\n"
+        "For single-cell studies `single_cell` carries the per-sample (GSM) "
+        "breakdown: `cells`, `genes`, `nnz` and the `experiment_accessions` "
+        "(SRX/DRX/ERX) behind each sample. `cells` is a matrix COLUMN count: "
+        "when `unfiltered` is set those columns are 10x barcodes, not cells, and "
+        "must not be summed. The list is capped at 200 samples; when `truncated` "
+        "is true, page the rest via /project/{accession}/single-cell, which also "
+        "carries the read-derived calls and microbe flags. `single_cell` is null "
+        "when the study is not in the Pentimento."
     ),
     operation_id="get_project",
 )
@@ -5671,7 +5716,7 @@ def get_project(
                 row = _fetch_project_row(cur, accession)
                 if row:
                     # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP,
-                    # not the PRJ. Resolve FIRST so the linked accession is set in
+                    # Resolve FIRST so the linked accession is set in
                     # external_id before enrichment (below) reads it as a
                     # publication candidate.
                     enrich_acc = accession
@@ -5705,6 +5750,7 @@ def get_project(
                         row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
                     else:
                         row["has_enriched"] = False
+                    _attach_single_cell_samples(cur, row, enrich_acc)
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
@@ -8383,7 +8429,11 @@ def find_geo_series_samples(
         raise HTTPException(500, "Internal server error")
     if rows is None:
         return {"samples": [], "capped": False, "filtered": False}
-    return {"samples": rows, "capped": len(rows) >= _SAMPLE_FIND_LIMIT, "filtered": True}
+    return {
+        "samples": rows,
+        "capped": len(rows) >= _SAMPLE_FIND_LIMIT,
+        "filtered": True,
+    }
 
 
 @api_app.get(
@@ -8645,18 +8695,13 @@ def _csv_cell(value) -> str:
 def _stream_results_csv(sql: str, params: dict):
     """Yield the entire match set as CSV, a row at a time.
 
-    A server-side cursor keeps this process off the materialized result set: a
-    broad query ("cancer") matches ~100k datasets, which the old
-    build-it-all-in-a-BytesIO approach would have held in memory. It fetches in
-    itersize batches rather than cur.stream()'s row-at-a-time protocol, which
-    costs a network round trip per row (measured: 14k rows in 120s over a tunnel).
+    Server-side cursor: a broad query matches ~100k datasets, too many to hold in
+    memory. itersize batches, not cur.stream(), which costs a round trip per row
+    (14k rows in 120s over a tunnel).
 
-    Errors mid-stream can no longer become an HTTP status — the headers are long
-    gone — so they're logged and the CSV simply ends.
-
-    ponytail: holds one pooled connection (max_size=20) for the whole download,
-    so ~20 concurrent big downloads can starve the API. The 20/minute rate limit
-    is the only guard; if that ever bites, give downloads their own small pool.
+    Errors mid-stream cannot become an HTTP status; they are logged and the CSV
+    ends. Holds one pooled connection (max_size=20) for the whole download, so
+    ~20 concurrent downloads can starve the API; only the rate limit guards it.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -8772,9 +8817,7 @@ def download_by_query(
     return StreamingResponse(
         _stream_results_csv(sql, params),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": 'attachment; filename="seqout_results.csv"'
-        },
+        headers={"Content-Disposition": 'attachment; filename="seqout_results.csv"'},
     )
 
 
@@ -10393,6 +10436,197 @@ def _resolve_prj(cur, accession: str) -> dict:
     return {"gse": gse, "srp": row["accession"] if row else None}
 
 
+def _resolve_pentimento_accession(
+    cur, accession: str, *, shallow: bool = False
+) -> str | None:
+    """Caller accession -> the GSE the atlas is keyed under, or None."""
+    acc = accession.upper()
+    if not shallow and acc.startswith("PRJ"):
+        resolved = _resolve_prj(cur, acc)
+        acc = (resolved["gse"] or resolved["srp"] or acc).upper()
+    if acc.startswith("GSE"):
+        return acc
+    cur.execute(PENTIMENTO_RESOLVE_SQL, {"acc": acc})
+    row = cur.fetchone()
+    if row:
+        return row["gse"]
+    if shallow:
+        return None
+    cur.execute(PENTIMENTO_RESOLVE_GSM_SQL, (acc,))
+    row = cur.fetchone()
+    return row["study_accession"] if row else None
+
+
+@api_app.get(
+    "/project/{accession}/single-cell",
+    summary="Get single-cell cell counts, read-derived calls and microbe flags",
+    description=(
+        "Per-sample cell/gene counts joined to read-derived (preflightx) "
+        "species, sex and assay calls and to viral/microbial presence flags. "
+        "404s when the study is not in the Pentimento.\n\n"
+        "Read the flags as EVIDENCE, not diagnosis: a flag means unitigs from "
+        "the run align across at least 20% of a panel reference (50% for the "
+        "host-endogenous and vector-derived retroviruses MLV, MMTV, HIV1, "
+        "HTLV1). There is no raw-read, UMI or replicate confirmation.\n\n"
+        "NULL is not false. A null flag list means nothing about that sample "
+        "was measurable; an EMPTY list means it was measured and nothing was "
+        "found. `cells` is a matrix COLUMN count: when `unfiltered` is set "
+        "those columns are 10x barcodes, not cells, and must not be summed."
+    ),
+    operation_id="get_project_single_cell",
+)
+@limiter.limit("100/minute")
+def get_project_single_cell(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession)
+                if not resolved:
+                    raise HTTPException(404, "Study not in the Pentimento")
+                cur.execute(PENTIMENTO_STUDY_SQL, (resolved,))
+                study = cur.fetchone()
+                if not study:
+                    raise HTTPException(404, "Study not in the Pentimento")
+                cur.execute(PENTIMENTO_SAMPLES_SQL, (resolved, limit, offset))
+                samples = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_project_single_cell")
+        raise HTTPException(500, "Internal server error")
+    return {**study, "samples": samples, "limit": limit, "offset": offset}
+
+
+_CONTROL_KINGDOMS = frozenset({"spike_in_control", "negative_control"})
+
+
+@api_app.get(
+    "/sample/{accession}/microbes",
+    summary="Every microbial detection for a sample, by organism and by kingdom",
+    description=(
+        "Per-organism detections plus kingdom-level totals: unitigs mapped, "
+        "k-mer mass, reads and reference coverage.\n\n"
+        "Filterable on the raw numbers, so a caller need not accept the stored "
+        "gates (viral breadth 0.20; bacterial breadth 0.30 + 20 kb covered). "
+        "`kind` selects viral, bacterial, both, or all classes; `min_breadth` "
+        "and `min_kmer_mass` filter directly; `validated_only` keeps only rows "
+        "passing the stored gates.\n\n"
+        "`kmer_mass` is a WEIGHTED k-mer count, not a distinct-k-mer tally -- a "
+        "relative proxy for how much sequence of an organism is present, "
+        "comparable between organisms in a run, not an absolute k-mer number. "
+        "`n_unitigs` IS a plain count of assembled unitigs that mapped.\n\n"
+        "Kingdoms are not all findings. `spike_in_control` (PhiX) and "
+        "`negative_control` (animalPV, which calibrates the viral threshold) "
+        "are controls; `bacterial_background` is reagent kitome and skin flora, "
+        "excluded unless include_background. Never sum controls into viral or "
+        "bacterial.\n\n"
+        "`measurable` is tri-state: false/null means the runs were never "
+        "screened, so an empty result is not an absence call."
+    ),
+    operation_id="get_sample_microbes",
+)
+@limiter.limit("100/minute")
+def get_sample_microbes(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=r"^[A-Z][A-Z0-9]+$"),
+    kind: str = Query("all", pattern="^(viral|bacterial|both|all)$"),
+    min_breadth: float | None = Query(None, ge=0.0, le=1.0),
+    min_kmer_mass: float | None = Query(None, ge=0.0),
+    validated_only: bool = Query(False),
+    include_background: bool = Query(False),
+    limit: int = Query(500, ge=1, le=1000),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    acc = accession.upper()
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    PENTIMENTO_MICROBES_SQL,
+                    {
+                        "acc": acc,
+                        "kind": kind,
+                        "min_breadth": min_breadth,
+                        "min_kmer_mass": min_kmer_mass,
+                        "validated_only": validated_only,
+                        "include_background": include_background,
+                        "limit": limit,
+                    },
+                )
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_sample_microbes")
+        raise HTTPException(500, "Internal server error")
+
+    def agg(subset: list[dict]) -> dict:
+        return {
+            "n_organisms": len({r["organism"] for r in subset}),
+            "n_unitigs": sum(r["n_unitigs"] or 0 for r in subset),
+            "kmer_mass": sum(r["kmer_mass"] or 0.0 for r in subset),
+            "reads": sum(r["reads"] or 0 for r in subset),
+            "covered_bp": sum(r["covered_bp"] or 0 for r in subset),
+            "max_breadth_frac": max(
+                (r["breadth_frac"] or 0.0 for r in subset), default=0.0
+            ),
+        }
+
+    # organism-less rows only answer "was this screened"; not detections
+    detections = [r for r in rows if r["organism"] is not None]
+    by_kingdom: defaultdict[str, list[dict]] = defaultdict(list)
+    by_organism: defaultdict[str, list[dict]] = defaultdict(list)
+    for r in detections:
+        by_kingdom[r["kingdom"]].append(r)
+        by_organism[r["organism"]].append(r)
+    kingdoms = {k: agg(v) for k, v in by_kingdom.items()}
+    # one row per organism, summed over the sample's runs
+    organisms = sorted(
+        (
+            {
+                "organism": name,
+                "class": group[0]["class"],
+                "kingdom": group[0]["kingdom"],
+                "is_validated_viral": any(r["is_validated_viral"] for r in group),
+                "is_viral_evidence": any(r["is_viral_evidence"] for r in group),
+                "is_validated_bacterial": any(
+                    r["is_validated_bacterial"] for r in group
+                ),
+                **agg(group),
+            }
+            for name, group in by_organism.items()
+        ),
+        key=lambda r: r["kmer_mass"],
+        reverse=True,
+    )
+    # animalPV calibrates the viral threshold, so summing it into the headline
+    # would put the control inside the number it validates
+    findings = [r for r in detections if r["kingdom"] not in _CONTROL_KINGDOMS]
+    return {
+        "sample_accession": acc,
+        "kind": kind,
+        "filters": {
+            "min_breadth": min_breadth,
+            "min_kmer_mass": min_kmer_mass,
+            "validated_only": validated_only,
+            "include_background": include_background,
+        },
+        "measurable": None if not rows else any(r["measurable"] for r in rows),
+        "n_runs": len({r["run_accession"] for r in rows}),
+        "totals": agg(findings),
+        "control_kingdoms": sorted(_CONTROL_KINGDOMS),
+        "by_kingdom": kingdoms,
+        "by_organism": organisms,
+        "detections": detections,
+    }
+
+
 def _resolve_enrichment_accession(cur, accession: str) -> str:
     """Map a PRJ* to the accession enrichment is keyed under (GSE or SRP).
 
@@ -10862,7 +11096,14 @@ experiments have that link; microarray ones legitimately have no FASTQ.
    Use `classify_accession` when the user gives an accession and the right tool is
    unclear. It is pattern-only and cheap. Use `resolve_accession_project` for
    GSM/SRS/ERS/DRS/SRX/ERX/DRX child-to-project lookup. Use `resolve_prj_project`
-   for PRJNA/PRJEB/PRJDA before calling study-only download tools.
+   for PRJNA/PRJEB/PRJDA before calling study-only download tools. Use
+   `resolve_submission_studies` for a submission accession (SRA######, ERA######,
+   DRA######), which names a filing rather than a study and has no metadata of its
+   own. Use `convert_accession` when the user wants the same dataset in a named
+   archive ("the SRA study for this GSE"); it resolves any accession to its project
+   and lists the linked projects elsewhere, and `db=` narrows that to one archive.
+   `convert_accessions` is its batch form. Prefer `get_project_xref` when the user
+   just wants to see every equivalent at once.
 
 4. Prefer structured JSON tools for MCP.
    Use JSON tools (`get_project_metadata_rows`, `get_study_download_manifest`,
@@ -10918,6 +11159,12 @@ Use `search_suggest` only when a query returns no or very few results and appear
 misspelled. If suggestions are returned inside `search_all`, present or use them
 instead of guessing.
 
+Use `search_expansion` to explain a plain-keyword result set: it returns the
+synonyms that actually reached the search per term, and how many that term has in
+total, which differ when the variant cap truncates the expansion. Reach for it when
+results look too broad or too narrow and the user asks why, not on every search.
+Structured/boolean queries are never expanded, so `chunks` is empty for them.
+
 Use `search_structured` for explicit metadata filters or cohort questions. It can
 combine `q` with:
 - `organism`: exact scientific name, such as `Homo sapiens`.
@@ -10952,7 +11199,8 @@ Structured-search caveats:
 Before choosing filter values, use `list_library_strategies`,
 `list_instrument_models`, `list_journals`, and `list_centers`.
 Use `search_organisms` for organism autocomplete and `get_common_name_by_scientific_name`
-for common-name display.
+for common-name display; `get_common_names_by_scientific_names` resolves a whole list
+in one call, so prefer it whenever more than one organism needs a common name.
 
 ## Project Drilldown
 
@@ -10969,6 +11217,10 @@ Use sample-list tools when the user wants the child records:
 - SRA/ENA experiment: `get_experiment` for metadata plus runs, or
   `get_experiment_runs` for just runs.
 - SRA/ENA sample/experiment/GSM with parent context: `get_sample_detail`.
+
+`get_study_runs` previews only the first 500 runs. On a larger study, do not page
+it to find specific runs; use `find_study_runs`, which filters every run in the
+study by column and returns up to 500 matches with `capped` set when more exist.
 
 ## FASTQ, SRA, BAM, And Supplementary Retrieval
 
@@ -11084,6 +11336,12 @@ Both only find studies linked to a PubMed publication.
   country/organism scope.
 - `get_country_accessions`: plain newline accession list for a country, optionally
   organism and assay_l2 filtered.
+- `get_country_pis`: investigators for a whole country ranked by project count, with
+  no topic. Use it only for "who deposits the most from <country>".
+- `get_search_investigators`: investigators behind any search, so use this whenever
+  the question names a topic ("who works on CRISPR in India"). `senior_only=true`
+  ranks last authors (PIs); false counts every author. Never pull `get_country_pis`
+  and filter it by topic yourself.
 - `get_platform_totals`, `get_platform_growth`, `get_platform_instruments`, and
   `get_platform_filters`: sequencing technology totals, trends, instruments, and
   filter options.
@@ -11114,6 +11372,7 @@ Both only find studies linked to a PubMed publication.
 MCP_OPERATION_IDS = {
     "search_all",
     "search_suggest",
+    "search_expansion",
     "search_structured",
     "search_by_author",
     "search_author_projects",
@@ -11124,6 +11383,7 @@ MCP_OPERATION_IDS = {
     "get_study_experiments",
     "get_study_samples",
     "get_study_runs",
+    "find_study_runs",
     "get_study_bams",
     "get_study_download_manifest",
     "download_study_script",
@@ -11147,11 +11407,15 @@ MCP_OPERATION_IDS = {
     "get_ae_experiment_samples",
     "resolve_accession_project",
     "resolve_prj_project",
+    "resolve_submission_studies",
     "classify_accession",
+    "convert_accession",
+    "convert_accessions",
     "get_project_xref",
     "get_project_cite",
     "find_publication",
     "get_common_name_by_scientific_name",
+    "get_common_names_by_scientific_names",
     "get_source_totals",
     "get_last_updated",
     "get_enriched_stats",
@@ -11232,17 +11496,24 @@ class EnrichmentDisabledMiddleware(BaseHTTPMiddleware):
 
 mcp_api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 mcp_api_app.state.limiter = limiter
+mcp_api_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 mcp_api_app.router.routes.extend(
     route
     for route in api_app.router.routes
     if getattr(route, "operation_id", None) in MCP_OPERATION_IDS
 )
 
+_MCP_TOOL_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+
 mcp = FastMCP.from_fastapi(
     app=mcp_api_app,
     name="seqout MCP",
     instructions=MCP_INSTRUCTIONS_ACTIVE,
+    mcp_component_fn=lambda route, component: setattr(
+        component, "annotations", _MCP_TOOL_ANNOTATIONS
+    ),
 )
+
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
 if ENRICHMENT_ENABLED:

@@ -714,8 +714,6 @@ def _search_filter_clauses(
     dim_clauses = {}
     if organism:
         # case-insensitive: unnest so "mus musculus" matches "Mus musculus".
-        # ponytail: per-row unnest over the already-materialized match set; if
-        # this ever gets hot, add a lower(organism) expression index upstream.
         dim_clauses["organism"] = (
             "EXISTS (SELECT 1 FROM unnest(matched.organisms) o"
             " WHERE lower(o) = lower(%(organism)s))"
@@ -4600,10 +4598,7 @@ def build_country_filters_sql(
         select_parts.append(f"SELECT '{kind}' AS kind, value, count FROM {cte_name}")
 
     cte_parts.append(
-        f"totals AS (\n"
-        f"    SELECT COUNT(*) AS count\n"
-        f"    FROM scoped_base\n"
-        f")"
+        f"totals AS (\n    SELECT COUNT(*) AS count\n    FROM scoped_base\n)"
     )
     select_parts.append("SELECT 'total' AS kind, NULL AS value, count FROM totals")
 
@@ -4724,20 +4719,20 @@ def _reltuples(table: str) -> str:
 
 SOURCE_TOTALS_SQL = f"""
 SELECT
-    {_reltuples('geo_series')} AS geo_projects,
-    {_reltuples('geo_samples')} AS geo_samples,
-    {_reltuples('sra_studies')} AS sra_projects,
-    {_reltuples('sra_samples')} AS sra_samples,
-    {_reltuples('arrayexpress_experiments')} AS arrayexpress_projects,
-    {_reltuples('arrayexpress_samples')} AS arrayexpress_samples,
-    {_reltuples('ena_studies')} AS ena_projects,
-    {_reltuples('ena_samples')} AS ena_samples,
-    {_reltuples('gsa_studies')} AS gsa_projects,
-    {_reltuples('gsa_samples')} AS gsa_samples,
-    {_reltuples('dra_studies')} AS dra_projects,
-    {_reltuples('dra_samples')} AS dra_samples,
-    {_reltuples('gea_experiments')} AS gea_projects,
-    {_reltuples('gea_samples')} AS gea_samples;
+    {_reltuples("geo_series")} AS geo_projects,
+    {_reltuples("geo_samples")} AS geo_samples,
+    {_reltuples("sra_studies")} AS sra_projects,
+    {_reltuples("sra_samples")} AS sra_samples,
+    {_reltuples("arrayexpress_experiments")} AS arrayexpress_projects,
+    {_reltuples("arrayexpress_samples")} AS arrayexpress_samples,
+    {_reltuples("ena_studies")} AS ena_projects,
+    {_reltuples("ena_samples")} AS ena_samples,
+    {_reltuples("gsa_studies")} AS gsa_projects,
+    {_reltuples("gsa_samples")} AS gsa_samples,
+    {_reltuples("dra_studies")} AS dra_projects,
+    {_reltuples("dra_samples")} AS dra_samples,
+    {_reltuples("gea_experiments")} AS gea_projects,
+    {_reltuples("gea_samples")} AS gea_samples;
 """
 
 LAST_UPDATED_SQL = """
@@ -5226,4 +5221,135 @@ LOW_CONFIDENCE_TAGS_SQL = """
 SELECT sample_accession, tags
 FROM low_confidence
 WHERE study_accession = %s;
+"""
+
+
+#### Pentimento: single-cell counts, read-derived calls, microbial flags #####
+PENTIMENTO_RESOLVE_SQL = """
+WITH candidates AS (
+    SELECT geo_accession AS gse, 1 AS pri
+    FROM cross_ref_geo
+    WHERE target_accession = %(acc)s
+    UNION ALL
+    SELECT alias AS gse, 1 AS pri
+    FROM sra_studies
+    WHERE accession = %(acc)s AND alias LIKE 'GSE%%'
+    UNION ALL
+    SELECT study_accession AS gse, 2 AS pri
+    FROM pentimento_study
+    WHERE aliases @> to_jsonb(%(acc)s::text)
+)
+SELECT c.gse
+FROM candidates c
+JOIN pentimento_study p ON p.study_accession = c.gse
+GROUP BY c.gse
+ORDER BY MIN(c.pri), c.gse
+LIMIT 1;
+"""
+
+# Last resort when the archives link the accession to no GSE at all
+PENTIMENTO_RESOLVE_GSM_SQL = """
+SELECT s.study_accession, COUNT(*) AS n
+FROM pentimento_run r
+JOIN pentimento_sample s ON s.sample_accession = r.gsm_accession
+WHERE r.study_accession = %s
+GROUP BY s.study_accession
+ORDER BY n DESC
+LIMIT 1;
+"""
+
+PENTIMENTO_SAMPLE_CELLS_SQL = """
+WITH s AS (
+    SELECT sample_accession, cells, genes, nnz, unfiltered
+    FROM pentimento_sample
+    WHERE study_accession = %(acc)s
+    ORDER BY sample_accession
+    LIMIT %(limit)s
+), x AS (
+    SELECT sample_accession,
+           array_agg(DISTINCT experiment_accession
+                     ORDER BY experiment_accession) AS experiment_accessions
+    FROM (
+        SELECT s.sample_accession, r.experiment_accession
+        FROM s JOIN pentimento_run r ON r.gsm_accession = s.sample_accession
+        WHERE r.experiment_accession IS NOT NULL
+        UNION ALL
+        SELECT s.sample_accession, r.experiment_accession
+        FROM s JOIN pentimento_run r ON r.sample_accession = s.sample_accession
+        WHERE r.experiment_accession IS NOT NULL
+    ) u
+    GROUP BY sample_accession
+)
+SELECT s.sample_accession, s.cells, s.genes, s.nnz, s.unfiltered,
+       COALESCE(x.experiment_accessions, '{}'::text[]) AS experiment_accessions,
+       (SELECT p.n_samples_detailed FROM pentimento_study p
+        WHERE p.study_accession = %(acc)s) AS n_samples_total
+FROM s
+LEFT JOIN x ON x.sample_accession = s.sample_accession
+ORDER BY s.sample_accession;
+"""
+
+PENTIMENTO_STUDY_SQL = """
+SELECT study_accession, source, title, study_cells, cells_unfiltered,
+       single_cell_file_format, n_samples_reported, n_samples_detailed,
+       sample_cells_total, unassigned_cells, sample_breakdown_complete,
+       any_unfiltered, n_runs_linked, n_runs_preflightx, n_runs_measurable,
+       has_metadata, has_celltype,
+       has_donor, has_demographics, flags
+FROM pentimento_study
+WHERE study_accession = %s;
+"""
+
+# ORDER BY keeps LIMIT/OFFSET paging stable
+PENTIMENTO_SAMPLES_SQL = """
+SELECT sample_accession, cells, genes, nnz, file_format, unfiltered,
+       n_runs, n_runs_measurable,
+       species_called, species_confidence, species_hit_reads,
+       species_hit_fraction, species_runner_up, species_margin,
+       species_ambiguous, species_mislabel,
+       sex_verdict, sex_confidence, sex_reads_scanned, y_hits, xist_hits,
+       y_xist_ratio, sex_panel_status, sex_mixed_suspected, deep_n_reads,
+       assay, assay_display, assay_is_single_cell,
+       calls_ambiguous, flags, n_flags, hpv_top_type, hpv_ambiguous,
+       has_viral_reads, has_bacterial_reads,
+       viral_kmer_mass, bacterial_kmer_mass
+FROM pentimento_sample
+WHERE study_accession = %s
+ORDER BY sample_accession
+LIMIT %s OFFSET %s;
+"""
+
+PENTIMENTO_MICROBES_SQL = """
+SELECT r.run_accession, r.gsm_accession, r.sample_accession, r.study_accession,
+       r.measurable, r.total_reads,
+       m.organism, m.class, m.reads, m.kmer_mass, m.n_unitigs,
+       m.ref_bp, m.covered_bp, m.breadth_frac, m.is_background,
+       m.is_validated_viral, m.is_viral_evidence, m.is_validated_bacterial,
+       CASE m.class
+         WHEN 'virus'    THEN 'viral'
+         WHEN 'pathogen' THEN 'bacterial'
+         WHEN 'culture'  THEN 'bacterial'
+         WHEN 'kitome'   THEN 'bacterial_background'
+         WHEN 'flora'    THEN 'bacterial_background'
+         WHEN 'parasite' THEN 'eukaryotic_parasite'
+         WHEN 'spike'    THEN 'spike_in_control'
+         WHEN 'animalPV' THEN 'negative_control'
+         WHEN 'vector'   THEN 'vector'
+         ELSE 'other'
+       END AS kingdom
+FROM pentimento_run r
+LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
+  AND (%(include_background)s OR NOT m.is_background)
+  AND (%(kind)s = 'all'
+       OR (%(kind)s = 'viral'     AND m.class = 'virus')
+       OR (%(kind)s = 'bacterial' AND m.class IN ('pathogen', 'culture'))
+       OR (%(kind)s = 'both'      AND m.class IN ('virus','pathogen','culture')))
+  AND (%(min_breadth)s::real IS NULL OR m.breadth_frac >= %(min_breadth)s::real)
+  AND (%(min_kmer_mass)s::double precision IS NULL
+       OR m.kmer_mass >= %(min_kmer_mass)s::double precision)
+  AND (NOT %(validated_only)s
+       OR m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)
+WHERE (r.gsm_accession = %(acc)s OR r.sample_accession = %(acc)s)
+ORDER BY m.kmer_mass DESC NULLS LAST, m.breadth_frac DESC NULLS LAST
+LIMIT %(limit)s;
 """
