@@ -93,6 +93,32 @@ FROM pubmed_metadata
 WHERE pmid = ANY(%(pmids)s);
 """
 
+# ENA and GSA have no alias source
+ALIASES_BATCH_SQL = """
+SELECT DISTINCT accession, alias FROM (
+    SELECT accession, unnest(alias_all) FROM geo_series WHERE accession = ANY(%(acc)s)
+    UNION ALL
+    SELECT accession, alias FROM sra_studies WHERE accession = ANY(%(acc)s)
+    UNION ALL
+    SELECT accession, alias FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
+    UNION ALL
+    SELECT accession, alias FROM dra_studies WHERE accession = ANY(%(acc)s)
+    UNION ALL
+    -- Same GEA -> DRA hop as PROJECT_GEA_SQL and _RESOLVE_DL_STUDY; keep in step.
+    SELECT DISTINCT g.accession, d.accession
+        FROM gea_experiments g JOIN dra_studies d ON d.bioproject_id = g.bioproject
+       WHERE g.accession = ANY(%(acc)s)
+    UNION ALL
+    -- cross_ref_* holds the AE reverse links but not the PRJ*-class ones, so
+    -- resolve here. alias_values() must match idx_unified_metadata_alias_values.
+    SELECT a.acc, um.canonical_accession
+        FROM unified_metadata um
+        CROSS JOIN LATERAL unnest(alias_values(um.aliases)) AS a(acc)
+       WHERE alias_values(um.aliases) && %(acc)s::text[]
+         AND a.acc = ANY(%(acc)s)
+) u(accession, alias) WHERE alias IS NOT NULL;
+"""
+
 SUBMITTER_BATCH_SQL = """
 SELECT canonical_accession AS accession, center_name AS submitter, country_code,
        is_single_cell, single_cell_modality

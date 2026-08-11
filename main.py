@@ -189,6 +189,7 @@ from queries import (
     PROJECTS_BY_PMID_SQL,
     STUDY_BAMS_SQL,
     STUDY_EXPERIMENTS_SQL,
+    ALIASES_BATCH_SQL,
     STUDY_PUBLICATIONS_BATCH_SQL,
     STUDY_RUNS_PREVIEW_SQL,
     STUDY_RUNS_SQL,
@@ -979,8 +980,7 @@ def _rich_pub(pmid: str, m: dict) -> dict:
 
 
 def _hydrate_pub(pub: dict, pubmed_map: dict[str, dict]) -> dict:
-    """Fill a stored study_publications entry's gaps from pubmed_metadata.
-    """
+    """Fill a stored study_publications entry's gaps from pubmed_metadata."""
     pmid = str(pub.get("pmid") or "")
     m = pubmed_map.get(pmid)
     if not m:
@@ -1115,20 +1115,25 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     if not accessions:
         return rows
 
-    # Candidate accessions per row: own accession first, then aliases.
+    row_aliases = {
+        r["accession"]: _normalize_aliases(r.get("alias"))
+        for r in rows
+        if r.get("accession")
+    }
+    missing_alias = [a for a, al in row_aliases.items() if not al]
+    if missing_alias:
+        cur.execute(ALIASES_BATCH_SQL, {"acc": missing_alias})
+        for r in cur.fetchall():
+            row_aliases[r["accession"]].extend(_normalize_aliases(r["alias"]))
+
     row_candidates: dict[str, list[str]] = {}
     all_cands: set[str] = set()
     for r in rows:
         acc = r.get("accession")
         if not acc:
             continue
-        cands = [acc] + [
-            a for a in _normalize_aliases(r.get("alias")) if a and a != acc
-        ]
-        # Linked archives named in external_id ({"GEO": "GSE..", "SRA": "SRP.."})
-        # lend their publication too, so a PRJ* wrapper — or any project holding a
-        # same-study cross-archive link — inherits the linked study's pub when it
-        # has none of its own. Own accession stays first, so a native pub wins.
+        cands = [acc] + [a for a in row_aliases[acc] if a != acc]
+        # Search for cross-archive links
         for linked in _external_id_accessions(r.get("external_id")):
             if linked and linked != acc and linked not in cands:
                 cands.append(linked)
