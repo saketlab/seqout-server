@@ -10,13 +10,24 @@ FROM study_publications
 WHERE accession = ANY(%s);
 """
 
+
+def _xref_pmid(a: str = "") -> str:
+    return f"btrim({a}links->'XREF_LINK'->>'ID')"
+
+
+def _xref_is_pubmed(a: str = "") -> str:
+    return f"upper({a}links->'XREF_LINK'->>'DB') = 'PUBMED'"
+
+
+_NOT_PRIVATE = "title NOT ILIKE 'GEO accession %% is currently private%%'"
+
 # src_rank encodes publication-source precedence within one accession:
 #   0 = the archive's own native pubmed_id (most authoritative)
 #   1 = pubmed_id_citation (DOI resolved from the submitter's <Citation>)
 #   2 = pubmed_id_pysradb (pysradb's SRA->PubMed elink; can be a citing paper)
 # The GROUP BY keeps the lowest rank per (accession, pmid) and ORDER BY makes the
 # lowest-rank pmid sort first, so it becomes publications[0] / the scalar pmid.
-PMID_VARIANT_BATCH_SQL = """
+PMID_VARIANT_BATCH_SQL = f"""
 SELECT accession, pmid FROM (
     SELECT accession, pmid, min(src_rank) AS src_rank FROM (
         SELECT accession, unnest(pubmed_id) AS pmid, 0 AS src_rank
@@ -28,12 +39,14 @@ SELECT accession, pmid FROM (
         SELECT accession, pubmed_id_pysradb, 2
             FROM geo_series WHERE accession = ANY(%(acc)s)
         UNION ALL
+        SELECT accession, {_xref_pmid()}, 0
+            FROM sra_studies WHERE accession = ANY(%(acc)s)
+            AND {_xref_is_pubmed()}
+            AND {_NOT_PRIVATE}
+        UNION ALL
         SELECT accession, pubmed_id_pysradb, 2
             FROM sra_studies WHERE accession = ANY(%(acc)s)
-            -- pysradb stamps a bogus pmid on private-placeholder mirrors
-            -- (title "GEO accession GSExxx is currently private ..."); ~4k of them.
-            -- Their real study has no publication yet, so drop the spurious pmid.
-            AND title NOT ILIKE 'GEO accession %% is currently private%%'
+            AND {_NOT_PRIVATE}
         UNION ALL
         SELECT study_accession, pubmed_id_pysradb, 2
             FROM ena_studies WHERE study_accession = ANY(%(acc)s)
@@ -44,6 +57,10 @@ SELECT accession, pmid FROM (
         SELECT accession, pubmed_id_pysradb, 2
             FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
         UNION ALL
+        SELECT accession, {_xref_pmid()}, 0
+            FROM dra_studies WHERE accession = ANY(%(acc)s)
+            AND {_xref_is_pubmed()}
+        UNION ALL
         SELECT accession, pubmed_id_pysradb, 2
             FROM dra_studies WHERE accession = ANY(%(acc)s)
         UNION ALL
@@ -52,6 +69,13 @@ SELECT accession, pmid FROM (
         UNION ALL
         SELECT accession, pubmed_id_pysradb, 2
             FROM gea_experiments WHERE accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT s.study_accession, jsonb_array_elements_text(p.pubmed_id), 0
+            FROM gsa_studies s JOIN gsa_projects p ON p.accession = s.project_name
+            WHERE s.study_accession = ANY(%(acc)s)
+        UNION ALL
+        SELECT study_accession, pubmed_id_pysradb, 2
+            FROM gsa_studies WHERE study_accession = ANY(%(acc)s)
     ) u
     WHERE pmid IS NOT NULL AND pmid <> ''
     GROUP BY accession, pmid
@@ -2050,7 +2074,7 @@ LIMIT 1;
 """
 
 # Inverse of _enrich_with_publications(): a pmid can live only in a repo's own column.
-PROJECTS_BY_PMID_SQL = """
+PROJECTS_BY_PMID_SQL = f"""
 WITH linked AS (
     SELECT accession,
            CASE WHEN source = 'ae' THEN 'arrayexpress' ELSE source END AS source,
@@ -2059,28 +2083,50 @@ WITH linked AS (
     WHERE publications @> %(pmid_json)s::jsonb
     UNION
     SELECT accession, 'geo', 'geo_series.pubmed_id'
-    FROM geo_series
-    WHERE pubmed_id @> ARRAY[%(pmid)s]::text[] OR pubmed_id_pysradb = %(pmid)s
+    FROM geo_series WHERE pubmed_id @> ARRAY[%(pmid)s]::text[]
+    UNION
+    SELECT accession, 'geo', 'geo_series.pubmed_id_pysradb'
+    FROM geo_series WHERE pubmed_id_pysradb = %(pmid)s
     UNION
     SELECT accession, 'sra', 'sra_studies.pubmed_id_pysradb'
     FROM sra_studies
     WHERE pubmed_id_pysradb = %(pmid)s
-      -- same private-placeholder guard as PMID_VARIANT_BATCH_SQL
-      AND title NOT ILIKE 'GEO accession %% is currently private%%'
+      AND {_NOT_PRIVATE}
+    UNION
+    SELECT accession, 'sra', 'sra_studies.links.XREF_LINK'
+    FROM sra_studies
+    WHERE {_xref_pmid()} = %(pmid)s
+      AND {_xref_is_pubmed()}
+      AND {_NOT_PRIVATE}
     UNION
     SELECT study_accession, 'ena', 'ena_studies.pubmed_id_pysradb'
     FROM ena_studies WHERE pubmed_id_pysradb = %(pmid)s
     UNION
     SELECT accession, 'arrayexpress', 'arrayexpress_experiments.pubmed_id'
-    FROM arrayexpress_experiments
-    WHERE pubmed_id = %(pmid)s OR pubmed_id_pysradb = %(pmid)s
+    FROM arrayexpress_experiments WHERE pubmed_id = %(pmid)s
+    UNION
+    SELECT accession, 'arrayexpress', 'arrayexpress_experiments.pubmed_id_pysradb'
+    FROM arrayexpress_experiments WHERE pubmed_id_pysradb = %(pmid)s
     UNION
     SELECT accession, 'dra', 'dra_studies.pubmed_id_pysradb'
     FROM dra_studies WHERE pubmed_id_pysradb = %(pmid)s
     UNION
+    SELECT accession, 'dra', 'dra_studies.links.XREF_LINK'
+    FROM dra_studies
+    WHERE {_xref_pmid()} = %(pmid)s AND {_xref_is_pubmed()}
+    UNION
     SELECT accession, 'gea', 'gea_experiments.pubmed_id'
-    FROM gea_experiments
-    WHERE pubmed_id = %(pmid)s OR pubmed_id_pysradb = %(pmid)s
+    FROM gea_experiments WHERE pubmed_id = %(pmid)s
+    UNION
+    SELECT accession, 'gea', 'gea_experiments.pubmed_id_pysradb'
+    FROM gea_experiments WHERE pubmed_id_pysradb = %(pmid)s
+    UNION
+    SELECT s.study_accession, 'gsa', 'gsa_projects.pubmed_id'
+    FROM gsa_studies s JOIN gsa_projects p ON p.accession = s.project_name
+    WHERE p.pubmed_id @> jsonb_build_array(%(pmid)s::text)
+    UNION
+    SELECT study_accession, 'gsa', 'gsa_studies.pubmed_id_pysradb'
+    FROM gsa_studies WHERE pubmed_id_pysradb = %(pmid)s
 ),
 -- Collapse multiple link rows for the same accession; study_publications wins as via.
 deduped AS (
@@ -2089,14 +2135,14 @@ deduped AS (
     ORDER BY accession, (via <> 'study_publications'), via
 )
 SELECT l.accession, l.source, l.via,
-       COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title)
-           AS title,
+       COALESCE(g.title, s.title, ae.title, en.study_title, d.title, ge.title,
+                gs.study_title) AS title,
        -- dra_studies / gea_experiments have no abstract column to fall back on,
        -- so those rows come back with a null summary.
-       COALESCE(g.summary, s.abstract, ae.description, en.study_description)
-           AS summary,
+       COALESCE(g.summary, s.abstract, ae.description, en.study_description,
+                gs.study_description) AS summary,
        COALESCE(g.published_at, s.published_at, ae.release_date, en.first_public,
-                d.published_at, ge.release_date) AS published_at
+                d.published_at, ge.release_date, gs.first_public) AS published_at
 FROM deduped l
 LEFT JOIN geo_series               g  ON g.accession        = l.accession
 LEFT JOIN sra_studies              s  ON s.accession        = l.accession
@@ -2104,6 +2150,7 @@ LEFT JOIN arrayexpress_experiments ae ON ae.accession       = l.accession
 LEFT JOIN ena_studies              en ON en.study_accession = l.accession
 LEFT JOIN dra_studies              d  ON d.accession        = l.accession
 LEFT JOIN gea_experiments          ge ON ge.accession       = l.accession
+LEFT JOIN gsa_studies              gs ON gs.study_accession = l.accession
 ORDER BY l.source, l.accession;
 """
 
@@ -2214,7 +2261,7 @@ ORDER BY m.citation_count DESC NULLS LAST;
 """
 
 # Reverse-resolve an author's pmids to projects via per-source pubmed_id columns
-_AUTHOR_PROJECTS_CTE = """
+_AUTHOR_PROJECTS_CTE = f"""
 WITH pm AS MATERIALIZED (
     SELECT pmid FROM pubmed_metadata WHERE authors ~* %(re)s
 ),
@@ -2254,13 +2301,7 @@ u AS (
       FROM ena_studies es
      WHERE es.pubmed_id_pysradb IN (SELECT pmid FROM pm)
     UNION ALL
-    SELECT gs.study_accession, gs.study_title, gs.study_description,
-           gs.last_updated, gs.first_public, NULL::text
-      FROM gsa_studies gs
-     WHERE gs.pubmed_id_pysradb IN (SELECT pmid FROM pm)
-    UNION ALL
-    -- Split the OR into two arms: a single "col1 IN (..) OR col2 IN (..)" forces
-    -- a seq scan over all ~60k AE rows; two arms each hit their own index.
+    -- Arms stay split per column: each has its own index, an OR would seq-scan.
     SELECT ae.accession, ae.title, ae.description,
            ae.release_date, ae.release_date,
            COALESCE(NULLIF(ae.contact_affiliation, ''), NULLIF(ae.organizations_text, ''))
@@ -2272,6 +2313,39 @@ u AS (
            COALESCE(NULLIF(ae.contact_affiliation, ''), NULLIF(ae.organizations_text, ''))
       FROM arrayexpress_experiments ae
      WHERE ae.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT ge.accession, ge.title, ge.description,
+           ge.updated_at, ge.release_date, ge.contact_affiliation
+      FROM gea_experiments ge
+     WHERE ge.pubmed_id IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT ge.accession, ge.title, ge.description,
+           ge.updated_at, ge.release_date, ge.contact_affiliation
+      FROM gea_experiments ge
+     WHERE ge.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT d.accession, d.title, d.abstract, d.updated_at, d.published_at,
+           NULL::text
+      FROM dra_studies d
+     WHERE d.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT d.accession, d.title, d.abstract, d.updated_at, d.published_at,
+           NULL::text
+      FROM dra_studies d
+     WHERE {_xref_pmid("d.")} IN (SELECT pmid FROM pm)
+       AND {_xref_is_pubmed("d.")}
+    UNION ALL
+    SELECT gs.study_accession, gs.study_title, gs.study_description,
+           gs.last_updated, gs.first_public, p.submitting_org
+      FROM gsa_studies gs LEFT JOIN gsa_projects p ON p.accession = gs.project_name
+     WHERE gs.pubmed_id_pysradb IN (SELECT pmid FROM pm)
+    UNION ALL
+    SELECT gs.study_accession, gs.study_title, gs.study_description,
+           gs.last_updated, gs.first_public, p.submitting_org
+      FROM gsa_studies gs JOIN gsa_projects p ON p.accession = gs.project_name
+     -- ?| takes the whole pmid set in one pass; a correlated
+     -- jsonb_array_elements_text EXISTS re-hashes pm per project row.
+     WHERE p.pubmed_id ?| ARRAY(SELECT pmid FROM pm)
 ),
 -- Dedup by accession; full_total is the real count before LIMIT.
 d AS (

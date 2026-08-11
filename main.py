@@ -2342,7 +2342,9 @@ _PROJECT_CACHE_CONTROL = "public, s-maxage=2592000, stale-while-revalidate=25920
 _SEARCH_FACETS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
 # (query, accession) -> words only changes on reindex, and one query fans out to
 # every result the user opens, so let the edge absorb the repeats.
-_SEARCH_HIGHLIGHT_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
+_SEARCH_HIGHLIGHT_CACHE_CONTROL = (
+    "public, s-maxage=604800, stale-while-revalidate=2592000"
+)
 _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
