@@ -978,6 +978,16 @@ def _rich_pub(pmid: str, m: dict) -> dict:
     }
 
 
+def _hydrate_pub(pub: dict, pubmed_map: dict[str, dict]) -> dict:
+    """Fill a stored study_publications entry's gaps from pubmed_metadata.
+    """
+    pmid = str(pub.get("pmid") or "")
+    m = pubmed_map.get(pmid)
+    if not m:
+        return pub
+    return {**_rich_pub(pmid, m), **{k: v for k, v in pub.items() if v is not None}}
+
+
 def _flat_pub(pmid: str | None, flat_row: dict | None) -> dict | None:
     """A publication entry from the project's own flat publication_* columns
     (ArrayExpress) and/or a bare pmid the frontend enriches from NCBI. None
@@ -1166,7 +1176,15 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     for r in cur.fetchall():
         cand_pmids.setdefault(r["accession"], []).append(str(r["pmid"]))
 
-    all_pmids = sorted({p for lst in cand_pmids.values() for p in lst})
+    all_pmids = sorted(
+        {p for lst in cand_pmids.values() for p in lst}
+        | {
+            str(pub["pmid"])
+            for pubs in pub_map.values()
+            for pub in (pubs or [])
+            if pub.get("pmid")
+        }
+    )
     pubmed_map: dict[str, dict] = {}
     if all_pmids:
         cur.execute(PUBMED_BY_PMIDS_BATCH_SQL, {"pmids": all_pmids})
@@ -1178,7 +1196,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         for i, cand in enumerate(row_candidates.get(acc, [acc] if acc else [])):
             sp = pub_map.get(cand)
             if sp:
-                pubs = sp
+                pubs = [_hydrate_pub(p, pubmed_map) for p in sp]
                 break
             # flat publication_* columns only exist on the project's own row.
             built = _build_publications(
