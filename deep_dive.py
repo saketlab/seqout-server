@@ -54,6 +54,87 @@ ORDER BY name
 """
 
 
+# Everything known about one term: its own xrefs, its MAPS_TO synonym cluster
+# (each with xrefs), within `hops` hops. `hops` is interpolated, never
+# parameterised — Cypher does not accept a parameter as a variable-length bound,
+# so callers MUST pass a validated int (see _HOPS_MAX).
+_CYPHER_TERM = """
+MATCH (start:Term) WHERE start.name = toLower($term)
+OPTIONAL MATCH (start)-[:MAPS_TO*1..%d]-(syn:Term)
+WITH start, [s IN collect(DISTINCT syn) WHERE s <> start] AS syns
+RETURN start.name AS name,
+       coalesce(start.xrefs, []) AS xrefs,
+       coalesce(start.has_children, false) AS has_children,
+       [s IN syns | {name: s.name, xrefs: coalesce(s.xrefs, [])}][0..%d] AS synonyms,
+       size(syns) AS synonym_total
+"""
+
+# Direct hierarchy children of the term's synonym cluster. Same shape as
+# _CYPHER_CHILDREN but hop-configurable and carrying each child's xrefs.
+_CYPHER_TERM_CHILDREN = """
+MATCH (start:Term) WHERE start.name = toLower($term)
+OPTIONAL MATCH (start)-[:MAPS_TO*1..%d]-(syn:Term)
+WITH start, collect(DISTINCT syn) AS syns
+WITH [start] + syns AS cluster
+UNWIND cluster AS s
+MATCH (child:Term)-[:SUBCLASS_OF|PART_OF]->(s)
+WHERE NOT child IN cluster
+WITH DISTINCT child
+ORDER BY child.name
+LIMIT %d
+RETURN child.name AS name,
+       coalesce(child.has_children, false) AS has_children,
+       coalesce(child.xrefs, []) AS xrefs
+"""
+
+_HOPS_MAX = 4
+_SYNONYM_LIMIT = 500
+_CHILDREN_LIMIT = 300
+
+
+def fetch_ontology_term(
+    neo4j_driver, term: str, max_hops: int = 2, children: bool = True
+) -> dict | None:
+    """Everything the graph knows about one term.
+
+    `max_hops` bounds the MAPS_TO synonym walk only (matching what "hops" means
+    everywhere else here); hierarchy children are always DIRECT children of the
+    resulting synonym cluster, exactly as the deep-dive explorer defines them.
+
+    Returns None if the term is not in the graph, else
+    {name, xrefs, has_children, synonyms: [{name, xrefs}], synonym_total,
+     children: [{name, has_children, xrefs}] | None, children_truncated}.
+    """
+    hops = max(1, min(int(max_hops), _HOPS_MAX))
+    records, _, _ = neo4j_driver.execute_query(
+        _CYPHER_TERM % (hops, _SYNONYM_LIMIT), term=term, database_="neo4j"
+    )
+    if not records:
+        return None
+    r = records[0]
+    result = {
+        "name": r["name"],
+        "xrefs": r["xrefs"],
+        "has_children": r["has_children"],
+        "synonyms": r["synonyms"],
+        "synonym_total": r["synonym_total"],
+        "children": None,
+        "children_truncated": False,
+    }
+    if children:
+        rows, _, _ = neo4j_driver.execute_query(
+            _CYPHER_TERM_CHILDREN % (hops, _CHILDREN_LIMIT),
+            term=term,
+            database_="neo4j",
+        )
+        result["children"] = [
+            {"name": c["name"], "has_children": c["has_children"], "xrefs": c["xrefs"]}
+            for c in rows
+        ]
+        result["children_truncated"] = len(rows) == _CHILDREN_LIMIT
+    return result
+
+
 def fetch_deep_dive_terms(neo4j_driver, query: str) -> list[dict]:
     """Query sub-phrases that exist in the graph AND have hierarchy children.
 

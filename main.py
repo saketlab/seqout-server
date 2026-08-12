@@ -44,7 +44,11 @@ from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
-from deep_dive import fetch_deep_dive_children, fetch_deep_dive_terms
+from deep_dive import (
+    fetch_deep_dive_children,
+    fetch_deep_dive_terms,
+    fetch_ontology_term,
+)
 from expansions import expand_terms, expand_terms_explained
 from grid_filters import (
     _indexed_accession,
@@ -4620,6 +4624,44 @@ def deep_dive_children(
         raise HTTPException(500, "Internal server error")
     took_ms = (time.perf_counter() - start) * 1000
     return {"term": term.lower(), "children": children, "took_ms": round(took_ms, 2)}
+
+
+@api_app.get(
+    "/ontology/term",
+    summary="Everything the ontology graph knows about a term",
+    description=(
+        "Look up one term in the ontology graph and return its source identifiers "
+        "(xrefs), its MAPS_TO synonym cluster, and its hierarchy children. "
+        "`max_hops` (default 2) bounds the synonym walk only — children are always "
+        "the DIRECT children of the resulting synonym cluster, as the deep-dive "
+        "explorer defines them. Set `children=false` to skip the children query "
+        "entirely, which is much cheaper. xrefs are source CURIEs "
+        "(UBERON:0002107, HGNC:5, MeSH:D008099, CVCL_0030) and are returned for "
+        "the queried term, every synonym, and every child. Synonyms capped at 500 "
+        "(synonym_total gives the true count), children at 300 "
+        "(children_truncated flags the cap). 404 if the term is not in the graph."
+    ),
+    operation_id="ontology_term",
+)
+@limiter.limit("100/minute")
+def ontology_term(
+    request: Request,
+    term: str = Query(..., min_length=1, max_length=200),
+    max_hops: int = Query(2, ge=1, le=4),
+    children: bool = Query(True),
+):
+    start = time.perf_counter()
+    try:
+        result = fetch_ontology_term(
+            neo4j_driver, term, max_hops=max_hops, children=children
+        )
+    except Exception:
+        logger.exception("ontology_term failed for term=%r", term)
+        raise HTTPException(500, "Internal server error")
+    if result is None:
+        raise HTTPException(404, f"Term not found in ontology graph: {term}")
+    took_ms = (time.perf_counter() - start) * 1000
+    return {**result, "max_hops": max_hops, "took_ms": round(took_ms, 2)}
 
 
 @api_app.get(
