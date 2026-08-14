@@ -4999,6 +4999,46 @@ ENRICHED_STATS_REFRESH = (
     "REFRESH MATERIALIZED VIEW enriched_crosstab;"
 )
 
+# rare disease (GARD)
+
+RARE_SUMMARY_SQL = """
+SELECT count(*)                        AS studies,
+       sum(n_samples)                  AS samples,
+       sum(cells)                      AS cells,
+       count(*) FILTER (WHERE reads_single_cell > 0) AS studies_single_cell,
+       sum(stated_male)                AS stated_male,
+       sum(stated_female)              AS stated_female,
+       sum(stated_missing)             AS stated_missing,
+       sum(reads_male)                 AS reads_male,
+       sum(reads_female)               AS reads_female
+FROM rare_disease_study;
+"""
+
+# a category no study carries is absent, not zero
+RARE_FACETS_SQL = """
+SELECT facet, value, studies FROM rare_disease_facet ORDER BY facet, studies DESC;
+"""
+
+RARE_PROJECTS_SQL = """
+SELECT r.study_accession, r.n_samples, r.n_diseases, r.cells,
+       r.assay_category, r.stated_male, r.stated_female,
+       r.stated_missing, r.reads_male, r.reads_female,
+       r.disease_names AS diseases,
+       r.categories,
+       (SELECT array_agg(DISTINCT gd.gard_name) FROM gard_disease gd
+         WHERE gd.mondo_id = ANY(r.mondo_ids)
+            OR gd.mondo_id IN (SELECT c.ancestor_id FROM ontology_closure c
+                                WHERE c.ontology = 'mondo'
+                                  AND c.descendant_id = ANY(r.mondo_ids))
+       ) AS gard_diseases
+FROM rare_disease_study r
+WHERE (%(category)s::text IS NULL
+       OR r.categories @> ARRAY[%(category)s::text])
+  AND (%(assay_category)s::text IS NULL OR r.assay_category = %(assay_category)s::text)
+ORDER BY r.cells DESC NULLS LAST, r.n_samples DESC
+LIMIT %(limit)s OFFSET %(offset)s;
+"""
+
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary;"
 ENRICHED_COLUMN_VALUES_SQL = (
     "SELECT value, n FROM enriched_column_top_values "

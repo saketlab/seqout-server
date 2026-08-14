@@ -88,6 +88,9 @@ from queries import (
     ENRICHED_STUDY_SQL,
     ENRICHED_STUDY_V3_SQL,
     ENRICHED_SUMMARY_SQL,
+    RARE_FACETS_SQL,
+    RARE_PROJECTS_SQL,
+    RARE_SUMMARY_SQL,
     ENRICHED_TOP_VALUES_PER_COLUMN,
     EXPERIMENT_RUNS_SQL,
     GEA_EXPERIMENT_SAMPLES_SQL,
@@ -10310,6 +10313,124 @@ def get_last_updated(
     }
 
 
+DISEASE_COLLECTIONS = {
+    "rare": {
+        "summary": RARE_SUMMARY_SQL,
+        "facets": RARE_FACETS_SQL,
+        "projects": RARE_PROJECTS_SQL,
+    },
+}
+
+
+def _collection(name: str) -> dict:
+    coll = DISEASE_COLLECTIONS.get(name)
+    if coll is None:
+        raise HTTPException(
+            404,
+            f"Unknown disease collection '{name}'. "
+            f"Available: {', '.join(sorted(DISEASE_COLLECTIONS))}",
+        )
+    return coll
+
+
+@api_app.get(
+    "/disease/{collection}/summary",
+    summary="Disease-collection corpus totals",
+    description=(
+        "Corpus-wide totals for studies with at least one sample annotated with "
+        "a disease in this collection. `rare` is NIH GARD, resolved through MONDO "
+        "ids and their descendants. Stated and read-derived sex are different "
+        "measurements and are reported separately."
+    ),
+    operation_id="get_disease_summary",
+)
+@limiter.limit("60/minute")
+def get_disease_summary(request: Request, collection: str):
+    sql = _collection(collection)["summary"]
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_disease_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, f"{collection} disease stats not available")
+    return row
+
+
+@api_app.get(
+    "/disease/{collection}/facets",
+    summary="Disease-collection facet counts",
+    description=(
+        "Study counts per disease category, clinical specialty and assay. "
+        "Precomputed; the live join is ~80 s."
+    ),
+    operation_id="get_disease_facets",
+)
+@limiter.limit("60/minute")
+def get_disease_facets(request: Request, collection: str):
+    sql = _collection(collection)["facets"]
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_disease_facets")
+        raise HTTPException(500, "Internal server error")
+    out: dict[str, list] = {}
+    for r in rows:
+        out.setdefault(r["facet"], []).append(
+            {"value": r["value"], "studies": r["studies"]}
+        )
+    return out
+
+
+@api_app.get(
+    "/disease/{collection}/projects",
+    summary="Projects with samples in a disease collection",
+    description=(
+        "One row per study with its per-sample rollup: sample and cell counts, "
+        "tissue/assay breadth, and both sex measurements. A null cell count "
+        "means unmeasured. Optional category and assay_category filters. "
+        "Ordered by cell count."
+    ),
+    operation_id="get_disease_projects",
+)
+@limiter.limit("60/minute")
+def get_disease_projects(
+    request: Request,
+    collection: str,
+    category: str | None = None,
+    assay_category: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    sql = _collection(collection)["projects"]
+    limit = max(1, min(limit, 200))
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                sql,
+                {
+                    "category": category,
+                    "assay_category": assay_category,
+                    "limit": limit,
+                    "offset": max(0, offset),
+                },
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_disease_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "collection": collection,
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
 @api_app.get(
     "/stats/enriched",
     summary="Enriched metadata coverage and per-column stats",
@@ -11525,6 +11646,10 @@ MCP_OPERATION_IDS = {
 }
 
 ENRICHMENT_OPERATION_IDS = {
+    # /disease/* is a rollup of ontology_samples_v4
+    "get_disease_summary",
+    "get_disease_facets",
+    "get_disease_projects",
     "get_enriched_stats",
     "get_enriched_crosstab",
     "get_enriched_column",
@@ -11556,6 +11681,7 @@ _ENRICHMENT_DISABLED_PATHS = (
     re.compile(r"^/experiment/[^/]+/enriched/?$", re.IGNORECASE),
     re.compile(r"^/run/[^/]+/enriched/?$", re.IGNORECASE),
     re.compile(r"^/stats/enriched(?:/.*)?$", re.IGNORECASE),
+    re.compile(r"^/disease(?:/.*)?$", re.IGNORECASE),
     re.compile(r"^/beacon(?:/.*)?$", re.IGNORECASE),
 )
 
