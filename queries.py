@@ -127,7 +127,7 @@ WHERE canonical_accession = ANY(%(acc)s);
 """
 
 # GSA's submitter/org live on the linked BioProject, not unified_metadata (which
-# has no GSA rows) — same join GSA_PROJECT_SQL uses, batched for result rows.
+# has no GSA rows), same join GSA_PROJECT_SQL uses, batched for result rows.
 GSA_SUBMITTER_BATCH_SQL = """
 SELECT es.study_accession AS accession,
        NULLIF(btrim(p.submitter), '') AS submitter_person,
@@ -174,7 +174,7 @@ all_matches AS (
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
-    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    -- total deferred to /search/facets (filtered by db); see SEARCH_SQL note.
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -212,7 +212,7 @@ all_matches AS (
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
-    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    -- total deferred to /search/facets (filtered by db); see SEARCH_SQL note.
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -250,7 +250,7 @@ all_matches AS (
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
-    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    -- total deferred to /search/facets (filtered by db); see SEARCH_SQL note.
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -295,7 +295,7 @@ all_matches AS (
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
-    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    -- total deferred to /search/facets (filtered by db); see SEARCH_SQL note.
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -340,7 +340,7 @@ all_matches AS (
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 counted AS (
-    -- total deferred to /search/facets (filtered by db) — see SEARCH_SQL note.
+    -- total deferred to /search/facets (filtered by db); see SEARCH_SQL note.
     SELECT *, NULL::bigint AS total_count FROM all_matches
 ),
 paged AS (
@@ -654,7 +654,7 @@ all_matches AS (
     -- title/abstract/organisms enriched from the BioProject and materialized
     -- onto gsa_studies_search by transfer.gsa_search, so the organism facet
     -- includes GSA; library_strategies/platforms stay NULL (per-run aggregation
-    -- is too costly for the hot path — as with ENA).
+    -- is too costly for the hot path, as with ENA).
     SELECT gss.accession,
            COALESCE(gss.study_title, gss.project_title, gss.study_name, gss.project_name, gss.accession) AS title,
            COALESCE(gss.study_description, gss.project_summary) AS summary,
@@ -695,14 +695,14 @@ all_matches AS (
 ),
 -- Filter to the requested source BEFORE the dedup. GEO↔SRA twins share a
 -- dedup_key (the SRA study carries the GSE as its alias); deduping first can
--- keep the higher-ranked SRA twin, and then a `source = 'geo'` filter would
+-- keep the higher-ranked SRA twin, and then a source = 'geo' filter would
 -- delete the GEO row entirely, undercounting the scoped total. Filtering first
 -- dedups only within the requested source (accessions are unique there, so no
 -- double-count is reintroduced); the unified db IS NULL path is unchanged.
 deduped AS (
     -- dedup_key is carried through because it IS unified_metadata.canonical_accession
-    -- (COALESCE(alias, accession) for SRA/AE, accession elsewhere). ~170k SRA studies
-    -- are canonicalised to their GSE alias, so joining unified_metadata on `accession`
+    -- (COALESCE(alias, accession) for SRA/AE, accession elsewhere). Some SRA studies
+    -- are canonicalised to their GSE alias, so joining unified_metadata on accession
     -- would drop them; the investigator ranking joins on dedup_key instead.
     SELECT DISTINCT ON (dedup_key)
         accession, dedup_key, title, summary, updated_at, organisms, countries,
@@ -836,8 +836,8 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
     """
     cte = _SEARCH_MATCH_CTE_STRUCTURED if structured else _SEARCH_MATCH_CTE
     # Only the columns the count + facet + filter queries actually read. Notably
-    # NOT title/summary (summary holds full abstracts — tens of MB over a broad
-    # match) — those exist in the shared CTE for the result-list path, not here.
+    # NOT title/summary (summary holds full abstracts over a broad
+    # match), those exist in the shared CTE for the result-list path, not here.
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
@@ -970,7 +970,7 @@ def build_search_results(
     elif not q:
         # query-less: rank is NULL on every row, so a (rank, accession) keyset
         # guard is always-true and paging never advances (infinite loop). Page by
-        # accession alone — the real sort order when all ranks are NULL.
+        # accession alone, the real sort order when all ranks are NULL.
         join_clause = ""
         order_by = "ORDER BY paged.accession DESC"
         paged_where = (
@@ -989,7 +989,7 @@ def build_search_results(
         + "\n"
         + "),\n"
         + "counted AS (\n"
-        # total deferred to /search/facets — see SEARCH_SQL note.
+        # total deferred to /search/facets; see SEARCH_SQL note.
         + "    SELECT *, NULL::bigint AS total_count FROM filtered\n"
         + "),\n"
         + "paged AS (\n"
@@ -1323,7 +1323,7 @@ SELECT
     -- ENA/DDBJ study hierarchy: a study may nest under an umbrella BioProject
     -- (parent), and umbrella projects may have many children. Child-of is a
     -- single cheap join; parent-of is a capped preview + total (needs the
-    -- idx_ena_studies_parent index — a big umbrella has tens of thousands).
+    -- idx_ena_studies_parent index for large umbrella projects).
     es.parent_study_accession AS parent_accession,
     parent.study_title AS parent_title,
     (
@@ -1760,7 +1760,7 @@ LIMIT 1;
 """
 
 # ENA (incl. the DDBJ mirror) stores some BioProjects keyed by the PRJ accession
-# itself (study_accession = PRJNA*/PRJDB*/PRJEB*), with no GEO/SRA/GSA study —
+# itself (study_accession = PRJNA*/PRJDB*/PRJEB*), with no GEO/SRA/GSA study,
 # e.g. assembly-only projects. The project page is /p/<PRJ>, so resolve to self.
 PRJ_TO_ENA_STUDY_SQL = """
 SELECT study_accession AS accession
@@ -1928,7 +1928,7 @@ _FASTQ_MD5_EXPR = (
 )
 
 # NCBI's object keys carry a version suffix the real file does not have
-# (..._R1_001.fastq.gz.1), so a name taken from the URL is wrong for ~92% of the
+# (..._R1_001.fastq.gz.1), so a name taken from the URL is wrong for
 # fallback entries. ncbi_files already stores the true filename; use it.
 #
 # Total by construction, never NULL where fastq_ftp is set: the ENA arm is just
@@ -2300,7 +2300,7 @@ u AS (
            array_to_string(gs.organizations, '; ') AS institute
       FROM geo_series gs
      -- Array-overlap against the whole pmid set: one GIN scan, vs a per-pmid
-     -- nested loop (loops=N) with `JOIN pm ON pubmed_id @> ARRAY[pm.pmid]`.
+     -- nested loop per pmid.
      WHERE gs.pubmed_id && ARRAY(SELECT pmid FROM pm)
     UNION ALL
     SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
@@ -2316,7 +2316,7 @@ u AS (
     UNION ALL
     -- SRA center_project_name / ENA center_name are submitting-center metadata
     -- (often a sequencing vendor, e.g. "Illumina Inc."), not an author
-    -- affiliation — leave institute NULL rather than mislead.
+    -- affiliation, leave institute NULL rather than mislead.
     SELECT s.accession, s.title, s.abstract, s.updated_at, s.published_at,
            NULL::text
       FROM sra_studies s
@@ -2763,7 +2763,6 @@ def build_structured_search(
     include_ena = source in (None, "all", "ena")
     include_gsa = source in (None, "all", "gsa")
 
-    # Skip sources that cannot satisfy required filters
     if library_strategy:
         include_geo = False
     if platform:
@@ -2780,7 +2779,6 @@ def build_structured_search(
         include_ena = False
         include_gsa = False
 
-    # Populate shared params
     if q:
         params["q"] = q
         params["q_variants"] = q_variants or [q]
@@ -2817,7 +2815,6 @@ def build_structured_search(
     if sample_cell_type:
         params["sample_cell_type"] = f"%{sample_cell_type}%"
 
-    # Geo filter kwargs
     geo_kwargs = dict(
         geo_country=geo_country,
         geo_country_code=geo_country_code,
@@ -2864,7 +2861,6 @@ def build_structured_search(
 
     has_pub_date = bool(pub_date_after or pub_date_before)
 
-    # --- GEO ---
     if include_geo:
         w = []
         joins = ""
@@ -2940,7 +2936,6 @@ def build_structured_search(
             f" FROM geo_series g{joins}{from_q}{where}"
         )
 
-    # --- SRA ---
     if include_sra:
         w = []
         joins = ""
@@ -3022,7 +3017,6 @@ def build_structured_search(
             f" FROM sra_studies s{joins}{from_q}{where}"
         )
 
-    # --- ArrayExpress ---
     if include_ae:
         w = []
         joins = ""
@@ -3086,7 +3080,6 @@ def build_structured_search(
             f" FROM arrayexpress_experiments ae{joins}{from_q}{where}"
         )
 
-    # --- ENA ---
     if include_ena:
         w = []
         joins = ""
@@ -3102,8 +3095,8 @@ def build_structured_search(
             w.append(f"{ena_tsv} @@ q.match_q")
         if organism:
             # GIN-indexed array containment (idx_ena_studies_organisms_gin); the
-            # scalar scientific_name only saw the study-level organism and missed
-            # every multi-organism ENA study (44k of them).
+            # scalar scientific_name only sees the study-level organism and misses
+            # multi-organism ENA studies.
             w.append("es.organisms @> ARRAY[%(organism)s]")
         if library_strategy or platform or country:
             ec = ["ee.study_accession = es.study_accession"]
@@ -3178,7 +3171,7 @@ def build_structured_search(
         # LEFT JOIN the enriched search table so q matches the BioProject/sample
         # text materialized onto gsa_studies_search by transfer.gsa_search, not
         # just the thin study_title/description. LEFT so non-q filters still see
-        # the ~5.4k studies absent from the search table.
+        # studies absent from the search table.
         joins = (
             " LEFT JOIN gsa_studies_search gss ON gss.accession = gs.study_accession"
         )
@@ -3190,7 +3183,7 @@ def build_structured_search(
             w.append(f"{gsa_tsv} @@ q.match_q")
         if organism:
             # GIN-indexed containment (idx_gsa_studies_organisms_gin); the scalar
-            # scientific_name missed every multi-organism GSA study (1,194).
+            # scientific_name missed multi-organism GSA studies.
             w.append("gs.organisms @> ARRAY[%(organism)s]")
         if library_strategy or platform or country:
             ec = ["ge.study_accession = gs.study_accession"]
@@ -3297,7 +3290,6 @@ def build_structured_search(
 ),
 """
 
-    # Prepend query and geo_accessions CTEs when active
     query_cte_prefix = query_cte
     geo_cte_prefix = f"{geo_cte},\n" if geo_cte else ""
 
@@ -3448,7 +3440,6 @@ def build_sorted_search_sql(
 
     all_matches = "\n    UNION ALL\n    ".join(cte_parts)
 
-    # Sort expression and optional join
     if sortby == "citations":
         sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
         join_clause = (
@@ -3709,7 +3700,7 @@ matched AS (
     UNION ALL
 
     -- GSA title/organisms come off the search table; gsa_studies has neither an
-    -- `accession` nor an `organisms` column (transfer.gsa_search enriches them
+    -- accession nor organisms columns (transfer.gsa_search enriches them
     -- from the BioProject). Same COALESCE ladder search uses, so the graph and
     -- the result rows agree on a study's name.
     SELECT
@@ -5001,43 +4992,276 @@ ENRICHED_STATS_REFRESH = (
 
 # rare disease (GARD)
 
-RARE_SUMMARY_SQL = """
+# Two collections, same shape, different catalogue: GARD resolves onto MONDO by
+# exact xref, NORD only by name, so NORD membership is looser. Both sets of
+# matviews come from scripts/create_rare_disease_matview.sh.
+DISEASE_COLLECTIONS = {
+    "rare": {
+        "prefix": "rare_disease",
+        # same alias in both collections so one renderer handles either
+        "label": "catalogue_diseases",
+        "label_col": "gard_names",
+        # query parameter -> matview array column, all faceted and GIN-indexed
+        "tags": {
+            "category": "categories",
+            "specialty": "specialties",
+            "group": "groups",
+        },
+        "catalogue": ("gard_disease", "gard_name"),
+    },
+    "nord": {
+        "prefix": "nord_disease",
+        "label": "catalogue_diseases",
+        "label_col": "nord_names",
+        "tags": {"nord_type": "nord_types"},
+        "catalogue": ("nord_disease", "nord_name"),
+    },
+}
+
+_SCALAR_FILTERS = ("assay_category",)
+
+# Only the positive case: has_fastq=false would conflate "none found" with
+# "study absent from the links table".
+_BOOL_FILTERS = ("has_fastq", "has_sra")
+
+_ARRAY_FILTERS = {
+    "ancestry": "ancestries",
+    "organism": "organisms",
+    "inheritance": "inheritance",
+}
+
+# study_accession is appended to every sort as the tiebreak: without a unique
+# last key two equal-valued rows swap between pages and a client sees one twice.
+SORTABLE = frozenset(
+    {
+        "cells",
+        "n_samples",
+        "n_diseases",
+        "title",
+        "study_accession",
+        "assay_category",
+        "organism",
+    }
+)
+
+# Scope is a filter, not baked into the matview, so it stays reversible; each
+# entry is (counter column, predicate).
+SCOPES = {
+    # human material that is neither an immortalized line nor a derived model
+    "human_primary": ("n_human_primary", "r.n_human_primary > 0"),
+    # organoid / iPSC / ESC / xenograft: patient-derived, but not a patient cohort
+    "patient_derived_model": ("n_model", "r.n_model > 0"),
+    "cell_line": ("n_cell_line", "r.n_cell_line > 0"),
+    "all": ("n_samples", "TRUE"),
+}
+DEFAULT_SCOPE = "human_primary"
+
+# Must stay identical to the normalizer in create_disease_alias_matview.sh: a
+# query normalized differently from the stored alias matches nothing.
+_ALIAS_NORM = "btrim(regexp_replace(lower({}), '[^a-z0-9]+', ' ', 'g'))"
+
+# One disease name -> that disease and every subtype. disease_alias flattens
+# GARD/NORD/MONDO names and their synonyms; the closure adds the subtypes.
+DISEASE_MONDO_SET = f"""(
+    SELECT coalesce(array_agg(DISTINCT m), '{{}}') FROM (
+        SELECT unnest(a.mondo_ids) AS m FROM disease_alias a
+         WHERE a.alias = {_ALIAS_NORM.format("%(disease)s::text")}
+        UNION
+        SELECT c.descendant_id FROM disease_alias a
+          JOIN ontology_closure c
+            ON c.ontology = 'mondo' AND c.ancestor_id = ANY(a.mondo_ids)
+         WHERE a.alias = {_ALIAS_NORM.format("%(disease)s::text")}
+    ) x
+)"""
+
+DISEASE_ALIAS_LOOKUP_SQL = f"""
+SELECT display_name, alias, mondo_ids, sources
+FROM disease_alias
+-- the %% operator, not similarity(): only the operator uses
+-- idx_disease_alias_trgm; both forms select the same
+-- rows. Every literal percent is doubled; psycopg scans comments for
+-- placeholders too
+WHERE alias %% {_ALIAS_NORM.format("%(q)s::text")}
+   OR alias LIKE {_ALIAS_NORM.format("%(q)s::text")} || '%%'
+ORDER BY (alias = {_ALIAS_NORM.format("%(q)s::text")}) DESC,
+         similarity(alias, {_ALIAS_NORM.format("%(q)s::text")}) DESC,
+         length(alias)
+LIMIT %(limit)s;
+"""
+
+# Upper-ontology terms every disease inherits; they say nothing about the study.
+UPPER_ONTOLOGY_TERMS = [
+    "entity",
+    "continuant",
+    "specifically dependent continuant",
+    "realizable entity",
+    "disposition",
+    "disease",
+    "human disease",
+]
+
+
+def build_disease_summary_sql(collection: str) -> str:
+    """Corpus-wide totals for one disease collection."""
+    prefix = DISEASE_COLLECTIONS[collection]["prefix"]
+    return f"""
 SELECT count(*)                        AS studies,
        sum(n_samples)                  AS samples,
        sum(cells)                      AS cells,
        count(*) FILTER (WHERE reads_single_cell > 0) AS studies_single_cell,
+       count(*) FILTER (WHERE cells IS NOT NULL)     AS studies_cells_measured,
+       count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms)) AS studies_human,
+       count(*) FILTER (WHERE n_human_primary > 0)   AS studies_human_primary,
+       count(*) FILTER (WHERE n_model > 0)           AS studies_model,
+       count(*) FILTER (WHERE n_cell_line > 0)       AS studies_cell_line,
+       -- reported ethnicity, not inferred ancestry; see the matview comment
+       count(*) FILTER (WHERE ancestries IS NOT NULL) AS studies_with_ancestry,
        sum(stated_male)                AS stated_male,
        sum(stated_female)              AS stated_female,
        sum(stated_missing)             AS stated_missing,
        sum(reads_male)                 AS reads_male,
        sum(reads_female)               AS reads_female
-FROM rare_disease_study;
-"""
+FROM {prefix}_study;
+"""  # noqa: S608 -- prefix comes from DISEASE_COLLECTIONS, not from the request
 
-# a category no study carries is absent, not zero
-RARE_FACETS_SQL = """
-SELECT facet, value, studies FROM rare_disease_facet ORDER BY facet, studies DESC;
-"""
 
-RARE_PROJECTS_SQL = """
-SELECT r.study_accession, r.n_samples, r.n_diseases, r.cells,
-       r.assay_category, r.stated_male, r.stated_female,
-       r.stated_missing, r.reads_male, r.reads_female,
-       r.disease_names AS diseases,
-       r.categories,
-       (SELECT array_agg(DISTINCT gd.gard_name) FROM gard_disease gd
-         WHERE gd.mondo_id = ANY(r.mondo_ids)
-            OR gd.mondo_id IN (SELECT c.ancestor_id FROM ontology_closure c
-                                WHERE c.ontology = 'mondo'
-                                  AND c.descendant_id = ANY(r.mondo_ids))
-       ) AS gard_diseases
-FROM rare_disease_study r
-WHERE (%(category)s::text IS NULL
-       OR r.categories @> ARRAY[%(category)s::text])
-  AND (%(assay_category)s::text IS NULL OR r.assay_category = %(assay_category)s::text)
-ORDER BY r.cells DESC NULLS LAST, r.n_samples DESC
-LIMIT %(limit)s OFFSET %(offset)s;
-"""
+def build_disease_facets_sql(collection: str) -> str:
+    """Facet counts. A value no study carries is absent, not zero."""
+    prefix = DISEASE_COLLECTIONS[collection]["prefix"]
+    return (  # noqa: S608 -- prefix is not request-derived
+        f"SELECT facet, value, studies FROM {prefix}_facet "
+        "ORDER BY facet, studies DESC;"
+    )
+
+
+def _disease_where(collection: str) -> str:
+    """Filter clauses shared by the page query and the count that reports it."""
+    coll = DISEASE_COLLECTIONS[collection]
+    return (
+        "".join(
+            f"\n      AND (%({param})s::text IS NULL"
+            f"\n           OR r.{col} @> ARRAY[%({param})s::text])"
+            for param, col in {**coll["tags"], **_ARRAY_FILTERS}.items()
+        )
+        + "".join(
+            f"\n      AND (%({c})s::text IS NULL OR r.{c} = %({c})s::text)"
+            for c in _SCALAR_FILTERS
+        )
+        + "".join(
+            f"\n      AND (%({c})s::boolean IS NOT TRUE OR r.{c})"
+            for c in _BOOL_FILTERS
+        )
+        + "\n      AND (%(disease)s::text IS NULL"
+        f"\n           OR r.resolved_mondo_ids && {DISEASE_MONDO_SET})"
+    )
+
+
+def build_disease_projects_sql(
+    collection: str,
+    sort: str = "cells",
+    descending: bool = True,
+    scope: str = DEFAULT_SCOPE,
+) -> str:
+    """
+    One page of studies, filtered and sorted.
+
+    Both the column list and the ORDER BY are assembled from module constants;
+    `sort` is validated against SORTABLE and never reaches the SQL as text.
+    """
+    coll = DISEASE_COLLECTIONS[collection]
+    prefix, label, label_col = coll["prefix"], coll["label"], coll["label_col"]
+    catalogue, name_col = coll["catalogue"]
+
+    tag_cols = "".join(f", r.{c}" for c in coll["tags"].values())
+    scope_col, scope_where = SCOPES[scope]
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+
+    # qualified: the outer FROM joins three relations that all carry study_accession
+    def order_by(alias: str) -> str:
+        return f"{alias}.{sort} {direction}, {alias}.study_accession"
+
+    return f"""
+WITH page AS (
+    SELECT r.study_accession, r.title, r.organism, r.organisms,
+           r.n_samples, r.n_diseases,
+           r.cells, r.assay_category, r.stated_male, r.stated_female,
+           r.stated_missing, r.reads_male, r.reads_female,
+           r.mondo_ids,
+           r.disease_names AS diseases,
+           r.ancestries, r.inheritance,
+           r.has_fastq, r.has_sra, r.n_fastq_runs, r.n_sra_runs,
+           r.n_human_primary, r.n_model, r.n_cell_line, r.n_nonhuman,
+           r.n_unknown_organism, r.cells_human_primary,
+           r.{scope_col} AS n_samples_in_scope,
+           r.{label_col} AS {label}_direct{tag_cols}
+    FROM {prefix}_study r
+    WHERE {scope_where}{_disease_where(collection)}
+    ORDER BY {order_by("r")}
+    LIMIT %(limit)s OFFSET %(offset)s
+),
+-- the catalogue disease each study rolled up to, direct or through the MONDO
+-- closure. Per page, not in the matview: precomputing all of them is too expensive.
+-- Both arms are equality joins so the catalogue's mondo_id index serves them;
+-- an OR over the two seq-scanned the catalogue once per page row.
+page_mondo AS (
+    SELECT p.study_accession, m FROM page p, unnest(p.mondo_ids) m
+),
+page_mondo_closed AS (
+    SELECT study_accession, m FROM page_mondo
+    UNION
+    SELECT pm.study_accession, c.ancestor_id
+      FROM page_mondo pm
+      JOIN ontology_closure c
+        ON c.ontology = 'mondo' AND c.descendant_id = pm.m
+),
+cat_names AS (
+    SELECT pmc.study_accession, array_agg(DISTINCT cat.{name_col}) AS names
+      FROM page_mondo_closed pmc
+      JOIN {catalogue} cat ON cat.mondo_id = pmc.m
+     GROUP BY 1
+),
+-- MONDO ancestry as the enrichment recorded it, not as the closure derives it:
+-- disease_ancestors is already per sample. Blank on plenty of rows (Huntington
+-- among them) and stays blank here.
+anc AS (
+    SELECT os.study_accession, array_agg(DISTINCT e->>'name') AS ancestors
+    FROM ontology_samples_v4 os,
+         LATERAL jsonb_array_elements(os.disease_ancestors::jsonb) e
+    WHERE os.study_accession IN (SELECT study_accession FROM page)
+      AND os.disease_ancestors LIKE '[%%'
+      AND e->>'name' <> ALL (%(upper_ontology)s::text[])
+    GROUP BY 1
+)
+SELECT p.*, cat_names.names AS {label}, anc.ancestors
+FROM page p
+LEFT JOIN cat_names ON cat_names.study_accession = p.study_accession
+LEFT JOIN anc ON anc.study_accession = p.study_accession
+ORDER BY {order_by("p")};
+"""  # noqa: S608 -- every interpolated name comes from module constants
+
+
+def build_disease_count_sql(collection: str, scope: str = DEFAULT_SCOPE) -> str:
+    """
+    How many studies match the filters, not how many are on this page.
+
+    Kept separate from the page query: "showing 50 of 50" would read as complete.
+    """
+    return f"""
+SELECT count(*) AS total FROM {DISEASE_COLLECTIONS[collection]["prefix"]}_study r
+WHERE {SCOPES[scope][1]}{_disease_where(collection)};
+"""  # noqa: S608 -- every interpolated name comes from module constants
+
+
+def disease_projects_params(collection: str) -> tuple[str, ...]:
+    """Filter parameter names this collection's projects query binds."""
+    return (
+        *DISEASE_COLLECTIONS[collection]["tags"],
+        *_ARRAY_FILTERS,
+        *_SCALAR_FILTERS,
+        *_BOOL_FILTERS,
+        "disease",
+    )
+
 
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary;"
 ENRICHED_COLUMN_VALUES_SQL = (
@@ -5095,17 +5319,9 @@ def build_country_accessions_sql(
     return sql + ";", params
 
 
-# Senior-author attribution: the LAST author of the linked publication, which is
-# the PI by convention. Verified on PMID 35389779 (Yazar et al., Science), whose
-# last author is the corresponding PI.
-#
-# The contributor-list fallback used by _PI_AUTHORS_CTE is deliberately absent
-# here. Measured over 20,192 GEO series that have >=3 contributors AND a linked
-# paper, the LAST GEO contributor is the paper's senior author only 38.5% of the
-# time (the FIRST contributor: 19.4%) -- GEO contributor order is submitter order,
-# not author order. Including those rows would put a wrong name on ~6 of every 10
-# fallback projects, so a PI ranking uses publications only and reports the
-# reduced coverage via covered_projects instead of guessing.
+# Senior-author attribution: use the last publication author by convention.
+# GEO contributor order is submitter order, not author order, so PI ranking uses
+# publications only and reports reduced coverage rather than guessing.
 _PI_SENIOR_AUTHORS_CTE = """
 authors AS (
     SELECT p.canonical_accession, p.pmid, p.center_name,
@@ -5120,7 +5336,7 @@ authors AS (
 )"""
 
 # Investigator attribution, shared by the country ranking and the search ranking
-# so the two can't drift. Expects a preceding `proj` CTE exposing
+# so the two can't drift. Expects a preceding proj CTE exposing
 # (canonical_accession, pmid, center_name). An investigator is any author of the
 # linked publication; projects with no pmid fall back to their contributor list.
 _PI_AUTHORS_CTE = """
@@ -5147,9 +5363,9 @@ authors AS (
 )"""
 
 # Ranking tail for _PI_AUTHORS_CTE. Authors are unnested, so project/paper counts
-# use DISTINCT. `covered_projects` is the distinct projects that yielded at least
+# use DISTINCT. covered_projects is the distinct projects that yielded at least
 # one investigator -- the honest denominator for "how much of the set is attributed".
-# `{limit}` is the caller's placeholder, so positional and named param styles both work.
+# The limit placeholder is caller-supplied, so positional and named param styles both work.
 _PI_RANK_TAIL = """
 SELECT
     a.pi,

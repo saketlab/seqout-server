@@ -88,9 +88,17 @@ from queries import (
     ENRICHED_STUDY_SQL,
     ENRICHED_STUDY_V3_SQL,
     ENRICHED_SUMMARY_SQL,
-    RARE_FACETS_SQL,
-    RARE_PROJECTS_SQL,
-    RARE_SUMMARY_SQL,
+    DISEASE_ALIAS_LOOKUP_SQL,
+    DISEASE_COLLECTIONS,
+    UPPER_ONTOLOGY_TERMS,
+    DEFAULT_SCOPE,
+    SCOPES,
+    SORTABLE,
+    build_disease_count_sql,
+    build_disease_facets_sql,
+    build_disease_projects_sql,
+    build_disease_summary_sql,
+    disease_projects_params,
     ENRICHED_TOP_VALUES_PER_COLUMN,
     EXPERIMENT_RUNS_SQL,
     GEA_EXPERIMENT_SAMPLES_SQL,
@@ -635,11 +643,11 @@ _growth_cache_lock = threading.Lock()
 _growth_cache: dict[tuple[str, str | None], dict] = {}
 _MAX_ORGANISM_CACHE_ENTRIES = 500
 _organism_growth_cache_lock = threading.Lock()
-_organism_growth_cache: dict[str, dict] = {}  # key -> {data, built_at}
+_organism_growth_cache: dict[str, dict] = {}
 _organisms_list_cache_lock = threading.Lock()
-_organisms_list_cache: dict[str, dict] = {}  # "plain"/"common" -> {data, built_at}
+_organisms_list_cache: dict[str, dict] = {}
 _organism_totals_cache_lock = threading.Lock()
-_organism_totals_cache: dict[str, dict] = {}  # cache_key -> {data, built_at}
+_organism_totals_cache: dict[str, dict] = {}
 _global_contributions_cache_lock = threading.Lock()
 _global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
 _global_contributions_query_cache_lock = threading.Lock()
@@ -660,43 +668,27 @@ _sitemap_counts_cache_lock = threading.Lock()
 _sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _enriched_crosstab_cache_lock = threading.Lock()
 _enriched_crosstab_cache: dict = {}
-# Broad-query facet cache: materializing the FTS match set is the cold-start cost
-# (up to ~68s for "cancer"). Once a broad query (total >= threshold) is computed we
-# keep its facets in-process with no expiry until /cache/purge clears it. Narrow
-# queries are never stored, so memory stays bounded to the few broad terms.
 _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
 _broad_facets_cache: dict[tuple, dict] = {}
-# First-page unfiltered results
 _search_results_cache_lock = threading.Lock()
 _search_results_cache: dict[tuple, dict] = {}
 _MAX_SEARCH_RESULTS_CACHE_ENTRIES = 300
-_SEARCH_RESULTS_PAGE = 200  # full page ⇒ broad query worth caching
-# Author-projects: deterministic per normalized name, and pages get revisited.
+_SEARCH_RESULTS_PAGE = 200
 _author_projects_cache_lock = threading.Lock()
 _author_projects_cache: dict[tuple, dict] = {}
 _AUTHOR_PROJECTS_CACHE_TTL = 24 * 3600
 _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
-# Fetch cap for faceting: the full deduped set is tiny for almost everyone.
-# total stays exact (the window runs pre-LIMIT); only facets undercount past the cap.
 _AUTHOR_PROJECTS_FETCH_CAP = 2000
 _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa", "dra", "gea")
 
 
-# Per-query ceiling
 _DEFAULT_STATEMENT_TIMEOUT = "30s"
 
 
 def _configure_connection(conn) -> None:
     conn.execute(f"SET statement_timeout = '{_DEFAULT_STATEMENT_TIMEOUT}'")
-    # Force custom (per-value) plans. The pool auto-prepares statements
-    # (prepare_threshold=2), and after a few executions Postgres switches an
-    # array-contains lookup like `samples @> ARRAY[$1]` to a GENERIC plan that
-    # can't estimate selectivity without the value -> seq scan of a 40M-row
-    # table -> 30s timeout (this is what made SRS/DRS/ERS sample pages hang).
-    # Re-planning per execute costs <1ms and keeps the GIN index in play; the
-    # parse savings of the prepared statement are retained.
     conn.execute("SET plan_cache_mode = force_custom_plan")
 
 
@@ -730,8 +722,6 @@ limiter = Limiter(key_func=get_remote_address)
 api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 api_app.state.limiter = limiter
 
-
-# Analytics
 
 _geoip_reader = None
 _geoip_lock = threading.Lock()
@@ -857,7 +847,6 @@ class AnalyticsMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response_ms = (time.perf_counter() - start) * 1000
 
-        # Extract all needed properties synchronously on the main thread
         search_query = request.query_params.get("q")
         client_ip = request.client.host if request.client else ""
         user_agent = request.headers.get("user-agent", "")
@@ -867,8 +856,6 @@ class AnalyticsMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         query_string = str(request.url.query) or None
 
-        # Schedule the blocking database write and GeoIP lookup to run asynchronously
-        # in asyncio's built-in thread pool executor.
         asyncio.create_task(
             asyncio.to_thread(
                 log_request,
@@ -1100,22 +1087,12 @@ def _attach_organism_taxa(row: dict, cur) -> None:
         )
         taxa = {r["name"]: r["taxon_id"] for r in cur.fetchall()}
     except Exception:
-        # Not built yet, or unreadable — the popover just loses its NCBI half.
         logger.warning("organism_taxa lookup unavailable", exc_info=True)
     row["organisms_with_taxa"] = [{"name": n, "taxon_id": taxa.get(n)} for n in names]
 
 
 def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
-    """Batch-lookup publications and center names, merge into result rows.
-
-    One uniform resolver for every project type. Per row, the linked
-    publication is resolved over candidate accessions — the project's own
-    accession first, then its aliases (so a project inherits its linked
-    archive's publication when it has none of its own). For each candidate:
-    study_publications → pmid (the repo's own pubmed_id / pubmed_id_pysradb
-    columns) → pubmed_metadata details / flat columns / pmid-only stub.
-    Always sets `center_name` from unified_metadata (own accession).
-    """
+    """Batch-lookup publications and center names, merge into result rows."""
     if not rows:
         return rows
     accessions = [r["accession"] for r in rows if r.get("accession")]
@@ -1140,7 +1117,6 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         if not acc:
             continue
         cands = [acc] + [a for a in row_aliases[acc] if a != acc]
-        # Search for cross-archive links
         for linked in _external_id_accessions(r.get("external_id")):
             if linked and linked != acc and linked not in cands:
                 cands.append(linked)
@@ -1151,7 +1127,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     cur.execute(STUDY_PUBLICATIONS_BATCH_SQL, (candidate_list,))
     pub_map = {r["accession"]: r["publications"] for r in cur.fetchall()}
 
-    # geo_series.contributors (author names, in order) for the GEO rows — the
+    # geo_series.contributors (author names, in order) for the GEO rows; the
     # author fallback when a series has no linked publication.
     geo_accs = [a for a in accessions if a.startswith("GSE")]
     contrib_map: dict[str, list] = {}
@@ -1163,7 +1139,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         citation_map = {r["accession"]: r["citation"] for r in cur.fetchall()}
 
     # GSA rows: unified_metadata has none, so their submitter/org come off the
-    # linked BioProject — the same place the project page reads them.
+    # linked BioProject, the same place the project page reads them.
     gsa_accs = [a for a in accessions if a[:3] in ("CRA", "HRA")]
     gsa_map: dict[str, dict] = {}
     if gsa_accs:
@@ -1182,7 +1158,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         }
 
     # pmid per candidate from each repo's own project table (pubmed_id /
-    # pubmed_id_pysradb) — the authoritative source across all repos.
+    # pubmed_id_pysradb), the authoritative source across all repos.
     cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": candidate_list})
     cand_pmids: dict[str, list[str]] = {}
     for r in cur.fetchall():
@@ -1218,7 +1194,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
                 pubs = built
                 break
         # Last resort: no candidate (own or linked) resolved to a PMID, but the
-        # submitter left a raw <Citation>. Show it as-submitted, flagged — so a
+        # submitter left a raw <Citation>. Show it as-submitted and flagged, so a
         # resolved alias PMID above always wins over unverified submitter text.
         if pubs is None:
             cites = citation_map.get(acc)
@@ -1246,7 +1222,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         row["is_single_cell"] = meta.get("is_single_cell")
         row["single_cell_modality"] = meta.get("single_cell_modality")
         # Prefer real publication authors; otherwise use geo_series.contributors
-        # (dedup preserving order — ingest may repeat names) over the center_name
+        # (dedup preserving order; ingest may repeat names) over the center_name
         # fallback. Orgs are unchanged: center_name already carries them.
         names = list(
             dict.fromkeys(n for n in (contrib_map.get(acc) or []) if n and n.strip())
@@ -1418,27 +1394,24 @@ def _transform_gea_sample_to_geo(sample: dict) -> dict:
     }
 
 
-# A broad `contains` filter can match most of a study, so the row count is
-# capped; the response reports `capped` so the grid can say "500+" rather than
-# present a truncated count as exact.
 _SAMPLE_FIND_LIMIT = 500
 _EXPERIMENT_FIND_LIMIT = 500
 _RUN_FIND_LIMIT = 500
 
 
 # The accession the samples grid displays, per source. These must mirror the
-# "accession" key built by the transforms above — AE/GEA rows have no single
+# "accession" key built by the transforms above; AE/GEA rows have no single
 # accession column, so the SQL has to rebuild the same COALESCE.
 _AE_SAMPLE_ACCESSION_EXPR = "COALESCE(ena_run, ena_experiment, source_name)"
 _GEA_SAMPLE_ACCESSION_EXPR = "COALESCE(dra_run, dra_experiment, biosample, source_name)"
 
 # Grid field -> SQL, per source. Names are unqualified: the find query wraps the
-# list SQL as `SELECT * FROM (...) f`, so they resolve against f. Fields absent
+# list SQL as SELECT * FROM (...) f, so they resolve against f. Fields absent
 # here (numeric columns, anything assembled from a second request) simply get
 # no server-side narrowing.
 #
 # GEO keeps its channels in JSONB, and the grid explodes one sample into one row
-# per channel — so those columns ask "any channel matches".
+# per channel, so those columns ask "any channel matches".
 _GEO_SAMPLE_FILTER_COLUMNS = {
     "sample": _indexed_accession("accession"),
     "title": "title",
@@ -1456,7 +1429,7 @@ _GEO_SAMPLE_FILTER_COLUMNS = {
     "extractProtocol": _jsonb_any_element("channels", "e->>'Extract-Protocol'"),
 }
 
-# AE and GEA have no channels column — the transforms synthesise a single
+# AE and GEA have no channels column; the transforms synthesise a single
 # channel from flat columns, so the channel fields map straight back to those.
 _AE_SAMPLE_FILTER_COLUMNS = {
     "sample": _AE_SAMPLE_ACCESSION_EXPR,
@@ -1480,7 +1453,7 @@ _GEA_SAMPLE_FILTER_COLUMNS = {
 }
 
 # The runs preview SQL ends in its own LIMIT 500, so the filter has to go
-# inside its WHERE rather than wrap it — hence the alias-qualified expressions,
+# inside its WHERE rather than wrap it, hence the alias-qualified expressions,
 # one map per SQL variant.
 _RUN_FILTER_COLUMNS = {
     "run_accession": _indexed_accession("dl.run_accession"),
@@ -1654,13 +1627,7 @@ def _fetch_study_experiments(
 
 
 def _find_study_experiments(cur, study: str, filters: str) -> list[dict] | None:
-    """Resolve the experiments grid's filter model across a whole study.
-
-    The grid pages 20 rows at a time, so its client-side filters cannot see past
-    what is loaded. Wrapping the same SQL the grid uses keeps the columns — and
-    the per-archive branching — from drifting; every variant exposes the same
-    output column names.
-    """
+    """Resolve the experiments grid's filter model across a whole study."""
     sql, _ = _study_experiments_sql(cur, study)
     where, params = _parse_grid_filters(filters, _EXPERIMENT_FILTER_COLUMNS)
     if not where:
@@ -1760,24 +1727,19 @@ def _fetch_samples_batch(cur, accessions) -> dict[str, dict]:
 
 
 def flatten_sra_study(cur, study: str) -> list[dict]:
-    # 1. Fetch experiments (like /project/{study}/experiments endpoint)
     experiments = _fetch_study_experiments(cur, study)
     if not experiments:
         return []
 
-    # 2. Fetch all unique samples (like frontend's fetchSamplesForExperiments)
     sample_accessions = []
     for e in experiments:
         if e.get("samples") and len(e["samples"]) > 0:
             sample_accessions.append(e["samples"][0])
 
-    # Remove duplicates while preserving order
     unique_sample_accs = list(dict.fromkeys(sample_accessions))
 
-    # Fetch all samples and parse attributes_json
     samples_map = {}
     for sample_acc, sample in _fetch_samples_batch(cur, unique_sample_accs).items():
-        # Parse attributes_json if it's a string (like frontend does)
         attrs = sample.get("attributes_json")
         if attrs and isinstance(attrs, str):
             try:
@@ -1786,7 +1748,6 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
                 sample["attributes_json"] = None
         samples_map[sample_acc] = sample
 
-    # 3. Collect all unique attribute keys (like frontend's useMemo)
     attribute_keys = set()
     for sample in samples_map.values():
         attrs = sample.get("attributes_json")
@@ -1801,7 +1762,6 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
 
     attribute_keys = sorted(attribute_keys)
 
-    # 4. Build rows matching the CSV structure
     rows = []
     for e in experiments:
         if not e.get("samples") or len(e["samples"]) == 0:
@@ -1810,7 +1770,6 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
         sample_acc = e["samples"][0]
         sample = samples_map.get(sample_acc)
 
-        # Base row matching frontend's baseRow
         row = {
             "Accession": e.get("accession") or "-",
             "Title": e.get("title") or "-",
@@ -1827,7 +1786,6 @@ def flatten_sra_study(cur, study: str) -> list[dict]:
             "Taxon ID": (sample.get("taxon_id") if sample else None) or "-",
         }
 
-        # Add attribute columns matching frontend's attrRow
         attrs = sample.get("attributes_json") if sample else None
         attrs_map = None
         if isinstance(attrs, list):
@@ -1928,7 +1886,6 @@ def flatten_ae_experiment(cur, accession: str) -> list[dict]:
     if not samples:
         return []
 
-    # Collect all attribute keys across samples
     attribute_keys = set()
     for s in samples:
         attrs = s.get("attributes_json")
@@ -2275,11 +2232,6 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
         labels, levels = _get_cluster_labels()
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                # One-time build query: the per-project enriched mode() aggregation
-                # over all of ontology_samples_v4 can exceed the default 30s
-                # statement_timeout. Raise it just for this query (explicit
-                # transaction so SET LOCAL actually applies under autocommit, and
-                # auto-resets when the block ends).
                 with conn.transaction():
                     cur.execute("SET LOCAL statement_timeout = '600s'")
                     cur.execute(MAP_POINTS_SQL)
@@ -2292,7 +2244,6 @@ def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
 def _get_clusters_rows() -> list[dict]:
     # Back-compat shape (title/centroid/num_points) for /clusters.json and the
     # atlas labels, sourced from the coarsest cluster layer of cluster_labels.
-    # Cheap filter over the cached labels — no need to cache the derived rows.
     labels, levels = _get_cluster_labels()
     coarsest = levels[-1] if levels else None
     return [
@@ -2306,11 +2257,8 @@ def _get_clusters_rows() -> list[dict]:
     ]
 
 
-# Label font scales by layer coarseness, not cluster size: coarser layers get
-# smaller, more minimal labels; finer (more localized) layers a touch larger.
-# Uniform within a layer, so no single big-cluster label dominates the view.
-_LABEL_FINEST_PT = 15.0  # finest layer (cluster_l0)
-_LABEL_COARSEST_PT = 10.0  # coarsest layer
+_LABEL_FINEST_PT = 15.0
+_LABEL_COARSEST_PT = 10.0
 
 
 def _label_font_pt(level: str, levels: list[str]) -> float:
@@ -2350,15 +2298,6 @@ def _get_labels_config() -> dict:
     }
 
 
-# Map assets (deepscatter tiles + countries.json; labels served live via /map/labels)
-#
-# The frontend map is powered by deepscatter, which needs a quadtree of Arrow
-# tiles and a country list (labels are served live via /map/labels). These are
-# derived from the map points loaded by _get_map_data. We generate them once
-# on the first request and cache them on disk under a content-hash version dir,
-# so a restart with unchanged data reuses the existing tiles instead of
-# rebuilding. Generation is heavy (pyarrow + quadfeather), so the builder module
-# is imported lazily inside _ensure_map_assets.
 _MAP_ASSETS_DIR = pathlib.Path(
     os.environ.get(
         "MAP_ASSETS_DIR",
@@ -2367,11 +2306,7 @@ _MAP_ASSETS_DIR = pathlib.Path(
 )
 _MAP_ASSETS_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _PROJECT_CACHE_CONTROL = "public, s-maxage=2592000, stale-while-revalidate=2592000"
-# Facets only change on reindex; cache hard at the edge so repeat/bot hits on a
-# query are free and the slow first computation is paid at most once per query.
 _SEARCH_FACETS_CACHE_CONTROL = "public, s-maxage=604800, stale-while-revalidate=2592000"
-# (query, accession) -> words only changes on reindex, and one query fans out to
-# every result the user opens, so let the edge absorb the repeats.
 _SEARCH_HIGHLIGHT_CACHE_CONTROL = (
     "public, s-maxage=604800, stale-while-revalidate=2592000"
 )
@@ -2379,20 +2314,11 @@ _MAP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAP_TILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 _map_assets_lock = threading.Lock()
 _map_assets_state: dict = {"ready": False, "version": None, "dir": None}
-# Pointer to the last-built version, so a cold start can serve /map/meta without
-# rescanning the ~800k-row point set. Cleared by /cache/purge to force a rebuild.
 _MAP_CURRENT_FILE = _MAP_ASSETS_DIR / "CURRENT"
 
 
-# Bump when the asset-generation logic (tile columns) changes, so the version hash
-# moves and clients rebuild without a manual /cache/purge.
 _MAP_ASSET_REV = "11-source-col" if ENRICHMENT_ENABLED else "11-source-col-no-enrich"
 
-# How many of the finest layers (cluster_l0 …) to bake as categorical columns, used
-# by the frontend for point coloring and for the cluster picker's filter. The picker
-# lists the COARSEST baked layer (seqout-map.tsx picks the last level present in the
-# tile columns), so this must cover every level or the coarse ones are advertised in
-# /map/meta but silently unusable. Leiden ships 8: cluster_l0 (70348) … cluster_l7 (23).
 _COLOR_LAYER_COUNT = 8
 
 
@@ -2435,20 +2361,11 @@ def _prune_old_map_versions(keep: str) -> None:
 
 
 def _ensure_map_assets() -> tuple[str, pathlib.Path]:
-    """Build the map assets if needed and return (version, version_dir).
-
-    Thread-safe and idempotent: only the first caller builds; the build is
-    written to a temp dir and atomically renamed into place so partial builds
-    are never served.
-    """
+    """Build the map assets if needed and return (version, version_dir)."""
     with _map_assets_lock:
         if _map_assets_state["ready"]:
             return _map_assets_state["version"], _map_assets_state["dir"]
 
-        # Fast path: a prior build (same asset rev) is recorded and its tiles are
-        # on disk — serve it without loading/hashing the ~800k-row point set. The
-        # pointer is "<rev>:<version>"; a rev bump (generation-logic change) or
-        # /cache/purge ("Refresh data") invalidates it and forces a rebuild.
         try:
             cached_rev, _, cached = _MAP_CURRENT_FILE.read_text().strip().partition(":")
         except OSError:
@@ -2463,7 +2380,6 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             _map_assets_state.update(ready=True, version=cached, dir=version_dir)
             return cached, version_dir
 
-        # Slow path: derive the content version and build the tiles if missing.
         rows, _labels, levels = _get_map_data()
         bake_levels = levels[:_COLOR_LAYER_COUNT]
         version = _compute_map_version(rows)
@@ -2473,11 +2389,6 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             import map_assets  # lazy: pulls in pyarrow / quadfeather
 
             _MAP_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-            # Per-process temp dir: _map_assets_lock is in-process only, so with
-            # several workers a shared "{version}.tmp" races — one worker renames it
-            # into place while another is still writing to that path, and the loser
-            # then rebuilds only the tail of the build (tiles, no countries.json)
-            # and rmtrees the winner's complete dir on top of it.
             tmp_dir = _MAP_ASSETS_DIR / f"{version}.{os.getpid()}.tmp"
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info(
@@ -2488,7 +2399,7 @@ def _ensure_map_assets() -> tuple[str, pathlib.Path]:
             map_assets.build_assets(
                 rows, bake_levels, tmp_dir, filter_columns=MAP_FILTER_COLUMNS
             )
-            # Another worker may have finished the same build meanwhile — keep theirs.
+            # Another worker may have finished the same build meanwhile; keep theirs.
             if _assets_complete(version_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
@@ -2631,7 +2542,7 @@ def _build_growth_data(mode: str, db: str | None = None) -> dict:
         return data
 
 
-_GROWTH_CACHE_TTL = 7 * 24 * 3600  # 7 days in seconds
+_GROWTH_CACHE_TTL = 7 * 24 * 3600
 
 
 def _normalize_stat_filter(value: str | None) -> str | None:
@@ -2707,8 +2618,8 @@ _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (GEA_PATTERN, "gea"),
     (AE_PATTERN, "ae"),
     (PRJ_PATTERN, "prj"),
-    # GSA accessions reuse the shared kinds: CRA/HRA → prj, CRR/HRR → srr,
-    # CRX/HRX → srx, HRS/SAMC → sam.
+    # GSA accessions reuse the shared kinds: CRA/HRA -> prj, CRR/HRR -> srr,
+    # CRX/HRX -> srx, HRS/SAMC -> sam.
     (GSA_STUDY_PATTERN, "prj"),
     (GSA_RUN_PATTERN, "srr"),
     (GSA_EXPERIMENT_PATTERN, "srx"),
@@ -2762,18 +2673,9 @@ def _try_accession_search(
     }
 
 
-# --- Zero-result prefix fallback -------------------------------------------
-# FTS matches whole lexemes, so a query can AND a lexeme no document holds and
-# return nothing, in two ways: a trailing partial ("...healthy comp" -> 'comp',
-# never indexed because the full word stems to 'comparison'), or a bare
-# non-idempotent stem the user typed directly ("obes" -> query-time stem 'obe',
-# in no document, even though 'obes' -- the stem of obese/obesity -- is itself a
-# stored lexeme). When (and only when) a normal search returns nothing, retry with
-# the offending lexemes turned into prefixes: 'comp:*' matches comparison, 'obe:*'
-# matches obes. Only lexemes ABSENT from the vocabulary are prefixed, so a word
-# that is a real corpus lexeme keeps its exact-word ranking; length>=2 stops a lone
-# 1-char prefix from scanning the whole index. The replacement keeps a single
-# placeholder in the same position, so the existing param tuple is reused verbatim.
+# Zero-result prefix fallback: when a normal FTS search finds nothing, retry
+# absent lexemes as prefixes. Existing lexemes keep exact-word ranking, and the
+# replacement preserves parameter positions.
 def _prefix_core_q(placeholder: str) -> str:
     return (
         "(SELECT COALESCE(NULLIF(string_agg("
@@ -2788,9 +2690,8 @@ def _prefix_core_q(placeholder: str) -> str:
     )
 
 
-# The relevance paths build SQL with positional %s params; the sorted path
-# (build_sorted_search_sql) uses named %(q)s. Same trailing-prefix trick either
-# way — the placeholder stays in the same spot, so the params are reused verbatim.
+# Relevance SQL uses positional params; sorted SQL uses named params. The
+# replacement keeps the placeholder position so params are reused verbatim.
 _CORE_Q_VARIANTS = (
     ("plainto_tsquery('english', %s) AS core_q", _prefix_core_q("%s")),
     ("plainto_tsquery('english', %(q)s) AS core_q", _prefix_core_q("%(q)s")),
@@ -2825,8 +2726,8 @@ def _run_search(cur, sql: str, params, q: str) -> list:
     return rows
 
 
-# after a Neo4j failure, skip expansion for the cooldown so an
-# outage costs one timed-out request per window, not one per search.
+# After a Neo4j failure, skip expansion for the cooldown so an outage costs
+# one timed-out request per window, not one per search.
 _neo4j_expand_circuit = {"open_until": 0.0}
 _NEO4J_EXPAND_COOLDOWN = 30.0
 
@@ -3001,7 +2902,7 @@ def _get_suggestions(q: str) -> list[dict]:
         return []
     words = q.split()
     corrections: list[dict] = []
-    correction_map: dict[int, str] = {}  # word index -> suggested term
+    correction_map: dict[int, str] = {}
 
     checkable = [w for w in words if 3 <= len(w) <= 50]
     known = _known_words(checkable)
@@ -3015,7 +2916,7 @@ def _get_suggestions(q: str) -> list[dict]:
         results = sym.lookup(lookup_word, Verbosity.CLOSEST, max_edit_distance=2)
         if results:
             suggested = results[0].term
-            if suggested == lookup_word:  # already a valid word — leave it alone
+            if suggested == lookup_word:  # leave valid words alone
                 continue
             if " " in suggested:  # never grow a token into a multi-word term
                 continue
@@ -3241,11 +3142,8 @@ def get_map_meta(request: Request):
     )
 
 
-# The {rev} segment is an opaque, frontend-controlled cache-busting token (it is
-# not used to locate files — assets live under {version} only). Bumping it gives
-# the browser a fresh URL so it re-downloads instead of using its HTTP cache,
-# which is how the frontend "purge and refetch" works for the tiles that
-# deepscatter loads internally.
+# The {rev} segment is frontend-controlled cache busting; assets live under
+# {version} only. Bumping rev forces deepscatter tile URLs past browser cache.
 @api_app.get(
     "/map/labels",
     summary="Cluster labels for a layer within a viewport",
@@ -3292,7 +3190,7 @@ def get_map_labels(
         logger.exception("Database error in get_map_labels")
         raise HTTPException(500, "Internal server error")
 
-    font_pt = _label_font_pt(level, levels)  # uniform within a layer
+    font_pt = _label_font_pt(level, levels)
     features = [
         {
             "type": "Feature",
@@ -3438,7 +3336,6 @@ def get_organism_growth(
     t0 = time.perf_counter()
     cache_key = organism.lower()
 
-    # Always fetch/cache the absolute organism data first
     with _organism_growth_cache_lock:
         now = time.time()
         cached = _organism_growth_cache.get(cache_key)
@@ -3468,7 +3365,6 @@ def get_organism_growth(
 
         with _organism_growth_cache_lock:
             now = time.time()
-            # Evict expired entries and cap size
             expired = [
                 k
                 for k, v in _organism_growth_cache.items()
@@ -3487,7 +3383,6 @@ def get_organism_growth(
                 "built_at": now,
             }
 
-    # For percentage mode, compute organism / total * 100 per month per db
     if mode == "percentage":
         try:
             growth_data = _get_growth_data("experiments")
@@ -3500,7 +3395,6 @@ def get_organism_growth(
         dbs = [db] if db else list(_STATS_SOURCES)
         for db_name in dbs:
             org_rows = all_series.get(db_name, [])
-            # Build lookup: month -> total count
             total_lookup = {r["month"]: r["count"] for r in total_exp.get(db_name, [])}
             pct_rows = []
             cum_org = 0
@@ -3589,7 +3483,6 @@ def get_organism_totals(
         logger.exception("Database error in get_organism_totals")
         raise HTTPException(500, "Internal server error")
 
-    # Pivot rows into {organism -> {geo, sra, arrayexpress, ena, total, common_name}}
     org_map: dict[str, dict] = {}
     for row in rows:
         name = row["organism"]
@@ -3606,7 +3499,6 @@ def get_organism_totals(
     organisms = sorted(org_map.values(), key=lambda x: x["total"], reverse=True)
 
     with _organism_totals_cache_lock:
-        # Evict stale entries (>24h)
         now = time.time()
         stale = [
             k for k, v in _organism_totals_cache.items() if now - v["built_at"] > 86400
@@ -4157,7 +4049,6 @@ def list_organisms(
     }
 
 
-# Platform display names
 _PLATFORM_DISPLAY_NAMES: dict[str, str] = {}
 _platform_csv = os.path.join(os.path.dirname(__file__), "data", "platforms.csv")
 if os.path.exists(_platform_csv):
@@ -4258,7 +4149,6 @@ def get_platform_growth(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if has_cross_filter:
-                    # Live query when cross-filters are active
                     sql, params = build_platform_growth_filtered_sql(
                         platform,
                         mode,
@@ -4295,7 +4185,6 @@ def get_platform_growth(
             p["cumulative"] = cumulative
 
     with _platform_growth_cache_lock:
-        # Evict stale entries and cap at 500
         now_ts = time.time()
         stale = [
             k
@@ -4794,7 +4683,7 @@ def search_highlight(
                 if not row:
                     raise HTTPException(404, "Project not found")
                 # Column names are already normalised across sources; SRA-side
-                # tables call the description `abstract`.
+                # tables call the description abstract.
                 texts = [
                     t
                     for t in (
@@ -4811,8 +4700,6 @@ def search_highlight(
     except HTTPException:
         raise
     except PgSyntaxError:
-        # Stripping NOT can leave a dangling operator ("a OR NOT b"). Highlighting
-        # is cosmetic — drop it rather than fail the page.
         logger.info("search_highlight: unparseable tsquery for q=%r", q)
         return empty
     except Exception:
@@ -4886,10 +4773,6 @@ def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
             result["suggestions"] = suggestions
         return result
 
-    # Auto-run the corrected query instead of only suggesting it. Call the
-    # undecorated function (search.__wrapped__) so this internal re-run doesn't
-    # re-enter the rate limiter. Recursion terminates: the corrected term is
-    # in-vocab so it doesn't re-correct.
     corrected = search.__wrapped__(request, q=corrected_q, **rerun)
     orig_results = result.get("results", [])
     if not corrected.get("results"):
@@ -4897,16 +4780,9 @@ def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
         result["suggestions"] = suggestions
         return result
 
-    # Corrected results become the paginated stream so offset paging stays clean;
-    # the few literal-typo matches (orig_results) ride in the correction payload
-    # and the client renders them as a separate page-1 block instead of shifting
-    # the 200-row server windows.
     result["results"] = corrected["results"]
     result["total"] = corrected.get("total")
     result["next_cursor"] = corrected.get("next_cursor")
-    # Banner + extras only on the first page; deeper pages are just the paginated
-    # corrected stream. Use explicit None checks so a legitimate cursor_rank/offset
-    # of 0 isn't read as "no cursor".
     first_page = (
         rerun["offset"] is None
         and rerun["cursor_rank"] is None
@@ -4914,17 +4790,12 @@ def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
         and rerun["cursor_sort"] is None
     )
     if first_page:
-        # Drop literal-typo matches that also appear in the corrected page so they
-        # don't render twice (extras block + main list).
         corrected_accs = {r["accession"] for r in corrected["results"]}
         extras = [r for r in orig_results if r["accession"] not in corrected_accs]
         result["correction"] = {
             "original_query": original_q,
             "corrected_query": corrected_q,
             "original_total": total_for_suggest,
-            # Based on orig_results, not extras: the original DID match
-            # (augmented) even if every match also appears in the corrected page
-            # and dedups out of the extras block.
             "mode": "augmented" if orig_results else "replaced",
             "extra_results": extras or None,
         }
@@ -4993,11 +4864,8 @@ def search(
     }
     has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
 
-    # Everything search() takes except `request` and `q` — what an auto-correction
-    # re-run must replay. Built once so the filtered and unfiltered paths cannot
-    # drift, and assembled from sidebar_filters so no filter can be forgotten (an
-    # omitted parameter would come back as a truthy Query() object; see
-    # _autocorrect_search).
+    # Search arguments an auto-correction re-run must replay. Built once from
+    # sidebar_filters so filtered and unfiltered paths cannot drift.
     rerun = {
         "structured": structured,
         "cursor_rank": cursor_rank,
@@ -5382,7 +5250,7 @@ def _compute_search_facets(
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Match /search's ceiling so broad-query totals materialize
-                    # instead of dying on the 30s pool default (e.g. "mouse brain").
+                    # instead of dying on the pool default.
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     # Single FTS pass: materialize the match set, then reuse it.
                     msql, mparams = build_search_match_temp(
@@ -5519,7 +5387,7 @@ def search_facets(
     # the corrected set undercounts the page by however many extras render.
     # Cached below under the original cache_key so repeat typo searches stay fast.
     # Applies with an active filter too -- /search's filtered path auto-corrects
-    # through the same _autocorrect_search, so gating this on `not has_filter`
+    # through the same _autocorrect_search, so gating this on not has_filter
     # would desync the count from the list the moment a filter went on.
     # Skipped in boolean mode: operators are deliberate, /search doesn't correct them.
     if boolean_tsq is None and total is not None and total <= _SUGGESTION_THRESHOLD:
@@ -5550,7 +5418,7 @@ def search_facets(
         # Filter-specific counts still cache (URL includes the filters), just with
         # a lower hit rate than the bare query.
         response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
-        # Broad queries are the expensive cold-start ones — pin them in-process
+        # Broad queries are the expensive cold-start ones; pin them in-process
         # until /cache/purge so the first slow hit is the only slow hit.
         if total >= _BROAD_SEARCH_MIN_TOTAL:
             with _broad_facets_cache_lock:
@@ -5649,8 +5517,8 @@ def get_search_investigators(
         with pool.connection() as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Broad queries ("single cell" -> 57k projects) need the same
-                    # ceiling as /search/facets; the pool default of 30s is short.
+                    # Broad queries need the same
+                    # ceiling as /search/facets; the pool default is short.
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     msql, mparams = build_search_match_temp(
                         q=boolean_tsq or nq,
@@ -5803,8 +5671,8 @@ def get_project(
                         # inherit the similarity graph + supplementary from the
                         # linked SRA study / GEO series.
                         _graft_linked_project(cur, row, srp, gse)
-                    # _enrich_with_publications resolves authors (publication →
-                    # geo_series.contributors → center_name) uniformly for every
+                    # _enrich_with_publications resolves authors (publication ->
+                    # geo_series.contributors -> center_name) uniformly for every
                     # project type.
                     _enrich_with_publications([row], cur)
                     _attach_organism_taxa(row, cur)
@@ -5933,7 +5801,7 @@ def get_study_experiments(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # Count is a cheap indexed query; the page fetch uses SQL
-                # LIMIT/OFFSET so 100k-experiment studies don't time out.
+                # LIMIT/OFFSET so large studies do not time out.
                 total = _count_study_experiments(cur, study)
                 result = _fetch_study_experiments(
                     cur, study, limit=limit, offset=offset
@@ -5971,7 +5839,7 @@ def find_study_experiments(
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
     # filtered=false means no supplied column maps to SQL here, so an empty
-    # list is "we did not narrow", not "no matches" — the grid must keep showing
+    # list is "we did not narrow", not "no matches"; the grid must keep showing
     # its own rows rather than blanking. See the superset rule in grid_filters.
     if rows is None:
         return {"experiments": [], "capped": False, "filtered": False}
@@ -6799,12 +6667,9 @@ def download_study_metadata_csv(
 ):
     study = study.upper()
 
-    # Fetch experiments and samples eagerly (bounded by experiment count),
-    # then stream runs to avoid buffering the full TSV in memory.
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Fetch experiments and build lookup in a single pass
                 experiments = _fetch_study_experiments(cur, study)
                 if not experiments:
                     raise HTTPException(404, f"No experiments found for {study}")
@@ -6812,7 +6677,6 @@ def download_study_metadata_csv(
                 exp_map: dict[str, dict] = {}
                 sample_accs: list[str] = []
                 for exp in experiments:
-                    # samples is TEXT[] — psycopg3 returns a Python list
                     samples_list = exp.get("samples") or []
                     sample_acc = samples_list[0] if samples_list else ""
                     exp["_sample_acc"] = sample_acc
@@ -6820,10 +6684,8 @@ def download_study_metadata_csv(
                     if sample_acc:
                         sample_accs.append(sample_acc)
 
-                # 2. Batch-fetch samples (SRA first, ENA fallback)
                 sample_map = _fetch_samples_batch(cur, sample_accs)
 
-                # 3. Collect dynamic attribute keys (order-preserving)
                 all_attr_keys: list[str] = []
                 seen_keys: set[str] = set()
                 for s in sample_map.values():
@@ -6841,7 +6703,6 @@ def download_study_metadata_csv(
                                 seen_keys.add(key)
                                 all_attr_keys.append(key)
 
-                # 4. Verify runs exist before streaming
                 cur.execute(STUDY_RUNS_SUMMARY_SQL, (study,))
                 summary = cur.fetchone()
                 if not summary or summary["total_runs"] == 0:
@@ -6853,7 +6714,6 @@ def download_study_metadata_csv(
         logger.exception("Error fetching metadata for %s", study)
         raise HTTPException(500, "Internal error generating metadata TSV")
 
-    # Pre-compute per-sample attribute dicts (already parsed above)
     sample_attrs: dict[str, dict[str, str]] = {}
     for acc, s in sample_map.items():
         attrs_raw = s.get("attributes_json")
@@ -6867,7 +6727,6 @@ def download_study_metadata_csv(
                 if attr.get("tag") or attr.get("key")
             }
 
-    # Define columns
     exp_cols = [
         "experiment_accession",
         "experiment_title",
@@ -7009,10 +6868,8 @@ def get_project_metadata_rows(
                     rows = flatten_geo_series(cur, accession)
                     source = "geo"
                 elif accession.startswith("E-GEAD-"):
-                    # Before the E- branch: "GEAD" is four letters, so E-GEAD-N
-                    # also matches ArrayExpress' E-XXXX-N shape (see AE_PATTERN).
-                    # Falling through to the AE flattener returned zero rows for
-                    # all 735 GEA studies.
+                    # Before the E- branch: GEAD is four letters, so E-GEAD-N
+                    # also matches ArrayExpress E-XXXX-N shape.
                     rows = flatten_gea_experiment(cur, accession)
                     source = "gea"
                 elif accession.startswith("E-"):
@@ -7795,7 +7652,7 @@ def download_study_script(
 
 _SUPP_GEO_SQL = "SELECT supplementary_data FROM geo_series WHERE accession = %s"
 # Processed archives (processed_data_files) plus the raw-data archive held in each
-# sample's comment[arrayexpress ftp file] attribute — show every available file.
+# sample's comment[arrayexpress ftp file] attribute; show every available file.
 _SUPP_AE_SQL = """
     SELECT (
         COALESCE(
@@ -8036,15 +7893,12 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     """
     acc = accession.upper()
 
-    # --- GSM sample ---
     if GEO_SAMPLE_PATTERN.match(acc):
-        # Fetch GEO sample
         cur.execute(GEO_SAMPLE_SQL, (acc,))
         geo_sample = cur.fetchone()
         if not geo_sample:
             raise HTTPException(404, f"Sample not found: {acc}")
 
-        # Find parent series
         cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
         series_row = cur.fetchone()
         if not series_row:
@@ -8066,9 +7920,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         }
         return result
 
-    # --- SRX/DRX/ERX / CRX/HRX experiment ---
     if EXPERIMENT_PATTERN.match(acc) or GSA_EXPERIMENT_PATTERN.match(acc):
-        # Fetch experiment
         cur.execute(SRA_EXPERIMENT_SQL, (acc,))
         experiment = cur.fetchone()
         if not experiment:
@@ -8084,7 +7936,6 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         if not study_acc:
             raise HTTPException(404, f"No parent study found for {acc}")
 
-        # Fetch parent project
         if study_acc.startswith(("CRA", "HRA")):
             cur.execute(PROJECT_GSA_SQL, (study_acc,))
         elif study_acc.startswith("PRJ"):
@@ -8095,13 +7946,11 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         if project:
             _enrich_with_publications([project], cur)
 
-        # Fetch associated sample
         sample = None
         samples_list = experiment.get("samples") or []
         if samples_list:
             sample = _fetch_sample(cur, samples_list[0])
 
-        # Fetch runs for this experiment
         cur.execute(EXPERIMENT_RUNS_SQL, (acc,))
         runs = _annotate_run_downloads(cur.fetchall())
 
@@ -8115,12 +7964,10 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         }
         return result
 
-    # --- SRS/DRS/ERS/SAM* sample ---
     sample = _fetch_sample(cur, acc)
     if not sample:
         raise HTTPException(404, f"Sample not found: {acc}")
 
-    # Find the experiment that references this sample
     cur.execute(SRA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
     exp_row = cur.fetchone()
     experiment = None
@@ -8133,7 +7980,6 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
         runs = _annotate_run_downloads(cur.fetchall())
     else:
-        # Try ENA
         cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
         exp_row = cur.fetchone()
         if exp_row:
@@ -8143,7 +7989,6 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
             cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
             runs = _annotate_run_downloads(cur.fetchall())
         else:
-            # Try GSA
             cur.execute(GSA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
             exp_row = cur.fetchone()
             if exp_row:
@@ -8153,7 +7998,6 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
                 cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
                 runs = _annotate_run_downloads(cur.fetchall())
 
-    # Find parent study
     study_acc = None
     if experiment:
         study_acc = experiment.get("study")
@@ -8249,7 +8093,6 @@ def download_sample_detail_csv(
     project_accession = detail.get("project_accession") or ""
 
     if sample_type == "geo_sample":
-        # For GEO samples, flatten channel info into a CSV
         channels = sample.get("channels") or []
         rows = []
         for ch in channels:
@@ -8296,8 +8139,6 @@ def download_sample_detail_csv(
             },
         )
 
-    # SRA experiment or sample
-    # Parse sample attributes
     attrs_raw = sample.get("attributes_json")
     if isinstance(attrs_raw, str):
         try:
@@ -8318,7 +8159,6 @@ def download_sample_detail_csv(
             attr_dict[f"sample_attribute:{key}"] = val
 
     if runs:
-        # One row per run
         rows = []
         for run in runs:
             row = {
@@ -8458,8 +8298,8 @@ def get_geo_series_samples(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                # Cheap indexed count + a SQL-paginated page so 100k-sample
-                # series don't fetch every row.
+                # Cheap indexed count + a SQL-paginated page so large
+                # series do not fetch every row.
                 total = _count_geo_series_samples(cur, accession, source)
                 rows = _fetch_geo_series_samples(
                     cur, accession, source, limit=limit, offset=offset
@@ -8741,7 +8581,7 @@ def bulk_project_samples_metadata(request: Request, payload: AccessionsRequest):
         raise HTTPException(500, "Internal server error")
 
 
-# Dataset-level columns only — one row per matching study, no per-sample fan-out.
+# Dataset-level columns only: one row per matching study, no per-sample fan-out.
 _DOWNLOAD_COLUMNS = (
     "accession",
     "source",
@@ -8792,8 +8632,8 @@ def _stream_results_csv(sql: str, params: dict):
         # Both need a real transaction.
         with pool.connection() as conn, conn.transaction():
             # Bounds the initial query and each FETCH, not the download's total
-            # wall-clock — a 100k-dataset CSV is legitimately slow to ship. Also
-            # lifts the pool's 30s default, which alone would kill a big download.
+            # wall-clock; a broad CSV is legitimately slow to ship. Also
+            # lifts the pool default, which alone would kill a big download.
             conn.execute("SET LOCAL statement_timeout = '300s'")
             with conn.cursor(name="download_query", row_factory=dict_row) as cur:
                 cur.itersize = 2000
@@ -9143,7 +8983,7 @@ def _author_name_regex(q: str) -> str | None:
         body = f"{esc[0]}( [^,]*)? {esc[-1]}"
     else:
         # A single token matches a whole word anywhere in the name (given,
-        # middle, or surname), not just the surname — so "saket" finds
+        # middle, or surname), not just the surname, so "saket" finds
         # "Saket Choudhary". Leading/trailing spaces enforce word boundaries.
         body = f"([^,]* )?{esc[0]}( [^,]*)?"
     return f"(^|, ){body}(,|$)"
@@ -9193,7 +9033,6 @@ def search_author_projects(
                 for r in rows:
                     r.pop("full_total", None)
 
-                # Clean each card's institute string: drop noise, dedup orgs per project.
                 for r in rows:
                     seen: dict[str, str] = {}
                     for part in (r.get("institute") or "").split(";"):
@@ -9202,8 +9041,6 @@ def search_author_projects(
                             seen.setdefault(name.lower(), name)
                     r["institute"] = "; ".join(seen.values()) or None
 
-                # Institute facets over the full fetched set (case-insensitive,
-                # first-seen casing wins; each project counts an institute once).
                 facets: dict[str, dict] = {}
                 for r in rows:
                     if not r["institute"]:
@@ -9891,7 +9728,6 @@ def get_project_xref(
                 cur.execute(RELATED_SQL, {"acc": accession})
                 rows = cur.fetchall()
 
-                # Deduplicate by accession (keep first occurrence)
                 seen: set[str] = set()
                 unique = []
                 for row in rows:
@@ -10313,24 +10149,18 @@ def get_last_updated(
     }
 
 
-DISEASE_COLLECTIONS = {
-    "rare": {
-        "summary": RARE_SUMMARY_SQL,
-        "facets": RARE_FACETS_SQL,
-        "projects": RARE_PROJECTS_SQL,
-    },
-}
+# Regexes expose valid values in the OpenAPI/MCP schema.
+_SCOPE_PATTERN = f"^({'|'.join(sorted(SCOPES))})$"
+_SORT_PATTERN = f"^({'|'.join(sorted(SORTABLE))})$"
 
 
-def _collection(name: str) -> dict:
-    coll = DISEASE_COLLECTIONS.get(name)
-    if coll is None:
+def _collection(name: str) -> None:
+    if name not in DISEASE_COLLECTIONS:
         raise HTTPException(
             404,
             f"Unknown disease collection '{name}'. "
             f"Available: {', '.join(sorted(DISEASE_COLLECTIONS))}",
         )
-    return coll
 
 
 @api_app.get(
@@ -10338,15 +10168,16 @@ def _collection(name: str) -> dict:
     summary="Disease-collection corpus totals",
     description=(
         "Corpus-wide totals for studies with at least one sample annotated with "
-        "a disease in this collection. `rare` is NIH GARD, resolved through MONDO "
-        "ids and their descendants. Stated and read-derived sex are different "
-        "measurements and are reported separately."
+        "a disease in this collection, resolved through MONDO ids and their "
+        "descendants. `rare` is NIH GARD, matched by exact MONDO xref; `nord` "
+        "is NORD, matched by name and so a looser set."
     ),
     operation_id="get_disease_summary",
 )
 @limiter.limit("60/minute")
 def get_disease_summary(request: Request, collection: str):
-    sql = _collection(collection)["summary"]
+    _collection(collection)
+    sql = build_disease_summary_sql(collection)
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql)
@@ -10370,7 +10201,8 @@ def get_disease_summary(request: Request, collection: str):
 )
 @limiter.limit("60/minute")
 def get_disease_facets(request: Request, collection: str):
-    sql = _collection(collection)["facets"]
+    _collection(collection)
+    sql = build_disease_facets_sql(collection)
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql)
@@ -10387,36 +10219,114 @@ def get_disease_facets(request: Request, collection: str):
 
 
 @api_app.get(
+    "/disease/aliases",
+    summary="Resolve a disease name to its MONDO ids",
+    description=("GARD and NORD names"),
+    operation_id="get_disease_aliases",
+)
+@limiter.limit("60/minute")
+def get_disease_aliases(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=100),
+):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(DISEASE_ALIAS_LOOKUP_SQL, {"q": q, "limit": limit})
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_disease_aliases")
+        raise HTTPException(500, "Internal server error")
+    return {"query": q, "count": len(rows), "results": rows}
+
+
+@api_app.get(
     "/disease/{collection}/projects",
     summary="Projects with samples in a disease collection",
     description=(
-        "One row per study with its per-sample rollup: sample and cell counts, "
-        "tissue/assay breadth, and both sex measurements. A null cell count "
-        "means unmeasured. Optional category and assay_category filters. "
-        "Ordered by cell count."
+        "One row per study with its per-sample rollup: title, organism, sample "
+        "and cell counts, assay category, both sex measurements, the "
+        "catalogue disease it matched and the MONDO ancestry the enrichment "
+        "recorded. A null cell count means unmeasured, and blank ancestry means "
+        "unrecorded. `has_fastq` and `has_sra` are NULL when the study is "
+        "absent from the download-links table, which means unknown, not "
+        "unavailable; filtering on them accepts only true for that reason. "
+        "`inheritance` is the mode of inheritance from HPO and "
+        "Orphanet, plus GARD's own where it publishes one; a disease can carry "
+        "more than one, and 'Not applicable' means the disease has no Mendelian "
+        "pattern rather than that nobody looked. `ancestries` is the "
+        "submitter-reported ethnicity field "
+        "verbatim, not inferred genetic ancestry, and is present on 13% of "
+        "studies. `n_samples` counts the samples that matched this "
+        "collection, not the study's total, so controls and out-of-scope "
+        "samples are not in it. `total` is the filtered study count; `count` "
+        "is this page. "
+        "Filters take values from /disease/{collection}/facets and are rejected "
+        "if the collection does not carry them. Sort with sort= and order=. "
+        "`scope` defaults to human_primary (human material that is neither an "
+        "immortalized line nor a derived model); use patient_derived_model, "
+        "cell_line, or all to see what that excludes. Every row carries the "
+        "full set of scope counters either way, so nothing is hidden."
     ),
     operation_id="get_disease_projects",
 )
 @limiter.limit("60/minute")
-def get_disease_projects(
+def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by design
     request: Request,
     collection: str,
     category: str | None = None,
+    specialty: str | None = None,
+    group: str | None = None,
+    nord_type: str | None = None,
+    ancestry: str | None = None,
+    inheritance: str | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    disease: str | None = None,
     assay_category: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    organism: str | None = None,
+    scope: str = Query(DEFAULT_SCOPE, pattern=_SCOPE_PATTERN),
+    sort: str = Query("cells", pattern=_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    sql = _collection(collection)["projects"]
-    limit = max(1, min(limit, 200))
+    _collection(collection)
+    allowed = disease_projects_params(collection)
+    supplied = {
+        "category": category,
+        "specialty": specialty,
+        "group": group,
+        "nord_type": nord_type,
+        "ancestry": ancestry,
+        "inheritance": inheritance,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "disease": disease,
+        "assay_category": assay_category,
+        "organism": organism,
+    }
+    # rejected, not dropped: ignoring one returns an unfiltered page that looks filtered
+    if bad := sorted(
+        k for k, v in supplied.items() if v is not None and k not in allowed
+    ):
+        raise HTTPException(
+            400,
+            f"Filter(s) {', '.join(bad)} do not apply to collection "
+            f"'{collection}'. Available: {', '.join(sorted(allowed))}",
+        )
+    params = {k: supplied[k] for k in allowed}
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_disease_count_sql(collection, scope), params)
+            total_row = cur.fetchone()
             cur.execute(
-                sql,
+                build_disease_projects_sql(collection, sort, order == "desc", scope),
                 {
-                    "category": category,
-                    "assay_category": assay_category,
+                    **params,
+                    "upper_ontology": UPPER_ONTOLOGY_TERMS,
                     "limit": limit,
-                    "offset": max(0, offset),
+                    "offset": offset,
                 },
             )
             rows = cur.fetchall()
@@ -10425,8 +10335,12 @@ def get_disease_projects(
         raise HTTPException(500, "Internal server error")
     return {
         "collection": collection,
+        "total": total_row["total"],
         "count": len(rows),
         "offset": offset,
+        "scope": scope,
+        "sort": sort,
+        "order": order,
         "results": rows,
     }
 
@@ -10792,7 +10706,6 @@ def get_sample_microbes(
         by_kingdom[r["kingdom"]].append(r)
         by_organism[r["organism"]].append(r)
     kingdoms = {k: agg(v) for k, v in by_kingdom.items()}
-    # one row per organism, summed over the sample's runs
     organisms = sorted(
         (
             {
@@ -10915,7 +10828,7 @@ def _fetch_project_enriched(
     if sample_filter is not None:
         samples = [s for s in samples if s.get("sample") in sample_filter]
 
-    # Scope low-confidence tags to the rows we're returning so a 100k-sample
+    # Scope low-confidence tags to the rows we're returning so a large
     # study doesn't pull its whole low_confidence table on every page.
     sample_accs = [s.get("sample") for s in samples if s.get("sample")]
     if sample_accs:
@@ -11225,34 +11138,29 @@ def _age_hours_to_human(value: str | None) -> str | None:
     try:
         hours = float(value)
     except (ValueError, TypeError):
-        return value  # not a number, return as-is (e.g. already formatted)
+        return value
 
     if hours < 0:
         return value
 
-    # < 1 day: show hours
     if hours < 24:
         h = round(hours, 1)
         return f"{h:g} hour{'s' if h != 1 else ''}"
 
     days = hours / 24
 
-    # < 14 days: show days
     if days < 14:
         d = round(days, 1)
         return f"{d:g} day{'s' if d != 1 else ''}"
 
-    # < 60 days: show weeks
     if days < 60:
         weeks = round(days / 7, 1)
         return f"{weeks:g} week{'s' if weeks != 1 else ''}"
 
-    # < 730 days (~2 years): show months
     if days < 730:
         months = round(days / 30, 1)
         return f"{months:g} month{'s' if months != 1 else ''}"
 
-    # >= 2 years: show years
     years = round(days / 365, 1)
     return f"{years:g} year{'s' if years != 1 else ''}"
 
@@ -11650,6 +11558,7 @@ ENRICHMENT_OPERATION_IDS = {
     "get_disease_summary",
     "get_disease_facets",
     "get_disease_projects",
+    "get_disease_aliases",
     "get_enriched_stats",
     "get_enriched_crosstab",
     "get_enriched_column",
@@ -11744,12 +11653,6 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(EnrichmentDisabledMiddleware)
 combined_app.add_middleware(AnalyticsMiddleware)
-# combined_app.add_middleware(
-#    CORSMiddleware,
-#    allow_origins=["*"],
-#    allow_methods=["GET", "OPTIONS"],
-#    allow_headers=["*"],
-# )
 
 app = combined_app
 
