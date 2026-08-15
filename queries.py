@@ -4,6 +4,27 @@ import math
 
 _EARTH_RADIUS_KM = 6371.0088
 
+ONTOLOGY_FIELDS: dict[str, str] = {
+    "disease": "mondo",
+    "tissue": "uberon",
+    "cell_type": "cl",
+    "assay": "efo",
+    "development_stage": "uberon",
+}
+
+DAYS_PER_YEAR = 365.25
+
+
+def _as_list(value):
+    """Scalar -> [scalar], list/tuple -> list; None/""/[] -> None (filter is off)."""
+    if value is None or value == "" or value == []:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        vals = [v for v in value if v not in (None, "")]
+        return vals or None
+    return [value]
+
+
 STUDY_PUBLICATIONS_BATCH_SQL = """
 SELECT accession, publications
 FROM study_publications
@@ -762,11 +783,13 @@ def _search_filter_clauses(
     filters accept lists and match on array overlap / ANY.
     """
     dim_clauses = {}
+    organism = _as_list(organism)
     if organism:
         # case-insensitive: unnest so "mus musculus" matches "Mus musculus".
         dim_clauses["organism"] = (
             "EXISTS (SELECT 1 FROM unnest(matched.organisms) o"
-            " WHERE lower(o) = lower(%(organism)s))"
+            " WHERE lower(o) = ANY(SELECT lower(x)"
+            " FROM unnest(%(organism)s::text[]) x))"
         )
         params["organism"] = organism
     if country:
@@ -2757,6 +2780,9 @@ def build_structured_search(
     params = {}
     cte_parts = []
 
+    organism = _as_list(organism)
+    library_strategy = _as_list(library_strategy)
+
     include_geo = source in (None, "all", "geo")
     include_sra = source in (None, "all", "sra")
     include_ae = source in (None, "all", "arrayexpress")
@@ -2870,7 +2896,7 @@ def build_structured_search(
         if q:
             w.append("g.tsv @@ q.match_q")
         if organism:
-            w.append("g.organisms @> ARRAY[%(organism)s]")
+            w.append("g.organisms && %(organism)s::text[]")
         if country:
             w.append(
                 "EXISTS (SELECT 1 FROM geo_contributors gc"
@@ -2945,11 +2971,11 @@ def build_structured_search(
         if q:
             w.append("s.tsv @@ q.match_q")
         if organism:
-            w.append("s.organisms @> ARRAY[%(organism)s]")
+            w.append("s.organisms && %(organism)s::text[]")
         if library_strategy or platform:
             ec = ["e.study = s.accession"]
             if library_strategy:
-                ec.append("e.library_strategy = %(library_strategy)s")
+                ec.append("e.library_strategy = ANY(%(library_strategy)s)")
             if platform:
                 ec.append("e.platform = %(platform)s")
             w.append(
@@ -3026,9 +3052,9 @@ def build_structured_search(
         if q:
             w.append("ae.tsv @@ q.match_q")
         if organism:
-            w.append("ae.organisms @> ARRAY[%(organism)s]")
+            w.append("ae.organisms && %(organism)s::text[]")
         if library_strategy:
-            w.append("ae.technology = %(library_strategy)s")
+            w.append("ae.technology = ANY(%(library_strategy)s)")
         if center:
             w.append("ae.organizations::text ILIKE '%%' || %(center)s || '%%'")
         if year_from is not None:
@@ -3097,11 +3123,11 @@ def build_structured_search(
             # GIN-indexed array containment (idx_ena_studies_organisms_gin); the
             # scalar scientific_name only sees the study-level organism and misses
             # multi-organism ENA studies.
-            w.append("es.organisms @> ARRAY[%(organism)s]")
+            w.append("es.organisms && %(organism)s::text[]")
         if library_strategy or platform or country:
             ec = ["ee.study_accession = es.study_accession"]
             if library_strategy:
-                ec.append("ee.library_strategy = %(library_strategy)s")
+                ec.append("ee.library_strategy = ANY(%(library_strategy)s)")
             if platform:
                 ec.append("ee.instrument_platform = %(platform)s")
             if country:
@@ -3184,11 +3210,11 @@ def build_structured_search(
         if organism:
             # GIN-indexed containment (idx_gsa_studies_organisms_gin); the scalar
             # scientific_name missed multi-organism GSA studies.
-            w.append("gs.organisms @> ARRAY[%(organism)s]")
+            w.append("gs.organisms && %(organism)s::text[]")
         if library_strategy or platform or country:
             ec = ["ge.study_accession = gs.study_accession"]
             if library_strategy:
-                ec.append("ge.library_strategy = %(library_strategy)s")
+                ec.append("ge.library_strategy = ANY(%(library_strategy)s)")
             if platform:
                 ec.append("ge.instrument_platform = %(platform)s")
             if country:
@@ -5075,7 +5101,8 @@ DISEASE_MONDO_SET = f"""(
 )"""
 
 DISEASE_ALIAS_LOOKUP_SQL = f"""
-SELECT display_name, alias, mondo_ids, sources
+SELECT display_name, alias, mondo_ids, sources,
+       COUNT(*) OVER () AS total_count
 FROM disease_alias
 -- the %% operator, not similarity(): only the operator uses
 -- idx_disease_alias_trgm; both forms select the same
@@ -5580,6 +5607,320 @@ WHERE study_accession = %s;
 """
 
 
+_SAMPLE_SEARCH_LIKE_COLS = frozenset(
+    {
+        "tissue",
+        "disease",
+        "cell_type",
+        "assay",
+        "assay_category",
+        "phenotype",
+        "treatment",
+        "development_stage",
+        "sample_type",
+        "genetic_modification",
+        "strain",
+        "cell_line",
+        "ethnicity",
+        "tissue_primary_site",
+    }
+)
+
+# ILIKE '%male%' would also match 'female'.
+_SAMPLE_SEARCH_EXACT_COLS = frozenset({"organism", "sex", "taxid", "study_accession"})
+
+_SAMPLE_SEARCH_ONTOLOGY_COLS = {
+    f"{field}_ontology_id": (field, ontology)
+    for field, ontology in ONTOLOGY_FIELDS.items()
+}
+
+_SAMPLE_SEARCH_RANGE_COLS = {
+    "age_min_days": ("age_days", ">="),
+    "age_max_days": ("age_days", "<="),
+    "min_cell_count": ("cell_count", ">="),
+    "max_cell_count": ("cell_count", "<="),
+    "min_gene_count": ("gene_count", ">="),
+    "max_gene_count": ("gene_count", "<="),
+}
+
+_SAMPLE_SEARCH_PENTIMENTO_BOOL = {
+    "single_cell_only": "ps.assay_is_single_cell",
+    "has_viral_reads": "ps.has_viral_reads",
+    "has_bacterial_reads": "ps.has_bacterial_reads",
+}
+_SAMPLE_SEARCH_PENTIMENTO_LIKE = {"hpv_type": "ps.hpv_top_type"}
+
+_SAMPLE_SEARCH_MICROBE_KEYS = frozenset(
+    {
+        "microbe",
+        "microbe_class",
+        "microbe_min_breadth",
+        "microbe_min_kmer_mass",
+        "microbe_validated_only",
+    }
+)
+
+SAMPLE_SEARCH_FILTERS = frozenset(
+    set(_SAMPLE_SEARCH_LIKE_COLS)
+    | set(_SAMPLE_SEARCH_EXACT_COLS)
+    | set(_SAMPLE_SEARCH_ONTOLOGY_COLS)
+    | set(_SAMPLE_SEARCH_RANGE_COLS)
+    | set(_SAMPLE_SEARCH_PENTIMENTO_BOOL)
+    | set(_SAMPLE_SEARCH_PENTIMENTO_LIKE)
+    | set(_SAMPLE_SEARCH_MICROBE_KEYS)
+)
+
+_MICROBE_KINGDOM_CASE = """CASE m.class
+             WHEN 'virus'    THEN 'viral'
+             WHEN 'pathogen' THEN 'bacterial'
+             WHEN 'culture'  THEN 'bacterial'
+             WHEN 'kitome'   THEN 'bacterial_background'
+             WHEN 'flora'    THEN 'bacterial_background'
+             WHEN 'parasite' THEN 'eukaryotic_parasite'
+             WHEN 'spike'    THEN 'spike_in_control'
+             WHEN 'animalPV' THEN 'negative_control'
+             WHEN 'vector'   THEN 'vector'
+             ELSE 'other'
+           END"""
+
+_MICROBE_VALIDATED_EXPR = (
+    "(m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)"
+)
+
+_MICROBE_ROW_CAP = 50
+
+SAMPLE_SEARCH_SORTABLE = frozenset(
+    {"sample", "study_accession", "age_days", "cell_count", "gene_count"}
+)
+
+_SAMPLE_SEARCH_SELECT = """
+    sample, study_accession, organism, taxid,
+    age, age_days, sex, ethnicity, phenotype,
+    cell_type, tissue, strain, disease, assay,
+    assay_category, cell_line, treatment,
+    development_stage, sample_type, genetic_modification,
+    tissue_primary_site, tissue_site_type,
+    cell_count, gene_count, cell_count_estimated,
+    disease_ontology_id, disease_ontology_name,
+    tissue_ontology_id, tissue_ontology_name,
+    cell_type_ontology_id, cell_type_ontology_name,
+    assay_ontology_id, assay_ontology_name,
+    development_stage_ontology_id, development_stage_ontology_name
+""".strip()
+
+
+def _sample_search_where(filters: dict, include_descendants: bool) -> tuple[str, dict]:
+    """WHERE body + params for a cross-project sample search; unknown keys raise."""
+    clauses: list[str] = []
+    params: dict = {}
+    for key, value in filters.items():
+        if value is None or value == "":
+            continue
+        if key not in SAMPLE_SEARCH_FILTERS:
+            raise ValueError(f"unknown sample filter: {key}")
+        if key in _SAMPLE_SEARCH_MICROBE_KEYS:
+            continue
+        pkey = f"f_{key}"
+        if key in _SAMPLE_SEARCH_PENTIMENTO_BOOL:
+            if value:
+                clauses.append(f"{_SAMPLE_SEARCH_PENTIMENTO_BOOL[key]} IS TRUE")
+            continue
+        if key in _SAMPLE_SEARCH_PENTIMENTO_LIKE:
+            clauses.append(f"{_SAMPLE_SEARCH_PENTIMENTO_LIKE[key]} ILIKE %({pkey})s")
+            params[pkey] = f"%{value}%"
+            continue
+        if key in _SAMPLE_SEARCH_LIKE_COLS:
+            clauses.append(f"s.{key} ILIKE %({pkey})s")
+            params[pkey] = f"%{value}%"
+        elif key in _SAMPLE_SEARCH_EXACT_COLS:
+            if key == "taxid":
+                clauses.append(f"s.{key} = %({pkey})s")
+            else:
+                clauses.append(f"lower(s.{key}::text) = lower(%({pkey})s::text)")
+            params[pkey] = value
+        elif key in _SAMPLE_SEARCH_ONTOLOGY_COLS:
+            col, ontology = _SAMPLE_SEARCH_ONTOLOGY_COLS[key]
+            if include_descendants:
+                clauses.append(
+                    f"s.{col}_ontology_id = ANY(ARRAY("
+                    f"SELECT descendant_id FROM ontology_closure"
+                    f" WHERE ontology = %({pkey}_onto)s"
+                    f" AND ancestor_id = %({pkey})s"
+                    f" UNION SELECT %({pkey})s))"
+                )
+                params[f"{pkey}_onto"] = ontology
+            else:
+                clauses.append(f"s.{col}_ontology_id = %({pkey})s")
+            params[pkey] = value
+        elif key in _SAMPLE_SEARCH_RANGE_COLS:
+            col, op = _SAMPLE_SEARCH_RANGE_COLS[key]
+            clauses.append(f"s.{col} {op} %({pkey})s")
+            params[pkey] = value
+        else:
+            raise ValueError(f"unhandled sample filter bucket: {key}")
+    return (" AND ".join(clauses) if clauses else "TRUE"), params
+
+
+def _microbe_conds(filters: dict, params: dict) -> str:
+    """The detection-matching predicate, shared by the LATERAL and the EXISTS."""
+    conds = ["NOT m.is_background"]
+    if filters.get("microbe"):
+        conds.append("m.organism ILIKE %(f_microbe)s")
+        params["f_microbe"] = f"%{filters['microbe']}%"
+    if filters.get("microbe_class"):
+        conds.append("m.class = %(f_microbe_class)s")
+        params["f_microbe_class"] = filters["microbe_class"]
+    if filters.get("microbe_min_breadth") is not None:
+        conds.append("m.breadth_frac >= %(f_microbe_min_breadth)s::real")
+        params["f_microbe_min_breadth"] = filters["microbe_min_breadth"]
+    if filters.get("microbe_min_kmer_mass") is not None:
+        conds.append("m.kmer_mass >= %(f_microbe_min_kmer_mass)s::double precision")
+        params["f_microbe_min_kmer_mass"] = filters["microbe_min_kmer_mass"]
+    if filters.get("microbe_validated_only"):
+        conds.append(_MICROBE_VALIDATED_EXPR)
+    return " AND ".join(conds)
+
+
+def _microbe_exists(filters: dict, params: dict) -> str:
+    """Cohort narrowing without the aggregates -- short-circuits on first hit."""
+    return f"""EXISTS (
+    SELECT 1
+    FROM pentimento_run r
+    JOIN pentimento_microbe m ON m.run_accession = r.run_accession
+    WHERE (r.gsm_accession = s.sample OR r.sample_accession = s.sample)
+      AND {_microbe_conds(filters, params)}
+)"""
+
+
+def _microbe_lateral(filters: dict, params: dict) -> str:
+    """LATERAL attaching microbial detections to one sample. Aggregates over every
+    matching detection; only `microbes` is capped, per `microbes_truncated`."""
+    conds = _microbe_conds(filters, params)
+    return f"""
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*)                                    AS n_detections,
+        MAX(d.breadth_frac)                         AS max_breadth_frac,
+        SUM(d.reads)                                AS reads,
+        SUM(d.kmer_mass)                            AS kmer_mass,
+        COUNT(*) > {_MICROBE_ROW_CAP}               AS microbes_truncated,
+        jsonb_agg(
+            jsonb_build_object(
+                'organism', d.organism, 'class', d.class, 'kingdom', d.kingdom,
+                'run_accession', d.run_accession,
+                'reads', d.reads, 'kmer_mass', d.kmer_mass,
+                'n_unitigs', d.n_unitigs, 'breadth_frac', d.breadth_frac,
+                'covered_bp', d.covered_bp, 'ref_bp', d.ref_bp,
+                'is_validated_viral', d.is_validated_viral,
+                'is_viral_evidence', d.is_viral_evidence,
+                'is_validated_bacterial', d.is_validated_bacterial
+            ) ORDER BY d.kmer_mass DESC NULLS LAST
+        ) FILTER (WHERE d.rn <= {_MICROBE_ROW_CAP}) AS microbes
+    FROM (
+        SELECT m.organism, m.class, m.reads, m.kmer_mass, m.n_unitigs,
+               m.covered_bp, m.ref_bp, m.breadth_frac, r.run_accession,
+               m.is_validated_viral, m.is_viral_evidence,
+               m.is_validated_bacterial,
+               {_MICROBE_KINGDOM_CASE} AS kingdom,
+               ROW_NUMBER() OVER (
+                   ORDER BY m.kmer_mass DESC NULLS LAST
+               ) AS rn
+        FROM pentimento_run r
+        JOIN pentimento_microbe m ON m.run_accession = r.run_accession
+        WHERE (r.gsm_accession = s.sample OR r.sample_accession = s.sample)
+          AND {conds}
+    ) d
+) mq ON TRUE"""
+
+
+def _wants_microbes(filters: dict) -> bool:
+    return any(
+        filters.get(k) not in (None, "", False) for k in _SAMPLE_SEARCH_MICROBE_KEYS
+    )
+
+
+# LIMIT 1: pentimento_sample.sample_accession is not proven unique, and a duplicate
+# would fan out the sample row and inflate COUNT(*) OVER ().
+_PENTIMENTO_SAMPLE_LATERAL = """
+LEFT JOIN LATERAL (
+    SELECT p.cells, p.genes, p.assay_display, p.assay_is_single_cell,
+           p.hpv_top_type, p.hpv_ambiguous, p.has_viral_reads,
+           p.has_bacterial_reads, p.viral_kmer_mass, p.bacterial_kmer_mass
+    FROM pentimento_sample p
+    WHERE p.sample_accession = s.sample
+    LIMIT 1
+) ps ON TRUE"""
+
+
+def _sample_search_body(
+    filters: dict, include_descendants: bool, aggregate: bool
+) -> tuple[str, dict]:
+    """FROM + JOINs + WHERE, shared by the cohort page query and its count.
+    `aggregate` resolves the microbe filter with the LATERAL; otherwise EXISTS."""
+    where, params = _sample_search_where(filters, include_descendants)
+    joins = _PENTIMENTO_SAMPLE_LATERAL
+    if _wants_microbes(filters):
+        if aggregate:
+            joins += _microbe_lateral(filters, params)
+            where = f"({where}) AND mq.n_detections > 0"
+        else:
+            where = f"({where}) AND {_microbe_exists(filters, params)}"
+    return f"FROM ontology_samples_v4 s{joins}\nWHERE {where}", params
+
+
+def build_enriched_sample_search_sql(
+    filters: dict,
+    sort: str = "sample",
+    order: str = "asc",
+    limit: int = 100,
+    offset: int = 0,
+    include_descendants: bool = True,
+) -> tuple[str, dict]:
+    """Cross-project sample cohort search over ontology_samples_v4 -> (sql, params).
+    Rows carry `total_count`; any `microbe*` filter also restricts the cohort."""
+    if sort not in SAMPLE_SEARCH_SORTABLE:
+        raise ValueError(f"unsortable column: {sort}")
+    direction = "DESC" if str(order).lower() == "desc" else "ASC"
+
+    body, params = _sample_search_body(filters, include_descendants, aggregate=True)
+    microbe_cols = (
+        """,
+       mq.n_detections      AS microbe_n_detections,
+       mq.max_breadth_frac  AS microbe_max_breadth_frac,
+       mq.reads             AS microbe_reads,
+       mq.kmer_mass         AS microbe_kmer_mass,
+       mq.microbes_truncated,
+       mq.microbes"""
+        if _wants_microbes(filters)
+        else ""
+    )
+    params["limit"] = limit
+    params["offset"] = offset
+    # `sample` breaks ties so paging is stable across identical sort values.
+    tiebreak = "" if sort == "sample" else ", s.sample ASC"
+    sql = f"""
+SELECT {_SAMPLE_SEARCH_SELECT},
+       ps.cells, ps.genes, ps.assay_display AS pentimento_assay,
+       ps.assay_is_single_cell, ps.hpv_top_type, ps.hpv_ambiguous,
+       ps.has_viral_reads, ps.has_bacterial_reads,
+       ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols},
+       COUNT(*) OVER () AS total_count
+{body}
+ORDER BY s.{sort} {direction} NULLS LAST{tiebreak}
+LIMIT %(limit)s OFFSET %(offset)s;
+"""
+    return sql, params
+
+
+def build_enriched_sample_count_sql(
+    filters: dict, include_descendants: bool = True
+) -> tuple[str, dict]:
+    """COUNT for the same cohort, for the one case the window count cannot cover:
+    `COUNT(*) OVER ()` rides on returned rows, so a past-the-end OFFSET yields none."""
+    body, params = _sample_search_body(filters, include_descendants, aggregate=False)
+    return f"SELECT COUNT(*)::bigint AS total\n{body};", params
+
+
 #### Pentimento: single-cell counts, read-derived calls, microbial flags #####
 PENTIMENTO_RESOLVE_SQL = """
 WITH candidates AS (
@@ -5686,24 +6027,13 @@ WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s)
 ORDER BY pri;
 """
 
-PENTIMENTO_MICROBES_SQL = """
+PENTIMENTO_MICROBES_SQL = f"""
 SELECT r.run_accession, r.gsm_accession, r.sample_accession, r.study_accession,
        r.measurable, r.total_reads,
        m.organism, m.class, m.reads, m.kmer_mass, m.n_unitigs,
        m.ref_bp, m.covered_bp, m.breadth_frac, m.is_background,
        m.is_validated_viral, m.is_viral_evidence, m.is_validated_bacterial,
-       CASE m.class
-         WHEN 'virus'    THEN 'viral'
-         WHEN 'pathogen' THEN 'bacterial'
-         WHEN 'culture'  THEN 'bacterial'
-         WHEN 'kitome'   THEN 'bacterial_background'
-         WHEN 'flora'    THEN 'bacterial_background'
-         WHEN 'parasite' THEN 'eukaryotic_parasite'
-         WHEN 'spike'    THEN 'spike_in_control'
-         WHEN 'animalPV' THEN 'negative_control'
-         WHEN 'vector'   THEN 'vector'
-         ELSE 'other'
-       END AS kingdom
+       {_MICROBE_KINGDOM_CASE} AS kingdom
 FROM pentimento_run r
 LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
   AND (%(include_background)s OR NOT m.is_background)
@@ -5714,9 +6044,120 @@ LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
   AND (%(min_breadth)s::real IS NULL OR m.breadth_frac >= %(min_breadth)s::real)
   AND (%(min_kmer_mass)s::double precision IS NULL
        OR m.kmer_mass >= %(min_kmer_mass)s::double precision)
-  AND (NOT %(validated_only)s
-       OR m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)
+  AND (NOT %(validated_only)s OR {_MICROBE_VALIDATED_EXPR})
 WHERE (r.gsm_accession = %(acc)s OR r.sample_accession = %(acc)s)
 ORDER BY m.kmer_mass DESC NULLS LAST, m.breadth_frac DESC NULLS LAST
 LIMIT %(limit)s;
 """
+
+
+if __name__ == "__main__":
+    sql, p = build_enriched_sample_search_sql({"sex": "female"})
+    assert "lower(s.sex::text) = lower(%(f_sex)s::text)" in sql, sql
+    assert p["f_sex"] == "female", p
+    assert "ILIKE" not in sql.split("WHERE")[1].split("ORDER BY")[0], sql
+
+    sql, p = build_enriched_sample_search_sql({"tissue": "liver"})
+    assert "s.tissue ILIKE %(f_tissue)s" in sql and p["f_tissue"] == "%liver%", p
+
+    assert "COUNT(*) OVER () AS total_count" in sql, sql
+
+    sql, p = build_enriched_sample_search_sql({"disease_ontology_id": "MONDO:0005061"})
+    assert "ontology_closure" in sql and p["f_disease_ontology_id_onto"] == "mondo", p
+    sql, p = build_enriched_sample_search_sql(
+        {"disease_ontology_id": "MONDO:0005061"}, include_descendants=False
+    )
+    assert "ontology_closure" not in sql, sql
+
+    try:
+        build_enriched_sample_search_sql({"nonsense": "x"})
+        raise AssertionError("unknown filter should raise")
+    except ValueError as e:
+        assert "nonsense" in str(e), e
+
+    try:
+        build_enriched_sample_search_sql({"tissue": "liver"}, sort="sample; DROP TABLE")
+        raise AssertionError("bad sort should raise")
+    except ValueError:
+        pass
+
+    sql, p = build_enriched_sample_search_sql(
+        {
+            "tissue": "cervi",
+            "assay": "single cell rna",
+            "microbe": "papillomavirus",
+            "single_cell_only": True,
+        },
+        sort="cell_count",
+        order="desc",
+    )
+    assert "LEFT JOIN LATERAL" in sql, sql
+    assert p["f_microbe"] == "%papillomavirus%", p
+    assert "mq.n_detections > 0" in sql, sql
+    assert "ps.assay_is_single_cell IS TRUE" in sql, sql
+    assert "mq.microbes_truncated" in sql, sql
+    assert "ORDER BY s.cell_count DESC NULLS LAST, s.sample ASC" in sql, sql
+
+    lateral = _microbe_lateral({"microbe": "papillomavirus"}, {})
+    assert f"FILTER (WHERE d.rn <= {_MICROBE_ROW_CAP})" in lateral, lateral
+    assert "COUNT(*)" in lateral, lateral
+    assert "LIMIT" not in lateral, lateral
+
+    sql, _ = build_enriched_sample_search_sql({"tissue": "liver"})
+    assert "pentimento_microbe" not in sql, sql
+    assert "microbe_n_detections" not in sql, sql
+    assert sql.count("LEFT JOIN LATERAL") == 1, sql
+
+    assert _as_list("Homo sapiens") == ["Homo sapiens"]
+    assert _as_list(["Homo sapiens", "Mus musculus"]) == [
+        "Homo sapiens",
+        "Mus musculus",
+    ]
+    assert _as_list(None) is None and _as_list([]) is None and _as_list("") is None
+    s3, p3 = build_structured_search(organism="Homo sapiens")
+    assert p3["organism"] == ["Homo sapiens"], p3
+
+    fp = {}
+    dim, _ = _search_filter_clauses(fp, organism=["Homo sapiens", "Mus musculus"])
+    assert "unnest(%(organism)s::text[])" in dim["organism"], dim
+    assert fp["organism"] == ["Homo sapiens", "Mus musculus"], fp
+    fp2 = {}
+    _search_filter_clauses(fp2, organism="Homo sapiens")
+    assert fp2["organism"] == ["Homo sapiens"], fp2
+
+    for param in ("organism", "library_strategy"):
+        s4, p4 = build_structured_search(**{param: ["RNA-Seq", "ATAC-seq"]})
+        assert isinstance(p4[param], list), (param, p4)
+        scalar_eq = f"= %({param})s"
+        assert scalar_eq not in s4, (
+            f"{param} binds a list but {scalar_eq!r} is still a scalar compare"
+        )
+    s5, _ = build_structured_search(library_strategy=["RNA-Seq"])
+    assert "= ANY(%(library_strategy)s)" in s5, s5
+
+    assert "COUNT(*) OVER () AS total_count" in DISEASE_ALIAS_LOOKUP_SQL
+
+    assert "LEFT JOIN pentimento_sample" not in sql, sql
+    assert "FROM pentimento_sample p" in sql and "LIMIT 1\n) ps ON TRUE" in sql, sql
+
+    page, pp = build_enriched_sample_search_sql(
+        {"tissue": "cervi", "microbe": "papillomavirus"}
+    )
+    csql, cp = build_enriched_sample_count_sql(
+        {"tissue": "cervi", "microbe": "papillomavirus"}
+    )
+    assert csql.startswith("SELECT COUNT(*)::bigint AS total"), csql
+    assert "EXISTS (" in csql and "jsonb_agg" not in csql, csql
+    assert "LIMIT %(limit)s" not in csql, csql
+    assert cp["f_microbe"] == pp["f_microbe"] == "%papillomavirus%", (cp, pp)
+    assert cp["f_tissue"] == pp["f_tissue"], (cp, pp)
+    csql2, _ = build_enriched_sample_count_sql({"tissue": "liver"})
+    assert "pentimento_microbe" not in csql2, csql2
+
+    assert set(_SAMPLE_SEARCH_ONTOLOGY_COLS) == {
+        f"{f}_ontology_id" for f in ONTOLOGY_FIELDS
+    }
+    assert _MICROBE_KINGDOM_CASE in PENTIMENTO_MICROBES_SQL
+    assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_MICROBES_SQL
+
+    print("OK: cohort search + structured multi-value self-checks pass")

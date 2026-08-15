@@ -8,13 +8,7 @@ from __future__ import annotations
 import json
 import re
 
-ONTOLOGY_FIELDS: dict[str, str] = {
-    "disease": "mondo",
-    "tissue": "uberon",
-    "cell_type": "cl",
-    "assay": "efo",
-    "development_stage": "uberon",
-}
+from queries import DAYS_PER_YEAR, ONTOLOGY_FIELDS
 
 _PREFIX_TO_FIELDS: dict[str, list[tuple[str, str]]] = {
     "MONDO": [("disease", "mondo")],
@@ -58,8 +52,8 @@ _ISO_DUR_RE = re.compile(
     r"^P(?=\d)(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?"
     r"(?:(\d+(?:\.\d+)?)W)?(?:(\d+(?:\.\d+)?)D)?$"
 )
-_DAYS_PER_YEAR = 365.25
-_DAYS_PER_MONTH = 365.25 / 12
+_DAYS_PER_YEAR = DAYS_PER_YEAR
+_DAYS_PER_MONTH = DAYS_PER_YEAR / 12
 _EMBEDDED_OP_RE = re.compile(r"^(<=|>=|!=|!|=|<|>)\s*(.+)$")
 
 
