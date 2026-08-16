@@ -13,6 +13,8 @@ import psycopg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from queries import SITEMAP_PAGE_SIZE, SITEMAP_TABLES  # noqa: E402
 
+from _db import dsn  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("build_sitemap_bounds")
 
@@ -42,23 +44,8 @@ def rebuild_source(
     return cur.rowcount
 
 
-def _dsn() -> str:
-    # Prefer the DB_* parts (point at the SSH tunnel) over DATABASE_URL, which in
-    # .env is the production DSN and won't resolve through the tunnel.
-    if os.environ.get("DB_HOST"):
-        return (
-            f"host={os.environ['DB_HOST']} port={os.environ.get('DB_PORT', '5432')} "
-            f"dbname={os.environ['DB_NAME']} user={os.environ['DB_USER']} "
-            f"password={os.environ['DB_PASSWORD']}"
-        )
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        sys.exit("set DB_HOST/DB_PORT/... or DATABASE_URL")
-    return dsn
-
-
 def main() -> None:
-    with psycopg.connect(_dsn()) as conn:
+    with psycopg.connect(dsn()) as conn:
         for source, (table, col, distinct, where) in SITEMAP_TABLES.items():
             with conn.transaction(), conn.cursor() as cur:
                 pages = rebuild_source(cur, source, table, col, distinct, where)

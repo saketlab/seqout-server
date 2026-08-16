@@ -4834,6 +4834,14 @@ def _reltuples(table: str) -> str:
     return f"(SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass)"
 
 
+# Cross-archive project overlap
+PROJECT_OVERLAP_SQL = """
+SELECT dbs, projects, n_dbs, built_at
+FROM project_overlap
+ORDER BY projects DESC;
+"""
+
+
 SOURCE_TOTALS_SQL = f"""
 SELECT
     {_reltuples("geo_series")} AS geo_projects,
@@ -4892,14 +4900,14 @@ ENRICHED_STAT_COLUMNS = [
 ENRICHED_TOP_VALUES_PER_COLUMN = 100
 
 
-def _enriched_summary_ddl() -> str:
+def _enriched_summary_ddl(suffix: str = "") -> str:
     cols = ",\n    ".join(
         f"COUNT({c}) AS {c}_filled, COUNT(DISTINCT {c}) AS {c}_distinct"
         for c in ENRICHED_STAT_COLUMNS
     )
     return (
-        "DROP MATERIALIZED VIEW IF EXISTS enriched_summary;\n"
-        "CREATE MATERIALIZED VIEW enriched_summary AS\nSELECT\n"
+        f"DROP MATERIALIZED VIEW IF EXISTS enriched_summary{suffix};\n"
+        f"CREATE MATERIALIZED VIEW enriched_summary{suffix} AS\nSELECT\n"
         "    COUNT(*) AS enriched_samples,\n"
         "    COUNT(DISTINCT study_accession) AS enriched_projects,\n"
         f"    {cols}\n"
@@ -4907,7 +4915,7 @@ def _enriched_summary_ddl() -> str:
     )
 
 
-def _enriched_top_values_ddl() -> str:
+def _enriched_top_values_ddl(suffix: str = "") -> str:
     union = "\n        UNION ALL\n        ".join(
         f"SELECT '{c}' AS column_name, {c}::text AS value, COUNT(*) AS n "
         f"FROM ontology_samples_v4 WHERE {c} IS NOT NULL AND {c}::text <> '' "
@@ -4915,15 +4923,15 @@ def _enriched_top_values_ddl() -> str:
         for c in ENRICHED_STAT_COLUMNS
     )
     return (
-        "DROP MATERIALIZED VIEW IF EXISTS enriched_column_top_values;\n"
-        "CREATE MATERIALIZED VIEW enriched_column_top_values AS\n"
+        f"DROP MATERIALIZED VIEW IF EXISTS enriched_column_top_values{suffix};\n"
+        f"CREATE MATERIALIZED VIEW enriched_column_top_values{suffix} AS\n"
         "SELECT column_name, value, n FROM (\n"
         "    SELECT column_name, value, n,\n"
         "           ROW_NUMBER() OVER (PARTITION BY column_name ORDER BY n DESC) AS rk\n"
         "    FROM (\n        " + union + "\n    ) g\n"
         f") ranked WHERE rk <= {ENRICHED_TOP_VALUES_PER_COLUMN};\n"
-        "CREATE INDEX IF NOT EXISTS idx_enriched_top_values_col_n "
-        "ON enriched_column_top_values (column_name, n DESC);"
+        f"CREATE INDEX IF NOT EXISTS idx_enriched_top_values_col_n{suffix} "
+        f"ON enriched_column_top_values{suffix} (column_name, n DESC);"
     )
 
 
@@ -4944,7 +4952,7 @@ ENRICHED_CROSSTAB_TOP_GROUPS = 100
 ENRICHED_CROSSTAB_TOP_BREAKDOWN = 50
 
 
-def _enriched_crosstab_ddl() -> str:
+def _enriched_crosstab_ddl(suffix: str = "") -> str:
     base_cols = ",\n            ".join(
         (
             "COALESCE(cn.common_name, um.dominant_scientific_name) AS organism"
@@ -4955,17 +4963,18 @@ def _enriched_crosstab_ddl() -> str:
     )
     pairs = "\n        UNION ALL\n        ".join(
         f"SELECT '{g}' AS group_col, {g}::text AS group_val, "
-        f"'{b}' AS breakdown_col, {b}::text AS breakdown_val "
+        f"'{b}' AS breakdown_col, {b}::text AS breakdown_val, COUNT(*) AS n "
         f"FROM base "
         f"WHERE {g} IS NOT NULL AND {g}::text <> '' "
-        f"AND {b} IS NOT NULL AND {b}::text <> ''"
+        f"AND {b} IS NOT NULL AND {b}::text <> '' "
+        f"GROUP BY {g}, {b}"
         for g in ENRICHED_CROSSTAB_COLUMNS
         for b in ENRICHED_CROSSTAB_COLUMNS
         if g != b
     )
     return (
-        "DROP MATERIALIZED VIEW IF EXISTS enriched_crosstab;\n"
-        "CREATE MATERIALIZED VIEW enriched_crosstab AS\n"
+        f"DROP MATERIALIZED VIEW IF EXISTS enriched_crosstab{suffix};\n"
+        f"CREATE MATERIALIZED VIEW enriched_crosstab{suffix} AS\n"
         "WITH base AS MATERIALIZED (\n"
         f"        SELECT\n            {base_cols}\n"
         "        FROM ontology_samples_v4 os\n"
@@ -4977,7 +4986,7 @@ def _enriched_crosstab_ddl() -> str:
         "    ),\n"
         "    pairs AS (\n        " + pairs + "\n    ),\n"
         "    counts AS (\n"
-        "        SELECT group_col, group_val, breakdown_col, breakdown_val, COUNT(*) AS n\n"
+        "        SELECT group_col, group_val, breakdown_col, breakdown_val, SUM(n) AS n\n"
         "        FROM pairs GROUP BY 1, 2, 3, 4\n"
         "    ),\n"
         "    grp AS (\n"
@@ -4998,36 +5007,31 @@ def _enriched_crosstab_ddl() -> str:
         "       n, group_total, group_distinct\n"
         f"FROM ranked WHERE brk <= {ENRICHED_CROSSTAB_TOP_BREAKDOWN} "
         f"AND grk <= {ENRICHED_CROSSTAB_TOP_GROUPS};\n"
-        "CREATE INDEX IF NOT EXISTS idx_enriched_crosstab_pair "
-        "ON enriched_crosstab (group_col, breakdown_col, group_total DESC);"
+        f"CREATE INDEX IF NOT EXISTS idx_enriched_crosstab_pair{suffix} "
+        f"ON enriched_crosstab{suffix} (group_col, breakdown_col, group_total DESC);"
     )
 
 
-ENRICHED_STATS_DDL = (
-    _enriched_summary_ddl()
-    + "\n\n"
-    + _enriched_top_values_ddl()
-    + "\n\n"
-    + _enriched_crosstab_ddl()
-)
-ENRICHED_STATS_REFRESH = (
-    "REFRESH MATERIALIZED VIEW enriched_summary;\n"
-    "REFRESH MATERIALIZED VIEW enriched_column_top_values;\n"
-    "REFRESH MATERIALIZED VIEW enriched_crosstab;"
-)
+def enriched_stats_ddl(suffix: str = "") -> str:
+    """DDL for the three enriched-stats matviews, optionally under a suffix."""
+    return (
+        _enriched_summary_ddl(suffix)
+        + "\n\n"
+        + _enriched_top_values_ddl(suffix)
+        + "\n\n"
+        + _enriched_crosstab_ddl(suffix)
+    )
+
+
+ENRICHED_STATS_DDL = enriched_stats_ddl()
 
 # rare disease (GARD)
 
-# Two collections, same shape, different catalogue: GARD resolves onto MONDO by
-# exact xref, NORD only by name, so NORD membership is looser. Both sets of
-# matviews come from scripts/create_rare_disease_matview.sh.
 DISEASE_COLLECTIONS = {
     "rare": {
         "prefix": "rare_disease",
-        # same alias in both collections so one renderer handles either
         "label": "catalogue_diseases",
         "label_col": "gard_names",
-        # query parameter -> matview array column, all faceted and GIN-indexed
         "tags": {
             "category": "categories",
             "specialty": "specialties",
@@ -5046,8 +5050,6 @@ DISEASE_COLLECTIONS = {
 
 _SCALAR_FILTERS = ("assay_category",)
 
-# Only the positive case: has_fastq=false would conflate "none found" with
-# "study absent from the links table".
 _BOOL_FILTERS = ("has_fastq", "has_sra")
 
 _ARRAY_FILTERS = {
@@ -5056,8 +5058,6 @@ _ARRAY_FILTERS = {
     "inheritance": "inheritance",
 }
 
-# study_accession is appended to every sort as the tiebreak: without a unique
-# last key two equal-valued rows swap between pages and a client sees one twice.
 SORTABLE = frozenset(
     {
         "cells",
@@ -5070,8 +5070,6 @@ SORTABLE = frozenset(
     }
 )
 
-# Scope is a filter, not baked into the matview, so it stays reversible; each
-# entry is (counter column, predicate).
 SCOPES = {
     # human material that is neither an immortalized line nor a derived model
     "human_primary": ("n_human_primary", "r.n_human_primary > 0"),
@@ -5082,12 +5080,8 @@ SCOPES = {
 }
 DEFAULT_SCOPE = "human_primary"
 
-# Must stay identical to the normalizer in create_disease_alias_matview.sh: a
-# query normalized differently from the stored alias matches nothing.
 _ALIAS_NORM = "btrim(regexp_replace(lower({}), '[^a-z0-9]+', ' ', 'g'))"
 
-# One disease name -> that disease and every subtype. disease_alias flattens
-# GARD/NORD/MONDO names and their synonyms; the closure adds the subtypes.
 DISEASE_MONDO_SET = f"""(
     SELECT coalesce(array_agg(DISTINCT m), '{{}}') FROM (
         SELECT unnest(a.mondo_ids) AS m FROM disease_alias a
@@ -5226,10 +5220,6 @@ WITH page AS (
     ORDER BY {order_by("r")}
     LIMIT %(limit)s OFFSET %(offset)s
 ),
--- the catalogue disease each study rolled up to, direct or through the MONDO
--- closure. Per page, not in the matview: precomputing all of them is too expensive.
--- Both arms are equality joins so the catalogue's mondo_id index serves them;
--- an OR over the two seq-scanned the catalogue once per page row.
 page_mondo AS (
     SELECT p.study_accession, m FROM page p, unnest(p.mondo_ids) m
 ),
@@ -5247,9 +5237,6 @@ cat_names AS (
       JOIN {catalogue} cat ON cat.mondo_id = pmc.m
      GROUP BY 1
 ),
--- MONDO ancestry as the enrichment recorded it, not as the closure derives it:
--- disease_ancestors is already per sample. Blank on plenty of rows (Huntington
--- among them) and stays blank here.
 anc AS (
     SELECT os.study_accession, array_agg(DISTINCT e->>'name') AS ancestors
     FROM ontology_samples_v4 os,
@@ -5264,19 +5251,17 @@ FROM page p
 LEFT JOIN cat_names ON cat_names.study_accession = p.study_accession
 LEFT JOIN anc ON anc.study_accession = p.study_accession
 ORDER BY {order_by("p")};
-"""  # noqa: S608 -- every interpolated name comes from module constants
+"""  # noqa: S608
 
 
 def build_disease_count_sql(collection: str, scope: str = DEFAULT_SCOPE) -> str:
     """
     How many studies match the filters, not how many are on this page.
-
-    Kept separate from the page query: "showing 50 of 50" would read as complete.
     """
     return f"""
 SELECT count(*) AS total FROM {DISEASE_COLLECTIONS[collection]["prefix"]}_study r
 WHERE {SCOPES[scope][1]}{_disease_where(collection)};
-"""  # noqa: S608 -- every interpolated name comes from module constants
+"""  # noqa: S608
 
 
 def disease_projects_params(collection: str) -> tuple[str, ...]:
@@ -5509,13 +5494,12 @@ _ENRICHED_SAMPLES_BASE_COLS = [
     "cell_line",
     "treatment",
 ]
+# cell_count/gene_count are deliberately absent: they are NULL on every row of
+# enriched_samples too, and come from pentimento_sample via the lateral below.
 _ENRICHED_SAMPLES_NEW_COLS = [
     "development_stage",
     "sample_type",
     "genetic_modification",
-    "cell_count",
-    "gene_count",
-    "cell_count_estimated",
 ]
 
 
@@ -5538,8 +5522,9 @@ def build_enriched_samples_sql(pg_conn) -> str:
 
     col_str = ", ".join(f"es.{c}" if " " not in c else c for c in cols)
     return f"""
-SELECT {col_str}
-FROM enriched_samples es
+SELECT {col_str},
+       pc.cells AS cell_count, pc.genes AS gene_count, pc.unfiltered
+FROM enriched_samples es{_pentimento_counts_lateral("es.sample")}
 WHERE es.study_accession = %s
 ORDER BY es.sample;
 """
@@ -5563,42 +5548,41 @@ WHERE st.accession = %s;
 """
 
 
-ENRICHED_STUDY_V3_SQL = """
+ENRICHED_STUDY_V4_SQL = """
 SELECT st.accession, st.title, st.n_samples, st.single_cell_modality
 FROM enriched_studies_v4 st
 WHERE st.accession = %s;
 """
 
-ONTOLOGY_SAMPLES_V3_SQL = """
-SELECT
-    sample, age, sex, ethnicity, phenotype,
-    cell_type, tissue, strain, disease, assay,
-    assay_category, cell_line, treatment,
-    development_stage, sample_type, genetic_modification,
-    organism, taxid, tissue_primary_site, tissue_site_type,
-    cell_count, gene_count, cell_count_estimated,
-    disease_ontology_id, disease_ontology_name,
-    tissue_ontology_id, tissue_ontology_name,
-    cell_type_ontology_id, cell_type_ontology_name,
-    assay_ontology_id, assay_ontology_name,
-    development_stage_ontology_id, development_stage_ontology_name
-FROM ontology_samples_v4
-WHERE study_accession = %s
-ORDER BY sample;
-"""
 
-ENRICHED_SAMPLES_V3_SQL = """
-SELECT
-    sample, age, sex, ethnicity, phenotype,
-    cell_type, tissue, strain, disease, assay,
-    assay_category, cell_line, treatment,
-    development_stage, sample_type, genetic_modification,
-    cell_count, gene_count, cell_count_estimated
-FROM enriched_samples_v4
-WHERE study_accession = %s
-ORDER BY sample;
-"""
+def _pentimento_counts_lateral(sample_expr: str) -> str:
+    """Per-sample matrix counts for a study page."""
+    return f"""
+LEFT JOIN LATERAL (
+    SELECT p.cells, p.genes, p.unfiltered
+    FROM pentimento_sample p
+    WHERE p.sample_accession = {sample_expr}
+    LIMIT 1
+) pc ON TRUE"""
 
+
+ONTOLOGY_SAMPLES_V4_SQL = f"""
+SELECT
+    os.sample, os.age, os.sex, os.ethnicity, os.phenotype,
+    os.cell_type, os.tissue, os.strain, os.disease, os.assay,
+    os.assay_category, os.cell_line, os.treatment,
+    os.development_stage, os.sample_type, os.genetic_modification,
+    os.organism, os.taxid, os.tissue_primary_site, os.tissue_site_type,
+    pc.cells AS cell_count, pc.genes AS gene_count, pc.unfiltered,
+    os.disease_ontology_id, os.disease_ontology_name,
+    os.tissue_ontology_id, os.tissue_ontology_name,
+    os.cell_type_ontology_id, os.cell_type_ontology_name,
+    os.assay_ontology_id, os.assay_ontology_name,
+    os.development_stage_ontology_id, os.development_stage_ontology_name
+FROM ontology_samples_v4 os{_pentimento_counts_lateral("os.sample")}
+WHERE os.study_accession = %s
+ORDER BY os.sample;
+"""
 # Low-confidence tags per sample within a study
 LOW_CONFIDENCE_TAGS_SQL = """
 SELECT sample_accession, tags
@@ -5637,18 +5621,22 @@ _SAMPLE_SEARCH_ONTOLOGY_COLS = {
 _SAMPLE_SEARCH_RANGE_COLS = {
     "age_min_days": ("age_days", ">="),
     "age_max_days": ("age_days", "<="),
-    "min_cell_count": ("cell_count", ">="),
-    "max_cell_count": ("cell_count", "<="),
-    "min_gene_count": ("gene_count", ">="),
-    "max_gene_count": ("gene_count", "<="),
 }
 
-_SAMPLE_SEARCH_PENTIMENTO_BOOL = {
-    "single_cell_only": "ps.assay_is_single_cell",
-    "has_viral_reads": "ps.has_viral_reads",
-    "has_bacterial_reads": "ps.has_bacterial_reads",
+# Every pentimento_sample filter: key -> (clause over alias `p`, param value).
+# The value callable is None for flags that bind nothing. Matrix counts live
+# here and NOT on ontology_samples_v4, whose cell_count/gene_count are NULL on
+# all 16.1M rows with nothing writing them -- those filters matched nothing.
+_SAMPLE_SEARCH_PENTIMENTO = {
+    "single_cell_only": ("p.assay_is_single_cell IS TRUE", None),
+    "has_viral_reads": ("p.has_viral_reads IS TRUE", None),
+    "has_bacterial_reads": ("p.has_bacterial_reads IS TRUE", None),
+    "hpv_type": ("p.hpv_top_type ILIKE %(f_hpv_type)s", lambda v: f"%{v}%"),
+    "min_cell_count": ("p.cells >= %(f_min_cell_count)s", int),
+    "max_cell_count": ("p.cells <= %(f_max_cell_count)s", int),
+    "min_gene_count": ("p.genes >= %(f_min_gene_count)s", int),
+    "max_gene_count": ("p.genes <= %(f_max_gene_count)s", int),
 }
-_SAMPLE_SEARCH_PENTIMENTO_LIKE = {"hpv_type": "ps.hpv_top_type"}
 
 _SAMPLE_SEARCH_MICROBE_KEYS = frozenset(
     {
@@ -5660,14 +5648,17 @@ _SAMPLE_SEARCH_MICROBE_KEYS = frozenset(
     }
 )
 
+# Resolved by semi-join against the small pentimento tables, not by a column compare
+_SAMPLE_SEARCH_PENTIMENTO_KEYS = _SAMPLE_SEARCH_MICROBE_KEYS | set(
+    _SAMPLE_SEARCH_PENTIMENTO
+)
+
 SAMPLE_SEARCH_FILTERS = frozenset(
     set(_SAMPLE_SEARCH_LIKE_COLS)
     | set(_SAMPLE_SEARCH_EXACT_COLS)
     | set(_SAMPLE_SEARCH_ONTOLOGY_COLS)
     | set(_SAMPLE_SEARCH_RANGE_COLS)
-    | set(_SAMPLE_SEARCH_PENTIMENTO_BOOL)
-    | set(_SAMPLE_SEARCH_PENTIMENTO_LIKE)
-    | set(_SAMPLE_SEARCH_MICROBE_KEYS)
+    | _SAMPLE_SEARCH_PENTIMENTO_KEYS
 )
 
 _MICROBE_KINGDOM_CASE = """CASE m.class
@@ -5689,24 +5680,85 @@ _MICROBE_VALIDATED_EXPR = (
 
 _MICROBE_ROW_CAP = 50
 
+# Sorting on these means joining pentimento_sample into the page CTE, because
+# the page is cut before the LATERALs run. Everything else sorts on its own
+# ontology_samples_v4 column.
+_PENTIMENTO_SORT_COLS = {"cell_count": "cells", "gene_count": "genes"}
 SAMPLE_SEARCH_SORTABLE = frozenset(
-    {"sample", "study_accession", "age_days", "cell_count", "gene_count"}
+    {"sample", "study_accession", "age_days"} | set(_PENTIMENTO_SORT_COLS)
 )
 
 _SAMPLE_SEARCH_SELECT = """
-    sample, study_accession, organism, taxid,
-    age, age_days, sex, ethnicity, phenotype,
-    cell_type, tissue, strain, disease, assay,
-    assay_category, cell_line, treatment,
-    development_stage, sample_type, genetic_modification,
-    tissue_primary_site, tissue_site_type,
-    cell_count, gene_count, cell_count_estimated,
-    disease_ontology_id, disease_ontology_name,
-    tissue_ontology_id, tissue_ontology_name,
-    cell_type_ontology_id, cell_type_ontology_name,
-    assay_ontology_id, assay_ontology_name,
-    development_stage_ontology_id, development_stage_ontology_name
+    s.sample, s.study_accession, s.organism, s.taxid,
+    s.age, s.age_days, s.sex, s.ethnicity,
+    s.phenotype, s.cell_type, s.tissue, s.strain,
+    s.disease, s.assay, s.assay_category, s.cell_line,
+    s.treatment, s.development_stage, s.sample_type, s.genetic_modification,
+    s.tissue_primary_site, s.tissue_site_type, s.disease_ontology_id, s.disease_ontology_name,
+    s.tissue_ontology_id, s.tissue_ontology_name, s.cell_type_ontology_id, s.cell_type_ontology_name,
+    s.assay_ontology_id, s.assay_ontology_name, s.development_stage_ontology_id, s.development_stage_ontology_name
 """.strip()
+
+
+def _pentimento_sort_page(
+    select: str,
+    sort: str,
+    col: str,
+    where: str,
+    direction: str,
+    tiebreak: str,
+    measured_only: bool = False,
+) -> str:
+    """Page CTE body for a sort on a pentimento matrix count.
+
+    Only 85k of 16.1M samples carry a count, and NULLS LAST puts the unmeasured
+    ones last in *both* directions -- so the measured rows are always a prefix of
+    the result. Producing them by joining the small table (an inner join, ~150ms)
+    and leaving the tail to an anti-join (~110ms) beats scanning the big table
+    with an outer join to a dedup subquery (~1060ms, and it flipped to a
+    disk-spilling merge join on wider cohorts).
+
+    The measured branch joins pentimento_sample directly: a duplicate
+    sample_accession would fan the page out past the count query, and
+    idx_pentimento_sample_sample_uniq now forbids one. Each branch is capped at
+    offset+limit and the outer ORDER BY re-sorts at most 2*(offset+limit) rows,
+    so correctness never relies on UNION ALL preserving branch order.
+
+    `measured_only` drops the second branch entirely. A pentimento_sample filter
+    and "has no pentimento_sample row" are contradictory, so that branch is
+    guaranteed empty -- but Postgres cannot prove it and scans for it anyway,
+    which measured 20% of the time and 31% of the buffers on a liver-sized page."""
+    if measured_only:
+        return f"""
+    SELECT {select},
+           pv.{col} AS {sort}
+    FROM pentimento_sample pv
+    JOIN ontology_samples_v4 s ON s.sample = pv.sample_accession
+    WHERE {where}
+    ORDER BY pv.{col} {direction} NULLS LAST{tiebreak}
+    LIMIT %(limit)s OFFSET %(offset)s"""
+    outer_tiebreak = tiebreak.replace("s.", "")
+    return f"""
+    SELECT * FROM (
+        (SELECT {select},
+                pv.{col} AS {sort}
+         FROM pentimento_sample pv
+         JOIN ontology_samples_v4 s ON s.sample = pv.sample_accession
+         WHERE {where}
+         ORDER BY pv.{col} {direction} NULLS LAST{tiebreak}
+         LIMIT %(page_end)s)
+        UNION ALL
+        (SELECT {select},
+                NULL::bigint AS {sort}
+         FROM ontology_samples_v4 s
+         WHERE {where}
+           AND NOT EXISTS (SELECT 1 FROM pentimento_sample pn
+                           WHERE pn.sample_accession = s.sample)
+         ORDER BY{tiebreak.lstrip(",")}
+         LIMIT %(page_end)s)
+    ) u
+    ORDER BY {sort} {direction} NULLS LAST{outer_tiebreak}
+    LIMIT %(limit)s OFFSET %(offset)s"""
 
 
 def _sample_search_where(filters: dict, include_descendants: bool) -> tuple[str, dict]:
@@ -5718,17 +5770,9 @@ def _sample_search_where(filters: dict, include_descendants: bool) -> tuple[str,
             continue
         if key not in SAMPLE_SEARCH_FILTERS:
             raise ValueError(f"unknown sample filter: {key}")
-        if key in _SAMPLE_SEARCH_MICROBE_KEYS:
+        if key in _SAMPLE_SEARCH_PENTIMENTO_KEYS:
             continue
         pkey = f"f_{key}"
-        if key in _SAMPLE_SEARCH_PENTIMENTO_BOOL:
-            if value:
-                clauses.append(f"{_SAMPLE_SEARCH_PENTIMENTO_BOOL[key]} IS TRUE")
-            continue
-        if key in _SAMPLE_SEARCH_PENTIMENTO_LIKE:
-            clauses.append(f"{_SAMPLE_SEARCH_PENTIMENTO_LIKE[key]} ILIKE %({pkey})s")
-            params[pkey] = f"%{value}%"
-            continue
         if key in _SAMPLE_SEARCH_LIKE_COLS:
             clauses.append(f"s.{key} ILIKE %({pkey})s")
             params[pkey] = f"%{value}%"
@@ -5762,7 +5806,7 @@ def _sample_search_where(filters: dict, include_descendants: bool) -> tuple[str,
 
 
 def _microbe_conds(filters: dict, params: dict) -> str:
-    """The detection-matching predicate, shared by the LATERAL and the EXISTS."""
+    """The detection-matching predicate, shared by the LATERAL and the semi-join."""
     conds = ["NOT m.is_background"]
     if filters.get("microbe"):
         conds.append("m.organism ILIKE %(f_microbe)s")
@@ -5781,15 +5825,54 @@ def _microbe_conds(filters: dict, params: dict) -> str:
     return " AND ".join(conds)
 
 
-def _microbe_exists(filters: dict, params: dict) -> str:
-    """Cohort narrowing without the aggregates -- short-circuits on first hit."""
-    return f"""EXISTS (
-    SELECT 1
-    FROM pentimento_run r
-    JOIN pentimento_microbe m ON m.run_accession = r.run_accession
-    WHERE (r.gsm_accession = s.sample OR r.sample_accession = s.sample)
-      AND {_microbe_conds(filters, params)}
-)"""
+def _is_set(value) -> bool:
+    """A filter counts as set unless it is absent. `is`-comparisons, not
+    truthiness: min_cell_count=0 is a real bound, and `0 in (None, "", False)`
+    is True in Python."""
+    return value is not None and value is not False and value != ""
+
+
+def _sample_semi(inner: str) -> str:
+    """Wrap a sub-select as a cohort-narrowing semi-join over `s.sample`.
+
+    `= ANY(ARRAY(...))`, not `IN (...)`: with IN the planner is free to read the
+    sub-select as a semi-join driven from the 16M-row side, probing pentimento
+    once per ontology row -- 1.9s for a count bound, 2.1s for a microbe filter.
+    ARRAY() builds the small side once instead: same rows, 47ms and 220ms."""
+    return f"\n  AND s.sample = ANY(ARRAY(\n    {inner}\n  ))"
+
+
+def _microbe_semi(filters: dict, params: dict) -> str:
+    """Semi-join over the 914k detections."""
+    if not _wants_microbes(filters):
+        return ""
+    # DISTINCT + NOT NULL: unnest emits both accessions per run, most of them
+    # repeats and ~14% NULL, so the raw array runs 2.3x the size of the set it
+    # represents (26 MB on a broad filter) and is materialised twice per request.
+    return _sample_semi(f"""SELECT DISTINCT x FROM (
+        SELECT unnest(ARRAY[r.gsm_accession, r.sample_accession]) AS x
+        FROM pentimento_run r
+        JOIN pentimento_microbe m ON m.run_accession = r.run_accession
+        WHERE {_microbe_conds(filters, params)}
+    ) t WHERE x IS NOT NULL""")
+
+
+def _pentimento_semi(filters: dict, params: dict) -> str:
+    """Semi-join over the 85k-row pentimento_sample flags and matrix counts."""
+    conds = []
+    for key, (clause, to_param) in _SAMPLE_SEARCH_PENTIMENTO.items():
+        value = filters.get(key)
+        if not _is_set(value):
+            continue
+        conds.append(clause)
+        if to_param is not None:
+            params[f"f_{key}"] = to_param(value)
+    if not conds:
+        return ""
+    return _sample_semi(
+        f"""SELECT p.sample_accession FROM pentimento_sample p
+    WHERE {" AND ".join(conds)}"""
+    )
 
 
 def _microbe_lateral(filters: dict, params: dict) -> str:
@@ -5833,17 +5916,27 @@ LEFT JOIN LATERAL (
 ) mq ON TRUE"""
 
 
+def _wants_pentimento_sample(filters: dict) -> bool:
+    """True if any filter is resolved against pentimento_sample itself."""
+    return any(
+        _is_set(filters.get(k))
+        for k in _SAMPLE_SEARCH_PENTIMENTO
+        if k not in _SAMPLE_SEARCH_MICROBE_KEYS
+    )
+
+
 def _wants_microbes(filters: dict) -> bool:
     return any(
         filters.get(k) not in (None, "", False) for k in _SAMPLE_SEARCH_MICROBE_KEYS
     )
 
 
-# LIMIT 1: pentimento_sample.sample_accession is not proven unique, and a duplicate
-# would fan out the sample row and inflate COUNT(*) OVER ().
+# LIMIT 1: redundant under idx_pentimento_sample_sample_uniq, but it keeps the
+# planner on a correlated index probe rather than hashing all 85k rows.
 _PENTIMENTO_SAMPLE_LATERAL = """
 LEFT JOIN LATERAL (
-    SELECT p.cells, p.genes, p.assay_display, p.assay_is_single_cell,
+    SELECT p.cells, p.genes, p.unfiltered, p.assay_display,
+           p.assay_is_single_cell,
            p.hpv_top_type, p.hpv_ambiguous, p.has_viral_reads,
            p.has_bacterial_reads, p.viral_kmer_mass, p.bacterial_kmer_mass
     FROM pentimento_sample p
@@ -5852,20 +5945,14 @@ LEFT JOIN LATERAL (
 ) ps ON TRUE"""
 
 
-def _sample_search_body(
-    filters: dict, include_descendants: bool, aggregate: bool
-) -> tuple[str, dict]:
-    """FROM + JOINs + WHERE, shared by the cohort page query and its count.
-    `aggregate` resolves the microbe filter with the LATERAL; otherwise EXISTS."""
+def _sample_search_filter(filters: dict, include_descendants: bool) -> tuple[str, dict]:
+    """The whole WHERE for the cohort, shared by the page query and its count.
+
+    FROM is ontology_samples_v4 alone; the pentimento filters appear here as
+    semi-joins so they narrow that scan instead of decorating its output."""
     where, params = _sample_search_where(filters, include_descendants)
-    joins = _PENTIMENTO_SAMPLE_LATERAL
-    if _wants_microbes(filters):
-        if aggregate:
-            joins += _microbe_lateral(filters, params)
-            where = f"({where}) AND mq.n_detections > 0"
-        else:
-            where = f"({where}) AND {_microbe_exists(filters, params)}"
-    return f"FROM ontology_samples_v4 s{joins}\nWHERE {where}", params
+    where += _pentimento_semi(filters, params) + _microbe_semi(filters, params)
+    return where, params
 
 
 def build_enriched_sample_search_sql(
@@ -5877,37 +5964,69 @@ def build_enriched_sample_search_sql(
     include_descendants: bool = True,
 ) -> tuple[str, dict]:
     """Cross-project sample cohort search over ontology_samples_v4 -> (sql, params).
-    Rows carry `total_count`; any `microbe*` filter also restricts the cohort."""
+
+    Every pentimento filter -- `microbe*`, the flags, and the matrix-count bounds
+    -- also restricts the cohort, so `total` shrinks with them. Pair with the
+    count builder, which applies the identical WHERE."""
     if sort not in SAMPLE_SEARCH_SORTABLE:
         raise ValueError(f"unsortable column: {sort}")
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
 
-    body, params = _sample_search_body(filters, include_descendants, aggregate=True)
-    microbe_cols = (
-        """,
+    where, params = _sample_search_filter(filters, include_descendants)
+    joins = _PENTIMENTO_SAMPLE_LATERAL
+    microbe_cols = ""
+    if _wants_microbes(filters):
+        joins += _microbe_lateral(filters, params)
+        microbe_cols = """,
        mq.n_detections      AS microbe_n_detections,
        mq.max_breadth_frac  AS microbe_max_breadth_frac,
        mq.reads             AS microbe_reads,
        mq.kmer_mass         AS microbe_kmer_mass,
        mq.microbes_truncated,
        mq.microbes"""
-        if _wants_microbes(filters)
-        else ""
-    )
     params["limit"] = limit
     params["offset"] = offset
-    # `sample` breaks ties so paging is stable across identical sort values.
-    tiebreak = "" if sort == "sample" else ", s.sample ASC"
+    # (sample, study_accession) is unique; sample alone is not, so without the
+    # full tiebreak two pages can repeat or skip a row.
+    tiebreak = "".join(
+        f", s.{c} ASC" for c in ("sample", "study_accession") if c != sort
+    )
+
+    def order_by(expr: str) -> str:
+        return f"ORDER BY {expr} {direction} NULLS LAST{tiebreak}"
+
+    # The page is cut before the LATERALs run, so they decorate at most `limit`
+    # rows rather than every row the filters matched.
+    if sort in _PENTIMENTO_SORT_COLS:
+        measured_only = _wants_pentimento_sample(filters)
+        if not measured_only:
+            params["page_end"] = offset + limit
+        page_body = _pentimento_sort_page(
+            _SAMPLE_SEARCH_SELECT,
+            sort,
+            _PENTIMENTO_SORT_COLS[sort],
+            where,
+            direction,
+            tiebreak,
+            measured_only=measured_only,
+        )
+    else:
+        page_body = f"""
+    SELECT {_SAMPLE_SEARCH_SELECT}
+    FROM ontology_samples_v4 s
+    WHERE {where}
+    {order_by(f"s.{sort}")}
+    LIMIT %(limit)s OFFSET %(offset)s"""
     sql = f"""
+WITH page AS ({page_body}
+)
 SELECT {_SAMPLE_SEARCH_SELECT},
-       ps.cells, ps.genes, ps.assay_display AS pentimento_assay,
+       ps.cells, ps.genes, ps.unfiltered, ps.assay_display AS pentimento_assay,
        ps.assay_is_single_cell, ps.hpv_top_type, ps.hpv_ambiguous,
        ps.has_viral_reads, ps.has_bacterial_reads,
-       ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols},
-       COUNT(*) OVER () AS total_count
-{body}
-ORDER BY s.{sort} {direction} NULLS LAST{tiebreak}
-LIMIT %(limit)s OFFSET %(offset)s;
+       ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols}
+FROM page s{joins}
+{order_by(f"s.{sort}")};
 """
     return sql, params
 
@@ -5915,10 +6034,12 @@ LIMIT %(limit)s OFFSET %(offset)s;
 def build_enriched_sample_count_sql(
     filters: dict, include_descendants: bool = True
 ) -> tuple[str, dict]:
-    """COUNT for the same cohort, for the one case the window count cannot cover:
-    `COUNT(*) OVER ()` rides on returned rows, so a past-the-end OFFSET yields none."""
-    body, params = _sample_search_body(filters, include_descendants, aggregate=False)
-    return f"SELECT COUNT(*)::bigint AS total\n{body};", params
+    """Cohort total. Same WHERE as the page, none of its per-row decoration."""
+    where, params = _sample_search_filter(filters, include_descendants)
+    return (
+        f"SELECT COUNT(*)::bigint AS total\nFROM ontology_samples_v4 s\nWHERE {where};",
+        params,
+    )
 
 
 #### Pentimento: single-cell counts, read-derived calls, microbial flags #####
@@ -6017,14 +6138,9 @@ LIMIT %s OFFSET %s;
 """
 
 PENTIMENTO_SAMPLE_TISSUE_SQL = """
-SELECT sample, tissue, 1 AS pri
+SELECT sample, tissue
 FROM ontology_samples_v4
-WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s)
-UNION ALL
-SELECT sample, tissue, 2 AS pri
-FROM enriched_samples_v4
-WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s)
-ORDER BY pri;
+WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s);
 """
 
 PENTIMENTO_MICROBES_SQL = f"""
@@ -6060,8 +6176,6 @@ if __name__ == "__main__":
     sql, p = build_enriched_sample_search_sql({"tissue": "liver"})
     assert "s.tissue ILIKE %(f_tissue)s" in sql and p["f_tissue"] == "%liver%", p
 
-    assert "COUNT(*) OVER () AS total_count" in sql, sql
-
     sql, p = build_enriched_sample_search_sql({"disease_ontology_id": "MONDO:0005061"})
     assert "ontology_closure" in sql and p["f_disease_ontology_id_onto"] == "mondo", p
     sql, p = build_enriched_sample_search_sql(
@@ -6093,10 +6207,57 @@ if __name__ == "__main__":
     )
     assert "LEFT JOIN LATERAL" in sql, sql
     assert p["f_microbe"] == "%papillomavirus%", p
-    assert "mq.n_detections > 0" in sql, sql
-    assert "ps.assay_is_single_cell IS TRUE" in sql, sql
+    assert "p.assay_is_single_cell IS TRUE" in sql, sql
     assert "mq.microbes_truncated" in sql, sql
-    assert "ORDER BY s.cell_count DESC NULLS LAST, s.sample ASC" in sql, sql
+    tail = " DESC NULLS LAST, s.sample ASC, s.study_accession ASC"
+    # single_cell_only is a pentimento_sample filter, so "has no pentimento_sample
+    # row" is contradictory and the unmeasured branch is dropped entirely.
+    assert f"ORDER BY pv.cells{tail}" in sql, sql
+    assert "UNION ALL" not in sql, sql
+    assert "NOT EXISTS (SELECT 1 FROM pentimento_sample pn" not in sql, sql
+    assert "page_end" not in sql, sql
+
+    # Without such a filter the unmeasured tail is reachable, so both branches
+    # are emitted, each capped, and re-sorted over the small union.
+    both, bp = build_enriched_sample_search_sql(
+        {"tissue": "cervi"}, sort="cell_count", order="desc"
+    )
+    assert f"ORDER BY pv.cells{tail}" in both, both  # measured branch
+    assert "NULL::bigint AS cell_count" in both, both  # unmeasured branch
+    assert "NOT EXISTS (SELECT 1 FROM pentimento_sample pn" in both, both
+    assert both.count("LIMIT %(page_end)s") == 2, both  # both capped
+    assert bp["page_end"] == bp["offset"] + bp["limit"], bp
+    assert (  # outer re-sort
+        "ORDER BY cell_count DESC NULLS LAST, sample ASC, study_accession ASC" in both
+    ), both
+    assert f"ORDER BY s.cell_count{tail}" in both, both  # final page order
+    # measured branch joins pentimento directly (uniqueness is enforced by index)
+    assert "FROM pentimento_sample pv" in sql, sql
+    # the sort column is not repeated as its own tiebreak
+    by_study, _ = build_enriched_sample_search_sql(
+        {"tissue": "liver"}, sort="study_accession"
+    )
+    assert "ORDER BY s.study_accession ASC NULLS LAST, s.sample ASC\n" in by_study, (
+        by_study
+    )
+    assert "FROM pentimento_sample pv" not in by_study, by_study
+
+    # matrix counts come from pentimento, never from the all-NULL ontology columns
+    for key, (clause, _to_param) in _SAMPLE_SEARCH_PENTIMENTO.items():
+        csql, cparams = build_enriched_sample_count_sql({key: 100})
+        assert clause in csql and "pentimento_sample p" in csql, (key, csql)
+        assert "s.cell_count" not in csql and "s.gene_count" not in csql, (key, csql)
+    # 0 is a real bound; False/None/"" mean the filter is absent
+    assert "p.cells >=" in build_enriched_sample_count_sql({"min_cell_count": 0})[0]
+    for absent in (None, False, ""):
+        assert (
+            "pentimento"
+            not in build_enriched_sample_count_sql(
+                {"min_cell_count": absent, "tissue": "liver"}
+            )[0]
+        ), absent
+    assert "s.cell_count" not in _SAMPLE_SEARCH_SELECT, _SAMPLE_SEARCH_SELECT
+    assert "s.gene_count" not in _SAMPLE_SEARCH_SELECT, _SAMPLE_SEARCH_SELECT
 
     lateral = _microbe_lateral({"microbe": "papillomavirus"}, {})
     assert f"FILTER (WHERE d.rn <= {_MICROBE_ROW_CAP})" in lateral, lateral
@@ -6147,12 +6308,24 @@ if __name__ == "__main__":
         {"tissue": "cervi", "microbe": "papillomavirus"}
     )
     assert csql.startswith("SELECT COUNT(*)::bigint AS total"), csql
-    assert "EXISTS (" in csql and "jsonb_agg" not in csql, csql
+    assert "jsonb_agg" not in csql and "LATERAL" not in csql, csql
     assert "LIMIT %(limit)s" not in csql, csql
     assert cp["f_microbe"] == pp["f_microbe"] == "%papillomavirus%", (cp, pp)
     assert cp["f_tissue"] == pp["f_tissue"], (cp, pp)
     csql2, _ = build_enriched_sample_count_sql({"tissue": "liver"})
-    assert "pentimento_microbe" not in csql2, csql2
+    assert "pentimento" not in csql2, csql2
+
+    # The 504s: every pentimento filter has to restrict the scan of the 16M-row
+    # table, never be a predicate applied after a LATERAL runs once per row.
+    assert "COUNT(*) OVER ()" not in page, page
+    assert page.index("LIMIT %(limit)s") < page.index("LEFT JOIN LATERAL"), page
+    for f, table in (
+        ({"microbe": "HPV"}, "pentimento_microbe"),
+        ({"single_cell_only": True}, "pentimento_sample"),
+        ({"hpv_type": "16"}, "pentimento_sample"),
+    ):
+        c, _ = build_enriched_sample_count_sql(f)
+        assert "AND s.sample = ANY(ARRAY(" in c and table in c, (f, c)
 
     assert set(_SAMPLE_SEARCH_ONTOLOGY_COLS) == {
         f"{f}_ontology_id" for f in ONTOLOGY_FIELDS

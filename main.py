@@ -83,10 +83,9 @@ from queries import (
     ENRICHED_CROSSTAB_COLUMNS,
     ENRICHED_CROSSTAB_SQL,
     ENRICHED_SAMPLES_SQL,
-    ENRICHED_SAMPLES_V3_SQL,
     ENRICHED_STAT_COLUMNS,
     ENRICHED_STUDY_SQL,
-    ENRICHED_STUDY_V3_SQL,
+    ENRICHED_STUDY_V4_SQL,
     ENRICHED_SUMMARY_SQL,
     DISEASE_ALIAS_LOOKUP_SQL,
     DISEASE_COLLECTIONS,
@@ -148,7 +147,7 @@ from queries import (
     LIST_LIBRARY_STRATEGIES_SQL,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
-    ONTOLOGY_SAMPLES_V3_SQL,
+    ONTOLOGY_SAMPLES_V4_SQL,
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
     ORGANISM_TOTALS_YEAR_SQL,
@@ -174,6 +173,7 @@ from queries import (
     PROJECT_GEA_SQL,
     PROJECT_GEO_SQL,
     PROJECT_GSA_SQL,
+    PROJECT_OVERLAP_SQL,
     PROJECT_SRA_SQL,
     PUBLICATION_BY_DOI_SQL,
     PUBLICATION_BY_PMID_SQL,
@@ -2492,17 +2492,22 @@ def _growth_relation_name(mode: str) -> str | None:
     return None
 
 
+class _NotBuiltYet(Exception):
+    """Precomputed relation missing or empty; a 503, not a 500."""
+
+
+def _relation_exists(cur, name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL AS available", (f"public.{name}",))
+    row = cur.fetchone()
+    return bool(row and row["available"])
+
+
 def _growth_relation_exists(conn, mode: str) -> bool:
     relation_name = _growth_relation_name(mode)
     if relation_name is None:
         return False
     with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            "SELECT to_regclass(%s) IS NOT NULL AS available",
-            (f"public.{relation_name}",),
-        )
-        row = cur.fetchone()
-    return bool(row and row["available"])
+        return _relation_exists(cur, relation_name)
 
 
 def _fetch_growth_relation(conn, mode: str, db: str | None = None) -> dict[str, list]:
@@ -5692,14 +5697,11 @@ def get_project(
                     _enrich_with_publications([row], cur)
                     _attach_organism_taxa(row, cur)
                     if ENRICHMENT_ENABLED:
-                        # Cheap existence probe so the UI can show/hide the Enriched
-                        # tab without eagerly loading the heavy enriched payload.
                         cur.execute(
                             "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
-                            " OR EXISTS(SELECT 1 FROM enriched_samples_v4 WHERE study_accession = %s)"
                             " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                             " AS has_enriched",
-                            (enrich_acc, enrich_acc, enrich_acc),
+                            (enrich_acc, enrich_acc),
                         )
                         row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
                     else:
@@ -10176,6 +10178,39 @@ def _get_source_totals() -> dict:
     return data
 
 
+def _get_project_overlap() -> dict:
+    """Cross-archive project overlap."""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "project_overlap"):
+                raise _NotBuiltYet(
+                    "Project overlap data is being prepared; retry shortly."
+                )
+            cur.execute(PROJECT_OVERLAP_SQL)
+            rows = cur.fetchall()
+
+    if not rows:
+        raise _NotBuiltYet("Project overlap data is being prepared; retry shortly.")
+    intersections = [
+        {"sets": list(r["dbs"]), "count": r["projects"], "degree": r["n_dbs"]}
+        for r in rows
+    ]
+    set_sizes: dict[str, int] = {}
+    for item in intersections:
+        for db_ in item["sets"]:
+            set_sizes[db_] = set_sizes.get(db_, 0) + item["count"]
+
+    data = {
+        "identity": "accession_component",
+        "databases": sorted(set_sizes, key=lambda d: -set_sizes[d]),
+        "set_sizes": set_sizes,
+        "intersections": intersections,
+        "total_projects": sum(i["count"] for i in intersections),
+        "built_at": rows[0]["built_at"].isoformat(),
+    }
+    return data
+
+
 def _get_last_updated() -> dict:
     with _last_updated_cache_lock:
         if (
@@ -10215,6 +10250,25 @@ def get_source_totals(request: Request):
         return _get_source_totals()
     except Exception:
         logger.exception("Database error in get_source_totals")
+        raise HTTPException(500, "Internal server error")
+
+
+@api_app.get(
+    "/stats/project-overlap",
+    summary="Cross-archive project overlap",
+    description=(
+        "Stats of how many projects each archive holds and how they intersect"
+    ),
+    operation_id="get_project_overlap",
+)
+@limiter.limit("60/minute")
+def get_project_overlap(request: Request):
+    try:
+        return _get_project_overlap()
+    except _NotBuiltYet as e:
+        raise HTTPException(503, str(e))
+    except Exception:
+        logger.exception("Database error in get_project_overlap")
         raise HTTPException(500, "Internal server error")
 
 
@@ -10723,25 +10777,23 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
             offset=offset,
             include_descendants=include_descendants,
         )
+        count_sql, count_params = build_enriched_sample_count_sql(
+            active, include_descendants=include_descendants
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
     start = time.perf_counter()
-    total = 0
     try:
-        with pool.connection() as conn:
+        # The pool is autocommit, where SET LOCAL is a silent no-op
+        with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '60s'")
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-                if rows:
-                    total = rows[0]["total_count"]
-                    for r in rows:
-                        r.pop("total_count", None)
-                elif offset:
-                    count_sql, count_params = build_enriched_sample_count_sql(
-                        active, include_descendants=include_descendants
-                    )
+                if len(rows) < limit and (rows or offset == 0):
+                    total = offset + len(rows)
+                else:
                     cur.execute(count_sql, count_params)
                     total = cur.fetchone()["total"]
     except QueryCanceled:
@@ -10771,7 +10823,7 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         "Return structured metadata extracted by LLM with ontology mappings. "
         "Fields include tissue, cell_type, disease, assay, development_stage "
         "each with standardised ontology IDs (UBERON, CL, MONDO, EFO). "
-        "Falls back to legacy enriched_samples if v3 data is unavailable. "
+        "Falls back to legacy enriched_samples if v4 data is unavailable. "
         "Use alongside metadata/rows when raw run/sample fields or FASTQ links "
         "are also needed."
     ),
@@ -10844,9 +10896,7 @@ def _attach_pentimento_labels(cur, study: str, samples: list[dict]) -> None:
         return
     titles = _fetch_sample_titles(cur, accs)
     cur.execute(PENTIMENTO_SAMPLE_TISSUE_SQL, {"acc": study, "samples": accs})
-    tissues: dict[str, str | None] = {}
-    for r in cur.fetchall():
-        tissues.setdefault(r["sample"], r["tissue"])
+    tissues = {r["sample"]: r["tissue"] for r in cur.fetchall()}
     for s in samples:
         acc = s.get("sample_accession")
         s["title"] = (titles.get(acc) or (None, None))[0]
@@ -11090,18 +11140,13 @@ def _fetch_project_enriched(
     # PRJ* accessions are keyed under their GSE/SRP in the enrichment tables.
     accession = _resolve_enrichment_accession(cur, accession)
 
-    cur.execute(ENRICHED_STUDY_V3_SQL, (accession,))
+    cur.execute(ENRICHED_STUDY_V4_SQL, (accession,))
     study = cur.fetchone()
     if study:
-        # Pick the source once (per-study, offset-independent) so paginated pages
-        # stay on the same table instead of an empty page tripping the fallback.
-        cur.execute(
-            "SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s LIMIT 1",
-            (accession,),
+        samples = _exec_enriched_samples(
+            cur, ONTOLOGY_SAMPLES_V4_SQL, accession, page_limit, offset
         )
-        sql = ONTOLOGY_SAMPLES_V3_SQL if cur.fetchone() else ENRICHED_SAMPLES_V3_SQL
-        samples = _exec_enriched_samples(cur, sql, accession, page_limit, offset)
-        version = "v3"
+        version = "v4"
     else:
         cur.execute(ENRICHED_STUDY_SQL, (accession,))
         study = cur.fetchone()
@@ -11613,7 +11658,7 @@ combine `q` with:
   `geo_postcode`, and `geo_lat`/`geo_lng` with optional `geo_radius_km`.
 - `multi_platform=true` for studies with 2+ sequencing platforms.
 - `sample_tissue`, `sample_disease`, `sample_cell_type` for ontology-enriched
-  sample filters. These only find studies that have enriched v3 sample metadata.
+  sample filters. These only find studies that have enriched v4 sample metadata.
 - `count_by=year|source|organism|country|library_strategy|instrument_model` for
   bucket counts instead of rows.
 
@@ -11795,7 +11840,14 @@ How its filters behave, because guessing wrong changes the cohort:
   excluded by an age filter, so an age range narrows to samples that reported
   one -- say so rather than presenting the result as the whole cohort.
 - min_cell_count/max_cell_count and min_gene_count/max_gene_count are per-sample
-  matrix counts; read the `cells` caveat in the single-cell section below.
+  matrix counts sourced from the read-derived (Pentimento) data, which covers
+  ~85k samples. Like an age filter they exclude everything with no measured
+  count, so they narrow to the measured subset - say so rather than presenting
+  the result as the whole cohort. Same for sort=cell_count/gene_count, which
+  keeps unmeasured samples but sorts them last. Read the `cells` caveat in the
+  single-cell section below. The returned per-sample fields are `cells` and
+  `genes` (not `cell_count`/`gene_count`), and `unfiltered` marks rows whose
+  `cells` are 10x barcodes rather than cells - never sum those.
 
 Read-derived (Pentimento) filters, layered on the same query:
 - `single_cell_only`, `has_viral_reads`, `has_bacterial_reads` and `hpv_type`
