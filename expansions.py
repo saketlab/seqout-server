@@ -63,21 +63,25 @@ ONTOLOGY_IDS = frozenset(o for o, _ in ONTOLOGIES)
 # with no xrefs at all (~130k of the synonym-bearing ones) are never dropped:
 # nothing attributes them, so no toggle owns them.
 #
-# ponytail: the filter applies to the endpoint, not to a 2-hop path's middle
-# node, so a disabled ontology can still bridge two enabled ones. Filtering the
-# bridge too means matching on paths instead of nodes; do that if the bridging
-# turns out to matter.
+# Every node the path passes through is tested, not just the one it ends on: a
+# disabled hub that still bridges hands back everything behind it. "sma" carries
+# MONDO, EFO and HGNC ids, and with those off it used to disappear from the
+# results while its 2-hop neighbours -- "superior mesenteric artery", GO's
+# "s methyltransferase activity" -- stayed.
 _XREF_PREFIX = (
     "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
+)
+_ENABLED = (
+    "size($disabled) = 0"
+    " OR size(coalesce(n.xrefs, [])) = 0"
+    f" OR size([x IN n.xrefs WHERE NOT ({_XREF_PREFIX}) IN $disabled]) > 0"
 )
 _CYPHER_SYNONYM_CLUSTER = f"""
 UNWIND $terms AS term
 MATCH (start:Term)
 WHERE start.name = toLower(term)
-OPTIONAL MATCH (start)-[:MAPS_TO*1..2]-(connected:Term)
-WHERE size($disabled) = 0
-   OR size(coalesce(connected.xrefs, [])) = 0
-   OR size([x IN connected.xrefs WHERE NOT ({_XREF_PREFIX}) IN $disabled]) > 0
+OPTIONAL MATCH path = (start)-[:MAPS_TO*1..2]-(connected:Term)
+WHERE all(n IN tail(nodes(path)) WHERE {_ENABLED})
 RETURN term, collect(DISTINCT connected.name) AS synonyms
 """
 
@@ -228,8 +232,10 @@ def extract_graph_terms(neo4j_driver, query: str) -> list[tuple[str, str]]:
 
 
 def _normalize_disabled(disabled) -> list[str]:
-    """Keep only ids we know; an unknown one would silently filter nothing."""
-    return [o for o in dict.fromkeys(disabled or ()) if o in ONTOLOGY_IDS]
+    """Split the comma-joined param and keep only ids we know; an unknown one
+    would silently filter nothing."""
+    ids = (part for value in (disabled or ()) for part in str(value).split(","))
+    return [o for o in dict.fromkeys(i.strip() for i in ids) if o in ONTOLOGY_IDS]
 
 
 def _expand_passes(
@@ -239,6 +245,13 @@ def _expand_passes(
     normalized_query = " ".join(query.split())
     if not normalized_query:
         return [], []
+
+    # Every ontology off means nothing attributable survives. The graph would
+    # still hand back the unattributed nodes (nothing names them, so no toggle
+    # drops them), which reads as the switches doing nothing -- so skip it and
+    # run the query as typed.
+    if set(disabled) >= ONTOLOGY_IDS:
+        return [(normalized_query, 0, ())], [[]]
 
     # Detached sc/sn assay prefixes are glued before matching so separate terms cannot bury the real cluster past the variant cap.
     # The stem allowlist prevents cell line or gene-like phrases from being glued.
@@ -456,6 +469,15 @@ if __name__ == "__main__":
         "nafld hepatic",
     ]
     assert variants[4:] == ["masld hepatic", "fatty liver hepatic"]
+
+    # The param arrives as one comma-joined value.
+    assert _normalize_disabled(["MeSH,MONDO"]) == ["MeSH", "MONDO"]
+    assert _normalize_disabled(["MeSH, MONDO, nope"]) == ["MeSH", "MONDO"]
+
+    # Switching every ontology off is no expansion at all, not expansion through
+    # whatever the toggles cannot reach.
+    assert expand_terms(d, "nafld liver", [o for o, _ in ONTOLOGIES]) == ["nafld liver"]
+    assert expand_terms_explained(d, "nafld liver", ONTOLOGY_IDS)["chunks"] == []
 
     # Explanation must report capped survivors without starving earlier chunks.
     _MAX_QUERY_VARIANTS = 4
