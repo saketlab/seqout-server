@@ -861,10 +861,11 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
     # Only the columns the count + facet + filter queries actually read. Notably
     # NOT title/summary (summary holds full abstracts over a broad
     # match), those exist in the shared CTE for the result-list path, not here.
+    # rank IS kept: the facets order by summed relevance, not hit count.
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
-        + "\nSELECT accession, dedup_key, updated_at, organisms, countries,"
+        + "\nSELECT accession, dedup_key, rank, updated_at, organisms, countries,"
         + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"
     )
@@ -884,6 +885,19 @@ def build_search_total_over_matched(**filters):
     conds = list(dim_clauses.values()) + always_clauses
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
     return f"SELECT COUNT(*)::int AS total FROM matched{where};", params
+
+
+def build_search_max_rank_over_matched():
+    """Top relevance rank over the whole q+db match set, BEFORE sidebar filters.
+
+    The "Low relevance" badge on a result card is thresholded against this, so it
+    has to be the query's own ceiling. Computing it over the FILTERED set would
+    defeat the badge exactly where it matters: filter an SMA search down to
+    Arabidopsis and every remaining row is a weak match, so the filtered max is
+    itself weak and nothing looks unusual. `matched` is the pre-filter set (the
+    filters live in the count/facet queries), which is what we want.
+    """
+    return "SELECT MAX(rank)::float8 AS max_rank FROM matched;", {}
 
 
 def build_search_facets_over_matched(**filters):
@@ -907,23 +921,30 @@ def build_search_facets_over_matched(**filters):
         where = " WHERE " + " AND ".join(conds)
         branches.append(
             f"SELECT '{facet}'::text AS facet, {value_expr} AS value,"
-            f" COUNT(*)::int AS count"
+            f" COUNT(*)::int AS count,"
+            f" COALESCE(SUM(matched.rank), 0)::float8 AS score"
             f" FROM {from_clause}{where}"
             f" GROUP BY {value_expr}"
         )
 
+    # Ordered by summed match rank, not hit count: a query can match a lot of
+    # studies in one organism for a reason that has nothing to do with what was
+    # asked, and those matches all score near zero. Summing (rather than taking
+    # the max) keeps the ordering count-weighted, so a big well-matched value
+    # still beats a single lucky hit. rank is NULL on a query-less search, so
+    # score collapses to 0 there and the count tiebreak carries the order.
     sql = (
         "WITH facets AS (\n"
         + "\n    UNION ALL\n".join(branches)
         + "\n),\n"
         + "ranked AS (\n"
-        + "    SELECT facet, value, count,\n"
+        + "    SELECT facet, value, count, score,\n"
         + "           ROW_NUMBER() OVER (PARTITION BY facet"
-        + " ORDER BY count DESC, value) AS rn\n"
+        + " ORDER BY score DESC, count DESC, value) AS rn\n"
         + "    FROM facets\n"
         + ")\n"
-        + "SELECT facet, value, count FROM ranked WHERE rn <= 1000\n"
-        + "ORDER BY facet, count DESC, value;"
+        + "SELECT facet, value, count, score FROM ranked WHERE rn <= 1000\n"
+        + "ORDER BY facet, score DESC, count DESC, value;"
     )
     return sql, params
 

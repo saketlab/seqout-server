@@ -222,6 +222,7 @@ from queries import (
     build_global_contributions_sql,
     build_platform_growth_filtered_sql,
     build_search_facets_over_matched,
+    build_search_max_rank_over_matched,
     build_search_investigators_sql,
     build_search_match_temp,
     build_search_results,
@@ -5251,12 +5252,15 @@ def _compute_search_facets(
     OR over every variant). That is what makes an auto-corrected search countable:
     the user sees the corrected results *plus* the literal-typo extras.
 
-    Returns ({facet_name: [{value, count}, ...]}, total). The facets degrade to
-    {} on a facet-only timeout while the total survives; a hard failure (the FTS
-    itself, etc.) yields ({}, None) so the caller can avoid caching it.
+    Returns ({facet_name: [{value, count, score}, ...]}, total, max_rank), where
+    max_rank is the top rank over the UNFILTERED match set (the threshold the
+    result cards mark "Low relevance" against). The facets degrade to {} on a
+    facet-only timeout while the total survives; a hard failure (the FTS itself,
+    etc.) yields ({}, None, None) so the caller can avoid caching it.
     """
     out: dict[str, list[dict]] = {}
     total: int | None = None
+    max_rank: float | None = None
     try:
         with pool.connection() as conn:
             # Boolean mode: count the literal to_tsquery, no Neo4j expansion, so
@@ -5285,6 +5289,11 @@ def _compute_search_facets(
                     tsql, tparams = build_search_total_over_matched(**filters)
                     cur.execute(tsql, tparams)
                     total = cur.fetchone()["total"]
+                    # Unfiltered, so a filter that narrows the page to weak rows
+                    # can't drag the badge threshold down with it.
+                    rsql, rparams = build_search_max_rank_over_matched()
+                    cur.execute(rsql, rparams)
+                    max_rank = cur.fetchone()["max_rank"]
                     # Search-as-you-type: if the exact query matched nothing
                     # (trailing partial word), rebuild the temp with a prefix
                     # core_q and recount, so the header count and sidebar agree
@@ -5298,6 +5307,8 @@ def _compute_search_facets(
                             cur.execute(pmsql, mparams)
                             cur.execute(tsql, tparams)
                             total = cur.fetchone()["total"]
+                            cur.execute(rsql, rparams)
+                            max_rank = cur.fetchone()["max_rank"]
                     try:
                         with conn.transaction():
                             cur.execute("SET LOCAL statement_timeout = 60000")
@@ -5305,7 +5316,11 @@ def _compute_search_facets(
                             cur.execute(fsql, fparams)
                             for r in cur.fetchall():
                                 out.setdefault(r["facet"], []).append(
-                                    {"value": r["value"], "count": r["count"]}
+                                    {
+                                        "value": r["value"],
+                                        "count": r["count"],
+                                        "score": r["score"],
+                                    }
                                 )
                     except Exception:
                         logger.warning(
@@ -5313,8 +5328,8 @@ def _compute_search_facets(
                         )
     except Exception:
         logger.exception("Database error computing search facets")
-        return {}, None
-    return out, total
+        return {}, None, None
+    return out, total, max_rank
 
 
 @api_app.get(
@@ -5325,7 +5340,15 @@ def _compute_search_facets(
         "library_source, instrument_model, journal) over the FULL match set for a query, so the "
         "UI can show real totals without paging through every result. Computed "
         "independently of /search so it doesn't block result rendering. "
-        "Returns {facets: {name: [{value, count}], ...}, took_ms}."
+        "Values come back ordered by `score` (the summed match rank of the "
+        "studies behind each value) rather than by `count`, so a value that "
+        "matched a lot of studies weakly sorts below one that matched fewer "
+        "studies well. score is 0 for a query-less search. "
+        "`max_rank` is the highest result rank for the query, ignoring the "
+        "sidebar filters, so a client can flag results far below it as weak "
+        "matches. "
+        "Returns {facets: {name: [{value, count, score}], ...}, total, max_rank, "
+        "took_ms}."
     ),
     operation_id="search_facets",
 )
@@ -5380,10 +5403,11 @@ def search_facets(
         return {
             "facets": cached["facets"],
             "total": cached["total"],
+            "max_rank": cached.get("max_rank"),
             "took_ms": round((time.perf_counter() - t0) * 1000, 2),
         }
 
-    facets, total = _compute_search_facets(
+    facets, total, max_rank = _compute_search_facets(
         nq,
         db,
         structured_tsq=boolean_tsq,
@@ -5414,7 +5438,7 @@ def search_facets(
         _suggestions = _get_suggestions(nq)
         _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
-            c_facets, c_total = _compute_search_facets(
+            c_facets, c_total, c_max_rank = _compute_search_facets(
                 _corrected_q,
                 db,
                 extra_variants=_search_query_variants(nq),
@@ -5430,7 +5454,7 @@ def search_facets(
                 year_to=year_to,
             )
             if c_total:
-                facets, total = c_facets, c_total
+                facets, total, max_rank = c_facets, c_total, c_max_rank
     # Only cache a complete response. A timeout degrades to {facets:{}, total:null};
     # caching that for a week would pin the wrong total (e.g. the loaded-page count)
     # on every later search of this query, so leave it uncached to allow a retry.
@@ -5445,7 +5469,7 @@ def search_facets(
                 _set_bounded_cache_entry(
                     _broad_facets_cache,
                     cache_key,
-                    {"facets": facets, "total": total},
+                    {"facets": facets, "total": total, "max_rank": max_rank},
                     _MAX_BROAD_FACETS_CACHE_ENTRIES,
                     float("inf"),
                 )
@@ -5454,6 +5478,7 @@ def search_facets(
     return {
         "facets": facets,
         "total": total,
+        "max_rank": max_rank,
         "took_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
 
