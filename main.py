@@ -49,7 +49,7 @@ from deep_dive import (
     fetch_deep_dive_terms,
     fetch_ontology_term,
 )
-from expansions import expand_terms, expand_terms_explained
+from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
 from grid_filters import (
     _indexed_accession,
     _jsonb_any_element,
@@ -2751,12 +2751,22 @@ _neo4j_expand_circuit = {"open_until": 0.0}
 _NEO4J_EXPAND_COOLDOWN = 30.0
 
 
-def _search_query_variants(q: str) -> list[str]:
+# One list, four endpoints. expansions.ONTOLOGIES is the source of truth for
+# which ids exist (it mirrors ontology-scripts/GRAPH.md "What's ingested").
+_EXCLUDE_ONTOLOGY_DOC = (
+    "Ontology ids whose synonyms must not be used for query expansion: "
+    + ", ".join(o for o, _ in ONTOLOGIES)
+    + ". Unknown ids are ignored."
+)
+
+
+def _search_query_variants(q: str, disabled=()) -> list[str]:
+    """`disabled` is the ontology ids the caller switched off (expansions.ONTOLOGIES)."""
     # Best-effort synonym expansion via Neo4j; degrade to the raw query on failure.
     if time.time() < _neo4j_expand_circuit["open_until"]:
         return [q]
     try:
-        return list(dict.fromkeys(expand_terms(neo4j_driver, q)))
+        return list(dict.fromkeys(expand_terms(neo4j_driver, q, disabled)))
     except Exception:
         _neo4j_expand_circuit["open_until"] = time.time() + _NEO4J_EXPAND_COOLDOWN
         logger.warning(
@@ -4360,12 +4370,12 @@ def search_geo(
     return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
-def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None):
+def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
     start = time.perf_counter()
 
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(q)
+            q_variants = _search_query_variants(q, disabled)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '60s'")
                 rows = _run_search(
@@ -4423,12 +4433,12 @@ def search_sra(
     return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
-def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None):
+def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
     start = time.perf_counter()
 
     try:
         with pool.connection() as conn:
-            q_variants = _search_query_variants(q)
+            q_variants = _search_query_variants(q, disabled)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '60s'")
                 rows = _run_search(
@@ -4591,6 +4601,7 @@ def ontology_term(
 def search_expansion(
     request: Request,
     q: str = Query(..., min_length=1, max_length=500),
+    exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     start = time.perf_counter()
     if is_boolean_query(q):
@@ -4603,7 +4614,7 @@ def search_expansion(
             "took_ms": 0.0,
         }
     try:
-        result = expand_terms_explained(neo4j_driver, q)
+        result = expand_terms_explained(neo4j_driver, q, exclude_ontology or ())
     except Exception:
         logger.exception("search_expansion failed for q=%r", q)
         raise HTTPException(500, "Internal server error")
@@ -4724,6 +4735,12 @@ def search_highlight(
     response: Response,
     q: str = Query(..., min_length=1, max_length=500),
     accession: str = Query(..., pattern=PROJECT_REGEX),
+    structured: bool = Query(
+        False,
+        description="Mark only the words as typed, no ontology synonyms — the "
+        "highlight twin of /search's structured mode.",
+    ),
+    exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     start = time.perf_counter()
     accession = accession.upper()
@@ -4735,10 +4752,11 @@ def search_highlight(
         "derived": {},
         "took_ms": 0.0,
     }
-    # Boolean mode runs the exact terms, so every marked word is one the user
-    # typed and there is nothing to attribute.
+    # Exact terms, so every marked word is one the user typed and there is
+    # nothing to attribute -- whether the caller asked for it (structured) or the
+    # query's own operators forced it.
     variants: list[str] = []
-    if is_boolean_query(q):
+    if structured or is_boolean_query(q):
         sql, params = (
             _HEADLINE_BOOLEAN_SQL,
             {"tsq": to_tsquery_string(_NOT_CLAUSE.sub(" ", q))},
@@ -4746,7 +4764,7 @@ def search_highlight(
         if not params["tsq"]:
             return empty
     else:
-        variants = _search_query_variants(q)
+        variants = _search_query_variants(q, exclude_ontology or ())
         sql, params = _HEADLINE_SQL, {"variants": variants}
 
     try:
@@ -4921,6 +4939,7 @@ def search(
     year_to: int | None = Query(None, ge=1900, le=2100),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
+    exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(400, "date_from must be <= date_to")
@@ -4944,6 +4963,7 @@ def search(
     # sidebar_filters so filtered and unfiltered paths cannot drift.
     rerun = {
         "structured": structured,
+        "exclude_ontology": exclude_ontology,
         "cursor_rank": cursor_rank,
         "cursor_acc": cursor_acc,
         "cursor_sort": cursor_sort,
@@ -4983,6 +5003,7 @@ def search(
             sortby,
             order,
             boolean_tsq=boolean_tsq,
+            disabled=exclude_ontology or (),
         )
         # Same auto-correction as the unfiltered path: a typo is still a typo with
         # a sidebar filter on, and leaving it uncorrected here made the result
@@ -5013,7 +5034,14 @@ def search(
         and cursor_sort is None
         and not offset
     ):
-        results_cache_key = (q, db, sortby, order, boolean_tsq is not None)
+        results_cache_key = (
+            q,
+            db,
+            sortby,
+            order,
+            boolean_tsq is not None,
+            tuple(exclude_ontology or ()),
+        )
         with _search_results_cache_lock:
             _cached_results = _get_bounded_cache_entry(
                 _search_results_cache, results_cache_key, float("inf")
@@ -5089,7 +5117,7 @@ def search(
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(q)
+                q_variants = _search_query_variants(q, exclude_ontology or ())
                 sql, params = build_sorted_search_sql(
                     q=q,
                     q_variants=q_variants,
@@ -5125,14 +5153,18 @@ def search(
             ),
         }
     elif db == "geo":
-        result = _search_geo_impl(request, q, cursor_rank, cursor_acc, offset)
+        result = _search_geo_impl(
+            request, q, cursor_rank, cursor_acc, offset, exclude_ontology or ()
+        )
     elif db == "sra":
-        result = _search_sra_impl(request, q, cursor_rank, cursor_acc, offset)
+        result = _search_sra_impl(
+            request, q, cursor_rank, cursor_acc, offset, exclude_ontology or ()
+        )
     elif db in _SEARCH_SQL_BY_DB:
         start = time.perf_counter()
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(q)
+                q_variants = _search_query_variants(q, exclude_ontology or ())
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     rows = _run_search(
@@ -5167,7 +5199,7 @@ def search(
 
         try:
             with pool.connection() as conn:
-                q_variants = _search_query_variants(q)
+                q_variants = _search_query_variants(q, exclude_ontology or ())
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     rows = _run_search(
@@ -5230,6 +5262,7 @@ def _search_filtered(
     sortby=None,
     order="desc",
     boolean_tsq=None,
+    disabled=(),
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
@@ -5250,7 +5283,7 @@ def _search_filtered(
                 fts_q, q_variants = boolean_tsq, [boolean_tsq]
             else:
                 fts_q = q
-                q_variants = _search_query_variants(q) if q else []
+                q_variants = _search_query_variants(q, disabled) if q else []
             sql, params = build_search_results(
                 q=fts_q,
                 q_variants=q_variants,
@@ -5295,8 +5328,9 @@ def _compute_search_facets(
     db: str | None,
     structured_tsq: str | None = None,
     extra_variants: list[str] | None = None,
+    disabled=(),
     **filters,
-) -> tuple[dict[str, list[dict]], int | None]:
+) -> tuple[dict[str, list[dict]], int | None, float | None]:
     """Exact result total and per-filter facet counts for a query.
 
     The match set is materialized ONCE into a temp table (the single FTS pass);
@@ -5325,7 +5359,7 @@ def _compute_search_facets(
             if structured_tsq:
                 q_variants = None
             else:
-                q_variants = _search_query_variants(q)
+                q_variants = _search_query_variants(q, disabled)
                 if extra_variants:
                     q_variants = list(dict.fromkeys(q_variants + extra_variants))
             with conn.transaction():
@@ -5426,6 +5460,7 @@ def search_facets(
     multi_platform: bool = Query(False),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
+    exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     t0 = time.perf_counter()
     nq = _replace_query_hyphens(q)
@@ -5442,6 +5477,7 @@ def search_facets(
         nq,
         db,
         boolean_tsq is not None,
+        tuple(exclude_ontology or ()),
         organism,
         tuple(sorted(country or [])),
         tuple(sorted(library_strategy or [])),
@@ -5468,6 +5504,7 @@ def search_facets(
         nq,
         db,
         structured_tsq=boolean_tsq,
+        disabled=exclude_ontology or (),
         organism=organism,
         country=country,
         library_strategy=library_strategy,
@@ -5498,7 +5535,8 @@ def search_facets(
             c_facets, c_total, c_max_rank = _compute_search_facets(
                 _corrected_q,
                 db,
-                extra_variants=_search_query_variants(nq),
+                extra_variants=_search_query_variants(nq, exclude_ontology or ()),
+                disabled=exclude_ontology or (),
                 organism=organism,
                 country=country,
                 library_strategy=library_strategy,
@@ -8779,6 +8817,7 @@ def download_by_query(
     date_to: date | None = Query(None),
     updated_year_from: int | None = Query(None, ge=1900, le=2100, deprecated=True),
     updated_year_to: int | None = Query(None, ge=1900, le=2100, deprecated=True),
+    exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     # updated_year_* were this endpoint's own names for the /search year range.
     year_from = year_from if year_from is not None else updated_year_from
@@ -8819,7 +8858,9 @@ def download_by_query(
     if boolean_tsq is not None:
         fts_q, q_variants = boolean_tsq, [boolean_tsq]
     else:
-        fts_q, q_variants = q, (_search_query_variants(q) if q else [])
+        fts_q, q_variants = q, (
+            _search_query_variants(q, exclude_ontology or ()) if q else []
+        )
 
     sql, params = build_search_results(q=fts_q, q_variants=q_variants, db=db, **filters)
     if boolean_tsq is not None:

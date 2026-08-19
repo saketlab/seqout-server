@@ -38,11 +38,46 @@ WHERE t.name = toLower(candidate)
 RETURN candidate
 """
 
-_CYPHER_SYNONYM_CLUSTER = """
+# The eight ontologies actually ingested into the graph (ontology-scripts/GRAPH.md
+# "What's ingested"). Everything else a node's xrefs may name -- GO, PATO,
+# NCBITaxon, HP, PR -- rides in as an imported class of one of these, so it is
+# not a source anyone can switch off.
+#
+# Provenance lives in Term.xrefs as `PREFIX:id`; Cellosaurus is the exception,
+# its ids are bare `CVCL_0030` with no prefix at all.
+ONTOLOGIES = (
+    ("MONDO", "Diseases (MONDO)"),
+    ("MeSH", "MeSH"),
+    ("HGNC", "Genes (HGNC)"),
+    ("CHEBI", "Chemicals (ChEBI)"),
+    ("UBERON", "Anatomy (Uberon)"),
+    ("CL", "Cell types (CL)"),
+    ("EFO", "Experimental factors (EFO)"),
+    ("CVCL", "Cell lines (Cellosaurus)"),
+)
+ONTOLOGY_IDS = frozenset(o for o, _ in ONTOLOGIES)
+
+# A synonym survives if ANY of its xrefs is from an ontology still switched on --
+# nodes are merged by name, so "spinal muscular atrophy" carries HP, MONDO and
+# MeSH ids at once and turning MeSH off must not delete the MONDO term. Nodes
+# with no xrefs at all (~130k of the synonym-bearing ones) are never dropped:
+# nothing attributes them, so no toggle owns them.
+#
+# ponytail: the filter applies to the endpoint, not to a 2-hop path's middle
+# node, so a disabled ontology can still bridge two enabled ones. Filtering the
+# bridge too means matching on paths instead of nodes; do that if the bridging
+# turns out to matter.
+_XREF_PREFIX = (
+    "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
+)
+_CYPHER_SYNONYM_CLUSTER = f"""
 UNWIND $terms AS term
 MATCH (start:Term)
 WHERE start.name = toLower(term)
 OPTIONAL MATCH (start)-[:MAPS_TO*1..2]-(connected:Term)
+WHERE size($disabled) = 0
+   OR size(coalesce(connected.xrefs, [])) = 0
+   OR size([x IN connected.xrefs WHERE NOT ({_XREF_PREFIX}) IN $disabled]) > 0
 RETURN term, collect(DISTINCT connected.name) AS synonyms
 """
 
@@ -192,8 +227,13 @@ def extract_graph_terms(neo4j_driver, query: str) -> list[tuple[str, str]]:
     return [(phrase, name) for _, phrase, name in matched]
 
 
+def _normalize_disabled(disabled) -> list[str]:
+    """Keep only ids we know; an unknown one would silently filter nothing."""
+    return [o for o in dict.fromkeys(disabled or ()) if o in ONTOLOGY_IDS]
+
+
 def _expand_passes(
-    neo4j_driver, query: str
+    neo4j_driver, query: str, disabled=()
 ) -> tuple[list[tuple[str, int, tuple[str, ...]]], list[list[tuple[str, list[str]]]]]:
     """Run every expansion pass and keep per-chunk choices for explain mode."""
     normalized_query = " ".join(query.split())
@@ -267,6 +307,7 @@ def _expand_passes(
         records, _, _ = neo4j_driver.execute_query(
             cypher,
             terms=matched_terms,
+            disabled=disabled,
             database_="neo4j",
         )
         for record in records:
@@ -284,14 +325,16 @@ def _expand_passes(
     return variant_records, passes
 
 
-def expand_terms(neo4j_driver, query: str) -> list[str]:
-    records, _ = _expand_passes(neo4j_driver, query)
+def expand_terms(neo4j_driver, query: str, disabled=()) -> list[str]:
+    records, _ = _expand_passes(neo4j_driver, query, _normalize_disabled(disabled))
     return _dedupe(v for v, _, _ in records)[:_MAX_QUERY_VARIANTS]
 
 
-def expand_terms_explained(neo4j_driver, query: str) -> dict:
+def expand_terms_explained(neo4j_driver, query: str, disabled=()) -> dict:
     """Report only synonyms that reached surviving variants, using the same path as expand_terms."""
-    records, passes = _expand_passes(neo4j_driver, query)
+    records, passes = _expand_passes(
+        neo4j_driver, query, _normalize_disabled(disabled)
+    )
 
     # Replay expand_terms dedupe and cap while preserving choices for explanation.
     seen: set[str] = set()
