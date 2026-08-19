@@ -4662,6 +4662,47 @@ def _headline_words(marked: str | None) -> list[str]:
     return list(seen)
 
 
+# Which expanded term put a highlighted word on the page. ts_headline marks the
+# surface word but says nothing about WHY it matched, and after expansion the
+# why is the interesting part: "activates" lighting up in an Arabidopsis abstract
+# came from the synonym "s methyltransferase activity", not from anything the
+# user typed. Stem each marked word the same way the index did, drop the ones the
+# typed query already accounts for, and attribute the rest to the first variant
+# that contains them (variants come back most-relevant-first).
+_ATTRIBUTION_SQL = """
+WITH stems AS (
+    SELECT w, (tsvector_to_array(to_tsvector('english', w)))[1] AS stem
+    FROM unnest(%(words)s::text[]) AS w
+),
+core AS (
+    SELECT tsvector_to_array(to_tsvector('english', %(q)s)) AS lex
+),
+vars AS (
+    SELECT ord, v, tsvector_to_array(to_tsvector('english', v)) AS lex
+    FROM unnest(%(variants)s::text[]) WITH ORDINALITY AS t(v, ord)
+)
+SELECT s.w AS word,
+       (SELECT v FROM vars WHERE s.stem = ANY(vars.lex) ORDER BY ord LIMIT 1) AS term
+FROM stems s, core
+WHERE s.stem IS NOT NULL AND NOT (s.stem = ANY(core.lex))
+"""
+
+
+def _derived_words(cur, q: str, variants: list[str], words: list[str]) -> dict:
+    """{surface word -> the expanded term it came from}, for the words the typed
+    query does not itself explain. Empty when nothing was expanded."""
+    if not words or len(variants) < 2:
+        return {}
+    try:
+        cur.execute(_ATTRIBUTION_SQL, {"words": words, "q": q, "variants": variants})
+        return {r["word"]: r["term"] for r in cur.fetchall() if r["term"]}
+    except Exception:
+        # Attribution is a garnish on the highlight; losing it is not worth the
+        # request.
+        logger.warning("search_highlight attribution failed", exc_info=True)
+        return {}
+
+
 @api_app.get(
     "/search/highlight",
     summary="Query words a project's text matched",
@@ -4670,7 +4711,10 @@ def _headline_words(marked: str | None) -> list[str]:
         "design that the query matched — stemmed, synonym-expanded and tokenised "
         "by the same Postgres text search the results came from. Intended for "
         "highlighting the query on a project page arrived at from a search. "
-        "Returns {accession, query, words: [...], took_ms}."
+        "`derived` maps a word to the expanded term that put it there, for the "
+        "words the typed query does not itself explain; words absent from it "
+        "came from the query as typed. "
+        "Returns {accession, query, words: [...], derived: {word: term}, took_ms}."
     ),
     operation_id="search_highlight",
 )
@@ -4684,7 +4728,16 @@ def search_highlight(
     start = time.perf_counter()
     accession = accession.upper()
 
-    empty = {"accession": accession, "query": q, "words": [], "took_ms": 0.0}
+    empty = {
+        "accession": accession,
+        "query": q,
+        "words": [],
+        "derived": {},
+        "took_ms": 0.0,
+    }
+    # Boolean mode runs the exact terms, so every marked word is one the user
+    # typed and there is nothing to attribute.
+    variants: list[str] = []
     if is_boolean_query(q):
         sql, params = (
             _HEADLINE_BOOLEAN_SQL,
@@ -4693,7 +4746,8 @@ def search_highlight(
         if not params["tsq"]:
             return empty
     else:
-        sql, params = _HEADLINE_SQL, {"variants": _search_query_variants(q)}
+        variants = _search_query_variants(q)
+        sql, params = _HEADLINE_SQL, {"variants": variants}
 
     try:
         with pool.connection() as conn:
@@ -4716,6 +4770,8 @@ def search_highlight(
                     return empty
                 cur.execute(sql, {**params, "texts": texts, "opts": _HEADLINE_OPTS})
                 marked = (cur.fetchone() or {}).get("string_agg")
+                words = _headline_words(marked)
+                derived = _derived_words(cur, q, variants, words)
     except HTTPException:
         raise
     except PgSyntaxError:
@@ -4730,7 +4786,8 @@ def search_highlight(
     return {
         "accession": accession,
         "query": q,
-        "words": _headline_words(marked),
+        "words": words,
+        "derived": derived,
         "took_ms": round(took_ms, 2),
     }
 
