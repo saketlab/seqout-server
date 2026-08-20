@@ -4334,6 +4334,12 @@ ORDER BY filter_type, count DESC;
 """
 
 
+def _organism_membership_clause(alias: str = "") -> str:
+    """Match studies where an organism is dominant or present in organism_counts."""
+    q = f"{alias}." if alias else ""
+    return f"({q}dominant_scientific_name = %s OR {q}organism_counts ? %s)"
+
+
 def build_platform_growth_filtered_sql(
     platform: str,
     mode: str = "experiments",
@@ -4363,8 +4369,8 @@ def build_platform_growth_filtered_sql(
     if organism or assay or country:
         um_join = " JOIN unified_metadata u ON u.canonical_accession = COALESCE(st.alias, st.accession)"
         if organism:
-            um_conditions.append("u.dominant_scientific_name = %s")
-            params.append(organism)
+            um_conditions.append(_organism_membership_clause("u"))
+            params.extend([organism, organism])
         if assay:
             um_conditions.append("u.dominant_assay_l2 = %s")
             params.append(assay)
@@ -4586,8 +4592,8 @@ def build_global_contributions_sql(
     conditions: list[str] = ["TRUE"]
     params: list = []
     if organism:
-        conditions.append("dominant_scientific_name = %s")
-        params.append(organism)
+        conditions.append(_organism_membership_clause())
+        params.extend([organism, organism])
     if assay_l1:
         conditions.append("dominant_assay_l1 = %s")
         params.append(assay_l1)
@@ -4701,12 +4707,15 @@ def build_country_filters_sql(
         if col in cols:
             ctes_cfg.append((f"{col}_opts", col, col, "", "scoped_base"))
 
-    facet_cols = ", ".join(dict.fromkeys(col for _, col, _, _, _ in ctes_cfg).keys())
+    base_cols = list(dict.fromkeys(col for _, col, _, _, _ in ctes_cfg).keys())
+    if organism:
+        base_cols.append("organism_counts")
+    facet_cols = ", ".join(base_cols)
     params: list = [country]
     scoped_where = ""
     if organism:
-        scoped_where = "WHERE dominant_scientific_name = %s"
-        params.append(organism)
+        scoped_where = f"WHERE {_organism_membership_clause()}"
+        params.extend([organism, organism])
 
     cte_parts = [
         "country_base AS MATERIALIZED (\n"
@@ -5324,8 +5333,8 @@ def _country_scope_conditions(
     ]
     params: list = [country]
     if organism:
-        conditions.append(f"{q}dominant_scientific_name = %s")
-        params.append(organism)
+        conditions.append(_organism_membership_clause(alias))
+        params.extend([organism, organism])
     if assay_l2:
         conditions.append(f"{q}dominant_assay_l2 = %s")
         params.append(assay_l2)
@@ -5544,7 +5553,9 @@ def build_enriched_samples_sql(pg_conn) -> str:
     col_str = ", ".join(f"es.{c}" if " " not in c else c for c in cols)
     return f"""
 SELECT {col_str},
-       pc.cells AS cell_count, pc.genes AS gene_count, pc.unfiltered
+       pc.cells AS cell_count, pc.genes AS gene_count,
+       (pc.sample_accession IS NOT NULL) AS pentimento_screened,
+       pc.unfiltered
 FROM enriched_samples es{_pentimento_counts_lateral("es.sample")}
 WHERE es.study_accession = %s
 ORDER BY es.sample;
@@ -5580,7 +5591,7 @@ def _pentimento_counts_lateral(sample_expr: str) -> str:
     """Per-sample matrix counts for a study page."""
     return f"""
 LEFT JOIN LATERAL (
-    SELECT p.cells, p.genes, p.unfiltered
+    SELECT p.sample_accession, p.cells, p.genes, p.unfiltered
     FROM pentimento_sample p
     WHERE p.sample_accession = {sample_expr}
     LIMIT 1
@@ -5956,7 +5967,7 @@ def _wants_microbes(filters: dict) -> bool:
 # planner on a correlated index probe rather than hashing all 85k rows.
 _PENTIMENTO_SAMPLE_LATERAL = """
 LEFT JOIN LATERAL (
-    SELECT p.cells, p.genes, p.unfiltered, p.assay_display,
+    SELECT p.sample_accession, p.cells, p.genes, p.unfiltered, p.assay_display,
            p.assay_is_single_cell,
            p.hpv_top_type, p.hpv_ambiguous, p.has_viral_reads,
            p.has_bacterial_reads, p.viral_kmer_mass, p.bacterial_kmer_mass
@@ -6042,7 +6053,9 @@ def build_enriched_sample_search_sql(
 WITH page AS ({page_body}
 )
 SELECT {_SAMPLE_SEARCH_SELECT},
-       ps.cells, ps.genes, ps.unfiltered, ps.assay_display AS pentimento_assay,
+       ps.cells, ps.genes,
+       (ps.sample_accession IS NOT NULL) AS pentimento_screened,
+       ps.unfiltered, ps.assay_display AS pentimento_assay,
        ps.assay_is_single_cell, ps.hpv_top_type, ps.hpv_ambiguous,
        ps.has_viral_reads, ps.has_bacterial_reads,
        ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols}
@@ -6229,6 +6242,7 @@ if __name__ == "__main__":
     assert "LEFT JOIN LATERAL" in sql, sql
     assert p["f_microbe"] == "%papillomavirus%", p
     assert "p.assay_is_single_cell IS TRUE" in sql, sql
+    assert "AS pentimento_screened" in sql, sql
     assert "mq.microbes_truncated" in sql, sql
     tail = " DESC NULLS LAST, s.sample ASC, s.study_accession ASC"
     # single_cell_only is a pentimento_sample filter, so "has no pentimento_sample
@@ -6298,6 +6312,24 @@ if __name__ == "__main__":
     assert _as_list(None) is None and _as_list([]) is None and _as_list("") is None
     s3, p3 = build_structured_search(organism="Homo sapiens")
     assert p3["organism"] == ["Homo sapiens"], p3
+
+    gpsql, gpp = build_global_contributions_sql(organism="Homo sapiens")
+    assert "organism_counts ? %s" in gpsql and gpp == [
+        "Homo sapiens",
+        "Homo sapiens",
+    ], (gpsql, gpp)
+    cpsql, cpp = build_country_accessions_sql("United States", organism="Homo sapiens")
+    assert "organism_counts ? %s" in cpsql and cpp == [
+        "United States",
+        "Homo sapiens",
+        "Homo sapiens",
+    ], (cpsql, cpp)
+    psql, pp = build_platform_growth_filtered_sql("ILLUMINA", organism="Homo sapiens")
+    assert "u.organism_counts ? %s" in psql and pp == [
+        "ILLUMINA",
+        "Homo sapiens",
+        "Homo sapiens",
+    ], (psql, pp)
 
     fp = {}
     dim, _ = _search_filter_clauses(fp, organism=["Homo sapiens", "Mus musculus"])
