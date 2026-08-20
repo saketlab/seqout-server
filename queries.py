@@ -140,9 +140,28 @@ SELECT DISTINCT accession, alias FROM (
 ) u(accession, alias) WHERE alias IS NOT NULL;
 """
 
+# `is_single_cell` is DERIVED from single_cell_status here rather than read from
+# its own column, so the two can never disagree. Verified 2026-08-21: the columns
+# are exactly 1:1 across all 1,223,313 rows, with status the strict refinement --
+# is_single_cell=true splits into measured_single_cell (21,934) and
+# text_indicates_single_cell (16,037), a distinction the boolean cannot express.
+#
+# The boolean stays in the response because clients consume it, but it is now a
+# projection of the status, not a second source of truth. NULL stays NULL:
+# not_screened means nothing has looked, which is not the same as "not single
+# cell".
 SUBMITTER_BATCH_SQL = """
 SELECT canonical_accession AS accession, center_name AS submitter, country_code,
-       is_single_cell, single_cell_modality
+       single_cell_status,
+       CASE
+         WHEN single_cell_status IS NULL OR single_cell_status = 'not_screened'
+           THEN NULL
+         WHEN single_cell_status IN ('measured_single_cell',
+                                     'text_indicates_single_cell')
+           THEN TRUE
+         ELSE FALSE
+       END AS is_single_cell,
+       single_cell_modality
 FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
@@ -5660,6 +5679,16 @@ _SAMPLE_SEARCH_RANGE_COLS = {
 # here and NOT on ontology_samples_v4, whose cell_count/gene_count are NULL on
 # all 16.1M rows with nothing writing them -- those filters matched nothing.
 _SAMPLE_SEARCH_PENTIMENTO = {
+    # `has_matrix` is the PROOF tier: a cell-by-gene matrix was parsed for this
+    # sample. Prefer it over single_cell_only when you want data you can
+    # reanalyse without realignment.
+    #
+    # single_cell_only is a read-derived call (10x barcode-whitelist hits) and
+    # needs FASTQ plus a completed preflightx scan, so it is NULL on most
+    # verified single-cell samples: measured 2026-08-21, only 769 of the 16,381
+    # studies with a counted matrix carry a barcode hit anywhere -- 4.7%. The two
+    # filters answer different questions and neither subsumes the other.
+    "has_matrix": ("p.cells > 0", None),
     "single_cell_only": ("p.assay_is_single_cell IS TRUE", None),
     "has_viral_reads": ("p.has_viral_reads IS TRUE", None),
     "has_bacterial_reads": ("p.has_bacterial_reads IS TRUE", None),
@@ -6141,15 +6170,21 @@ LEFT JOIN x ON x.sample_accession = s.sample_accession
 ORDER BY s.sample_accession;
 """
 
-PENTIMENTO_STUDY_SQL = """
-SELECT study_accession, source, title, study_cells, cells_unfiltered,
-       single_cell_file_format, n_samples_reported, n_samples_detailed,
-       sample_cells_total, unassigned_cells, sample_breakdown_complete,
-       any_unfiltered, n_runs_linked, n_runs_preflightx, n_runs_measurable,
-       has_metadata, has_celltype,
-       has_donor, has_demographics, flags
-FROM pentimento_study
-WHERE study_accession = %s;
+# The pentimento_study projection, shared by the study endpoint and the
+# single-cell summary. pentimento_study is rebuilt whole by the ingestion side
+# and gains columns; two hand-maintained copies of this list would drift
+# silently, so it lives in one place.
+_PENTIMENTO_STUDY_COLS = """p.study_accession, p.source, p.title, p.study_cells,
+       p.cells_unfiltered, p.single_cell_file_format, p.n_samples_reported,
+       p.n_samples_detailed, p.sample_cells_total, p.unassigned_cells,
+       p.sample_breakdown_complete, p.any_unfiltered, p.n_runs_linked,
+       p.n_runs_preflightx, p.n_runs_measurable, p.has_metadata, p.has_celltype,
+       p.has_donor, p.has_demographics"""
+
+PENTIMENTO_STUDY_SQL = f"""
+SELECT {_PENTIMENTO_STUDY_COLS}, p.flags
+FROM pentimento_study p
+WHERE p.study_accession = %s;
 """
 
 # ORDER BY keeps LIMIT/OFFSET paging stable
@@ -6169,6 +6204,157 @@ FROM pentimento_sample
 WHERE study_accession = %s
 ORDER BY sample_accession
 LIMIT %s OFFSET %s;
+"""
+
+# --- single-cell status and summary -------------------------------------------
+#
+# Three things these queries exist to keep straight, because the raw columns
+# invite the opposite reading:
+#
+# 1. `unified_metadata.single_cell_status` is a CACHED label, recomputed by the
+#    recall_fix recipe in seqout-ingestion, not by this server. It lags the
+#    evidence: measured 2026-08-21 it said 21,934 `measured_single_cell` while
+#    the three evidence sources below resolved to 26,298 studies. So the status
+#    is returned ALONGSIDE the evidence, never instead of it.
+#
+# 2. The three evidence sources are INDEPENDENT and are not all attempted on
+#    every study: the matrix route needs supplementary files, the two read
+#    routes need FASTQ plus a preflightx scan. A study scoring 1 of 3 is not
+#    weak evidence, it is usually the only measurement that could be made. A
+#    counted matrix is proof on its own.
+#
+# 3. `n_runs_measurable = 0` means the quantifier NEVER RAN. It does not mean
+#    "clean". An empty `flags` list with n_runs_measurable > 0 is the "measured,
+#    found nothing" case. The handler emits an explicit microbe_measured bool so
+#    a caller cannot collapse the two.
+# A SELECT-LIST FRAGMENT, not a CTE. Interpolated into both single-study queries
+# so the definition of "single-cell evidence" exists once. It owns its trailing
+# comma so call sites cannot disagree about it.
+SINGLE_CELL_EVIDENCE_COLS = """
+  (SELECT count(*) FROM pentimento_sample s
+    WHERE s.study_accession = %(acc)s AND s.cells > 0)          AS samples_with_matrix,
+  -- Runs reach a study by EITHER its own accession or its GSM link. The two
+  -- evidence tables do not share an accession space: pentimento_sample is 100%
+  -- GSE, pentimento_run is mostly SRP (9,144 SRP vs 908 GSE on the barcode
+  -- call). Matching on study_accession alone misses every GEO study whose reads
+  -- are filed under an SRP, which is most of them -- it undercounted studies
+  -- carrying BOTH kinds of evidence 7-fold, 783 against a true 5,721.
+  EXISTS (SELECT 1 FROM pentimento_run r
+           LEFT JOIN pentimento_sample s2 ON s2.sample_accession = r.gsm_accession
+           WHERE (r.study_accession = %(acc)s OR s2.study_accession = %(acc)s)
+             AND r.assay_is_single_cell)                        AS barcode_whitelist_hit,
+  EXISTS (SELECT 1 FROM pentimento_run r
+           LEFT JOIN pentimento_sample s2 ON s2.sample_accession = r.gsm_accession
+           WHERE (r.study_accession = %(acc)s OR s2.study_accession = %(acc)s)
+             AND r.bulk_vs_sc = 'single_cell')                  AS r1_length_single_cell,
+  -- pentimento's own count of runs it could resolve for the study. Do NOT
+  -- substitute a join to sra_run_download_links: that table is keyed by SRP and
+  -- most matrix studies are GSE, so the join silently matches nothing and every
+  -- study looks read-less.
+  COALESCE((SELECT p2.n_runs_linked FROM pentimento_study p2
+             WHERE p2.study_accession = %(acc)s), 0)            AS n_runs_linked_ev,
+  -- WHERE each kind of evidence actually lives. A GEO study's matrix sits under
+  -- its GSE while its reads sit under an SRP, so a caller that wants to fetch
+  -- the reads needs the read-side accession, not the one it asked about.
+  (SELECT array_agg(DISTINCT r.study_accession)
+     FROM pentimento_run r
+     LEFT JOIN pentimento_sample s3 ON s3.sample_accession = r.gsm_accession
+    WHERE (r.study_accession = %(acc)s OR s3.study_accession = %(acc)s)
+      AND (r.assay_is_single_cell OR r.bulk_vs_sc = 'single_cell'))
+                                                                AS reads_accessions,
+  (SELECT array_agg(DISTINCT s4.study_accession)
+     FROM pentimento_sample s4
+    WHERE s4.study_accession = %(acc)s AND s4.cells > 0)        AS matrix_accessions,
+"""
+
+# Anchored on the ACCESSION, not on unified_metadata, so exactly one row always
+# comes back. 1,359 studies live in pentimento_study but not in unified_metadata
+# (measured 2026-08-21); anchoring on the unified table 404s on precisely the
+# studies this endpoint exists to answer for. `in_unified` / `in_pentimento` tell
+# the caller which side knows about it -- "nothing has measured this" is an
+# answer, not an error.
+SINGLE_CELL_STATUS_SQL = f"""
+SELECT u.canonical_accession, u.source, u.single_cell_status, u.is_single_cell,
+       (u.canonical_accession IS NOT NULL)                      AS in_unified,
+       EXISTS (SELECT 1 FROM pentimento_study p
+                WHERE p.study_accession = %(acc)s)              AS in_pentimento,
+       {SINGLE_CELL_EVIDENCE_COLS.rstrip().rstrip(",")}
+FROM (SELECT 1) AS _one
+LEFT JOIN unified_metadata u ON u.canonical_accession = %(acc)s;
+"""
+
+# Everything the atlas already rolled up, plus the status label and the per-organism
+# microbe detail. `flags` is the STUDY-level rollup the build produced;
+# pentimento_microbe is a per-RUN detail table that does not always cover the same
+# runs (GSE155736 carries flags ['is_ebv'] and has zero pentimento_microbe rows),
+# so the two are reported separately rather than reconciled into one number.
+SINGLE_CELL_SUMMARY_SQL = f"""
+SELECT {_PENTIMENTO_STUDY_COLS},
+       p.flags,
+       u.single_cell_status,
+       {SINGLE_CELL_EVIDENCE_COLS}
+       (SELECT count(DISTINCT m.organism) FROM pentimento_microbe m
+          JOIN pentimento_run r ON r.run_accession = m.run_accession
+         WHERE r.study_accession = %(acc)s
+           AND m.is_viral_evidence)                             AS n_viral_organisms,
+       (SELECT count(DISTINCT m.organism) FROM pentimento_microbe m
+          JOIN pentimento_run r ON r.run_accession = m.run_accession
+         WHERE r.study_accession = %(acc)s
+           AND m.is_validated_bacterial)                        AS n_bacterial_organisms
+FROM pentimento_study p
+LEFT JOIN unified_metadata u ON u.canonical_accession = p.study_accession
+WHERE p.study_accession = %(acc)s;
+"""
+
+# The confident set: the UNION of the three independent evidence sources. Deliberately
+# NOT `is_single_cell IS TRUE` (a text regex that conflates measured with asserted)
+# and not the cached status label (stale by ~4,400 studies).
+SINGLE_CELL_STUDIES_SQL = """
+WITH ev AS (
+  SELECT study_accession,
+         max(CASE WHEN src = 'matrix'  THEN 1 ELSE 0 END) AS matrix,
+         max(CASE WHEN src = 'barcode' THEN 1 ELSE 0 END) AS barcode,
+         max(CASE WHEN src = 'r1len'   THEN 1 ELSE 0 END) AS r1len
+  FROM (
+    SELECT study_accession, 'matrix'  AS src FROM pentimento_sample WHERE cells > 0
+    UNION ALL
+    -- COALESCE folds a run filed under an SRP onto the GSE its GSM belongs to,
+    -- so one study yields ONE row instead of a GSE row holding the matrix and a
+    -- separate SRP row holding the read call.
+    SELECT COALESCE(s2.study_accession, r.study_accession), 'barcode'
+      FROM pentimento_run r
+      LEFT JOIN pentimento_sample s2 ON s2.sample_accession = r.gsm_accession
+     WHERE r.assay_is_single_cell
+    UNION ALL
+    SELECT COALESCE(s2.study_accession, r.study_accession), 'r1len'
+      FROM pentimento_run r
+      LEFT JOIN pentimento_sample s2 ON s2.sample_accession = r.gsm_accession
+     WHERE r.bulk_vs_sc = 'single_cell'
+  ) t
+  GROUP BY study_accession
+)
+SELECT ev.study_accession, ev.matrix::bool AS counted_matrix,
+       ev.barcode::bool AS barcode_whitelist_hit,
+       ev.r1len::bool AS r1_length_single_cell,
+       ev.matrix + ev.barcode + ev.r1len AS n_independent_evidence,
+       -- same four-way classification _evidence_block applies per study, so a
+       -- listed row and a fetched one agree
+       CASE
+         WHEN ev.matrix = 1 AND (ev.barcode = 1 OR ev.r1len = 1)
+           THEN 'matrix_and_reads'
+         WHEN ev.matrix = 1 AND COALESCE(p.n_runs_linked, 0) > 0
+           THEN 'matrix_reads_unscanned'
+         WHEN ev.matrix = 1 THEN 'matrix_only'
+         ELSE 'reads_only'
+       END AS kind,
+       p.study_cells, p.any_unfiltered, u.single_cell_status
+FROM ev
+LEFT JOIN pentimento_study p ON p.study_accession = ev.study_accession
+LEFT JOIN unified_metadata u ON u.canonical_accession = ev.study_accession
+WHERE ev.matrix + ev.barcode + ev.r1len >= %(min_evidence)s
+  AND (NOT %(require_matrix)s OR ev.matrix = 1)
+ORDER BY ev.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
 """
 
 PENTIMENTO_SAMPLE_TISSUE_SQL = """

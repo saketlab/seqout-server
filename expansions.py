@@ -30,7 +30,6 @@ def _dedupe(items: Iterable[str]) -> list[str]:
     return out
 
 
-# Term.name is already lowercase, so lower only the parameter side to keep the term_name index usable.
 _CYPHER_BATCH_EXISTS = """
 UNWIND $candidates AS candidate
 MATCH (t:Term)
@@ -38,13 +37,6 @@ WHERE t.name = toLower(candidate)
 RETURN candidate
 """
 
-# The eight ontologies actually ingested into the graph (ontology-scripts/GRAPH.md
-# "What's ingested"). Everything else a node's xrefs may name -- GO, PATO,
-# NCBITaxon, HP, PR -- rides in as an imported class of one of these, so it is
-# not a source anyone can switch off.
-#
-# Provenance lives in Term.xrefs as `PREFIX:id`; Cellosaurus is the exception,
-# its ids are bare `CVCL_0030` with no prefix at all.
 ONTOLOGIES = (
     ("MONDO", "Diseases (MONDO)"),
     ("MeSH", "MeSH"),
@@ -57,20 +49,7 @@ ONTOLOGIES = (
 )
 ONTOLOGY_IDS = frozenset(o for o, _ in ONTOLOGIES)
 
-# A synonym survives if ANY of its xrefs is from an ontology still switched on --
-# nodes are merged by name, so "spinal muscular atrophy" carries HP, MONDO and
-# MeSH ids at once and turning MeSH off must not delete the MONDO term. Nodes
-# with no xrefs at all (~130k of the synonym-bearing ones) are never dropped:
-# nothing attributes them, so no toggle owns them.
-#
-# Every node the path passes through is tested, not just the one it ends on: a
-# disabled hub that still bridges hands back everything behind it. "sma" carries
-# MONDO, EFO and HGNC ids, and with those off it used to disappear from the
-# results while its 2-hop neighbours -- "superior mesenteric artery", GO's
-# "s methyltransferase activity" -- stayed.
-_XREF_PREFIX = (
-    "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
-)
+_XREF_PREFIX = "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
 _ENABLED = (
     "size($disabled) = 0"
     " OR size(coalesce(n.xrefs, [])) = 0"
@@ -345,9 +324,7 @@ def expand_terms(neo4j_driver, query: str, disabled=()) -> list[str]:
 
 def expand_terms_explained(neo4j_driver, query: str, disabled=()) -> dict:
     """Report only synonyms that reached surviving variants, using the same path as expand_terms."""
-    records, passes = _expand_passes(
-        neo4j_driver, query, _normalize_disabled(disabled)
-    )
+    records, passes = _expand_passes(neo4j_driver, query, _normalize_disabled(disabled))
 
     # Replay expand_terms dedupe and cap while preserving choices for explanation.
     seen: set[str] = set()

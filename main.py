@@ -188,6 +188,9 @@ from queries import (
     SEARCH_STRUCTURED_SQL,
     structured_search_sql,
     SIMILAR_STUDIES_SQL,
+    SINGLE_CELL_STATUS_SQL,
+    SINGLE_CELL_STUDIES_SQL,
+    SINGLE_CELL_SUMMARY_SQL,
     SITEMAP_ACCESSIONS_SQL,
     SITEMAP_BOUNDS_COUNTS_SQL,
     SITEMAP_BOUND_LOOKUP_SQL,
@@ -1158,6 +1161,7 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             "submitter": r["submitter"],
             "country_code": r["country_code"],
             "is_single_cell": r["is_single_cell"],
+            "single_cell_status": r["single_cell_status"],
             "single_cell_modality": r["single_cell_modality"],
         }
 
@@ -1215,8 +1219,6 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["citation_count"] = primary.get("citation_count")
         meta = sub_map.get(acc, {})
         gsa = gsa_map.get(acc, {})
-        # unified_metadata has no GSA rows, so don't let a missing submitter erase
-        # a center_name the per-source project query already supplied.
         row["center_name"] = (
             meta.get("submitter") or gsa.get("center_name") or row.get("center_name")
         )
@@ -1224,10 +1226,8 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             row["authors"] = gsa["submitter_person"]
         row["country_code"] = meta.get("country_code")
         row["is_single_cell"] = meta.get("is_single_cell")
+        row["single_cell_status"] = meta.get("single_cell_status")
         row["single_cell_modality"] = meta.get("single_cell_modality")
-        # Prefer real publication authors; otherwise use geo_series.contributors
-        # (dedup preserving order; ingest may repeat names) over the center_name
-        # fallback. Orgs are unchanged: center_name already carries them.
         names = list(
             dict.fromkeys(n for n in (contrib_map.get(acc) or []) if n and n.strip())
         )
@@ -8858,8 +8858,9 @@ def download_by_query(
     if boolean_tsq is not None:
         fts_q, q_variants = boolean_tsq, [boolean_tsq]
     else:
-        fts_q, q_variants = q, (
-            _search_query_variants(q, exclude_ontology or ()) if q else []
+        fts_q, q_variants = (
+            q,
+            (_search_query_variants(q, exclude_ontology or ()) if q else []),
         )
 
     sql, params = build_search_results(q=fts_q, q_variants=q_variants, db=db, **filters)
@@ -10817,6 +10818,7 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
     max_cell_count: int | None = Query(None, ge=0),
     min_gene_count: int | None = Query(None, ge=0),
     max_gene_count: int | None = Query(None, ge=0),
+    has_matrix: bool = Query(False),
     single_cell_only: bool = Query(False),
     has_viral_reads: bool = Query(False),
     has_bacterial_reads: bool = Query(False),
@@ -10869,6 +10871,7 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         "max_cell_count": max_cell_count,
         "min_gene_count": min_gene_count,
         "max_gene_count": max_gene_count,
+        "has_matrix": has_matrix,
         "single_cell_only": single_cell_only,
         "has_viral_reads": has_viral_reads,
         "has_bacterial_reads": has_bacterial_reads,
@@ -11026,6 +11029,163 @@ def _attach_pentimento_labels(cur, study: str, samples: list[dict]) -> None:
         s["tissue"] = tissues.get(acc)
 
 
+def _evidence_block(row: dict) -> dict:
+    """Evidence fo single cell."""
+    matrix = row["samples_with_matrix"] > 0
+    barcode = bool(row["barcode_whitelist_hit"])
+    r1len = bool(row["r1_length_single_cell"])
+    read_call = barcode or r1len
+    linked = row.get("n_runs_linked_ev") or row.get("n_runs_linked") or 0
+
+    if matrix and read_call:
+        kind = "matrix_and_reads"
+    elif matrix and linked > 0:
+        # a matrix plus FASTQ that preflightx has not confirmed single-cell yet
+        kind = "matrix_reads_unscanned"
+    elif matrix:
+        kind = "matrix_only"
+    else:
+        kind = "reads_only"
+
+    return {
+        "samples_with_matrix": row["samples_with_matrix"],
+        "barcode_whitelist_hit": barcode,
+        "r1_length_single_cell": r1len,
+        # kept though derivable: the list endpoint filters on this exact quantity
+        "n_independent_evidence": sum((matrix, barcode, r1len)),
+        "has_matrix": matrix,
+        "has_reads_linked": linked > 0,
+        "reads_scanned": read_call,
+        "kind": kind,
+        # where to go for each kind of data: a GEO study's matrix is under its
+        # GSE and its reads under an SRP, so these differ for most studies
+        "matrix_accessions": row.get("matrix_accessions") or [],
+        "reads_accessions": row.get("reads_accessions") or [],
+    }
+
+
+@api_app.get(
+    "/project/{accession}/single-cell/status",
+    summary="Is this study single-cell, and what is that based on",
+    description=(
+        "Resolves any GSE/SRP/ERP and reports the cached `single_cell_status` label. "
+    ),
+    operation_id="get_project_single_cell_status",
+)
+@limiter.limit("100/minute")
+def get_project_single_cell_status(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession, shallow=True)
+                acc = (resolved or accession).upper()
+                cur.execute(SINGLE_CELL_STATUS_SQL, {"acc": acc})
+                row = cur.fetchone()
+                if not row or not (row["in_unified"] or row["in_pentimento"]):
+                    raise HTTPException(404, "Accession not found")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_project_single_cell_status")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "accession": acc,
+        "queried_as": accession.upper(),
+        "source": row["source"],
+        "single_cell_status": row["single_cell_status"],
+        "in_unified_metadata": row["in_unified"],
+        "in_pentimento": row["in_pentimento"],
+        "evidence": _evidence_block(row),
+    }
+
+
+@api_app.get(
+    "/project/{accession}/single-cell/summary",
+    summary="Project-level single-cell summary: cells, preflightx, microbe",
+    description=("Summary of single cell projects at the sample level"),
+    operation_id="get_project_single_cell_summary",
+)
+@limiter.limit("100/minute")
+def get_project_single_cell_summary(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession)
+                if not resolved:
+                    raise HTTPException(404, "Study not in the Pentimento")
+                cur.execute(SINGLE_CELL_SUMMARY_SQL, {"acc": resolved})
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(404, "Study not in the Pentimento")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in get_project_single_cell_summary")
+        raise HTTPException(500, "Internal server error")
+
+    return {
+        **row,
+        "queried_as": accession.upper(),
+        "evidence": _evidence_block(row),
+        "microbe_measured": (row["n_runs_measurable"] or 0) > 0,
+    }
+
+
+@api_app.get(
+    "/single-cell/studies",
+    summary="List studies with measured single-cell evidence",
+    description=(
+        "Studies carrying at least `min_evidence` of the "
+        "three independent measurements (counted matrix, barcode-whitelist hit, "
+        "R1 length structure).\n\n"
+    ),
+    operation_id="list_single_cell_studies",
+)
+@limiter.limit("60/minute")
+def list_single_cell_studies(
+    request: Request,
+    response: Response,
+    min_evidence: int = Query(1, ge=1, le=3),
+    require_matrix: bool = Query(False),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    SINGLE_CELL_STUDIES_SQL,
+                    {
+                        "min_evidence": min_evidence,
+                        "require_matrix": require_matrix,
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                )
+                rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in list_single_cell_studies")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "studies": rows,
+        "min_evidence": min_evidence,
+        "require_matrix": require_matrix,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell cell counts, read-derived calls and microbe flags",
@@ -11033,14 +11193,6 @@ def _attach_pentimento_labels(cur, study: str, samples: list[dict]) -> None:
         "Per-sample cell/gene counts joined to read-derived (preflightx) "
         "species, sex and assay calls and to viral/microbial presence flags. "
         "404s when the study is not in the Pentimento.\n\n"
-        "Read the flags as EVIDENCE, not diagnosis: a flag means unitigs from "
-        "the run align across at least 20% of a panel reference (50% for the "
-        "host-endogenous and vector-derived retroviruses MLV, MMTV, HIV1, "
-        "HTLV1). There is no raw-read, UMI or replicate confirmation.\n\n"
-        "NULL is not false. A null flag list means nothing about that sample "
-        "was measurable; an EMPTY list means it was measured and nothing was "
-        "found. `cells` is a matrix COLUMN count: when `unfiltered` is set "
-        "those columns are 10x barcodes, not cells, and must not be summed."
     ),
     operation_id="get_project_single_cell",
 )
@@ -11083,22 +11235,6 @@ _CONTROL_KINGDOMS = frozenset({"spike_in_control", "negative_control"})
     description=(
         "Per-organism detections plus kingdom-level totals: unitigs mapped, "
         "k-mer mass, reads and reference coverage.\n\n"
-        "Filterable on the raw numbers, so a caller need not accept the stored "
-        "gates (viral breadth 0.20; bacterial breadth 0.30 + 20 kb covered). "
-        "`kind` selects viral, bacterial, both, or all classes; `min_breadth` "
-        "and `min_kmer_mass` filter directly; `validated_only` keeps only rows "
-        "passing the stored gates.\n\n"
-        "`kmer_mass` is a WEIGHTED k-mer count, not a distinct-k-mer tally -- a "
-        "relative proxy for how much sequence of an organism is present, "
-        "comparable between organisms in a run, not an absolute k-mer number. "
-        "`n_unitigs` IS a plain count of assembled unitigs that mapped.\n\n"
-        "Kingdoms are not all findings. `spike_in_control` (PhiX) and "
-        "`negative_control` (animalPV, which calibrates the viral threshold) "
-        "are controls; `bacterial_background` is reagent kitome and skin flora, "
-        "excluded unless include_background. Never sum controls into viral or "
-        "bacterial.\n\n"
-        "`measurable` is tri-state: false/null means the runs were never "
-        "screened, so an empty result is not an absence call."
     ),
     operation_id="get_sample_microbes",
 )
@@ -11136,7 +11272,6 @@ def get_sample_microbes(
         logger.exception("Database error in get_sample_microbes")
         raise HTTPException(500, "Internal server error")
 
-    # Filters live in the LEFT JOIN, so zero rows means the sample was never screened.
     if not rows:
         raise HTTPException(
             404,
@@ -11973,6 +12108,10 @@ How its filters behave, because guessing wrong changes the cohort:
   `cells` are 10x barcodes rather than cells - never sum those.
 
 Read-derived (Pentimento) filters, layered on the same query:
+- `has_matrix` keeps samples with a parsed cell-by-gene matrix. This is the
+  proof tier for single-cell data and is NOT the same as `single_cell_only`,
+  which is a read-derived barcode call requiring FASTQ plus a preflightx
+  scan -- only 4.7% of studies with a counted matrix carry one.
 - `single_cell_only`, `has_viral_reads`, `has_bacterial_reads` and `hpv_type`
   come from read-derived calls, not submitter metadata. They only constrain when
   set to true; false does not mean "absent", it means "do not filter".
