@@ -125,13 +125,10 @@ SELECT DISTINCT accession, alias FROM (
     UNION ALL
     SELECT accession, alias FROM dra_studies WHERE accession = ANY(%(acc)s)
     UNION ALL
-    -- Same GEA -> DRA hop as PROJECT_GEA_SQL and _RESOLVE_DL_STUDY; keep in step.
     SELECT DISTINCT g.accession, d.accession
         FROM gea_experiments g JOIN dra_studies d ON d.bioproject_id = g.bioproject
        WHERE g.accession = ANY(%(acc)s)
     UNION ALL
-    -- cross_ref_* holds the AE reverse links but not the PRJ*-class ones, so
-    -- resolve here. alias_values() must match idx_unified_metadata_alias_values.
     SELECT a.acc, um.canonical_accession
         FROM unified_metadata um
         CROSS JOIN LATERAL unnest(alias_values(um.aliases)) AS a(acc)
@@ -140,16 +137,6 @@ SELECT DISTINCT accession, alias FROM (
 ) u(accession, alias) WHERE alias IS NOT NULL;
 """
 
-# `is_single_cell` is DERIVED from single_cell_status here rather than read from
-# its own column, so the two can never disagree. Verified 2026-08-21: the columns
-# are exactly 1:1 across all 1,223,313 rows, with status the strict refinement --
-# is_single_cell=true splits into measured_single_cell (21,934) and
-# text_indicates_single_cell (16,037), a distinction the boolean cannot express.
-#
-# The boolean stays in the response because clients consume it, but it is now a
-# projection of the status, not a second source of truth. NULL stays NULL:
-# not_screened means nothing has looked, which is not the same as "not single
-# cell".
 SUBMITTER_BATCH_SQL = """
 SELECT canonical_accession AS accession, center_name AS submitter, country_code,
        single_cell_status,
@@ -6283,11 +6270,6 @@ FROM (SELECT 1) AS _one
 LEFT JOIN unified_metadata u ON u.canonical_accession = %(acc)s;
 """
 
-# Everything the atlas already rolled up, plus the status label and the per-organism
-# microbe detail. `flags` is the STUDY-level rollup the build produced;
-# pentimento_microbe is a per-RUN detail table that does not always cover the same
-# runs (GSE155736 carries flags ['is_ebv'] and has zero pentimento_microbe rows),
-# so the two are reported separately rather than reconciled into one number.
 SINGLE_CELL_SUMMARY_SQL = f"""
 SELECT {_PENTIMENTO_STUDY_COLS},
        p.flags,
@@ -6306,11 +6288,8 @@ LEFT JOIN unified_metadata u ON u.canonical_accession = p.study_accession
 WHERE p.study_accession = %(acc)s;
 """
 
-# The confident set: the UNION of the three independent evidence sources. Deliberately
-# NOT `is_single_cell IS TRUE` (a text regex that conflates measured with asserted)
-# and not the cached status label (stale by ~4,400 studies).
-SINGLE_CELL_STUDIES_SQL = """
-WITH ev AS (
+_SINGLE_CELL_EV_CTE = """
+ev AS (
   SELECT study_accession,
          max(CASE WHEN src = 'matrix'  THEN 1 ELSE 0 END) AS matrix,
          max(CASE WHEN src = 'barcode' THEN 1 ELSE 0 END) AS barcode,
@@ -6332,7 +6311,10 @@ WITH ev AS (
      WHERE r.bulk_vs_sc = 'single_cell'
   ) t
   GROUP BY study_accession
-)
+)"""
+
+SINGLE_CELL_STUDIES_SQL = f"""
+WITH {_SINGLE_CELL_EV_CTE}
 SELECT ev.study_accession, ev.matrix::bool AS counted_matrix,
        ev.barcode::bool AS barcode_whitelist_hit,
        ev.r1len::bool AS r1_length_single_cell,
@@ -6361,6 +6343,51 @@ PENTIMENTO_SAMPLE_TISSUE_SQL = """
 SELECT sample, tissue
 FROM ontology_samples_v4
 WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s);
+"""
+
+SINGLE_CELL_OVERVIEW_SQL = f"""
+WITH {_SINGLE_CELL_EV_CTE},
+classified AS (
+  SELECT ev.study_accession,
+         CASE
+           WHEN ev.matrix = 1
+                AND (ev.barcode = 1 OR ev.r1len = 1
+                     OR COALESCE(p.n_runs_linked, 0) > 0)  THEN 'fastq_and_matrix'
+           WHEN ev.matrix = 1                              THEN 'matrix_only'
+           ELSE 'fastq_only'
+         END AS kind,
+         COALESCE(p.n_samples_detailed, p.n_samples_reported, 0) AS n_samples,
+         COALESCE(p.study_cells, 0) AS n_cells
+  FROM ev
+  LEFT JOIN pentimento_study p ON p.study_accession = ev.study_accession
+),
+tissue_organism AS (
+  SELECT os.study_accession,
+         COALESCE(os.tissue_ontology_name, os.tissue) AS tissue,
+         os.organism
+  FROM ontology_samples_v4 os
+  JOIN classified c ON c.study_accession = os.study_accession
+)
+SELECT
+  agg.n_studies, agg.n_samples, agg.n_cells,
+  (SELECT json_agg(x) FROM (
+     SELECT kind, count(*) AS n_studies
+     FROM classified GROUP BY kind
+   ) x)                                            AS by_kind,
+  (SELECT json_agg(x) FROM (
+     SELECT tissue, count(DISTINCT study_accession) AS n_studies
+     FROM tissue_organism WHERE tissue IS NOT NULL
+     GROUP BY 1 ORDER BY n_studies DESC LIMIT 15
+   ) x)                                            AS top_tissues,
+  (SELECT json_agg(x) FROM (
+     SELECT organism, count(DISTINCT study_accession) AS n_studies
+     FROM tissue_organism WHERE organism IS NOT NULL
+     GROUP BY 1 ORDER BY n_studies DESC LIMIT 15
+   ) x)                                            AS top_organisms
+FROM (
+  SELECT count(*) AS n_studies, sum(n_samples) AS n_samples, sum(n_cells) AS n_cells
+  FROM classified
+) agg;
 """
 
 PENTIMENTO_MICROBES_SQL = f"""
@@ -6554,8 +6581,6 @@ if __name__ == "__main__":
     csql2, _ = build_enriched_sample_count_sql({"tissue": "liver"})
     assert "pentimento" not in csql2, csql2
 
-    # The 504s: every pentimento filter has to restrict the scan of the 16M-row
-    # table, never be a predicate applied after a LATERAL runs once per row.
     assert "COUNT(*) OVER ()" not in page, page
     assert page.index("LIMIT %(limit)s") < page.index("LEFT JOIN LATERAL"), page
     for f, table in (

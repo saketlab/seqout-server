@@ -188,6 +188,7 @@ from queries import (
     SEARCH_STRUCTURED_SQL,
     structured_search_sql,
     SIMILAR_STUDIES_SQL,
+    SINGLE_CELL_OVERVIEW_SQL,
     SINGLE_CELL_STATUS_SQL,
     SINGLE_CELL_STUDIES_SQL,
     SINGLE_CELL_SUMMARY_SQL,
@@ -669,6 +670,8 @@ _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
 _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_single_cell_overview_cache_lock = threading.Lock()
+_single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
@@ -3029,6 +3032,8 @@ def purge_cache(request: Request):
         _platform_filters_cache.clear()
     with _source_totals_cache_lock:
         _source_totals_cache["ready"] = False
+    with _single_cell_overview_cache_lock:
+        _single_cell_overview_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
@@ -10377,6 +10382,51 @@ def get_source_totals(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+def _get_single_cell_overview() -> dict:
+    with _single_cell_overview_cache_lock:
+        if (
+            _single_cell_overview_cache["ready"]
+            and (time.time() - _single_cell_overview_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _single_cell_overview_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SINGLE_CELL_OVERVIEW_SQL)
+            row = cur.fetchone()
+
+    data = {
+        "n_studies": row["n_studies"] or 0,
+        "n_samples": row["n_samples"] or 0,
+        "n_cells": row["n_cells"] or 0,
+        "by_kind": row["by_kind"] or [],
+        "top_tissues": row["top_tissues"] or [],
+        "top_organisms": row["top_organisms"] or [],
+    }
+    with _single_cell_overview_cache_lock:
+        _single_cell_overview_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/single-cell",
+    summary="Overview of single-cell datasets",
+    description=(
+        "Study counts by type (fastq only, matrix only, fastq+matrix), total "
+        "samples/cells, and top tissues/organisms across those studies."
+    ),
+    operation_id="get_single_cell_overview",
+)
+@limiter.limit("60/minute")
+def get_single_cell_overview(request: Request):
+    try:
+        return _get_single_cell_overview()
+    except Exception:
+        logger.exception("Database error in get_single_cell_overview")
+        raise HTTPException(500, "Internal server error")
+
+
 @api_app.get(
     "/stats/project-overlap",
     summary="Cross-archive project overlap",
@@ -11040,7 +11090,6 @@ def _evidence_block(row: dict) -> dict:
     if matrix and read_call:
         kind = "matrix_and_reads"
     elif matrix and linked > 0:
-        # a matrix plus FASTQ that preflightx has not confirmed single-cell yet
         kind = "matrix_reads_unscanned"
     elif matrix:
         kind = "matrix_only"
@@ -11051,14 +11100,11 @@ def _evidence_block(row: dict) -> dict:
         "samples_with_matrix": row["samples_with_matrix"],
         "barcode_whitelist_hit": barcode,
         "r1_length_single_cell": r1len,
-        # kept though derivable: the list endpoint filters on this exact quantity
         "n_independent_evidence": sum((matrix, barcode, r1len)),
         "has_matrix": matrix,
         "has_reads_linked": linked > 0,
         "reads_scanned": read_call,
         "kind": kind,
-        # where to go for each kind of data: a GEO study's matrix is under its
-        # GSE and its reads under an SRP, so these differ for most studies
         "matrix_accessions": row.get("matrix_accessions") or [],
         "reads_accessions": row.get("reads_accessions") or [],
     }
