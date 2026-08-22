@@ -41,6 +41,18 @@ def _lexemes(term: str) -> str:
     return " <-> ".join(parts)
 
 
+def replace_query_hyphens(q: str, expand: bool = True) -> str:
+    """Treat hyphens as word separators in search text -- but only for a query we
+    are going to expand.
+
+    Both ways of asking for the words as typed are honoured: expand=False (the
+    term expansion switch is off) and a boolean query, which is never expanded
+    either. Then "scrna-seq" stays one token, which to_tsquery reads as the
+    adjacency phrase scrna <-> seq instead of the looser scrna & seq.
+    """
+    return q.replace("-", " ") if expand and not is_boolean_query(q) else q
+
+
 def to_tsquery_string(q: str) -> str:
     """Translate a google-lite boolean query to a to_tsquery('english', ...) input.
 
@@ -93,4 +105,15 @@ if __name__ == "__main__":
     assert to_tsquery_string('"single cell"') == "single <-> cell"
     assert to_tsquery_string("immun*") == "immun:*"
     assert to_tsquery_string("*") == ""  # nothing usable -> caller falls back
+
+    # Why /search only rewrites hyphens to spaces while term expansion is on: with
+    # the hyphen kept, a hyphenated term is one adjacency phrase, not two words
+    # that may sit paragraphs apart.
+    assert to_tsquery_string("scrna-seq") == "scrna <-> seq"
+    assert to_tsquery_string("scrna seq") == "scrna & seq"
+
+    # So the rewrite runs only for a query that will actually be expanded.
+    assert replace_query_hyphens("scrna-seq liver") == "scrna seq liver"
+    assert replace_query_hyphens("scrna-seq liver", expand=False) == "scrna-seq liver"
+    assert replace_query_hyphens('"scrna-seq" OR liver') == '"scrna-seq" OR liver' 
     print("ok")

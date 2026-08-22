@@ -233,7 +233,11 @@ from queries import (
     init_global_contributions_filters_sql,
     init_global_contributions_schema,
 )
-from boolean_query import is_boolean_query, to_tsquery_string
+from boolean_query import (
+    is_boolean_query,
+    replace_query_hyphens,
+    to_tsquery_string,
+)
 
 load_dotenv()
 
@@ -2620,11 +2624,6 @@ def _get_growth_data(mode: str, db: str | None = None) -> dict:
     return data
 
 
-def _replace_query_hyphens(q: str) -> str:
-    """Treat hyphens as word separators in search text."""
-    return q.replace("-", " ")
-
-
 _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (GEO_SERIES_PATTERN, "gse"),
     (GEO_SAMPLE_PATTERN, "gsm"),
@@ -4367,7 +4366,7 @@ def search_geo(
     acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="geo")
     if acc_result is not None:
         return acc_result
-    return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
+    return _search_geo_impl(request, replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
@@ -4430,7 +4429,7 @@ def search_sra(
     acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="sra")
     if acc_result is not None:
         return acc_result
-    return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
+    return _search_sra_impl(request, replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
@@ -4485,7 +4484,7 @@ def search_suggest(
     q: str = Query(..., min_length=1, max_length=500),
 ):
     start = time.perf_counter()
-    search_q = _replace_query_hyphens(q)
+    search_q = replace_query_hyphens(q)
     suggestions = _get_suggestions(search_q)
     took_ms = (time.perf_counter() - start) * 1000
     result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
@@ -4985,7 +4984,7 @@ def search(
     # so treat it as an ordinary query.
     boolean_tsq = None
     if q and (structured or is_boolean_query(q)):
-        _tsq = to_tsquery_string(_replace_query_hyphens(q))
+        _tsq = to_tsquery_string(replace_query_hyphens(q, expand=not structured))
         if _tsq:
             boolean_tsq = _tsq
 
@@ -5011,7 +5010,7 @@ def search(
         return _autocorrect_search(
             request,
             filtered,
-            _replace_query_hyphens(q) if q else "",
+            replace_query_hyphens(q, expand=not structured) if q else "",
             boolean_tsq,
             rerun,
         )
@@ -5023,7 +5022,7 @@ def search(
         if acc_result is not None:
             return acc_result
 
-    original_q = _replace_query_hyphens(q)
+    original_q = replace_query_hyphens(q, expand=not structured)
     q = original_q
 
     # First-page unfiltered searches are cacheable (filtered/accession returned above).
@@ -5271,7 +5270,7 @@ def _search_filtered(
     boolean_tsq set -> boolean mode: FTS uses the literal to_tsquery (no Neo4j
     expansion), so filtered results match the boolean facet counts."""
     query_less = not q  # no FTS to narrow -> can scan broadly; bound its runtime
-    q = _replace_query_hyphens(q) if q else ""
+    q = replace_query_hyphens(q) if q else ""
     start = time.perf_counter()
     try:
         with pool.connection() as conn, conn.transaction():
@@ -5463,7 +5462,7 @@ def search_facets(
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     t0 = time.perf_counter()
-    nq = _replace_query_hyphens(q)
+    nq = replace_query_hyphens(q, expand=not structured)
     # Boolean/structured query -> count the literal to_tsquery so the header total
     # matches the boolean result list. Applies with db scope and sidebar filters
     # too (build_search_match_temp respects db; the total/facet builders apply the
@@ -5631,7 +5630,7 @@ def get_search_investigators(
     limit: int = Query(20, ge=1, le=MAX_COUNTRY_PIS),
 ):
     t0 = time.perf_counter()
-    nq = _replace_query_hyphens(q)
+    nq = replace_query_hyphens(q, expand=not structured)
     if not nq.strip():
         raise HTTPException(400, "q is required")
 
@@ -8851,9 +8850,9 @@ def download_by_query(
     # corrected query it is displaying, so correcting again would be a no-op.
     boolean_tsq = None
     if q and (structured or is_boolean_query(q)):
-        if _tsq := to_tsquery_string(_replace_query_hyphens(q)):
+        if _tsq := to_tsquery_string(replace_query_hyphens(q, expand=not structured)):
             boolean_tsq = _tsq
-    q = _replace_query_hyphens(q) if q else ""
+    q = replace_query_hyphens(q, expand=not structured) if q else ""
 
     if boolean_tsq is not None:
         fts_q, q_variants = boolean_tsq, [boolean_tsq]
@@ -9762,7 +9761,7 @@ def search_structured(
     ),
 ):
     if q:
-        q = _replace_query_hyphens(q)
+        q = replace_query_hyphens(q)
 
     has_geo_filter = any(
         v is not None
