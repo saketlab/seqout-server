@@ -1,7 +1,4 @@
-"""SQL constants + filter/field resolution for the Beacon v2 API (see beacon.py).
-
-Spec: docs/superpowers/specs/2026-07-10-beacon-v2-metadata-design.md (§5, §6).
-"""
+"""SQL constants + filter/field resolution for the Beacon v2 API (see beacon.py)."""
 
 from __future__ import annotations
 
@@ -31,7 +28,6 @@ def resolve_filter_id(term_id: str) -> list[tuple[str, str]]:
     return []
 
 
-# Columns the biosample mapper reads (spec §5.2).
 BIOSAMPLE_COLUMNS = (
     "sample, study_accession, organism, taxid, sex, ethnicity, cell_line, "
     "disease, disease_ontology_id, disease_ontology_name, "
@@ -41,12 +37,20 @@ BIOSAMPLE_COLUMNS = (
     "development_stage, development_stage_ontology_id, development_stage_ontology_name"
 )
 
-_SQL_OPS = {"=": "=", "!": "<>", ">": ">", "<": "<", ">=": ">=", "<=": "<="}
+_SQL_OPS = {
+    "=": "=",
+    "!": "<>",
+    "!=": "<>",
+    "<>": "<>",
+    ">": ">",
+    "<": "<",
+    ">=": ">=",
+    "<=": "<=",
+}
 
 # Age is requested as an "alphanumeric" filter carrying an ISO8601 duration value
 # (e.g. EFO:0004847 / PATO:0000011 / "age" with operator ">" value "P70Y"). It
-# resolves against the precomputed ontology_samples_v4.age_days (days), NOT an
-# ontology CURIE — so it must be handled before resolve_filter_id (EFO -> assay).
+# resolves against the precomputed ontology_samples_v5.age_days (days)
 _AGE_IDS = {"EFO:0004847", "PATO:0000011", "AGE"}
 _ISO_DUR_RE = re.compile(
     r"^P(?=\d)(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?"
@@ -124,7 +128,11 @@ def build_biosample_where(filters: list[dict]) -> tuple[str, list]:
                 clauses.append("FALSE")
             else:
                 op = _SQL_OPS.get(f.get("operator", "="), "=")
-                clauses.append(f"{col} {op} %s")
+                if "%" in str(val) and op in ("=", "<>"):
+                    like = "LIKE" if op == "=" else "NOT LIKE"
+                    clauses.append(f"{col} {like} %s")
+                else:
+                    clauses.append(f"{col} {op} %s")
                 params.append(val)
         else:
             clauses.append("FALSE")  # unknown term -> empty result, not an error
@@ -133,7 +141,6 @@ def build_biosample_where(filters: list[dict]) -> tuple[str, list]:
 
 
 if __name__ == "__main__":
-    # self-checks (spec §6.3/§6.5); run: .venv/bin/python beacon_queries.py
     w, p = build_biosample_where([{"id": "MONDO:0004992"}, {"id": "CL:0000624"}])
     assert " AND " in w and w.count("ontology_closure") == 2, w
     assert "= ANY(ARRAY(" in w, w
@@ -162,6 +169,24 @@ if __name__ == "__main__":
 
     w, p = build_biosample_where([{"id": "sex", "operator": "=", "value": "female"}])
     assert w == "sex = %s" and p == ["female"], (w, p)
+
+    # "!=" has to negate; absent from _SQL_OPS it falls back to "=" and
+    # returns the set the caller asked to exclude
+    for token in ("!", "!=", "<>"):
+        w, p = build_biosample_where(
+            [{"id": "sex", "operator": token, "value": "Male"}]
+        )
+        assert w == "sex <> %s" and p == ["Male"], (token, w, p)
+
+    # % is an alphanumeric wildcard in the spec, so it needs LIKE
+    w, p = build_biosample_where(
+        [{"id": "organism", "operator": "=", "value": "%sapiens%"}]
+    )
+    assert w == "organism LIKE %s" and p == ["%sapiens%"], (w, p)
+    w, _ = build_biosample_where(
+        [{"id": "organism", "operator": "!", "value": "%sapiens%"}]
+    )
+    assert w == "organism NOT LIKE %s", w
 
     w, p = build_biosample_where([{"id": "PMID:23125363"}])
     assert "study_publications" in w and p == ['[{"pmid": "23125363"}]'], (w, p)

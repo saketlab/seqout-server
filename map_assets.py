@@ -1,14 +1,7 @@
-"""Build deepscatter map assets — quadfeather tiles and countries.json — from the
-rows the API loads out of Postgres.
+"""Build deepscatter quadfeather tiles and countries.json from Postgres map rows.
 
-The cluster layers used for coloring are baked as per-point *dictionary*
-(categorical) columns so the frontend can color points distinctly by their
-cluster at whatever layer matches the current zoom — deepscatter only assigns
-distinct colors to dictionary columns, and a shared dictionary keeps a cluster's
-color consistent across tiles. Labels are NOT baked here; the frontend fetches
-them on demand per viewport/zoom from /map/labels. Heavy deps (pyarrow /
-i18n-iso-countries) import with this module, which the server does lazily on the
-first map request.
+Cluster layers are baked as dictionary columns for distinct, consistent colors.
+Labels are fetched live from /map/labels.
 """
 
 from __future__ import annotations
@@ -26,9 +19,8 @@ from vendor.qf_tiler import main as qf_main
 
 TILE_SIZE = 10_000
 
-# Country codes the i18n-iso-countries library can't decode on its own. Kept
-# verbatim from the original pipeline so the generated names match what the
-# frontend was validated against.
+# Country codes that need hand-authored display names. Keep names aligned with
+# the validated frontend output.
 _SELF_NAMED = {"India", "Turkey", "Russia", "Macau", "Cote d'Ivoire", "Swaziland"}
 
 
@@ -68,9 +60,9 @@ def country_names(codes) -> list[str]:
 
 def clean_values(values) -> list[str]:
     """Sanitize a row's facet value(s) into distinct display strings safe for the
-    ;-joined tile column: drop empties, strip, and replace the ; list-delimiter
-    (and newlines) inside a value so the frontend's split stays correct. Commas
-    are fine — the CSV writer quotes them. Accepts a scalar (the dominant value),
+    ;-joined tile column. Drops empties, strips whitespace, and replaces the ;
+    list delimiter and newlines inside a value so the frontend's split stays
+    correct. The CSV writer quotes commas. Accepts a scalar (the dominant value),
     a list, or None."""
     if values is None:
         return []
@@ -103,8 +95,8 @@ def _write_points_csv(
     filter_columns: list[str],
 ) -> None:
     cols = ["x", "y", "accession", "source", "countries", *filter_columns, *levels]
-    # csv.writer (not hand-rolled) because enriched facet values can contain commas
-    # / quotes; pyarrow's CSV reader (quadfeather) parses the RFC4180 quoting back.
+    # csv.writer handles enriched facet values containing commas / quotes;
+    # pyarrow's CSV reader (quadfeather) parses the RFC4180 quoting back.
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
         w.writerow(cols)
@@ -202,7 +194,7 @@ def build_assets(
             (filter_dir / f"{col}.json").write_text(json.dumps(vals))
 
     dictionaries = _layer_dictionaries(rows, levels)
-    # shared dictionary for the categorical source column (7 archive strings).
+    # Shared dictionary for the categorical source column.
     source_vals = sorted({r.get("source") for r in rows if r.get("source")})
     dictionaries["source"] = pa.array(source_vals, type=pa.utf8())
     csv_path = out_dir / "points.csv"
@@ -224,7 +216,7 @@ if __name__ == "__main__":
     names = country_names(["US", "", "----------", None])
     assert len(names) == 1 and "United" in names[0], names
 
-    # Facet sanitizing: distinct, empties dropped, ; replaced (commas kept).
+    # Facet sanitizing: distinct values, dropped empties, ; replacement.
     # Accepts a scalar (the per-project dominant value), a list, or None.
     assert clean_values(["RNA-seq", "RNA-seq", "", None, "a;b"]) == ["RNA-seq", "a,b"]
     assert clean_values("brain") == ["brain"]
@@ -258,7 +250,7 @@ if __name__ == "__main__":
         p = pathlib.Path(d) / "p.csv"
         _write_points_csv(rows, ["cluster_l0", "cluster_l4"], p, ["tissue", "assay"])
         # Re-parse with a real CSV reader: the assay value's comma must round-trip
-        # as one field (it's quoted), not split the row.
+        # as one quoted field without splitting the row.
         with open(p, newline="") as f:
             parsed = list(csv.reader(f))
         assert parsed[0] == [

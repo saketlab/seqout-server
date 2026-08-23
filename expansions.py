@@ -225,10 +225,6 @@ def _expand_passes(
     if not normalized_query:
         return [], []
 
-    # Every ontology off means nothing attributable survives. The graph would
-    # still hand back the unattributed nodes (nothing names them, so no toggle
-    # drops them), which reads as the switches doing nothing -- so skip it and
-    # run the query as typed.
     if set(disabled) >= ONTOLOGY_IDS:
         return [(normalized_query, 0, ())], [[]]
 
@@ -247,11 +243,10 @@ def _expand_passes(
     # Token-boundary punctuation can make every candidate miss; an extra pass keeps comma-owning labels anchored as typed.
     depunctuated = " ".join(s for w in normalized_query.split() if (s := w.strip(",;")))
 
-    # A hyphen inside a token hides the words either side of it: candidates come
-    # from whitespace splitting, so "sepsis-associated" is one candidate and only
-    # ever matches a graph term spelled exactly that way — "sepsis" is never
-    # tried, and expansion silently switches off. An extra pass, not in place, so
-    # hyphenated terms the graph does store ("scrna-seq") still anchor as typed.
+    # A hyphen inside a token hides the words on either side: candidates come
+    # from whitespace splitting, so "sepsis-associated" is one candidate and
+    # expansion can miss "sepsis". An extra pass leaves stored hyphenated graph
+    # terms anchored as typed.
     dehyphenated = " ".join(normalized_query.replace("-", " ").split())
 
     # The query as typed always leads, so variants[0] stays the user's own wording.
@@ -378,7 +373,7 @@ if __name__ == "__main__":
     assert _graph_norm("sc rna") == "scrna"
     assert _graph_norm("sc 1") == "sc 1"
 
-    # Stop words must never stand alone because terms such as OF are HGNC aliases, but phrases may contain them.
+    # Stop words must never stand alone because HGNC aliases include OF, but phrases may contain them.
     phrases = {
         p for p, _, _ in _generate_candidate_subphrases("atlas of liver".split())
     }
@@ -421,16 +416,15 @@ if __name__ == "__main__":
     assert expand_terms(d, "cd4/cd8") == ["cd4/cd8"]
     assert expand_terms(d, " , ; ") == [", ;"]
 
-    # A hyphen joining a graph term to a plain word must not switch expansion off:
-    # "nafld-associated" is one whitespace token, so "nafld" was never a candidate.
+    # A hyphen joining a graph term to a plain word still exposes the graph term.
+    # "nafld-associated" is one whitespace token.
     hyphenated = expand_terms(d, "nafld-associated")
     assert hyphenated[0] == "nafld-associated"  # the query as typed still leads
     assert "masld associated" in hyphenated
 
     # Candidates are looked up by graph key, so every surface form of an assay
-    # reaches the same node. Regression: the search path used to match on the raw
-    # phrase, so "scrna-seq" missed the stored "scrna seq" and that chunk was
-    # silently left unexpanded while extract_graph_terms still reported it found.
+    # reaches the same node. This keeps "scrna-seq" aligned with stored
+    # "scrna seq" and extract_graph_terms reporting.
     d.vocab["scrna seq"] = ["single cell rna sequencing"]
     for form in ("scrna seq", "scrna-seq", "scrnaseq", "scRNA-seq"):
         got = expand_terms(d, f"nafld {form}")
@@ -451,8 +445,7 @@ if __name__ == "__main__":
     assert _normalize_disabled(["MeSH,MONDO"]) == ["MeSH", "MONDO"]
     assert _normalize_disabled(["MeSH, MONDO, nope"]) == ["MeSH", "MONDO"]
 
-    # Switching every ontology off is no expansion at all, not expansion through
-    # whatever the toggles cannot reach.
+    # Switching every ontology off leaves the query as typed.
     assert expand_terms(d, "nafld liver", [o for o, _ in ONTOLOGIES]) == ["nafld liver"]
     assert expand_terms_explained(d, "nafld liver", ONTOLOGY_IDS)["chunks"] == []
 

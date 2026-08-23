@@ -237,11 +237,7 @@ from queries import (
     init_global_contributions_filters_sql,
     init_global_contributions_schema,
 )
-from boolean_query import (
-    is_boolean_query,
-    replace_query_hyphens,
-    to_tsquery_string,
-)
+from boolean_query import is_boolean_query, to_tsquery_string
 
 load_dotenv()
 
@@ -554,7 +550,7 @@ WITH combined AS (
 enriched_agg AS (
     SELECT study_accession AS accession,
         {_MAP_ENRICHED_AGG}
-    FROM ontology_samples_v4
+    FROM ontology_samples_v5
     GROUP BY study_accession
 )
 SELECT
@@ -1081,14 +1077,7 @@ def _build_publications(
 
 
 def _attach_organism_taxa(row: dict, cur) -> None:
-    """Pair each organism name with its NCBI taxon id.
-
-    The id belongs to the organism, not the study, so it lives once in the
-    organism_taxa table rather than being copied into every project row — see
-    seqout-ingestion/src/backfill/organism_taxa.py. Kept out of the project SQL
-    so a missing table degrades to "no taxids" instead of 500-ing every project
-    page before the lookup has been built.
-    """
+    """Pair each organism name with its NCBI taxon id."""
     names = [n for n in (row.get("organisms") or []) if isinstance(n, str) and n]
     if not names:
         row["organisms_with_taxa"] = []
@@ -2355,10 +2344,7 @@ def _compute_map_version(rows: list[dict]) -> str:
 
 
 def _assets_complete(version_dir: pathlib.Path) -> bool:
-    """Every file build_assets produces, present. The manifest alone isn't enough:
-    a build that dies between the JSON sidecars and the tiles (or the other way
-    round) leaves a dir that looks built, and the map then 404s on countries.json
-    forever — the version hash is stable, so nothing ever triggers a retry."""
+    """Every file build_assets produces."""
     if not (version_dir / "tiles" / "manifest.feather").exists():
         return False
     if not (version_dir / "countries.json").exists():
@@ -2369,9 +2355,7 @@ def _assets_complete(version_dir: pathlib.Path) -> bool:
 
 
 def _prune_old_map_versions(keep: str) -> None:
-    """Remove stale map-asset version dirs, keeping only `keep`. Best-effort, so
-    disk holds at most one version. Leaves the CURRENT pointer and any in-progress
-    `*.tmp` dirs alone (their names don't match the version pattern)."""
+    """Remove stale map-asset version dirs, keeping only `keep`."""
     try:
         entries = list(_MAP_ASSETS_DIR.iterdir())
     except OSError:
@@ -2625,6 +2609,11 @@ def _get_growth_data(mode: str, db: str | None = None) -> dict:
             del _growth_cache[key]
         _growth_cache[cache_key] = {"data": data, "built_at": now}
     return data
+
+
+def _replace_query_hyphens(q: str) -> str:
+    """Treat hyphens as word separators in search text."""
+    return q.replace("-", " ")
 
 
 _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -4371,7 +4360,7 @@ def search_geo(
     acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="geo")
     if acc_result is not None:
         return acc_result
-    return _search_geo_impl(request, replace_query_hyphens(q), cursor_rank, cursor_acc)
+    return _search_geo_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
@@ -4434,7 +4423,7 @@ def search_sra(
     acc_result = _try_accession_search(q, cursor_rank, cursor_acc, db_filter="sra")
     if acc_result is not None:
         return acc_result
-    return _search_sra_impl(request, replace_query_hyphens(q), cursor_rank, cursor_acc)
+    return _search_sra_impl(request, _replace_query_hyphens(q), cursor_rank, cursor_acc)
 
 
 def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
@@ -4489,7 +4478,7 @@ def search_suggest(
     q: str = Query(..., min_length=1, max_length=500),
 ):
     start = time.perf_counter()
-    search_q = replace_query_hyphens(q)
+    search_q = _replace_query_hyphens(q)
     suggestions = _get_suggestions(search_q)
     took_ms = (time.perf_counter() - start) * 1000
     result: dict = {"suggestions": suggestions, "took_ms": round(took_ms, 2)}
@@ -4989,7 +4978,7 @@ def search(
     # so treat it as an ordinary query.
     boolean_tsq = None
     if q and (structured or is_boolean_query(q)):
-        _tsq = to_tsquery_string(replace_query_hyphens(q, expand=not structured))
+        _tsq = to_tsquery_string(_replace_query_hyphens(q))
         if _tsq:
             boolean_tsq = _tsq
 
@@ -5015,7 +5004,7 @@ def search(
         return _autocorrect_search(
             request,
             filtered,
-            replace_query_hyphens(q, expand=not structured) if q else "",
+            _replace_query_hyphens(q) if q else "",
             boolean_tsq,
             rerun,
         )
@@ -5027,7 +5016,7 @@ def search(
         if acc_result is not None:
             return acc_result
 
-    original_q = replace_query_hyphens(q, expand=not structured)
+    original_q = _replace_query_hyphens(q)
     q = original_q
 
     # First-page unfiltered searches are cacheable (filtered/accession returned above).
@@ -5275,7 +5264,7 @@ def _search_filtered(
     boolean_tsq set -> boolean mode: FTS uses the literal to_tsquery (no Neo4j
     expansion), so filtered results match the boolean facet counts."""
     query_less = not q  # no FTS to narrow -> can scan broadly; bound its runtime
-    q = replace_query_hyphens(q) if q else ""
+    q = _replace_query_hyphens(q) if q else ""
     start = time.perf_counter()
     try:
         with pool.connection() as conn, conn.transaction():
@@ -5467,7 +5456,7 @@ def search_facets(
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     t0 = time.perf_counter()
-    nq = replace_query_hyphens(q, expand=not structured)
+    nq = _replace_query_hyphens(q)
     # Boolean/structured query -> count the literal to_tsquery so the header total
     # matches the boolean result list. Applies with db scope and sidebar filters
     # too (build_search_match_temp respects db; the total/facet builders apply the
@@ -5635,7 +5624,7 @@ def get_search_investigators(
     limit: int = Query(20, ge=1, le=MAX_COUNTRY_PIS),
 ):
     t0 = time.perf_counter()
-    nq = replace_query_hyphens(q, expand=not structured)
+    nq = _replace_query_hyphens(q)
     if not nq.strip():
         raise HTTPException(400, "q is required")
 
@@ -5822,7 +5811,7 @@ def get_project(
                     _attach_organism_taxa(row, cur)
                     if ENRICHMENT_ENABLED:
                         cur.execute(
-                            "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
+                            "SELECT EXISTS(SELECT 1 FROM ontology_samples_v5 WHERE study_accession = %s)"
                             " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                             " AS has_enriched",
                             (enrich_acc, enrich_acc),
@@ -8855,9 +8844,9 @@ def download_by_query(
     # corrected query it is displaying, so correcting again would be a no-op.
     boolean_tsq = None
     if q and (structured or is_boolean_query(q)):
-        if _tsq := to_tsquery_string(replace_query_hyphens(q, expand=not structured)):
+        if _tsq := to_tsquery_string(_replace_query_hyphens(q)):
             boolean_tsq = _tsq
-    q = replace_query_hyphens(q, expand=not structured) if q else ""
+    q = _replace_query_hyphens(q) if q else ""
 
     if boolean_tsq is not None:
         fts_q, q_variants = boolean_tsq, [boolean_tsq]
@@ -9767,7 +9756,7 @@ def search_structured(
     ),
 ):
     if q:
-        q = replace_query_hyphens(q)
+        q = _replace_query_hyphens(q)
 
     has_geo_filter = any(
         v is not None
@@ -12346,7 +12335,7 @@ MCP_EXCLUDED_OPERATION_IDS = {
 
 ENRICHMENT_OPERATION_IDS = {
     "search_enriched_samples",
-    # /disease/* is a rollup of ontology_samples_v4
+    # /disease/* is a rollup of ontology_samples_v5
     "get_disease_summary",
     "get_disease_facets",
     "get_disease_projects",

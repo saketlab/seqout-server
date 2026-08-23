@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import json
+import logging
 import os
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 
@@ -16,11 +18,18 @@ import beacon_queries as bq
 BEACON_ID = os.environ.get("BEACON_ID", "org.seqout.beacon")
 API_VERSION = "v2.2.0"
 BEACON_ROOT = os.environ.get("BEACON_ROOT", "/api/beacon")
+BEACON_PUBLIC_ROOT = os.environ.get(
+    "BEACON_PUBLIC_ROOT", f"https://seqout.org{BEACON_ROOT}"
+)
 ENVIRONMENT = os.environ.get("BEACON_ENVIRONMENT", "prod")
 DEFAULT_STATEMENT_TIMEOUT_MS = int(
     os.environ.get("BEACON_STATEMENT_TIMEOUT_MS", "15000")
 )
+logger = logging.getLogger(__name__)
+
 MAX_RECORD_LIMIT = 100
+GRANULARITIES = ("boolean", "count", "record")
+INCLUDE_RESULTSET_RESPONSES = ("ALL", "HIT", "MISS", "NONE")
 
 ORGANIZATION = {
     "id": "seqout",
@@ -32,14 +41,16 @@ ORGANIZATION = {
 }
 
 BEACON_DESCRIPTION = (
-    "Metadata Beacon over GEO/SRA/ENA/ArrayExpress/GSA. Not a variant beacon "
-    "(no g_variants/analyses). Individuals are a 1:1 projection of biosamples; "
-    "counts reflect subjects-per-sample, not distinct persons. GSA contributes "
-    "datasets and runs only (its samples are not ontology-enriched). Runs follow the "
-    "default schema; runDate is omitted (no performed-date exists in source metadata; "
-    "release dates are in info.releaseDate). Ontology filters are scoped to biosamples "
-    "and individuals; run-level ontology filtering is deferred. Runs are accessible by "
-    "id or browse."
+    "Metadata Beacon over GEO/SRA/ENA/ArrayExpress/GSA/DDBJ. Not a variant "
+    "beacon (no g_variants/analyses). Individuals are a 1:1 projection of "
+    "biosamples; counts reflect subjects-per-sample, not distinct persons. All "
+    "six sources contribute ontology-enriched biosamples. Runs use a seqout run "
+    "schema: the default model requires runDate, and no source archive records a "
+    "performed-date; info.releaseDate carries the archive release date instead. "
+    "Ontology filters are scoped to biosamples and individuals; run-level "
+    "ontology filtering is deferred. Runs are accessible by id or browse. Samples "
+    "whose accession is free text group under the 'other' result set. Unfiltered "
+    "totals are planner estimates, not exact counts."
 )
 
 SOURCES = [
@@ -63,7 +74,9 @@ SOURCES = [
     },
 ]
 
-_DEFAULT_MODEL = "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main/models/src/beacon-v2-default-model"
+_RUN_SCHEMA_PATH = "/schemas/seqoutRun.json"
+
+_DEFAULT_MODEL = "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main/models/json/beacon-v2-default-model"
 
 ENTRY_TYPES: dict[str, dict[str, Any]] = {
     "dataset": {
@@ -104,9 +117,9 @@ ENTRY_TYPES: dict[str, dict[str, Any]] = {
         "name": "Run",
         "partOfSpecification": "Beacon v2.0.0",
         "defaultSchema": {
-            "id": "ga4gh-beacon-run-v2.0.0",
-            "name": "Default schema for a sequencing run",
-            "referenceToSchemaDefinition": f"{_DEFAULT_MODEL}/runs/defaultSchema.json",
+            "id": "seqout-beacon-run-v1.0.0",
+            "name": "seqout schema for a sequencing run",
+            "referenceToSchemaDefinition": f"{BEACON_PUBLIC_ROOT}{_RUN_SCHEMA_PATH}",
         },
         "ontologyTermForThisType": {"id": "NCIT:C148088", "label": "Sequencing run"},
     },
@@ -139,6 +152,10 @@ class BeaconRequest:
         filters: list[dict],
         test_mode: bool,
         entry_id: str | None,
+        entry_type: str | None = None,
+        include_resultset_responses: str = "HIT",
+        requested_schemas: list | None = None,
+        requested_api_version: str = API_VERSION,
     ):
         self.granularity = granularity  # boolean | count | record
         self.skip = skip  # PAGE index (spec §2: OFFSET skip*limit)
@@ -146,6 +163,10 @@ class BeaconRequest:
         self.filters = filters
         self.test_mode = test_mode
         self.entry_id = entry_id
+        self.entry_type = entry_type
+        self.include_resultset_responses = include_resultset_responses
+        self.requested_schemas = requested_schemas or []
+        self.requested_api_version = requested_api_version
 
     @property
     def offset(self) -> int:
@@ -161,10 +182,27 @@ def _normalize_filters(raw: Any) -> list[dict]:
         raw = [t.strip() for t in raw.split(",") if t.strip()]
     for f in raw:
         if isinstance(f, str):
-            out.append({"id": f})
+            out.append(_parse_filter_token(f))
         elif isinstance(f, dict) and f.get("id"):
             out.append(f)
+        else:
+            raise BeaconQueryError(400, f"Beacon filter is not interpretable: {f!r}")
     return out
+
+
+_GET_FILTER_RE = re.compile(r"^([^<>!=]+?)\s*(<=|>=|!=|<>|[<>!=])\s*(.+)$")
+
+
+def _parse_filter_token(token: str) -> dict:
+    """GET filters are `id`, or `id<op>value` for the alphanumeric ones."""
+    m = _GET_FILTER_RE.match(token)
+    if not m:
+        return {"id": token}
+    return {
+        "id": m.group(1).strip().rstrip(":"),
+        "operator": m.group(2),
+        "value": m.group(3).strip(),
+    }
 
 
 def _nonneg_int(raw: Any, default: int, field: str) -> int:
@@ -174,10 +212,22 @@ def _nonneg_int(raw: Any, default: int, field: str) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        raise HTTPException(400, f"Beacon '{field}' must be a non-negative integer")
+        raise BeaconQueryError(400, f"Beacon '{field}' must be a non-negative integer")
     if value < 0:
-        raise HTTPException(400, f"Beacon '{field}' must be >= 0")
+        raise BeaconQueryError(400, f"Beacon '{field}' must be >= 0")
     return value
+
+
+_PATH_ENTRY_TYPE = {
+    "datasets": "dataset",
+    "biosamples": "biosample",
+    "individuals": "individual",
+    "runs": "run",
+}
+
+
+def _entry_type_for(path: str) -> str | None:
+    return _PATH_ENTRY_TYPE.get(path.rstrip("/").rsplit("/", 1)[-1])
 
 
 async def parse_request(request: Request, body: dict | None) -> BeaconRequest:
@@ -187,14 +237,37 @@ async def parse_request(request: Request, body: dict | None) -> BeaconRequest:
     granularity = (
         q.get("requestedGranularity") or qp.get("requestedGranularity") or "record"
     )
+    if granularity not in GRANULARITIES:
+        raise BeaconQueryError(
+            400,
+            f"Beacon 'requestedGranularity' must be one of "
+            f"{', '.join(sorted(GRANULARITIES))}",
+        )
     skip = _nonneg_int(pagination.get("skip", qp.get("skip")), 0, "skip")
-    limit = _nonneg_int(pagination.get("limit", qp.get("limit")), 10, "limit") or 10
-    if granularity == "record":
-        limit = min(limit, MAX_RECORD_LIMIT)
+    limit = _nonneg_int(pagination.get("limit", qp.get("limit")), 10, "limit")
+    if limit == 0:
+        limit = MAX_RECORD_LIMIT
+    limit = min(limit, MAX_RECORD_LIMIT)
     filters = _normalize_filters(q.get("filters") if body else qp.get("filters"))
-    test_mode = str(qp.get("testMode", "")).lower() == "true" or bool(
-        (body or {}).get("meta", {}).get("testMode")
+    body_meta = (body or {}).get("meta") or {}
+    test_mode = (
+        str(qp.get("testMode", "")).lower() == "true"
+        or bool(q.get("testMode") if isinstance(q, dict) else False)
+        or bool(body_meta.get("testMode"))
     )
+    requested_schemas = body_meta.get("requestedSchemas") or []
+    requested_api_version = body_meta.get("apiVersion") or API_VERSION
+    include_rs = (
+        (q.get("includeResultsetResponses") if isinstance(q, dict) else None)
+        or qp.get("includeResultsetResponses")
+        or "HIT"
+    ).upper()
+    if include_rs not in INCLUDE_RESULTSET_RESPONSES:
+        raise BeaconQueryError(
+            400,
+            "Beacon 'includeResultsetResponses' must be one of "
+            + ", ".join(INCLUDE_RESULTSET_RESPONSES),
+        )
     entry_id = qp.get("id") or (q.get("id") if isinstance(q, dict) else None)
     return BeaconRequest(
         granularity=granularity,
@@ -203,13 +276,17 @@ async def parse_request(request: Request, body: dict | None) -> BeaconRequest:
         filters=filters,
         test_mode=test_mode,
         entry_id=entry_id,
+        entry_type=_entry_type_for(request.url.path),
+        include_resultset_responses=include_rs,
+        requested_schemas=requested_schemas,
+        requested_api_version=requested_api_version,
     )
 
 
 def _received_summary(req: BeaconRequest | None) -> dict:
     s: dict[str, Any] = {
-        "apiVersion": API_VERSION,
-        "requestedSchemas": [],
+        "apiVersion": req.requested_api_version if req else API_VERSION,
+        "requestedSchemas": req.requested_schemas if req else [],
         "pagination": {
             "skip": req.skip if req else 0,
             "limit": req.limit if req else 0,
@@ -219,7 +296,39 @@ def _received_summary(req: BeaconRequest | None) -> dict:
     if req:
         s["filters"] = [f.get("id") for f in req.filters]
         s["testMode"] = req.test_mode
+        s["includeResultsetResponses"] = req.include_resultset_responses
     return s
+
+
+class BeaconQueryError(Exception):
+    """A bad request, rendered as BeaconErrorResponse."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def beacon_error(
+    exc: BeaconQueryError, req: BeaconRequest | None = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status,
+        content={
+            "meta": build_meta("boolean", req),
+            "error": {"errorCode": exc.status, "errorMessage": exc.message},
+        },
+    )
+
+
+def _schemas_for(entry_type: str | None) -> list[dict]:
+    """returnedSchemas entries for the entity this response carries."""
+    types = [entry_type] if entry_type else list(ENTRY_TYPES)
+    return [
+        {"entityType": e, "schema": ENTRY_TYPES[e]["defaultSchema"]["id"]}
+        for e in types
+        if e in ENTRY_TYPES
+    ]
 
 
 def build_meta(returned_granularity: str, req: BeaconRequest | None = None) -> dict:
@@ -227,7 +336,7 @@ def build_meta(returned_granularity: str, req: BeaconRequest | None = None) -> d
         "beaconId": BEACON_ID,
         "apiVersion": API_VERSION,
         "returnedGranularity": returned_granularity,
-        "returnedSchemas": [],
+        "returnedSchemas": _schemas_for(req.entry_type if req else None),
         "receivedRequestSummary": _received_summary(req),
     }
 
@@ -285,6 +394,38 @@ beacon_router = APIRouter(
 )
 
 
+RUN_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": f"{BEACON_PUBLIC_ROOT}{_RUN_SCHEMA_PATH}",
+    "title": "seqout Beacon run",
+    "description": (
+        "The Beacon v2 default run model with id as the only required field. "
+        "Source archives record a release date, carried in info.releaseDate, "
+        "and no performed-date, so runDate is absent. biosampleId is emitted "
+        "when the archive links one."
+    ),
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "biosampleId": {"type": "string"},
+        "individualId": {"type": "string"},
+        "runDate": {"type": "string", "format": "date"},
+        "libraryStrategy": {"type": "string"},
+        "librarySelection": {"type": "string"},
+        "libraryLayout": {"type": "string"},
+        "platform": {"type": "string"},
+        "info": {"type": "object"},
+    },
+    "required": ["id"],
+    "additionalProperties": True,
+}
+
+
+@beacon_router.get(_RUN_SCHEMA_PATH)
+def run_schema() -> dict:
+    return RUN_SCHEMA
+
+
 def _info_payload() -> dict:
     return {
         "meta": build_meta("record"),
@@ -329,7 +470,9 @@ def configuration() -> dict:
         "meta": build_meta("record"),
         "response": {
             "$schema": "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main/framework/json/configuration/beaconConfigurationSchema.json",
-            "maturityAttributes": {"productionStatus": "DEV"},
+            "maturityAttributes": {
+                "productionStatus": "PROD" if ENVIRONMENT == "prod" else "DEV"
+            },
             "securityAttributes": {
                 "defaultGranularity": "record",
                 "securityLevels": ["PUBLIC"],
@@ -348,20 +491,23 @@ def entry_types() -> dict:
 def beacon_map() -> dict:
     def ep(path: str) -> dict:
         return {
-            "rootUrl": f"{BEACON_ROOT}{path}",
-            "singleEntryUrl": f"{BEACON_ROOT}{path}?id={{id}}",
-            "openAPIEndpointsDefinition": None,
+            "rootUrl": f"{BEACON_PUBLIC_ROOT}{path}",
+            "singleEntryUrl": f"{BEACON_PUBLIC_ROOT}{path}?id={{id}}",
         }
 
     return {
         "meta": build_meta("record"),
         "response": {
+            "$schema": (
+                "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main"
+                "/framework/json/configuration/beaconMapSchema.json"
+            ),
             "endpointSets": {
                 "dataset": {"entryType": "dataset", **ep("/datasets")},
                 "biosample": {"entryType": "biosample", **ep("/biosamples")},
                 "individual": {"entryType": "individual", **ep("/individuals")},
                 "run": {"entryType": "run", **ep("/runs")},
-            }
+            },
         },
     }
 
@@ -395,6 +541,17 @@ _ONTOLOGY_RESOURCES = [
 _filtering_terms_cache: list[dict] | None = None
 
 
+_AGE_FILTERING_TERMS = [
+    {
+        "type": "alphanumeric",
+        "id": _id,
+        "label": "age at collection (ISO8601 duration, e.g. P70Y)",
+        "scopes": ["biosample", "individual"],
+    }
+    for _id in ("EFO:0004847", "PATO:0000011", "age")
+]
+
+
 def _load_filtering_terms() -> list[dict]:
     """Read the precomputed beacon_filtering_terms table (built offline by
     pysradb-ingestion/enrichment/build_ontology_closure.py); cached in-process."""
@@ -412,6 +569,7 @@ def _load_filtering_terms() -> list[dict]:
         if r["vals"]:
             t["values"] = r["vals"]
         terms.append(t)
+    terms.extend(_AGE_FILTERING_TERMS)
     return terms
 
 
@@ -440,10 +598,10 @@ def _dataset_record(source: dict) -> dict:
 
 
 async def _query_datasets(request: Request, body: dict | None) -> dict:
-    req = await parse_request(request, body)
-    # datasets are the 5 source archives; they carry no ontology facets, so a
-    # sample/biosample filter can't match one. Return an honest empty set rather
-    # than silently ignoring filters and reporting exists=true / all 5.
+    try:
+        req = await parse_request(request, body)
+    except BeaconQueryError as exc:
+        return beacon_error(exc)
     if req.filters:
         rows: list = []
     else:
@@ -539,23 +697,64 @@ def biosample_record(row: dict) -> dict:
     return rec
 
 
+_SOURCE_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("GEO", ("GSM",)),
+    ("ArrayExpress", ("E-",)),
+    ("GSA", ("HRS", "CRS", "SAMC")),
+    ("DDBJ", ("DR", "SAMD")),
+    ("SRA", ("SR", "SAMN")),
+    ("ENA", ("ER", "SAME")),
+)
+
+
 def _source_of(sample: str) -> str:
-    if sample.startswith("GSM"):
-        return "GEO"
-    if sample.startswith("DR"):
-        return "DDBJ"
-    if sample.startswith("SR"):
-        return "SRA"
-    if sample.startswith("ER"):
-        return "ENA"
-    if sample.startswith(("HRS", "CRS", "SAMC")):
-        return "GSA"
+    for name, prefixes in _SOURCE_PREFIXES:
+        if sample.startswith(prefixes):
+            return name
     return "other"
+
+
+def _source_case_sql() -> str:
+    arms = " ".join(
+        "WHEN "
+        + " OR ".join(f"sample LIKE '{pfx}%'" for pfx in prefixes)
+        + f" THEN '{name}'"
+        for name, prefixes in _SOURCE_PREFIXES
+    )
+    return f"CASE {arms} ELSE 'other' END"
+
+
+_unfiltered_source_totals: dict[str, int] | None = None
+
+
+def _sample_totals_by_source(where: str, params: list) -> dict[str, int] | None:
+    """Per-source match counts, giving each resultSet its own size.
+
+    Returns None when the count is unavailable; the caller then falls back to
+    page counts. The unfiltered browse groups the whole table, so it is cached
+    on first use and a timeout returns None."""
+    global _unfiltered_source_totals
+    unfiltered = where == "TRUE"
+    if unfiltered and _unfiltered_source_totals is not None:
+        return _unfiltered_source_totals
+    sql = (
+        f"SELECT {_source_case_sql()} AS src, count(*) AS n "  # noqa: S608
+        f"FROM ontology_samples_v5 WHERE {where} GROUP BY 1"
+    )
+    try:
+        rows = query(sql, tuple(params))
+    except Exception:  # noqa: BLE001 - a slow count must not fail the query
+        logger.warning("per-source totals unavailable; falling back to page counts")
+        return None
+    totals = {r["src"]: int(r["n"]) for r in rows}
+    if unfiltered:
+        _unfiltered_source_totals = totals
+    return totals
 
 
 def _sample_exists(where: str, params: list) -> bool:
     rows = query(
-        f"SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE {where}) AS e",
+        f"SELECT EXISTS(SELECT 1 FROM ontology_samples_v5 WHERE {where}) AS e",
         tuple(params),
     )
     return bool(rows[0]["e"])
@@ -566,33 +765,46 @@ def _sample_total(where: str, params: list) -> int:
     if where == "TRUE":
         rows = query(
             "SELECT GREATEST(reltuples, 0)::bigint AS n FROM pg_class "
-            "WHERE relname = 'ontology_samples_v4'"
+            "WHERE relname = 'ontology_samples_v5'"
         )
         n = int(rows[0]["n"]) if rows else 0
         if n == 0:  # stats missing (pre-ANALYZE) -> exact count; never return -1
-            rows = query("SELECT count(*) AS n FROM ontology_samples_v4")
+            rows = query("SELECT count(*) AS n FROM ontology_samples_v5")
             n = int(rows[0]["n"])
         return n
     rows = query(
-        f"SELECT count(*) AS n FROM ontology_samples_v4 WHERE {where}", tuple(params)
+        f"SELECT count(*) AS n FROM ontology_samples_v5 WHERE {where}", tuple(params)
     )
     return int(rows[0]["n"])
 
 
-def _grouped_by_source(page: list, mapper) -> list[dict]:
-    """Group the returned page by source into resultSets."""
+def _grouped_by_source(
+    page: list, mapper, totals: dict[str, int] | None = None, include: str = "HIT"
+) -> list[dict]:
+    """Group the page by source. resultsCount is the size of the whole set, so
+    totals covers sources with no record on this page."""
     by_src: dict[str, list] = {}
     for r in page:
         by_src.setdefault(_source_of(r["sample"]), []).append(mapper(r))
     set_type = "biosample" if mapper is biosample_record else "individual"
-    return [
-        result_set(src, set_type, recs, len(recs))
-        for src, recs in sorted(by_src.items())
-    ]
+    names = sorted(set(by_src) | set(totals or {}))
+    sets = []
+    for src in names:
+        recs = by_src.get(src, [])
+        count = (totals or {}).get(src, len(recs))
+        if include == "HIT" and count == 0:
+            continue
+        if include == "MISS" and count > 0:
+            continue
+        sets.append(result_set(src, set_type, [] if include == "NONE" else recs, count))
+    return sets
 
 
 async def _query_biosamples(request: Request, body: dict | None) -> dict:
-    req = await parse_request(request, body)
+    try:
+        req = await parse_request(request, body)
+    except BeaconQueryError as exc:
+        return beacon_error(exc)
     if req.entry_id:
         where, params = "sample = %s", [req.entry_id]
     else:
@@ -605,11 +817,18 @@ async def _query_biosamples(request: Request, body: dict | None) -> dict:
         return count_response(total, req)
 
     page = query(
-        f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v4 WHERE {where} "
+        f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v5 WHERE {where} "
         f"ORDER BY study_accession, sample OFFSET %s LIMIT %s",
         tuple(params) + (req.offset, req.limit),
     )
-    return resultsets_response(_grouped_by_source(page, biosample_record), total, req)
+    totals = _sample_totals_by_source(where, params)
+    return resultsets_response(
+        _grouped_by_source(
+            page, biosample_record, totals, req.include_resultset_responses
+        ),
+        total,
+        req,
+    )
 
 
 @beacon_router.get("/biosamples")
@@ -655,7 +874,10 @@ def individual_record(row: dict) -> dict:
 
 
 async def _query_individuals(request: Request, body: dict | None) -> dict:
-    req = await parse_request(request, body)
+    try:
+        req = await parse_request(request, body)
+    except BeaconQueryError as exc:
+        return beacon_error(exc)
     if req.entry_id:
         # individual id is IND-<sample>; strip prefix to look up the biosample row
         sample = req.entry_id[4:] if req.entry_id.startswith("IND-") else req.entry_id
@@ -670,11 +892,18 @@ async def _query_individuals(request: Request, body: dict | None) -> dict:
         return count_response(total, req)
 
     page = query(
-        f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v4 WHERE {where} "
+        f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v5 WHERE {where} "
         f"ORDER BY study_accession, sample OFFSET %s LIMIT %s",
         tuple(params) + (req.offset, req.limit),
     )
-    return resultsets_response(_grouped_by_source(page, individual_record), total, req)
+    totals = _sample_totals_by_source(where, params)
+    return resultsets_response(
+        _grouped_by_source(
+            page, individual_record, totals, req.include_resultset_responses
+        ),
+        total,
+        req,
+    )
 
 
 @beacon_router.get("/individuals")
@@ -720,7 +949,9 @@ def _run_source(rid: str) -> str:
         return "ENA"
     if rid.startswith(("CRR", "HRR")):
         return "GSA"
-    return "SRA"  # SRR / DRR
+    if rid.startswith("DRR"):
+        return "DDBJ"
+    return "SRA"
 
 
 def _run_record(row: dict, source: str) -> dict:
@@ -728,7 +959,7 @@ def _run_record(row: dict, source: str) -> dict:
     rec: dict[str, Any] = {"id": row["id"]}
     biosample = (
         (row.get("samples") or [None])[0]
-        if source == "SRA"
+        if source in ("SRA", "DDBJ")  # DDBJ is mirrored into the SRA tables
         else row.get("sample_accession")
     )
     if biosample:
@@ -780,7 +1011,10 @@ def _run_total() -> int:
 
 
 async def _query_runs(request: Request, body: dict | None) -> dict:
-    req = await parse_request(request, body)
+    try:
+        req = await parse_request(request, body)
+    except BeaconQueryError as exc:
+        return beacon_error(exc)
 
     if req.entry_id:
         rec = _run_by_id(req.entry_id)
@@ -824,3 +1058,59 @@ async def runs_get(request: Request) -> dict:
 @beacon_router.post("/runs")
 async def runs_post(request: Request, body: dict = Body(default=None)) -> dict:
     return await _query_runs(request, body)
+
+
+if __name__ == "__main__":
+    import json as _json
+
+    assert GRANULARITIES == ("boolean", "count", "record")
+    assert INCLUDE_RESULTSET_RESPONSES == ("ALL", "HIT", "MISS", "NONE")
+
+    try:
+        _normalize_filters([{"bad": 1}])
+        raise AssertionError("malformed filter was accepted")
+    except BeaconQueryError:
+        pass
+
+    assert _normalize_filters(["sex!=Male"])[0] == {
+        "id": "sex",
+        "operator": "!=",
+        "value": "Male",
+    }
+    assert _normalize_filters(["age:>P70Y"])[0]["id"] == "age"
+    assert _normalize_filters(["UBERON:0002048"]) == [{"id": "UBERON:0002048"}]
+
+    assert _run_source("DRR1") == "DDBJ"  # DDBJ, not SRA
+    assert _source_of("DRS1") == "DDBJ"
+    assert "WHEN sample LIKE 'GSM%' THEN 'GEO'" in _source_case_sql()
+
+    _err = _json.loads(beacon_error(BeaconQueryError(400, "x")).body)
+    assert sorted(_err) == ["error", "meta"], _err
+    assert _err["error"]["errorCode"] == 400
+
+    assert _schemas_for("run") == [
+        {"entityType": "run", "schema": "seqout-beacon-run-v1.0.0"}
+    ]
+    assert "/models/json/" in _DEFAULT_MODEL  # the src/ tree holds YAML
+    assert ENTRY_TYPES["run"]["defaultSchema"][
+        "referenceToSchemaDefinition"
+    ].startswith("https://")
+    assert "runDate" not in RUN_SCHEMA["required"]
+
+    _page = [{"sample": "GSM1"}, {"sample": "SRS1"}]
+    _sets = _grouped_by_source(_page, biosample_record, {"GEO": 500, "SRA": 20}, "HIT")
+    assert [(s["id"], s["resultsCount"]) for s in _sets] == [("GEO", 500), ("SRA", 20)]
+    assert (
+        _grouped_by_source(_page, biosample_record, {"ENA": 0}, "MISS")[0]["id"]
+        == "ENA"
+    )
+    assert (
+        _grouped_by_source(_page, biosample_record, {"GEO": 5}, "NONE")[0]["results"]
+        == []
+    )
+    assert (
+        len(_grouped_by_source(_page, biosample_record, {"GEO": 5, "ENA": 0}, "ALL"))
+        == 3
+    )
+
+    print("beacon self-checks pass")

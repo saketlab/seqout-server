@@ -1,15 +1,7 @@
 """Deep-dive ontology-hierarchy queries for the search page.
 
-Pure Neo4j helpers with no web framework and no Postgres dependency, so they can
-be tested in isolation (the rest of main.py needs a live Postgres to import).
-The FastAPI routes in main.py are thin wrappers over these two functions.
-
-Graph shape: (:Term {name}) nodes joined by MAPS_TO (synonym short->long),
-SUBCLASS_OF and PART_OF (child->parent). "Children" of a term = everything
-pointing at it OR at any of its MAPS_TO synonyms via SUBCLASS_OF/PART_OF, so
-synonyms are transparent to the caller. SUBCLASS_OF and PART_OF are merged.
-Term.name is stored lowercase, so we only ever toLower() the parameter side
-(never t.name) to keep the term_name index usable.
+Pure Neo4j helpers stay importable before main.py opens Postgres.
+Lower only the query parameter so the term_name index stays usable.
 """
 
 from __future__ import annotations
@@ -55,9 +47,8 @@ ORDER BY name
 
 
 # Everything known about one term: its own xrefs, its MAPS_TO synonym cluster
-# (each with xrefs), within `hops` hops. `hops` is interpolated, never
-# parameterised — Cypher does not accept a parameter as a variable-length bound,
-# so callers MUST pass a validated int (see _HOPS_MAX).
+# (each with xrefs), within `hops` hops. Cypher requires a literal
+# variable-length bound, so callers MUST pass a validated int (see _HOPS_MAX).
 _CYPHER_TERM = """
 MATCH (start:Term) WHERE start.name = toLower($term)
 OPTIONAL MATCH (start)-[:MAPS_TO*1..%d]-(syn:Term)
