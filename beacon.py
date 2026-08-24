@@ -6,6 +6,7 @@ import re
 import json
 import logging
 import os
+import pathlib
 from typing import Any
 
 from fastapi import APIRouter, Body, Request
@@ -394,31 +395,26 @@ beacon_router = APIRouter(
 )
 
 
-RUN_SCHEMA = {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "$id": f"{BEACON_PUBLIC_ROOT}{_RUN_SCHEMA_PATH}",
-    "title": "seqout Beacon run",
-    "description": (
-        "The Beacon v2 default run model with id as the only required field. "
-        "Source archives record a release date, carried in info.releaseDate, "
-        "and no performed-date, so runDate is absent. biosampleId is emitted "
-        "when the archive links one."
-    ),
-    "type": "object",
-    "properties": {
-        "id": {"type": "string"},
-        "biosampleId": {"type": "string"},
-        "individualId": {"type": "string"},
-        "runDate": {"type": "string", "format": "date"},
-        "libraryStrategy": {"type": "string"},
-        "librarySelection": {"type": "string"},
-        "libraryLayout": {"type": "string"},
-        "platform": {"type": "string"},
-        "info": {"type": "object"},
-    },
-    "required": ["id"],
-    "additionalProperties": True,
-}
+_RUN_SCHEMA_FILE = (
+    pathlib.Path(__file__).parent / "schemas/beacon-v2.2.0/custom/seqoutRun.json"
+)
+_FRAMEWORK_REF = (
+    "https://raw.githubusercontent.com/ga4gh-beacon/beacon-v2/main"
+    "/framework/json/common/ontologyTerm.json"
+)
+
+
+def _load_run_schema() -> dict:
+    """Serve the schema CI validates against, so the two cannot disagree."""
+    schema = json.loads(_RUN_SCHEMA_FILE.read_text())
+    schema["$id"] = f"{BEACON_PUBLIC_ROOT}{_RUN_SCHEMA_PATH}"
+    ref = schema.get("properties", {}).get("platformModel", {}).get("$ref")
+    if ref and ref.startswith(".."):
+        schema["properties"]["platformModel"]["$ref"] = _FRAMEWORK_REF
+    return schema
+
+
+RUN_SCHEMA = _load_run_schema()
 
 
 @beacon_router.get(_RUN_SCHEMA_PATH)
@@ -659,7 +655,6 @@ def biosample_record(row: dict) -> dict:
     rec: dict[str, Any] = {
         "id": row["sample"],
         "individualId": individual_id_for(row["sample"]),
-        # required
         "biosampleStatus": (
             {"id": "EFO:0009655", "label": "abnormal sample"}
             if is_abnormal
@@ -677,7 +672,7 @@ def biosample_record(row: dict) -> dict:
     if is_abnormal:
         rec["histologicalDiagnosis"] = disease_term
         rec["diseases"] = [{"diseaseCode": disease_term}]
-    info: dict[str, Any] = {"source": _source_of(row["sample"])}
+    info: dict[str, Any] = {"source": _source_of(row.get("study_accession"))}
     for key, col in (("organism", "organism"), ("taxid", "taxid")):
         if row.get(col):
             info[key] = row[col]
@@ -698,55 +693,70 @@ def biosample_record(row: dict) -> dict:
 
 
 _SOURCE_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("GEO", ("GSM",)),
+    ("GEO", ("GSE",)),
+    ("DDBJ", ("E-GEAD", "DR")),
+    ("GSA", ("CR", "HR")),
     ("ArrayExpress", ("E-",)),
-    ("GSA", ("HRS", "CRS", "SAMC")),
-    ("DDBJ", ("DR", "SAMD")),
-    ("SRA", ("SR", "SAMN")),
-    ("ENA", ("ER", "SAME")),
+    ("SRA", ("SR",)),
+    ("ENA", ("ER",)),
 )
 
 
-def _source_of(sample: str) -> str:
+def _source_of(study: str | None) -> str:
     for name, prefixes in _SOURCE_PREFIXES:
-        if sample.startswith(prefixes):
+        if study and study.startswith(prefixes):
             return name
     return "other"
 
 
-def _source_case_sql() -> str:
-    arms = " ".join(
-        "WHEN "
-        + " OR ".join(f"sample LIKE '{pfx}%'" for pfx in prefixes)
-        + f" THEN '{name}'"
-        for name, prefixes in _SOURCE_PREFIXES
-    )
-    return f"CASE {arms} ELSE 'other' END"
+def _source_filters_sql() -> str:
+    """count(*) FILTER per source, and the grand total in the same pass.
+
+    GROUP BY on a LIKE chain gives the planner no group estimate, so it plans a
+    spilling HashAggregate. FILTER keeps it to one aggregate node.
+    """
+    parts = [
+        "count(*) FILTER (WHERE "
+        + " OR ".join(f"study_accession LIKE '{p}%'" for p in prefixes)
+        + f") AS src_{i}"
+        for i, (_, prefixes) in enumerate(_SOURCE_PREFIXES)
+    ]
+    return ", ".join([*parts, "count(*) AS total"])
 
 
 _unfiltered_source_totals: dict[str, int] | None = None
+_UNFILTERED_FAILED = "failed"
 
 
 def _sample_totals_by_source(where: str, params: list) -> dict[str, int] | None:
-    """Per-source match counts, giving each resultSet its own size.
+    """Per-source match counts plus "_total", giving each resultSet its own size.
 
     Returns None when the count is unavailable; the caller then falls back to
-    page counts. The unfiltered browse groups the whole table, so it is cached
-    on first use and a timeout returns None."""
+    page counts. The unfiltered browse aggregates the whole table, so both its
+    result and its failure are cached.
+    """
     global _unfiltered_source_totals
     unfiltered = where == "TRUE"
     if unfiltered and _unfiltered_source_totals is not None:
-        return _unfiltered_source_totals
+        cached = _unfiltered_source_totals
+        return None if cached == _UNFILTERED_FAILED else cached
     sql = (
-        f"SELECT {_source_case_sql()} AS src, count(*) AS n "  # noqa: S608
-        f"FROM ontology_samples_v5 WHERE {where} GROUP BY 1"
+        f"SELECT {_source_filters_sql()} "  # noqa: S608 - names come from a constant
+        f"FROM ontology_samples_v5 WHERE {where}"
     )
     try:
         rows = query(sql, tuple(params))
     except Exception:  # noqa: BLE001 - a slow count must not fail the query
         logger.warning("per-source totals unavailable; falling back to page counts")
+        if unfiltered:
+            _unfiltered_source_totals = _UNFILTERED_FAILED
         return None
-    totals = {r["src"]: int(r["n"]) for r in rows}
+    row = rows[0] if rows else {}
+    totals = {
+        name: int(row.get(f"src_{i}") or 0)
+        for i, (name, _) in enumerate(_SOURCE_PREFIXES)
+    }
+    totals["_total"] = int(row.get("total") or 0)
     if unfiltered:
         _unfiltered_source_totals = totals
     return totals
@@ -761,19 +771,19 @@ def _sample_exists(where: str, params: list) -> bool:
 
 
 def _sample_total(where: str, params: list) -> int:
-    """Total matching biosamples; unfiltered uses a fast reltuples estimate (full 13.6M count too slow), filtered/id an exact count."""
+    """Total matching biosamples. The unfiltered browse uses the reltuples
+    estimate; counting the whole table per request is too slow."""
     if where == "TRUE":
         rows = query(
             "SELECT GREATEST(reltuples, 0)::bigint AS n FROM pg_class "
             "WHERE relname = 'ontology_samples_v5'"
         )
         n = int(rows[0]["n"]) if rows else 0
-        if n == 0:  # stats missing (pre-ANALYZE) -> exact count; never return -1
-            rows = query("SELECT count(*) AS n FROM ontology_samples_v5")
-            n = int(rows[0]["n"])
-        return n
+        if n:
+            return n
     rows = query(
-        f"SELECT count(*) AS n FROM ontology_samples_v5 WHERE {where}", tuple(params)
+        f"SELECT count(*) AS n FROM ontology_samples_v5 WHERE {where}",  # noqa: S608
+        tuple(params),
     )
     return int(rows[0]["n"])
 
@@ -785,9 +795,9 @@ def _grouped_by_source(
     totals covers sources with no record on this page."""
     by_src: dict[str, list] = {}
     for r in page:
-        by_src.setdefault(_source_of(r["sample"]), []).append(mapper(r))
+        by_src.setdefault(_source_of(r.get("study_accession")), []).append(mapper(r))
     set_type = "biosample" if mapper is biosample_record else "individual"
-    names = sorted(set(by_src) | set(totals or {}))
+    names = sorted((set(by_src) | set(totals or {})) - {"_total"})
     sets = []
     for src in names:
         recs = by_src.get(src, [])
@@ -812,9 +822,8 @@ async def _query_biosamples(request: Request, body: dict | None) -> dict:
 
     if req.granularity == "boolean":
         return boolean_response(_sample_exists(where, params), req)
-    total = _sample_total(where, params)
     if req.granularity == "count":
-        return count_response(total, req)
+        return count_response(_sample_total(where, params), req)
 
     page = query(
         f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v5 WHERE {where} "
@@ -826,7 +835,7 @@ async def _query_biosamples(request: Request, body: dict | None) -> dict:
         _grouped_by_source(
             page, biosample_record, totals, req.include_resultset_responses
         ),
-        total,
+        totals["_total"] if totals else _sample_total(where, params),
         req,
     )
 
@@ -864,7 +873,7 @@ def individual_record(row: dict) -> dict:
     if disease_term and disease_txt not in _NORMAL_DISEASE:
         rec["diseases"] = [{"diseaseCode": disease_term}]
     info: dict[str, Any] = {
-        "source": _source_of(row["sample"]),
+        "source": _source_of(row.get("study_accession")),
         "derivedFromBiosample": row["sample"],
     }
     if row.get("organism"):
@@ -887,9 +896,8 @@ async def _query_individuals(request: Request, body: dict | None) -> dict:
 
     if req.granularity == "boolean":
         return boolean_response(_sample_exists(where, params), req)
-    total = _sample_total(where, params)
     if req.granularity == "count":
-        return count_response(total, req)
+        return count_response(_sample_total(where, params), req)
 
     page = query(
         f"SELECT {bq.BIOSAMPLE_COLUMNS} FROM ontology_samples_v5 WHERE {where} "
@@ -901,7 +909,7 @@ async def _query_individuals(request: Request, body: dict | None) -> dict:
         _grouped_by_source(
             page, individual_record, totals, req.include_resultset_responses
         ),
-        total,
+        totals["_total"] if totals else _sample_total(where, params),
         req,
     )
 
@@ -1081,8 +1089,12 @@ if __name__ == "__main__":
     assert _normalize_filters(["UBERON:0002048"]) == [{"id": "UBERON:0002048"}]
 
     assert _run_source("DRR1") == "DDBJ"  # DDBJ, not SRA
-    assert _source_of("DRS1") == "DDBJ"
-    assert "WHEN sample LIKE 'GSM%' THEN 'GEO'" in _source_case_sql()
+    assert _source_of("DRP1") == "DDBJ"
+    assert "study_accession LIKE 'GSE%'" in _source_filters_sql()
+    assert "count(*) AS total" in _source_filters_sql()
+    assert _source_of("E-GEAD-1") == "DDBJ"  # GEA, before the ArrayExpress E- rule
+    assert _source_of("E-MTAB-1") == "ArrayExpress"
+    assert _source_of(None) == "other"
 
     _err = _json.loads(beacon_error(BeaconQueryError(400, "x")).body)
     assert sorted(_err) == ["error", "meta"], _err
@@ -1097,20 +1109,22 @@ if __name__ == "__main__":
     ].startswith("https://")
     assert "runDate" not in RUN_SCHEMA["required"]
 
-    _page = [{"sample": "GSM1"}, {"sample": "SRS1"}]
-    _sets = _grouped_by_source(_page, biosample_record, {"GEO": 500, "SRA": 20}, "HIT")
+    _page = [
+        {"sample": "GSM1", "study_accession": "GSE1"},
+        {"sample": "SRS1", "study_accession": "SRP1"},
+    ]
+    _totals = {"GEO": 500, "SRA": 20, "ENA": 0, "_total": 520}
+    _sets = _grouped_by_source(_page, biosample_record, _totals, "HIT")
     assert [(s["id"], s["resultsCount"]) for s in _sets] == [("GEO", 500), ("SRA", 20)]
-    assert (
-        _grouped_by_source(_page, biosample_record, {"ENA": 0}, "MISS")[0]["id"]
-        == "ENA"
+    assert [
+        s["id"] for s in _grouped_by_source(_page, biosample_record, _totals, "MISS")
+    ] == ["ENA"]
+    assert all(
+        not s["results"]
+        for s in _grouped_by_source(_page, biosample_record, _totals, "NONE")
     )
-    assert (
-        _grouped_by_source(_page, biosample_record, {"GEO": 5}, "NONE")[0]["results"]
-        == []
-    )
-    assert (
-        len(_grouped_by_source(_page, biosample_record, {"GEO": 5, "ENA": 0}, "ALL"))
-        == 3
-    )
+    assert len(_grouped_by_source(_page, biosample_record, _totals, "ALL")) == 3
+    # _total rides in the same row as the sources; it is never a resultSet
+    assert "_total" not in [s["id"] for s in _sets]
 
     print("beacon self-checks pass")

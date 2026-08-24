@@ -1054,7 +1054,7 @@ def _build_publications(
     pmids: list[str], pubmed_map: dict[str, dict], flat_row: dict | None
 ) -> list[dict] | None:
     """One entry per resolved pmid (all of them, so multi-publication studies
-    show every paper). Each pmid: rich details from pubmed_metadata → flat
+    show every paper). Each pmid: rich details from pubmed_metadata, then flat
     columns / pmid-only stub. When there are no pmids, fall back to a
     flat-columns-only entry. Returns None when there's nothing to show.
 
@@ -2203,15 +2203,15 @@ def _etag_matches(if_none_match: str | None, etag: str) -> bool:
 
 
 def _level_num(level: str) -> int:
-    """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse↔fine)."""
+    """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse to fine)."""
     digits = "".join(ch for ch in level if ch.isdigit())
     return int(digits) if digits else 0
 
 
 def _get_cluster_labels() -> tuple[list[dict], list[str]]:
-    """Load cluster_labels once, cached (cheap — a few thousand rows). Returns
-    (labels, levels) with levels sorted finest→coarsest (cluster_l0 … cluster_lN,
-    discovered at runtime — the layer count changes when re-clustered)."""
+    """Load cluster_labels once, cached. Returns (labels, levels) with levels
+    sorted finest to coarsest (cluster_l0 … cluster_lN, discovered at runtime:
+    the layer count changes when re-clustered)."""
     with _clusters_cache_lock:
         if _clusters_cache.get("labels") is not None:
             return _clusters_cache["labels"], _clusters_cache["levels"]
@@ -2228,7 +2228,7 @@ def _get_cluster_labels() -> tuple[list[dict], list[str]]:
 
 
 def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
-    """Load the full map point set (heavy — ~1M rows) plus cluster labels, cached.
+    """Load the full map point set plus cluster labels, cached.
     Returns (rows, labels, levels). Only the tile builder needs the points; the
     label-only consumers use _get_cluster_labels."""
     with _map_data_cache_lock:
@@ -2279,8 +2279,8 @@ def _label_font_pt(level: str, levels: list[str]) -> float:
 
 
 def _get_labels_config() -> dict:
-    """Bootstrap for the dynamic label system: the layer list (finest→coarsest),
-    the coordinate extent (so the frontend can map zoom depth → layer), and the
+    """Bootstrap for the dynamic label system: the layer list (finest to coarsest),
+    the coordinate extent (so the frontend can map zoom depth to layer), and the
     max cluster id + cluster count per layer (so point coloring can size its color
     domain and avoid layers too large for deepscatter's color texture). Derived
     from the cached label set."""
@@ -3966,7 +3966,7 @@ def _get_country_pis(
     summary="Investigators for a country, ranked by project count",
     description=(
         "Return investigators for a whole country, ranked by project count "
-        "descending -- this is the map sidebar's ranking and takes no topic. "
+        "descending. This is the map sidebar's ranking and takes no topic. "
         "For any question that names a research topic ('single cell', 'CRISPR'), "
         "use `get_search_investigators` instead; do NOT pull this unfiltered list "
         "and filter it yourself. "
@@ -4745,9 +4745,6 @@ def search_highlight(
         "derived": {},
         "took_ms": 0.0,
     }
-    # Exact terms, so every marked word is one the user typed and there is
-    # nothing to attribute -- whether the caller asked for it (structured) or the
-    # query's own operators forced it.
     variants: list[str] = []
     if structured or is_boolean_query(q):
         sql, params = (
@@ -4836,7 +4833,7 @@ def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
 
     `rerun` is every parameter of search() except `request` and `q`. It must be
     COMPLETE: an omitted parameter falls back to search()'s signature default,
-    which is the FastAPI Query() object rather than the value inside it -- and
+    which is the FastAPI Query() object rather than the value inside it and
     Query(False) is truthy, so a missing flag reads as True.
     """
     # No "did you mean" in boolean mode: the operators are deliberate, so silently
@@ -4967,7 +4964,7 @@ def search(
         **sidebar_filters,
     }
 
-    # q is optional, but only when at least one filter narrows the set -- an
+    # q is optional, but only when at least one filter narrows the set. An
     # unfiltered, query-less search would materialize the whole corpus.
     if not q and not has_filter:
         raise HTTPException(400, "provide a query (q) or at least one filter")
@@ -5259,7 +5256,7 @@ def _search_filtered(
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
-    next_cursor). q may be empty -- a filter-only (query-less) search.
+    next_cursor). q may be empty, a filter-only (query-less) search.
 
     boolean_tsq set -> boolean mode: FTS uses the literal to_tsquery (no Neo4j
     expansion), so filtered results match the boolean facet counts."""
@@ -5511,13 +5508,13 @@ def search_facets(
     )
     # Mirror /search's auto-correction: when the original query is a low-result
     # typo, swap in the facets + total for what the corrected search actually
-    # shows. /search runs the correction in "augmented" mode -- the corrected
+    # shows. /search runs the correction in "augmented" mode, the corrected
     # results are the paginated stream AND the literal-typo matches ride along in
-    # correction.extra_results -- so the count must be over the UNION of both
+    # correction.extra_results, so the count must be over the UNION of both
     # match sets, not the corrected one alone. Hence extra_variants: counting only
     # the corrected set undercounts the page by however many extras render.
     # Cached below under the original cache_key so repeat typo searches stay fast.
-    # Applies with an active filter too -- /search's filtered path auto-corrects
+    # Applies with an active filter too. Search's filtered path auto-corrects
     # through the same _autocorrect_search, so gating this on not has_filter
     # would desync the count from the list the moment a filter went on.
     # Skipped in boolean mode: operators are deliberate, /search doesn't correct them.
@@ -5584,7 +5581,7 @@ def search_facets(
         "from search results. "
         "PICK THE MODE FROM THE QUESTION'S WORDING. Use senior_only=false when "
         "it asks about 'researchers', 'scientists', 'authors', 'people' or 'who "
-        "works on' -- this counts everyone who worked on the data. Use "
+        "works on'. This counts everyone who worked on the data. Use "
         "senior_only=true (the default) only when it explicitly asks for 'PIs', "
         "'principal investigators', 'senior authors', 'labs' or 'who leads' -- "
         "this counts last authors, so lab members are excluded. The two modes "
@@ -8738,13 +8735,12 @@ def _csv_cell(value) -> str:
 def _stream_results_csv(sql: str, params: dict):
     """Yield the entire match set as CSV, a row at a time.
 
-    Server-side cursor: a broad query matches ~100k datasets, too many to hold in
-    memory. itersize batches, not cur.stream(), which costs a round trip per row
-    (14k rows in 120s over a tunnel).
+    Server-side cursor: a broad query matches too many datasets to hold in
+    memory. itersize batches, not cur.stream(), which costs a round trip per row.
 
     Errors mid-stream cannot become an HTTP status; they are logged and the CSV
     ends. Holds one pooled connection (max_size=20) for the whole download, so
-    ~20 concurrent downloads can starve the API; only the rate limit guards it.
+    concurrent downloads can starve the API; only the rate limit guards it.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -9879,13 +9875,13 @@ def _sequence_bearing(acc: str) -> bool:
 def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
     """Sequence-bearing studies reachable from this project's publication.
 
-    Many GEO series carry no SRA cross-reference at all (~180k have a PMID but no
-    alias), yet the paper they belong to does have an SRA study -- so the FASTQs
-    exist and are simply unreachable by following links. Resolving through the
-    shared PMID recovers ~10.7k of those.
+    Many GEO series carry no SRA cross-reference at all (a PMID but no alias),
+    yet the paper they belong to does have an SRA study -- so the FASTQs exist
+    and are simply unreachable by following links. Resolving through the shared
+    PMID recovers them.
 
     This is an INFERENCE, not a cross-reference: a PMID names a paper, and a paper
-    can describe several studies (one GEO series resolves to 29). Rows are tagged
+    can describe several studies. Rows are tagged
     source='pmid' and carry `via_pmid` so callers can label the provenance and,
     when several come back, let the user choose rather than guessing.
     """

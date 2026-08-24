@@ -6312,7 +6312,7 @@ classified AS (
            WHEN ev.matrix = 1                              THEN 'matrix_only'
            ELSE 'fastq_only'
          END AS kind,
-         COALESCE(p.n_samples_detailed, p.n_samples_reported, 0) AS n_samples,
+         COALESCE(p.n_samples_detailed, p.n_samples_reported) AS n_samples,
          COALESCE(p.study_cells, 0) AS n_cells
   FROM ev
   LEFT JOIN pentimento_study p ON p.study_accession = ev.study_accession
@@ -6327,7 +6327,9 @@ tissue_organism AS (
 SELECT
   agg.n_studies, agg.n_samples, agg.n_cells,
   (SELECT json_agg(x) FROM (
-     SELECT kind, count(*) AS n_studies
+     SELECT kind, count(*) AS n_studies,
+            count(n_samples) AS n_studies_counted,  -- coverage for the sum
+            sum(n_samples) AS n_samples
      FROM classified GROUP BY kind
    ) x)                                            AS by_kind,
   (SELECT json_agg(x) FROM (
@@ -6367,6 +6369,88 @@ LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
 WHERE (r.gsm_accession = %(acc)s OR r.sample_accession = %(acc)s)
 ORDER BY m.kmer_mass DESC NULLS LAST, m.breadth_frac DESC NULLS LAST
 LIMIT %(limit)s;
+"""
+
+
+PENTIMENTO_OVERVIEW_SQL = f"""
+WITH rollup AS (
+  -- one pass over pentimento_run. min/max answer "none, or more than one"
+  -- without the sort count(DISTINCT) forces, and GROUPING SETS gets the study
+  -- count in the same scan; a sample can span studies, so min(study_accession)
+  -- would undercount.
+  SELECT COALESCE(gsm_accession, sample_accession) AS sample,
+         study_accession,
+         grouping(study_accession) AS is_sample_row,
+         bool_or(measurable) AS measurable,
+         min(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_lo,
+         max(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_hi,
+         min(assay) AS assay_lo,
+         max(assay) AS assay_hi
+  FROM pentimento_run
+  WHERE gsm_accession IS NOT NULL OR sample_accession IS NOT NULL
+  GROUP BY GROUPING SETS ((1), (2))
+),
+per_sample AS (SELECT * FROM rollup WHERE is_sample_row = 1),
+scanned AS (
+  SELECT count(*) FILTER (WHERE is_sample_row = 1) AS n_samples,
+         count(*) FILTER (WHERE is_sample_row = 1 AND measurable) AS n_measurable,
+         count(*) FILTER (WHERE is_sample_row = 0
+                          AND study_accession IS NOT NULL) AS n_studies
+  FROM rollup
+),
+sex AS (
+  -- runs that disagree are their own bucket, never folded into one sex
+  SELECT CASE WHEN sex_lo IS NULL     THEN 'no_verdict'
+              WHEN sex_lo <> sex_hi   THEN 'conflicting'
+              ELSE sex_lo END AS verdict,
+         count(*) AS n_samples
+  FROM per_sample GROUP BY 1
+),
+assay AS (
+  SELECT CASE WHEN assay_lo IS NULL     THEN 'No call'
+              WHEN assay_lo <> assay_hi THEN 'Mixed'
+              ELSE assay_lo END AS assay,
+         count(*) AS n_samples
+  FROM per_sample GROUP BY 1
+),
+hits AS (
+  SELECT m.class, m.organism,
+         COALESCE(r.gsm_accession, r.sample_accession) AS sample
+  FROM pentimento_microbe m
+  JOIN pentimento_run r ON r.run_accession = m.run_accession
+  WHERE {_MICROBE_VALIDATED_EXPR}
+    AND (r.gsm_accession IS NOT NULL OR r.sample_accession IS NOT NULL)
+)
+SELECT
+  scanned.n_samples, scanned.n_measurable, scanned.n_studies,
+  (SELECT count(DISTINCT sample) FROM hits)             AS n_samples_with_hit,
+  (SELECT json_agg(x) FROM (
+     SELECT verdict, n_samples FROM sex ORDER BY n_samples DESC
+   ) x)                                                 AS sex,
+  (SELECT json_agg(x) FROM (
+     SELECT class, count(DISTINCT sample) AS n_samples,
+            count(DISTINCT organism) AS n_organisms
+     FROM hits GROUP BY class ORDER BY n_samples DESC
+   ) x)                                                 AS microbe_by_class,
+  (SELECT json_agg(x) FROM (
+     SELECT organism, class, count(DISTINCT sample) AS n_samples
+     FROM hits GROUP BY organism, class ORDER BY n_samples DESC LIMIT 12
+   ) x)                                                 AS top_microbes,
+  (SELECT json_agg(x) FROM (
+     SELECT assay, n_samples FROM assay
+     WHERE assay NOT IN ('No call', 'Not single-cell', 'Mixed')
+     ORDER BY n_samples DESC LIMIT 12
+   ) x)                                                 AS by_assay,
+  -- the shares that partition every scanned sample. Runs that disagree about
+  -- being single-cell answer "unknown", so Mixed sits with No call.
+  (SELECT json_agg(x) FROM (
+     SELECT CASE WHEN assay IN ('No call', 'Mixed') THEN 'no_call'
+                 WHEN assay = 'Not single-cell' THEN 'not_single_cell'
+                 ELSE 'single_cell' END AS group_name,
+            sum(n_samples) AS n_samples
+     FROM assay GROUP BY 1
+   ) x)                                                 AS assay_groups
+FROM scanned;
 """
 
 
@@ -6552,5 +6636,10 @@ if __name__ == "__main__":
     }
     assert _MICROBE_KINGDOM_CASE in PENTIMENTO_MICROBES_SQL
     assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_MICROBES_SQL
+    assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_OVERVIEW_SQL
+    # sex_verdict is NULL when a run was never assessed; the overview keeps
+    # that bucket so the denominator stays visible
+    assert "'no_verdict'" in PENTIMENTO_OVERVIEW_SQL
+    assert "'conflicting'" in PENTIMENTO_OVERVIEW_SQL
 
     print("OK: cohort search + structured multi-value self-checks pass")
