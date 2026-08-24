@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "seqoutRun",
+  "title": "seqoutRun",
+  "description": "Custom run schema. Source metadata has no performed-date, so the default model's required runDate is dropped; release dates are carried in info.releaseDate + info.dateSource. biosampleId is optional because GSA runs have no ontology-backed biosample to reference.",
+  "type": "object",
+  "required": ["id"],
+  "properties": {
+    "id": {"type": "string", "description": "Run accession (SRR/ERR/DRR/CRR/HRR)."},
+    "biosampleId": {"type": "string", "description": "Sample accession; present only when resolvable in /biosamples (omitted for GSA)."},
+    "runId": {"type": "string"},
+    "librarySource": {"type": "string"},
+    "libraryStrategy": {"type": "string"},
+    "librarySelection": {"type": "string"},
+    "libraryLayout": {"type": "string"},
+    "platform": {"type": "string"},
+    "platformModel": {"$ref": "../framework/src/common/ontologyTerm.json"},
+    "info": {"type": "object", "description": "Non-model extras; releaseDate + dateSource live here."}
+  },
+  "additionalProperties": true,
+  "not": {"required": ["runDate"]}
+}

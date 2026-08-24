@@ -30,7 +30,7 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_PORT || 22 }}
-          source: "main.py,boolean_query.py,map_assets.py,queries.py,grid_filters.py,expansions.py,deep_dive.py,beacon.py, beacon_queries.py,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
+          source: "main.py,boolean_query.py,map_assets.py,queries.py,grid_filters.py,expansions.py,deep_dive.py,beacon.py,beacon_queries.py,schemas/beacon-v2.2.0/custom/seqoutRun.json,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
           target: /var/www/sramap/backend
           strip_components: 0
 
