@@ -187,6 +187,7 @@ from queries import (
     SEARCH_SQL,
     SEARCH_STRUCTURED_SQL,
     structured_search_sql,
+    PENTIMENTO_OVERVIEW_SQL,
     SIMILAR_STUDIES_SQL,
     SINGLE_CELL_OVERVIEW_SQL,
     SINGLE_CELL_STATUS_SQL,
@@ -672,6 +673,8 @@ _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _single_cell_overview_cache_lock = threading.Lock()
 _single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_pentimento_overview_cache_lock = threading.Lock()
+_pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
@@ -3022,6 +3025,8 @@ def purge_cache(request: Request):
         _source_totals_cache["ready"] = False
     with _single_cell_overview_cache_lock:
         _single_cell_overview_cache["ready"] = False
+    with _pentimento_overview_cache_lock:
+        _pentimento_overview_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
@@ -10411,6 +10416,55 @@ def get_single_cell_overview(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+def _get_pentimento_overview() -> dict:
+    with _pentimento_overview_cache_lock:
+        if (
+            _pentimento_overview_cache["ready"]
+            and (time.time() - _pentimento_overview_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _pentimento_overview_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(PENTIMENTO_OVERVIEW_SQL)
+            row = cur.fetchone()
+
+    data = {
+        "n_samples": row["n_samples"] or 0,
+        "n_measurable": row["n_measurable"] or 0,
+        "n_studies": row["n_studies"] or 0,
+        "n_samples_with_hit": row["n_samples_with_hit"] or 0,
+        "sex": row["sex"] or [],
+        "microbe_by_class": row["microbe_by_class"] or [],
+        "top_microbes": row["top_microbes"] or [],
+        "by_assay": row["by_assay"] or [],
+        "assay_groups": row["assay_groups"] or [],
+        "assay_by_tissue": row["assay_by_tissue"] or [],
+    }
+    with _pentimento_overview_cache_lock:
+        _pentimento_overview_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/pentimento",
+    summary="Overview of read-derived calls",
+    description=(
+        "Counts of samples scanned from the reads themselves: sex verdicts, "
+        "assay calls, and validated microbial detections."
+    ),
+    operation_id="get_pentimento_overview",
+)
+@limiter.limit("60/minute")
+def get_pentimento_overview(request: Request):
+    try:
+        return _get_pentimento_overview()
+    except Exception:
+        logger.exception("Database error in get_pentimento_overview")
+        raise HTTPException(500, "Internal server error")
+
+
 @api_app.get(
     "/stats/project-overlap",
     summary="Cross-archive project overlap",
@@ -12442,6 +12496,8 @@ def _prewarm_caches() -> None:
         _get_atlas_payloads,
         _get_global_contributions_cached,
         _get_global_contributions_filters,
+        _get_single_cell_overview,
+        _get_pentimento_overview,
     ):
         try:
             warm()

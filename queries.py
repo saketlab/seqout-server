@@ -6328,8 +6328,10 @@ SELECT
   agg.n_studies, agg.n_samples, agg.n_cells,
   (SELECT json_agg(x) FROM (
      SELECT kind, count(*) AS n_studies,
-            count(n_samples) AS n_studies_counted,  -- coverage for the sum
-            sum(n_samples) AS n_samples
+            -- coverage for the sum. A row counting zero samples is no more
+            -- counted than a missing one, so both stay out
+            count(*) FILTER (WHERE n_samples > 0) AS n_studies_counted,
+            COALESCE(sum(n_samples), 0) AS n_samples
      FROM classified GROUP BY kind
    ) x)                                            AS by_kind,
   (SELECT json_agg(x) FROM (
@@ -6420,6 +6422,43 @@ hits AS (
   JOIN pentimento_run r ON r.run_accession = m.run_accession
   WHERE {_MICROBE_VALIDATED_EXPR}
     AND (r.gsm_accession IS NOT NULL OR r.sample_accession IS NOT NULL)
+),
+-- chemistry read off the reads crossed with the tissue the submitter stated.
+-- Samples whose runs disagree carry no chemistry, so they stay out rather than
+-- landing in whichever call sorted first.
+sc_sample AS (
+  SELECT sample, assay_lo AS assay
+  FROM per_sample
+  WHERE assay_lo IS NOT NULL AND assay_lo = assay_hi
+    AND assay_lo <> 'Not single-cell'
+),
+-- one tissue per sample, so a sample filed under two studies cannot land in
+-- two stacks and inflate the chemistry it belongs to
+sample_tissue AS (
+  SELECT sc.sample, sc.assay,
+         min(COALESCE(os.tissue_ontology_name, os.tissue)) AS tissue,
+         min(os.study_accession) AS study_accession
+  FROM sc_sample sc
+  JOIN ontology_samples_v5 os ON os.sample = sc.sample
+  WHERE COALESCE(os.tissue_ontology_name, os.tissue) IS NOT NULL
+  GROUP BY 1, 2
+),
+-- studies, not samples: a plate-based study files one sample per well, so
+-- counting samples hands the chart to a couple of thousand Drop-seq studies
+-- that between them hold more samples than every 10x study combined
+tissue_cell AS (
+  SELECT assay, tissue, count(DISTINCT study_accession) AS n_studies
+  FROM sample_tissue GROUP BY 1, 2
+),
+top_assay AS (
+  SELECT assay, sum(n_studies) AS n_studies
+  FROM tissue_cell GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+),
+-- eight, so each drawn tissue gets its own hue out of the eight-wide palette
+-- and the remainder keeps the reserved grey
+top_tissue AS (
+  SELECT tissue FROM tissue_cell
+  GROUP BY 1 ORDER BY sum(n_studies) DESC LIMIT 8
 )
 SELECT
   scanned.n_samples, scanned.n_measurable, scanned.n_studies,
@@ -6449,7 +6488,14 @@ SELECT
                  ELSE 'single_cell' END AS group_name,
             sum(n_samples) AS n_samples
      FROM assay GROUP BY 1
-   ) x)                                                 AS assay_groups
+   ) x)                                                 AS assay_groups,
+  (SELECT json_agg(x) FROM (
+     SELECT tc.assay, tc.tissue, tc.n_studies
+     FROM tissue_cell tc
+     WHERE tc.assay IN (SELECT assay FROM top_assay)
+       AND tc.tissue IN (SELECT tissue FROM top_tissue)
+     ORDER BY tc.n_studies DESC
+   ) x)                                                 AS assay_by_tissue
 FROM scanned;
 """
 
