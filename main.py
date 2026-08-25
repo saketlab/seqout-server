@@ -80,6 +80,9 @@ from queries import (
     ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
     ENRICHED_COLUMN_VALUES_SQL,
+    ENRICHED_COVERAGE_COLUMNS,
+    ENRICHED_COVERAGE_SQL,
+    ENRICHED_COVERAGE_TOTALS_SQL,
     ENRICHED_CROSSTAB_COLUMNS,
     ENRICHED_CROSSTAB_SQL,
     ENRICHED_SAMPLES_SQL,
@@ -681,6 +684,9 @@ _sitemap_counts_cache_lock = threading.Lock()
 _sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _enriched_crosstab_cache_lock = threading.Lock()
 _enriched_crosstab_cache: dict = {}
+_enriched_coverage_cache_lock = threading.Lock()
+_enriched_coverage_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_MAX_COVERAGE_VALUES = 500
 _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
@@ -3031,6 +3037,8 @@ def purge_cache(request: Request):
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
         _enriched_crosstab_cache.clear()
+    with _enriched_coverage_cache_lock:
+        _enriched_coverage_cache["ready"] = False
     with _broad_facets_cache_lock:
         _broad_facets_cache.clear()
     with _search_results_cache_lock:
@@ -10829,6 +10837,99 @@ def get_enriched_crosstab(
         raise HTTPException(500, "Internal server error")
 
 
+def _coverage_source_row(row: dict, totals: dict) -> dict:
+    """Given archive's enriched counts, plus its archive total and share."""
+    whole = totals.get(row["value"]) or {}
+    out = {
+        "source": row["value"],
+        "projects": row["projects"],
+        "samples": row["samples"],
+    }
+    for what in ("projects", "samples"):
+        total = whole.get(what)
+        out[f"total_{what}"] = total
+        out[f"pct_{what}"] = (
+            round(100 * out[what] / total, 1) if total and total > 0 else None
+        )
+    return out
+
+
+def _get_enriched_coverage() -> dict:
+    with _enriched_coverage_cache_lock:
+        if (
+            _enriched_coverage_cache["ready"]
+            and (time.time() - _enriched_coverage_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _enriched_coverage_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "enriched_coverage"):
+                raise _NotBuiltYet(
+                    "Enrichment coverage is being prepared; retry shortly."
+                )
+            cur.execute(ENRICHED_COVERAGE_SQL, ("source", len(_STATS_SOURCES) + 1))
+            sources = cur.fetchall()
+            dims = {}
+            for column in ENRICHED_COVERAGE_COLUMNS:
+                cur.execute(ENRICHED_COVERAGE_SQL, (column, _MAX_COVERAGE_VALUES))
+                dims[column] = cur.fetchall()
+            # the per-dimension lists are capped, so report the true counts
+            cur.execute(ENRICHED_COVERAGE_TOTALS_SQL)
+            totals_by_dim = {r["dimension"]: r["n"] for r in cur.fetchall()}
+
+    totals = _get_source_totals()
+    data = {
+        "by_source": [_coverage_source_row(r, totals) for r in sources],
+        "distinct_values": {
+            column: totals_by_dim.get(column, 0) for column in ENRICHED_COVERAGE_COLUMNS
+        },
+    }
+    for column, rows in dims.items():
+        data[f"by_{column}"] = [
+            {column: r["value"], "projects": r["projects"], "samples": r["samples"]}
+            for r in rows
+        ]
+
+    with _enriched_coverage_cache_lock:
+        _enriched_coverage_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/enriched/coverage",
+    summary="Enrichment coverage by source database, organism and assay",
+    description=(
+        "Return how many projects and samples carry AI-enriched ontology "
+        "metadata, split by archive (geo, sra, ena, arrayexpress, gsa, dra, gea), "
+        "by organism, by assay and by assay_category. Archive totals are planner "
+        "row estimates, so the percentages are approximate. A project with "
+        "several organisms or assays counts under each, so those rows sum past "
+        "the corpus total. The organism and assay lists are capped at limit; "
+        "distinct_values carries the full counts. Reads the enriched_coverage "
+        "materialized view."
+    ),
+    operation_id="get_enriched_coverage",
+)
+@limiter.limit("60/minute")
+def get_enriched_coverage(
+    request: Request,
+    limit: int = Query(50, ge=1, le=_MAX_COVERAGE_VALUES),
+):
+    try:
+        data = _get_enriched_coverage()
+    except _NotBuiltYet as exc:
+        raise HTTPException(503, str(exc))
+    except Exception:
+        logger.exception("Database error in get_enriched_coverage")
+        raise HTTPException(500, "Internal server error")
+
+    out = {"by_source": data["by_source"], "distinct_values": data["distinct_values"]}
+    for column in ENRICHED_COVERAGE_COLUMNS:
+        out[f"by_{column}"] = data[f"by_{column}"][:limit]
+    return out
+
+
 @api_app.get(
     "/stats/enriched/{column}",
     summary="Top values for an enriched column",
@@ -12148,6 +12249,9 @@ project summaries plus flattened sample rows; for one project, prefer
 
 For enriched aggregate exploration:
 - `get_enriched_stats`: coverage and per-column fill/distinct counts.
+- `get_enriched_coverage`: enriched projects and samples per archive, with the
+  archive total and percentage, plus counts per organism, assay and
+  assay_category. Answers "how many are enriched", "which database/organism/assay".
 - `get_enriched_column`: call with `column=...` for top values from tissue,
   cell_type, disease, assay, etc.
 - `get_enriched_crosstab`: call with `group=...` and `breakdown=...` for cross-tabs
@@ -12385,6 +12489,7 @@ MCP_EXCLUDED_OPERATION_IDS = {
 
 ENRICHMENT_OPERATION_IDS = {
     "search_enriched_samples",
+    "get_enriched_coverage",
     # /disease/* is a rollup of ontology_samples_v5
     "get_disease_summary",
     "get_disease_facets",

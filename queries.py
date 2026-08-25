@@ -5042,14 +5042,81 @@ def _enriched_crosstab_ddl(suffix: str = "") -> str:
     )
 
 
+# ontology_samples_v5 has no source column; read the archive off the accession
+ENRICHED_SOURCE_CASE = """CASE
+            WHEN study_accession LIKE 'GSE%' THEN 'geo'
+            WHEN study_accession LIKE 'SRP%' OR study_accession LIKE 'PRJNA%' THEN 'sra'
+            WHEN study_accession LIKE 'ERP%' OR study_accession LIKE 'PRJEB%' THEN 'ena'
+            WHEN study_accession LIKE 'DRP%' OR study_accession LIKE 'PRJDB%' THEN 'dra'
+            WHEN study_accession LIKE 'CRA%' OR study_accession LIKE 'HRA%' THEN 'gsa'
+            WHEN study_accession LIKE 'E-GEAD-%' THEN 'gea'
+            WHEN study_accession LIKE 'E-%' THEN 'arrayexpress'
+            ELSE 'other'
+        END"""
+
+
+ENRICHED_COVERAGE_COLUMNS = ("organism", "assay", "assay_category")
+
+
+def _enriched_coverage_ddl(suffix: str = "") -> str:
+    """Enriched project/sample counts per archive, organism and assay."""
+    dims = "\n".join(
+        "UNION ALL\n"
+        f"SELECT '{c}', {c},\n"
+        "       COUNT(DISTINCT study_accession), COUNT(*)\n"
+        f"FROM base WHERE {c} IS NOT NULL AND {c} <> ''\n"
+        f"GROUP BY {c}"
+        for c in ENRICHED_COVERAGE_COLUMNS
+    )
+    cols = ", ".join(ENRICHED_COVERAGE_COLUMNS)
+    return (
+        f"DROP MATERIALIZED VIEW IF EXISTS enriched_coverage{suffix};\n"
+        f"CREATE MATERIALIZED VIEW enriched_coverage{suffix} AS\n"
+        "WITH base AS MATERIALIZED (\n"
+        f"        SELECT study_accession, {cols},\n"
+        f"               {ENRICHED_SOURCE_CASE} AS source\n"
+        "        FROM ontology_samples_v5\n"
+        "    )\n"
+        "SELECT 'source' AS dimension, source AS value,\n"
+        "       COUNT(DISTINCT study_accession) AS projects, COUNT(*) AS samples\n"
+        "FROM base GROUP BY source\n"
+        f"{dims};"
+    )
+
+
+# true counts; the API returns only a top slice
+ENRICHED_COVERAGE_TOTALS_SQL = """
+SELECT dimension, COUNT(*) AS n FROM enriched_coverage GROUP BY dimension;
+"""
+
+ENRICHED_COVERAGE_SQL = """
+SELECT dimension, value, projects, samples
+FROM enriched_coverage
+WHERE dimension = %s
+ORDER BY samples DESC, value
+LIMIT %s;
+"""
+
+
+# rebuild_enriched_stats.sh reads this list
+ENRICHED_STATS_VIEWS = (
+    "enriched_summary",
+    "enriched_column_top_values",
+    "enriched_crosstab",
+    "enriched_coverage",
+)
+
+
 def enriched_stats_ddl(suffix: str = "") -> str:
-    """DDL for the three enriched-stats matviews, optionally under a suffix."""
+    """DDL for the enriched-stats matviews, optionally under a suffix."""
     return (
         _enriched_summary_ddl(suffix)
         + "\n\n"
         + _enriched_top_values_ddl(suffix)
         + "\n\n"
         + _enriched_crosstab_ddl(suffix)
+        + "\n\n"
+        + _enriched_coverage_ddl(suffix)
     )
 
 
@@ -6328,8 +6395,7 @@ SELECT
   agg.n_studies, agg.n_samples, agg.n_cells,
   (SELECT json_agg(x) FROM (
      SELECT kind, count(*) AS n_studies,
-            -- coverage for the sum. A row counting zero samples is no more
-            -- counted than a missing one, so both stay out
+            -- a zero total counts as uncounted, same as a missing row
             count(*) FILTER (WHERE n_samples > 0) AS n_studies_counted,
             COALESCE(sum(n_samples), 0) AS n_samples
      FROM classified GROUP BY kind
@@ -6423,17 +6489,14 @@ hits AS (
   WHERE {_MICROBE_VALIDATED_EXPR}
     AND (r.gsm_accession IS NOT NULL OR r.sample_accession IS NOT NULL)
 ),
--- chemistry read off the reads crossed with the tissue the submitter stated.
--- Samples whose runs disagree carry no chemistry, so they stay out rather than
--- landing in whichever call sorted first.
+-- assay_lo = assay_hi is the agreement test; split samples drop out
 sc_sample AS (
   SELECT sample, assay_lo AS assay
   FROM per_sample
   WHERE assay_lo IS NOT NULL AND assay_lo = assay_hi
     AND assay_lo <> 'Not single-cell'
 ),
--- one tissue per sample, so a sample filed under two studies cannot land in
--- two stacks and inflate the chemistry it belongs to
+-- one tissue per sample; one filed under two studies stacks twice
 sample_tissue AS (
   SELECT sc.sample, sc.assay,
          min(COALESCE(os.tissue_ontology_name, os.tissue)) AS tissue,
@@ -6443,9 +6506,8 @@ sample_tissue AS (
   WHERE COALESCE(os.tissue_ontology_name, os.tissue) IS NOT NULL
   GROUP BY 1, 2
 ),
--- studies, not samples: a plate-based study files one sample per well, so
--- counting samples hands the chart to a couple of thousand Drop-seq studies
--- that between them hold more samples than every 10x study combined
+-- count studies; plate-based studies file one sample per well and dominate
+-- a sample count
 tissue_cell AS (
   SELECT assay, tissue, count(DISTINCT study_accession) AS n_studies
   FROM sample_tissue GROUP BY 1, 2
@@ -6454,8 +6516,7 @@ top_assay AS (
   SELECT assay, sum(n_studies) AS n_studies
   FROM tissue_cell GROUP BY 1 ORDER BY 2 DESC LIMIT 8
 ),
--- eight, so each drawn tissue gets its own hue out of the eight-wide palette
--- and the remainder keeps the reserved grey
+-- eight matches the palette width
 top_tissue AS (
   SELECT tissue FROM tissue_cell
   GROUP BY 1 ORDER BY sum(n_studies) DESC LIMIT 8
