@@ -4837,7 +4837,7 @@ def _boolean_source_sql(db: str | None) -> str:
     return _SEARCH_SQL_BY_DB[db]
 
 
-def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
+def _autocorrect_search(request, result, original_q, user_boolean, rerun):
     """Auto-run the spelling-corrected query when `result` is a low-result typo.
 
     Mutates and returns `result`: the corrected results become the paginated
@@ -4850,10 +4850,12 @@ def _autocorrect_search(request, result, original_q, boolean_tsq, rerun):
     which is the FastAPI Query() object rather than the value inside it -- and
     Query(False) is truthy, so a missing flag reads as True.
     """
-    # No "did you mean" in boolean mode: the operators are deliberate, so silently
-    # rewriting them would be wrong. A query-less (filter-only) search has nothing
-    # to correct.
-    if boolean_tsq is not None or not original_q:
+    # No "did you mean" when the user typed boolean operators: those are
+    # deliberate, so silently rewriting them would be wrong. Structured mode
+    # (term expansion off) is NOT that -- it only means "run the words as typed",
+    # so a typo is still worth correcting. A query-less (filter-only) search has
+    # nothing to correct.
+    if user_boolean or not original_q:
         return result
 
     # total is deferred (None) on the unified path now, so fall back to the
@@ -4988,7 +4990,8 @@ def search(
     # scope. tsq == "" means nothing usable survived translation (e.g. a lone "*"),
     # so treat it as an ordinary query.
     boolean_tsq = None
-    if q and (structured or is_boolean_query(q)):
+    user_boolean = bool(q) and is_boolean_query(q)
+    if q and (structured or user_boolean):
         _tsq = to_tsquery_string(replace_query_hyphens(q, expand=not structured))
         if _tsq:
             boolean_tsq = _tsq
@@ -5016,7 +5019,7 @@ def search(
             request,
             filtered,
             replace_query_hyphens(q, expand=not structured) if q else "",
-            boolean_tsq,
+            user_boolean,
             rerun,
         )
 
@@ -5241,7 +5244,7 @@ def search(
             ),
         }
 
-    result = _autocorrect_search(request, result, original_q, boolean_tsq, rerun)
+    result = _autocorrect_search(request, result, original_q, user_boolean, rerun)
 
     # Pin broad (full-page) results until /cache/purge.
     if results_cache_key and len(result.get("results", [])) >= _SEARCH_RESULTS_PAGE:
@@ -5473,7 +5476,8 @@ def search_facets(
     # too (build_search_match_temp respects db; the total/facet builders apply the
     # filters). tsq == "" means nothing usable survived, so treat as ordinary.
     boolean_tsq = None
-    if structured or is_boolean_query(nq):
+    user_boolean = is_boolean_query(nq)
+    if structured or user_boolean:
         _tsq = to_tsquery_string(nq)
         if _tsq:
             boolean_tsq = _tsq
@@ -5531,15 +5535,29 @@ def search_facets(
     # Applies with an active filter too -- /search's filtered path auto-corrects
     # through the same _autocorrect_search, so gating this on not has_filter
     # would desync the count from the list the moment a filter went on.
-    # Skipped in boolean mode: operators are deliberate, /search doesn't correct them.
-    if boolean_tsq is None and total is not None and total <= _SUGGESTION_THRESHOLD:
+    # Skipped when the user typed boolean operators: those are deliberate and
+    # /search doesn't correct them. Structured mode (term expansion off) still
+    # corrects, so it needs the union expressed as a literal tsquery -- the
+    # structured path takes no q_variants, so ORing the two tsqueries is how the
+    # corrected + literal-typo match sets get counted together.
+    if not user_boolean and total is not None and total <= _SUGGESTION_THRESHOLD:
         _suggestions = _get_suggestions(nq)
         _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
+            _c_tsq = None
+            if structured:
+                _c_tsq = to_tsquery_string(_corrected_q)
+                if _c_tsq and boolean_tsq:
+                    _c_tsq = f"({_c_tsq}) | ({boolean_tsq})"
             c_facets, c_total, c_max_rank = _compute_search_facets(
                 _corrected_q,
                 db,
-                extra_variants=_search_query_variants(nq, exclude_ontology or ()),
+                structured_tsq=_c_tsq,
+                extra_variants=(
+                    None
+                    if structured
+                    else _search_query_variants(nq, exclude_ontology or ())
+                ),
                 disabled=exclude_ontology or (),
                 organism=organism,
                 country=country,
