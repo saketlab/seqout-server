@@ -80,6 +80,9 @@ from queries import (
     ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
     ENRICHED_COLUMN_VALUES_SQL,
+    ENRICHED_COVERAGE_COLUMNS,
+    ENRICHED_COVERAGE_SQL,
+    ENRICHED_COVERAGE_TOTALS_SQL,
     ENRICHED_CROSSTAB_COLUMNS,
     ENRICHED_CROSSTAB_SQL,
     ENRICHED_SAMPLES_SQL,
@@ -187,6 +190,7 @@ from queries import (
     SEARCH_SQL,
     SEARCH_STRUCTURED_SQL,
     structured_search_sql,
+    PENTIMENTO_OVERVIEW_SQL,
     SIMILAR_STUDIES_SQL,
     SINGLE_CELL_OVERVIEW_SQL,
     SINGLE_CELL_STATUS_SQL,
@@ -554,7 +558,7 @@ WITH combined AS (
 enriched_agg AS (
     SELECT study_accession AS accession,
         {_MAP_ENRICHED_AGG}
-    FROM ontology_samples_v4
+    FROM ontology_samples_v5
     GROUP BY study_accession
 )
 SELECT
@@ -676,12 +680,17 @@ _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _single_cell_overview_cache_lock = threading.Lock()
 _single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_pentimento_overview_cache_lock = threading.Lock()
+_pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
 _sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _enriched_crosstab_cache_lock = threading.Lock()
 _enriched_crosstab_cache: dict = {}
+_enriched_coverage_cache_lock = threading.Lock()
+_enriched_coverage_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_MAX_COVERAGE_VALUES = 500
 _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
@@ -1058,7 +1067,7 @@ def _build_publications(
     pmids: list[str], pubmed_map: dict[str, dict], flat_row: dict | None
 ) -> list[dict] | None:
     """One entry per resolved pmid (all of them, so multi-publication studies
-    show every paper). Each pmid: rich details from pubmed_metadata → flat
+    show every paper). Each pmid: rich details from pubmed_metadata, then flat
     columns / pmid-only stub. When there are no pmids, fall back to a
     flat-columns-only entry. Returns None when there's nothing to show.
 
@@ -1081,14 +1090,7 @@ def _build_publications(
 
 
 def _attach_organism_taxa(row: dict, cur) -> None:
-    """Pair each organism name with its NCBI taxon id.
-
-    The id belongs to the organism, not the study, so it lives once in the
-    organism_taxa table rather than being copied into every project row — see
-    seqout-ingestion/src/backfill/organism_taxa.py. Kept out of the project SQL
-    so a missing table degrades to "no taxids" instead of 500-ing every project
-    page before the lookup has been built.
-    """
+    """Pair each organism name with its NCBI taxon id."""
     names = [n for n in (row.get("organisms") or []) if isinstance(n, str) and n]
     if not names:
         row["organisms_with_taxa"] = []
@@ -2214,15 +2216,15 @@ def _etag_matches(if_none_match: str | None, etag: str) -> bool:
 
 
 def _level_num(level: str) -> int:
-    """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse↔fine)."""
+    """Numeric suffix of a 'cluster_lN' layer name (for ordering coarse to fine)."""
     digits = "".join(ch for ch in level if ch.isdigit())
     return int(digits) if digits else 0
 
 
 def _get_cluster_labels() -> tuple[list[dict], list[str]]:
-    """Load cluster_labels once, cached (cheap — a few thousand rows). Returns
-    (labels, levels) with levels sorted finest→coarsest (cluster_l0 … cluster_lN,
-    discovered at runtime — the layer count changes when re-clustered)."""
+    """Load cluster_labels once, cached. Returns (labels, levels) with levels
+    sorted finest to coarsest (cluster_l0 … cluster_lN, discovered at runtime:
+    the layer count changes when re-clustered)."""
     with _clusters_cache_lock:
         if _clusters_cache.get("labels") is not None:
             return _clusters_cache["labels"], _clusters_cache["levels"]
@@ -2239,7 +2241,7 @@ def _get_cluster_labels() -> tuple[list[dict], list[str]]:
 
 
 def _get_map_data() -> tuple[list[dict], list[dict], list[str]]:
-    """Load the full map point set (heavy — ~1M rows) plus cluster labels, cached.
+    """Load the full map point set plus cluster labels, cached.
     Returns (rows, labels, levels). Only the tile builder needs the points; the
     label-only consumers use _get_cluster_labels."""
     with _map_data_cache_lock:
@@ -2290,8 +2292,8 @@ def _label_font_pt(level: str, levels: list[str]) -> float:
 
 
 def _get_labels_config() -> dict:
-    """Bootstrap for the dynamic label system: the layer list (finest→coarsest),
-    the coordinate extent (so the frontend can map zoom depth → layer), and the
+    """Bootstrap for the dynamic label system: the layer list (finest to coarsest),
+    the coordinate extent (so the frontend can map zoom depth to layer), and the
     max cluster id + cluster count per layer (so point coloring can size its color
     domain and avoid layers too large for deepscatter's color texture). Derived
     from the cached label set."""
@@ -2355,10 +2357,7 @@ def _compute_map_version(rows: list[dict]) -> str:
 
 
 def _assets_complete(version_dir: pathlib.Path) -> bool:
-    """Every file build_assets produces, present. The manifest alone isn't enough:
-    a build that dies between the JSON sidecars and the tiles (or the other way
-    round) leaves a dir that looks built, and the map then 404s on countries.json
-    forever — the version hash is stable, so nothing ever triggers a retry."""
+    """Every file build_assets produces."""
     if not (version_dir / "tiles" / "manifest.feather").exists():
         return False
     if not (version_dir / "countries.json").exists():
@@ -2369,9 +2368,7 @@ def _assets_complete(version_dir: pathlib.Path) -> bool:
 
 
 def _prune_old_map_versions(keep: str) -> None:
-    """Remove stale map-asset version dirs, keeping only `keep`. Best-effort, so
-    disk holds at most one version. Leaves the CURRENT pointer and any in-progress
-    `*.tmp` dirs alone (their names don't match the version pattern)."""
+    """Remove stale map-asset version dirs, keeping only `keep`."""
     try:
         entries = list(_MAP_ASSETS_DIR.iterdir())
     except OSError:
@@ -3033,10 +3030,14 @@ def purge_cache(request: Request):
         _source_totals_cache["ready"] = False
     with _single_cell_overview_cache_lock:
         _single_cell_overview_cache["ready"] = False
+    with _pentimento_overview_cache_lock:
+        _pentimento_overview_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
         _enriched_crosstab_cache.clear()
+    with _enriched_coverage_cache_lock:
+        _enriched_coverage_cache["ready"] = False
     with _broad_facets_cache_lock:
         _broad_facets_cache.clear()
     with _search_results_cache_lock:
@@ -3977,7 +3978,7 @@ def _get_country_pis(
     summary="Investigators for a country, ranked by project count",
     description=(
         "Return investigators for a whole country, ranked by project count "
-        "descending -- this is the map sidebar's ranking and takes no topic. "
+        "descending. This is the map sidebar's ranking and takes no topic. "
         "For any question that names a research topic ('single cell', 'CRISPR'), "
         "use `get_search_investigators` instead; do NOT pull this unfiltered list "
         "and filter it yourself. "
@@ -4756,9 +4757,6 @@ def search_highlight(
         "derived": {},
         "took_ms": 0.0,
     }
-    # Exact terms, so every marked word is one the user typed and there is
-    # nothing to attribute -- whether the caller asked for it (structured) or the
-    # query's own operators forced it.
     variants: list[str] = []
     if structured or is_boolean_query(q):
         sql, params = (
@@ -4847,7 +4845,7 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
 
     `rerun` is every parameter of search() except `request` and `q`. It must be
     COMPLETE: an omitted parameter falls back to search()'s signature default,
-    which is the FastAPI Query() object rather than the value inside it -- and
+    which is the FastAPI Query() object rather than the value inside it and
     Query(False) is truthy, so a missing flag reads as True.
     """
     # No "did you mean" when the user typed boolean operators: those are
@@ -4980,7 +4978,7 @@ def search(
         **sidebar_filters,
     }
 
-    # q is optional, but only when at least one filter narrows the set -- an
+    # q is optional, but only when at least one filter narrows the set. An
     # unfiltered, query-less search would materialize the whole corpus.
     if not q and not has_filter:
         raise HTTPException(400, "provide a query (q) or at least one filter")
@@ -5273,7 +5271,7 @@ def _search_filtered(
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
-    next_cursor). q may be empty -- a filter-only (query-less) search.
+    next_cursor). q may be empty, a filter-only (query-less) search.
 
     boolean_tsq set -> boolean mode: FTS uses the literal to_tsquery (no Neo4j
     expansion), so filtered results match the boolean facet counts."""
@@ -5526,13 +5524,13 @@ def search_facets(
     )
     # Mirror /search's auto-correction: when the original query is a low-result
     # typo, swap in the facets + total for what the corrected search actually
-    # shows. /search runs the correction in "augmented" mode -- the corrected
+    # shows. /search runs the correction in "augmented" mode, the corrected
     # results are the paginated stream AND the literal-typo matches ride along in
-    # correction.extra_results -- so the count must be over the UNION of both
+    # correction.extra_results, so the count must be over the UNION of both
     # match sets, not the corrected one alone. Hence extra_variants: counting only
     # the corrected set undercounts the page by however many extras render.
     # Cached below under the original cache_key so repeat typo searches stay fast.
-    # Applies with an active filter too -- /search's filtered path auto-corrects
+    # Applies with an active filter too. Search's filtered path auto-corrects
     # through the same _autocorrect_search, so gating this on not has_filter
     # would desync the count from the list the moment a filter went on.
     # Skipped when the user typed boolean operators: those are deliberate and
@@ -5613,7 +5611,7 @@ def search_facets(
         "from search results. "
         "PICK THE MODE FROM THE QUESTION'S WORDING. Use senior_only=false when "
         "it asks about 'researchers', 'scientists', 'authors', 'people' or 'who "
-        "works on' -- this counts everyone who worked on the data. Use "
+        "works on'. This counts everyone who worked on the data. Use "
         "senior_only=true (the default) only when it explicitly asks for 'PIs', "
         "'principal investigators', 'senior authors', 'labs' or 'who leads' -- "
         "this counts last authors, so lab members are excluded. The two modes "
@@ -5840,7 +5838,7 @@ def get_project(
                     _attach_organism_taxa(row, cur)
                     if ENRICHMENT_ENABLED:
                         cur.execute(
-                            "SELECT EXISTS(SELECT 1 FROM ontology_samples_v4 WHERE study_accession = %s)"
+                            "SELECT EXISTS(SELECT 1 FROM ontology_samples_v5 WHERE study_accession = %s)"
                             " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                             " AS has_enriched",
                             (enrich_acc, enrich_acc),
@@ -8767,13 +8765,12 @@ def _csv_cell(value) -> str:
 def _stream_results_csv(sql: str, params: dict):
     """Yield the entire match set as CSV, a row at a time.
 
-    Server-side cursor: a broad query matches ~100k datasets, too many to hold in
-    memory. itersize batches, not cur.stream(), which costs a round trip per row
-    (14k rows in 120s over a tunnel).
+    Server-side cursor: a broad query matches too many datasets to hold in
+    memory. itersize batches, not cur.stream(), which costs a round trip per row.
 
     Errors mid-stream cannot become an HTTP status; they are logged and the CSV
     ends. Holds one pooled connection (max_size=20) for the whole download, so
-    ~20 concurrent downloads can starve the API; only the rate limit guards it.
+    concurrent downloads can starve the API; only the rate limit guards it.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -9908,13 +9905,13 @@ def _sequence_bearing(acc: str) -> bool:
 def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
     """Sequence-bearing studies reachable from this project's publication.
 
-    Many GEO series carry no SRA cross-reference at all (~180k have a PMID but no
-    alias), yet the paper they belong to does have an SRA study -- so the FASTQs
-    exist and are simply unreachable by following links. Resolving through the
-    shared PMID recovers ~10.7k of those.
+    Many GEO series carry no SRA cross-reference at all (a PMID but no alias),
+    yet the paper they belong to does have an SRA study -- so the FASTQs exist
+    and are simply unreachable by following links. Resolving through the shared
+    PMID recovers them.
 
     This is an INFERENCE, not a cross-reference: a PMID names a paper, and a paper
-    can describe several studies (one GEO series resolves to 29). Rows are tagged
+    can describe several studies. Rows are tagged
     source='pmid' and carry `via_pmid` so callers can label the provenance and,
     when several come back, let the user choose rather than guessing.
     """
@@ -10444,6 +10441,55 @@ def get_single_cell_overview(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+def _get_pentimento_overview() -> dict:
+    with _pentimento_overview_cache_lock:
+        if (
+            _pentimento_overview_cache["ready"]
+            and (time.time() - _pentimento_overview_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _pentimento_overview_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(PENTIMENTO_OVERVIEW_SQL)
+            row = cur.fetchone()
+
+    data = {
+        "n_samples": row["n_samples"] or 0,
+        "n_measurable": row["n_measurable"] or 0,
+        "n_studies": row["n_studies"] or 0,
+        "n_samples_with_hit": row["n_samples_with_hit"] or 0,
+        "sex": row["sex"] or [],
+        "microbe_by_class": row["microbe_by_class"] or [],
+        "top_microbes": row["top_microbes"] or [],
+        "by_assay": row["by_assay"] or [],
+        "assay_groups": row["assay_groups"] or [],
+        "assay_by_tissue": row["assay_by_tissue"] or [],
+    }
+    with _pentimento_overview_cache_lock:
+        _pentimento_overview_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/pentimento",
+    summary="Overview of read-derived calls",
+    description=(
+        "Counts of samples scanned from the reads themselves: sex verdicts, "
+        "assay calls, and validated microbial detections."
+    ),
+    operation_id="get_pentimento_overview",
+)
+@limiter.limit("60/minute")
+def get_pentimento_overview(request: Request):
+    try:
+        return _get_pentimento_overview()
+    except Exception:
+        logger.exception("Database error in get_pentimento_overview")
+        raise HTTPException(500, "Internal server error")
+
+
 @api_app.get(
     "/stats/project-overlap",
     summary="Cross-archive project overlap",
@@ -10806,6 +10852,99 @@ def get_enriched_crosstab(
     except Exception:
         logger.exception("Database error in get_enriched_crosstab")
         raise HTTPException(500, "Internal server error")
+
+
+def _coverage_source_row(row: dict, totals: dict) -> dict:
+    """Given archive's enriched counts, plus its archive total and share."""
+    whole = totals.get(row["value"]) or {}
+    out = {
+        "source": row["value"],
+        "projects": row["projects"],
+        "samples": row["samples"],
+    }
+    for what in ("projects", "samples"):
+        total = whole.get(what)
+        out[f"total_{what}"] = total
+        out[f"pct_{what}"] = (
+            round(100 * out[what] / total, 1) if total and total > 0 else None
+        )
+    return out
+
+
+def _get_enriched_coverage() -> dict:
+    with _enriched_coverage_cache_lock:
+        if (
+            _enriched_coverage_cache["ready"]
+            and (time.time() - _enriched_coverage_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _enriched_coverage_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "enriched_coverage"):
+                raise _NotBuiltYet(
+                    "Enrichment coverage is being prepared; retry shortly."
+                )
+            cur.execute(ENRICHED_COVERAGE_SQL, ("source", len(_STATS_SOURCES) + 1))
+            sources = cur.fetchall()
+            dims = {}
+            for column in ENRICHED_COVERAGE_COLUMNS:
+                cur.execute(ENRICHED_COVERAGE_SQL, (column, _MAX_COVERAGE_VALUES))
+                dims[column] = cur.fetchall()
+            # the per-dimension lists are capped, so report the true counts
+            cur.execute(ENRICHED_COVERAGE_TOTALS_SQL)
+            totals_by_dim = {r["dimension"]: r["n"] for r in cur.fetchall()}
+
+    totals = _get_source_totals()
+    data = {
+        "by_source": [_coverage_source_row(r, totals) for r in sources],
+        "distinct_values": {
+            column: totals_by_dim.get(column, 0) for column in ENRICHED_COVERAGE_COLUMNS
+        },
+    }
+    for column, rows in dims.items():
+        data[f"by_{column}"] = [
+            {column: r["value"], "projects": r["projects"], "samples": r["samples"]}
+            for r in rows
+        ]
+
+    with _enriched_coverage_cache_lock:
+        _enriched_coverage_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/enriched/coverage",
+    summary="Enrichment coverage by source database, organism and assay",
+    description=(
+        "Return how many projects and samples carry AI-enriched ontology "
+        "metadata, split by archive (geo, sra, ena, arrayexpress, gsa, dra, gea), "
+        "by organism, by assay and by assay_category. Archive totals are planner "
+        "row estimates, so the percentages are approximate. A project with "
+        "several organisms or assays counts under each, so those rows sum past "
+        "the corpus total. The organism and assay lists are capped at limit; "
+        "distinct_values carries the full counts. Reads the enriched_coverage "
+        "materialized view."
+    ),
+    operation_id="get_enriched_coverage",
+)
+@limiter.limit("60/minute")
+def get_enriched_coverage(
+    request: Request,
+    limit: int = Query(50, ge=1, le=_MAX_COVERAGE_VALUES),
+):
+    try:
+        data = _get_enriched_coverage()
+    except _NotBuiltYet as exc:
+        raise HTTPException(503, str(exc))
+    except Exception:
+        logger.exception("Database error in get_enriched_coverage")
+        raise HTTPException(500, "Internal server error")
+
+    out = {"by_source": data["by_source"], "distinct_values": data["distinct_values"]}
+    for column in ENRICHED_COVERAGE_COLUMNS:
+        out[f"by_{column}"] = data[f"by_{column}"][:limit]
+    return out
 
 
 @api_app.get(
@@ -12127,6 +12266,9 @@ project summaries plus flattened sample rows; for one project, prefer
 
 For enriched aggregate exploration:
 - `get_enriched_stats`: coverage and per-column fill/distinct counts.
+- `get_enriched_coverage`: enriched projects and samples per archive, with the
+  archive total and percentage, plus counts per organism, assay and
+  assay_category. Answers "how many are enriched", "which database/organism/assay".
 - `get_enriched_column`: call with `column=...` for top values from tissue,
   cell_type, disease, assay, etc.
 - `get_enriched_crosstab`: call with `group=...` and `breakdown=...` for cross-tabs
@@ -12364,7 +12506,8 @@ MCP_EXCLUDED_OPERATION_IDS = {
 
 ENRICHMENT_OPERATION_IDS = {
     "search_enriched_samples",
-    # /disease/* is a rollup of ontology_samples_v4
+    "get_enriched_coverage",
+    # /disease/* is a rollup of ontology_samples_v5
     "get_disease_summary",
     "get_disease_facets",
     "get_disease_projects",
@@ -12475,6 +12618,8 @@ def _prewarm_caches() -> None:
         _get_atlas_payloads,
         _get_global_contributions_cached,
         _get_global_contributions_filters,
+        _get_single_cell_overview,
+        _get_pentimento_overview,
     ):
         try:
             warm()

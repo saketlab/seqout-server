@@ -589,7 +589,7 @@ LIMIT 200;
 """
 
 
-# --- Boolean/structured queries -------------------------------------------------
+# Boolean/structured queries
 # Every FTS path shares one CTE header: plainto_tsquery core_q + a Neo4j-expanded
 # OR-union match_q. Boolean mode swaps that header for a literal to_tsquery on both
 # core_q and match_q (the user's exact terms, no expansion). structured_search_sql()
@@ -617,8 +617,8 @@ _TSQUERY_HEADER_NAMED = _TSQUERY_HEADER_POS.replace("%s", "%(q)s")
 
 def structured_search_sql(sql):
     """Swap a search SQL's plainto+expansion CTE header for a literal to_tsquery
-    (boolean mode). Handles both positional and named param styles; a no-op if the
-    header isn't present."""
+    (boolean mode). Handles both positional and named param styles; unchanged
+    when the header is absent."""
     return sql.replace(_PLAINTO_HEADER_POS, _TSQUERY_HEADER_POS).replace(
         _PLAINTO_HEADER_NAMED, _TSQUERY_HEADER_NAMED
     )
@@ -864,10 +864,9 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
     literal terms with no expansion, so the total matches the boolean result list.
     """
     cte = _SEARCH_MATCH_CTE_STRUCTURED if structured else _SEARCH_MATCH_CTE
-    # Only the columns the count + facet + filter queries actually read. Notably
-    # NOT title/summary (summary holds full abstracts over a broad
-    # match), those exist in the shared CTE for the result-list path, not here.
-    # rank IS kept: the facets order by summed relevance, not hit count.
+    # Only the columns the count + facet + filter queries actually read.
+    # title/summary stay in the shared CTE for the result-list path.
+    # rank is kept because facets order by summed relevance.
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
@@ -875,16 +874,16 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
         + " instrument_models, library_strategies, platforms, library_sources\n"
         + "FROM matched;"
     )
-    # no_q is a SQL literal, not a bind param: "FALSE OR tsv @@ q" folds to
-    # "tsv @@ q" at plan time (keeps the FTS index in generic/prepared plans too),
-    # while "TRUE OR ..." folds to TRUE for the query-less full scan.
+    # no_q is a SQL literal: "FALSE OR tsv @@ q" folds to "tsv @@ q" at plan
+    # time, keeping the FTS index in generic/prepared plans too. "TRUE OR ..."
+    # folds to TRUE for the query-less full scan.
     sql = sql.replace("%(no_q)s", "TRUE" if not q else "FALSE")
     return sql, {"q": q, "q_variants": q_variants, "db": db}
 
 
 def build_search_total_over_matched(**filters):
     """Exact result total over the materialized `matched` temp table, with every
-    active filter applied (no exclude-self). Cheap — a filtered scan/count, no FTS.
+    active filter applied (no exclude-self). Filtered scan/count with no FTS.
     """
     params = {}
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
@@ -933,12 +932,12 @@ def build_search_facets_over_matched(**filters):
             f" GROUP BY {value_expr}"
         )
 
-    # Ordered by summed match rank, not hit count: a query can match a lot of
-    # studies in one organism for a reason that has nothing to do with what was
-    # asked, and those matches all score near zero. Summing (rather than taking
-    # the max) keeps the ordering count-weighted, so a big well-matched value
-    # still beats a single lucky hit. rank is NULL on a query-less search, so
-    # score collapses to 0 there and the count tiebreak carries the order.
+    # Ordered by summed match rank. A query can match many studies
+    # in one organism for an unrelated reason, and those matches all score near
+    # zero. Summing the ranks keeps the ordering count-weighted, so a big
+    # well-matched value still beats a single lucky hit. rank is NULL on a
+    # query-less search, so score collapses to 0 there and the count tiebreak
+    # carries the order.
     sql = (
         "WITH facets AS (\n"
         + "\n    UNION ALL\n".join(branches)
@@ -955,7 +954,6 @@ def build_search_facets_over_matched(**filters):
     return sql, params
 
 
-# Keyset guard for ranked (query-present) paging. cursor_rank NULL => first page.
 _RANK_KEYSET_WHERE = (
     "    WHERE (%(cursor_rank)s::float8 IS NULL\n"
     "           OR (rank, accession) < (%(cursor_rank)s::float8, %(cursor_acc)s::text))\n"
@@ -974,12 +972,12 @@ def build_search_results(
     **filters,
 ):
     """Paginated result list over the same filtered match set as the facet/total
-    queries — so the list and the sidebar counts always agree.
+    queries, so the list and the sidebar counts always agree.
 
     Default order is relevance (rank). `sortby` (year|citations|journal) overrides
     it with the same sort expression as build_sorted_search_sql, so filtered and
     unfiltered results order identically. All active filters apply (no
-    exclude-self). Offset-paginated, 200/page. total_count is NULL — the exact
+    exclude-self). Offset-paginated, 200/page. total_count is NULL; the exact
     total is deferred to /search/facets. Returns (sql, params) with %(name)s
     params and the same column layout as SEARCH_SQL.
     """
@@ -1067,11 +1065,10 @@ _RESULTS_PAGE_TAIL = "\nOFFSET COALESCE(%(offset)s::bigint, 0)\nLIMIT 200;"
 
 
 def strip_result_paging(sql):
-    """Drop build_search_results' 200-row page tail so the query returns every
-    match — for downloads, which stream the whole set instead of a page.
+    """Drop build_search_results' page tail, returning every match for downloads.
 
-    Raises if the tail moved: a silent no-op would cap every download at 200 rows
-    and look like a working download.
+    Raises if the tail moved: a silent no-op would cap every download at the page
+    size and look like a working download.
     """
     if _RESULTS_PAGE_TAIL not in sql:
         raise ValueError("result paging tail not found; strip_result_paging is stale")
@@ -1311,7 +1308,7 @@ LEFT JOIN ena_geocode eg ON eg.center_name = sub.center_name
 WHERE s.accession = %s;
 """
 
-# DDBJ-exclusive studies only -- a mirrored DRP is served by PROJECT_SRA_SQL.
+# DDBJ-exclusive studies. A mirrored DRP is served by PROJECT_SRA_SQL.
 # Shaped like PROJECT_SRA_SQL so the SRA project page renders it unchanged.
 PROJECT_DRA_SQL = """
 SELECT
@@ -1924,14 +1921,11 @@ LIMIT 1;
 """
 
 # ENA only mirrors runs that NCBI normalised into an .sra object. A run whose
-# submitter uploaded originals that were never normalised therefore has no
-# fastq_ftp at all, even though its original fastq.gz files are already listed in
-# ncbi_files -- so the page offered nothing to download while holding the links
-# (SRP567218: 44 runs, 0 files shown, 192 present).
+# submitter uploaded originals that were never normalised has no fastq_ftp, even
+# though its original fastq.gz files are already listed in ncbi_files.
 #
-# Only entries carrying a direct https url qualify. The rest are reachable solely
-# via "Use Cloud Data Delivery" s3 alternatives, which are requester-pays and not
-# a link we can hand a user; those runs keep showing no FASTQ, which is honest.
+# Direct https URLs qualify. The rest are requester-pays s3 alternatives from
+# "Use Cloud Data Delivery"; those runs keep showing no FASTQ.
 #
 # Every query reading fastq_ftp off sra_run_download_links needs this, or the
 # same run gains files on one page and stays empty on another.
@@ -1984,9 +1978,9 @@ _FASTQ_MD5_EXPR = (
 # Total by construction, never NULL where fastq_ftp is set: the ENA arm is just
 # the URL basename, which is byte-for-byte what callers derived themselves, so
 # reading this column can never change an ENA run's name. ORDINALITY keeps that
-# arm in url order; the fallback arm shares the aggregate's ORDER BY. Do not
-# strip the suffix by regex instead -- names like YCS122B_control.1.fastq.gz end
-# in a numeric component legitimately, and would be corrupted.
+# arm in url order; the fallback arm shares the aggregate's ORDER BY. Keep regex
+# out of this; names like YCS122B_control.1.fastq.gz end in a numeric component
+# legitimately, and would be corrupted.
 _FASTQ_FILENAMES_EXPR = """
 CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL
      THEN (SELECT string_agg(split_part(u, '/', -1), ';' ORDER BY ord)
@@ -2433,8 +2427,8 @@ d AS (
 """
 
 # Full deduped match set (capped). full_total is the real count before the cap
-# (window runs before LIMIT). The handler paginates + computes institute facets
-# in Python from this one result, so the CTE runs once instead of twice.
+# because the window runs before LIMIT. The handler paginates and computes
+# institute facets in Python from this one result, so the CTE runs once.
 SEARCH_AUTHOR_PROJECTS_SQL = (
     _AUTHOR_PROJECTS_CTE
     + """
@@ -2798,11 +2792,11 @@ def build_structured_search(
     sra.published_at, ae.release_date, ena.first_public).
 
     `sample_tissue`/`sample_disease`/`sample_cell_type` filter to studies that
-    have at least one matching row in ontology_samples_v4 (ILIKE substring match).
+    have at least one matching row in ontology_samples_v5 (ILIKE substring match).
 
     `count_by` switches the final SELECT to aggregation mode. Supported values:
     "year", "source", "organism", "country". Returns one row per bucket with
-    {bucket, count} instead of the paginated row list.
+    {bucket, count}.
     """
     params = {}
     cte_parts = []
@@ -2958,19 +2952,19 @@ def build_structured_search(
             w.append("array_length(g.platforms, 1) >= 2")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = g.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -3039,19 +3033,19 @@ def build_structured_search(
             w.append("array_length(s.platforms, 1) >= 2")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = s.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -3094,19 +3088,19 @@ def build_structured_search(
             w.append("ae.release_date <= %(published_before)s::date")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = ae.accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -3175,19 +3169,19 @@ def build_structured_search(
             w.append("es.first_public <= %(published_before)s::date")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = es.study_accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -3262,19 +3256,19 @@ def build_structured_search(
             w.append("gs.first_public <= %(published_before)s::date")
         if sample_tissue:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = gs.study_accession"
                 " AND os.tissue ILIKE %(sample_tissue)s)"
             )
         if sample_disease:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = gs.study_accession"
                 " AND os.disease ILIKE %(sample_disease)s)"
             )
         if sample_cell_type:
             w.append(
-                "EXISTS (SELECT 1 FROM ontology_samples_v4 os"
+                "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
                 " WHERE os.study_accession = gs.study_accession"
                 " AND os.cell_type ILIKE %(sample_cell_type)s)"
             )
@@ -4070,7 +4064,7 @@ WHERE %s::text IS NULL OR db = %s::text
 ORDER BY db, month;
 """
 
-# -- Projects mode (studies/series per month) --
+# Projects mode (studies/series per month)
 
 GROWTH_PROJECTS_GEO_SQL = """
 SELECT TO_CHAR(DATE_TRUNC('month', published_at), 'YYYY-MM') AS month,
@@ -4135,7 +4129,7 @@ GROUP BY DATE_TRUNC('month', release_date)
 ORDER BY month;
 """
 
-# -- Experiments mode (samples/experiments per month) --
+# Experiments mode (samples/experiments per month)
 
 GROWTH_EXPERIMENTS_GEO_SQL = """
 SELECT TO_CHAR(DATE_TRUNC('month', published_at), 'YYYY-MM') AS month,
@@ -4205,7 +4199,7 @@ GROUP BY DATE_TRUNC('month', e.release_date)
 ORDER BY month;
 """
 
-# -- Bases / bytes mode (data volume per month) --
+# Bases / bytes mode (data volume per month)
 
 GROWTH_BASES_ENA_SQL = """
 SELECT TO_CHAR(DATE_TRUNC('month', first_public), 'YYYY-MM') AS month,
@@ -4947,14 +4941,14 @@ def _enriched_summary_ddl(suffix: str = "") -> str:
         "    COUNT(*) AS enriched_samples,\n"
         "    COUNT(DISTINCT study_accession) AS enriched_projects,\n"
         f"    {cols}\n"
-        "FROM ontology_samples_v4;"
+        "FROM ontology_samples_v5;"
     )
 
 
 def _enriched_top_values_ddl(suffix: str = "") -> str:
     union = "\n        UNION ALL\n        ".join(
         f"SELECT '{c}' AS column_name, {c}::text AS value, COUNT(*) AS n "
-        f"FROM ontology_samples_v4 WHERE {c} IS NOT NULL AND {c}::text <> '' "
+        f"FROM ontology_samples_v5 WHERE {c} IS NOT NULL AND {c}::text <> '' "
         f"GROUP BY {c}"
         for c in ENRICHED_STAT_COLUMNS
     )
@@ -5013,7 +5007,7 @@ def _enriched_crosstab_ddl(suffix: str = "") -> str:
         f"CREATE MATERIALIZED VIEW enriched_crosstab{suffix} AS\n"
         "WITH base AS MATERIALIZED (\n"
         f"        SELECT\n            {base_cols}\n"
-        "        FROM ontology_samples_v4 os\n"
+        "        FROM ontology_samples_v5 os\n"
         "        LEFT JOIN unified_metadata um "
         "ON um.canonical_accession = os.study_accession\n"
         "        LEFT JOIN (SELECT scientific_name, MIN(common_name) AS common_name "
@@ -5048,14 +5042,81 @@ def _enriched_crosstab_ddl(suffix: str = "") -> str:
     )
 
 
+# ontology_samples_v5 has no source column; read the archive off the accession
+ENRICHED_SOURCE_CASE = """CASE
+            WHEN study_accession LIKE 'GSE%' THEN 'geo'
+            WHEN study_accession LIKE 'SRP%' OR study_accession LIKE 'PRJNA%' THEN 'sra'
+            WHEN study_accession LIKE 'ERP%' OR study_accession LIKE 'PRJEB%' THEN 'ena'
+            WHEN study_accession LIKE 'DRP%' OR study_accession LIKE 'PRJDB%' THEN 'dra'
+            WHEN study_accession LIKE 'CRA%' OR study_accession LIKE 'HRA%' THEN 'gsa'
+            WHEN study_accession LIKE 'E-GEAD-%' THEN 'gea'
+            WHEN study_accession LIKE 'E-%' THEN 'arrayexpress'
+            ELSE 'other'
+        END"""
+
+
+ENRICHED_COVERAGE_COLUMNS = ("organism", "assay", "assay_category")
+
+
+def _enriched_coverage_ddl(suffix: str = "") -> str:
+    """Enriched project/sample counts per archive, organism and assay."""
+    dims = "\n".join(
+        "UNION ALL\n"
+        f"SELECT '{c}', {c},\n"
+        "       COUNT(DISTINCT study_accession), COUNT(*)\n"
+        f"FROM base WHERE {c} IS NOT NULL AND {c} <> ''\n"
+        f"GROUP BY {c}"
+        for c in ENRICHED_COVERAGE_COLUMNS
+    )
+    cols = ", ".join(ENRICHED_COVERAGE_COLUMNS)
+    return (
+        f"DROP MATERIALIZED VIEW IF EXISTS enriched_coverage{suffix};\n"
+        f"CREATE MATERIALIZED VIEW enriched_coverage{suffix} AS\n"
+        "WITH base AS MATERIALIZED (\n"
+        f"        SELECT study_accession, {cols},\n"
+        f"               {ENRICHED_SOURCE_CASE} AS source\n"
+        "        FROM ontology_samples_v5\n"
+        "    )\n"
+        "SELECT 'source' AS dimension, source AS value,\n"
+        "       COUNT(DISTINCT study_accession) AS projects, COUNT(*) AS samples\n"
+        "FROM base GROUP BY source\n"
+        f"{dims};"
+    )
+
+
+# true counts; the API returns only a top slice
+ENRICHED_COVERAGE_TOTALS_SQL = """
+SELECT dimension, COUNT(*) AS n FROM enriched_coverage GROUP BY dimension;
+"""
+
+ENRICHED_COVERAGE_SQL = """
+SELECT dimension, value, projects, samples
+FROM enriched_coverage
+WHERE dimension = %s
+ORDER BY samples DESC, value
+LIMIT %s;
+"""
+
+
+# rebuild_enriched_stats.sh reads this list
+ENRICHED_STATS_VIEWS = (
+    "enriched_summary",
+    "enriched_column_top_values",
+    "enriched_crosstab",
+    "enriched_coverage",
+)
+
+
 def enriched_stats_ddl(suffix: str = "") -> str:
-    """DDL for the three enriched-stats matviews, optionally under a suffix."""
+    """DDL for the enriched-stats matviews, optionally under a suffix."""
     return (
         _enriched_summary_ddl(suffix)
         + "\n\n"
         + _enriched_top_values_ddl(suffix)
         + "\n\n"
         + _enriched_crosstab_ddl(suffix)
+        + "\n\n"
+        + _enriched_coverage_ddl(suffix)
     )
 
 
@@ -5179,13 +5240,13 @@ SELECT count(*)                        AS studies,
        sum(reads_male)                 AS reads_male,
        sum(reads_female)               AS reads_female
 FROM {prefix}_study;
-"""  # noqa: S608 -- prefix comes from DISEASE_COLLECTIONS, not from the request
+"""  # noqa: S608
 
 
 def build_disease_facets_sql(collection: str) -> str:
     """Facet counts. A value no study carries is absent, not zero."""
     prefix = DISEASE_COLLECTIONS[collection]["prefix"]
-    return (  # noqa: S608 -- prefix is not request-derived
+    return (  # noqa: S608
         f"SELECT facet, value, studies FROM {prefix}_facet "
         "ORDER BY facet, studies DESC;"
     )
@@ -5275,7 +5336,7 @@ cat_names AS (
 ),
 anc AS (
     SELECT os.study_accession, array_agg(DISTINCT e->>'name') AS ancestors
-    FROM ontology_samples_v4 os,
+    FROM ontology_samples_v5 os,
          LATERAL jsonb_array_elements(os.disease_ancestors::jsonb) e
     WHERE os.study_accession IN (SELECT study_accession FROM page)
       AND os.disease_ancestors LIKE '[%%'
@@ -5311,15 +5372,15 @@ def disease_projects_params(collection: str) -> tuple[str, ...]:
     )
 
 
-ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary;"
+ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary_v5;"
 ENRICHED_COLUMN_VALUES_SQL = (
-    "SELECT value, n FROM enriched_column_top_values "
+    "SELECT value, n FROM enriched_column_top_values_v5 "
     "WHERE column_name = %s ORDER BY n DESC LIMIT %s;"
 )
 
 ENRICHED_CROSSTAB_SQL = (
     "SELECT group_val, breakdown_val, n, group_total, group_distinct "
-    "FROM enriched_crosstab WHERE group_col = %s AND breakdown_col = %s "
+    "FROM enriched_crosstab_v5 WHERE group_col = %s AND breakdown_col = %s "
     "ORDER BY group_total DESC, group_val, n DESC;"
 )
 
@@ -5369,7 +5430,7 @@ def build_country_accessions_sql(
 
 # Senior-author attribution: use the last publication author by convention.
 # GEO contributor order is submitter order, not author order, so PI ranking uses
-# publications only and reports reduced coverage rather than guessing.
+# publications only and reports reduced coverage.
 _PI_SENIOR_AUTHORS_CTE = """
 authors AS (
     SELECT p.canonical_accession, p.pmid, p.center_name,
@@ -5412,8 +5473,7 @@ authors AS (
 
 # Ranking tail for _PI_AUTHORS_CTE. Authors are unnested, so project/paper counts
 # use DISTINCT. covered_projects is the distinct projects that yielded at least
-# one investigator -- the honest denominator for "how much of the set is attributed".
-# The limit placeholder is caller-supplied, so positional and named param styles both work.
+# one investigator.
 _PI_RANK_TAIL = """
 SELECT
     a.pi,
@@ -5464,31 +5524,7 @@ def build_search_investigators_sql(
     senior_only: bool = True,
     **filters,
 ) -> tuple[str, dict]:
-    """Rank investigators across the materialized `matched` temp table -- i.e. the
-    investigators behind an arbitrary full-text search, not a map region.
-
-    This is the aggregation the per-project tools can't do: it answers "who leads
-    this field" for any query, instead of forcing a caller to fan out thousands of
-    per-project lookups. Reads `matched` (built by build_search_match_temp, so it
-    inherits boolean/structured queries and the db scope).
-
-    senior_only (default): rank by the publication's LAST author -- the PI. This
-    is the honest reading of "top investigators"; counting every author instead
-    ranks prolific lab members above the PI who leads them. Pass senior_only=False
-    for the every-contributor tally.
-
-    Two joins that look wrong but aren't:
-      * unified_metadata is joined on IN (dedup_key, accession). Neither alone is
-        enough -- ~170k SRA studies canonicalise to their GSE alias (dedup_key),
-        while other matched rows are keyed by their own accession. Using both
-        covers 92% of a broad match set vs 75%/89% for either alone.
-      * `country` filters unified_metadata.country, NOT matched.countries. The
-        latter is raw per-source text where 'USA' and 'United States' are distinct
-        values, so an exact filter silently returns a fraction of the real set.
-        u.country is normalised, and matches get_country_pis' semantics.
-
-    Caller must run inside the same transaction that built `matched`.
-    """
+    """Rank investigators across the materialized `matched` temp table."""
     params: dict = {}
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
     conds = list(dim_clauses.values()) + always_clauses
@@ -5588,7 +5624,7 @@ WHERE st.accession = %s;
 
 ENRICHED_STUDY_V4_SQL = """
 SELECT st.accession, st.title, st.n_samples, st.single_cell_modality
-FROM enriched_studies_v4 st
+FROM enriched_studies_v5 st
 WHERE st.accession = %s;
 """
 
@@ -5617,7 +5653,7 @@ SELECT
     os.cell_type_ontology_id, os.cell_type_ontology_name,
     os.assay_ontology_id, os.assay_ontology_name,
     os.development_stage_ontology_id, os.development_stage_ontology_name
-FROM ontology_samples_v4 os{_pentimento_counts_lateral("os.sample")}
+FROM ontology_samples_v5 os{_pentimento_counts_lateral("os.sample")}
 WHERE os.study_accession = %s
 ORDER BY os.sample;
 """
@@ -5663,8 +5699,7 @@ _SAMPLE_SEARCH_RANGE_COLS = {
 
 # Every pentimento_sample filter: key -> (clause over alias `p`, param value).
 # The value callable is None for flags that bind nothing. Matrix counts live
-# here and NOT on ontology_samples_v4, whose cell_count/gene_count are NULL on
-# all 16.1M rows with nothing writing them -- those filters matched nothing.
+# here; ontology_samples_v5 cell_count/gene_count are NULL placeholders.
 _SAMPLE_SEARCH_PENTIMENTO = {
     # `has_matrix` is the PROOF tier: a cell-by-gene matrix was parsed for this
     # sample. Prefer it over single_cell_only when you want data you can
@@ -5672,9 +5707,8 @@ _SAMPLE_SEARCH_PENTIMENTO = {
     #
     # single_cell_only is a read-derived call (10x barcode-whitelist hits) and
     # needs FASTQ plus a completed preflightx scan, so it is NULL on most
-    # verified single-cell samples: measured 2026-08-21, only 769 of the 16,381
-    # studies with a counted matrix carry a barcode hit anywhere -- 4.7%. The two
-    # filters answer different questions and neither subsumes the other.
+    # verified single-cell samples. The two filters answer different questions
+    # and neither subsumes the other.
     "has_matrix": ("p.cells > 0", None),
     "single_cell_only": ("p.assay_is_single_cell IS TRUE", None),
     "has_viral_reads": ("p.has_viral_reads IS TRUE", None),
@@ -5730,7 +5764,7 @@ _MICROBE_ROW_CAP = 50
 
 # Sorting on these means joining pentimento_sample into the page CTE, because
 # the page is cut before the LATERALs run. Everything else sorts on its own
-# ontology_samples_v4 column.
+# ontology_samples_v5 column.
 _PENTIMENTO_SORT_COLS = {"cell_count": "cells", "gene_count": "genes"}
 SAMPLE_SEARCH_SORTABLE = frozenset(
     {"sample", "study_accession", "age_days"} | set(_PENTIMENTO_SORT_COLS)
@@ -5759,12 +5793,9 @@ def _pentimento_sort_page(
 ) -> str:
     """Page CTE body for a sort on a pentimento matrix count.
 
-    Only 85k of 16.1M samples carry a count, and NULLS LAST puts the unmeasured
-    ones last in *both* directions -- so the measured rows are always a prefix of
-    the result. Producing them by joining the small table (an inner join, ~150ms)
-    and leaving the tail to an anti-join (~110ms) beats scanning the big table
-    with an outer join to a dedup subquery (~1060ms, and it flipped to a
-    disk-spilling merge join on wider cohorts).
+    NULLS LAST puts unmeasured rows last in both directions, so measured rows form
+    a prefix. The measured branch joins pentimento_sample directly, and the
+    unmeasured tail is left to an anti-join.
 
     The measured branch joins pentimento_sample directly: a duplicate
     sample_accession would fan the page out past the count query, and
@@ -5773,15 +5804,14 @@ def _pentimento_sort_page(
     so correctness never relies on UNION ALL preserving branch order.
 
     `measured_only` drops the second branch entirely. A pentimento_sample filter
-    and "has no pentimento_sample row" are contradictory, so that branch is
-    guaranteed empty -- but Postgres cannot prove it and scans for it anyway,
-    which measured 20% of the time and 31% of the buffers on a liver-sized page."""
+    and a missing pentimento_sample row are contradictory, so that branch is
+    guaranteed empty. Postgres cannot prove it and scans for it anyway."""
     if measured_only:
         return f"""
     SELECT {select},
            pv.{col} AS {sort}
     FROM pentimento_sample pv
-    JOIN ontology_samples_v4 s ON s.sample = pv.sample_accession
+    JOIN ontology_samples_v5 s ON s.sample = pv.sample_accession
     WHERE {where}
     ORDER BY pv.{col} {direction} NULLS LAST{tiebreak}
     LIMIT %(limit)s OFFSET %(offset)s"""
@@ -5791,14 +5821,14 @@ def _pentimento_sort_page(
         (SELECT {select},
                 pv.{col} AS {sort}
          FROM pentimento_sample pv
-         JOIN ontology_samples_v4 s ON s.sample = pv.sample_accession
+         JOIN ontology_samples_v5 s ON s.sample = pv.sample_accession
          WHERE {where}
          ORDER BY pv.{col} {direction} NULLS LAST{tiebreak}
          LIMIT %(page_end)s)
         UNION ALL
         (SELECT {select},
                 NULL::bigint AS {sort}
-         FROM ontology_samples_v4 s
+         FROM ontology_samples_v5 s
          WHERE {where}
            AND NOT EXISTS (SELECT 1 FROM pentimento_sample pn
                            WHERE pn.sample_accession = s.sample)
@@ -5883,20 +5913,19 @@ def _is_set(value) -> bool:
 def _sample_semi(inner: str) -> str:
     """Wrap a sub-select as a cohort-narrowing semi-join over `s.sample`.
 
-    `= ANY(ARRAY(...))`, not `IN (...)`: with IN the planner is free to read the
-    sub-select as a semi-join driven from the 16M-row side, probing pentimento
-    once per ontology row -- 1.9s for a count bound, 2.1s for a microbe filter.
-    ARRAY() builds the small side once instead: same rows, 47ms and 220ms."""
+    `= ANY(ARRAY(...))` builds the small side once. `IN (...)` can let the planner
+    drive the semi-join from ontology_samples_v5 and probe pentimento once per
+    ontology row."""
     return f"\n  AND s.sample = ANY(ARRAY(\n    {inner}\n  ))"
 
 
 def _microbe_semi(filters: dict, params: dict) -> str:
-    """Semi-join over the 914k detections."""
+    """Semi-join over microbe detections."""
     if not _wants_microbes(filters):
         return ""
-    # DISTINCT + NOT NULL: unnest emits both accessions per run, most of them
-    # repeats and ~14% NULL, so the raw array runs 2.3x the size of the set it
-    # represents (26 MB on a broad filter) and is materialised twice per request.
+    # DISTINCT + NOT NULL: unnest emits both accessions per run, with repeats and
+    # NULLs, so the raw array is larger than the represented sample set and would
+    # be materialised twice per request.
     return _sample_semi(f"""SELECT DISTINCT x FROM (
         SELECT unnest(ARRAY[r.gsm_accession, r.sample_accession]) AS x
         FROM pentimento_run r
@@ -5980,7 +6009,7 @@ def _wants_microbes(filters: dict) -> bool:
 
 
 # LIMIT 1: redundant under idx_pentimento_sample_sample_uniq, but it keeps the
-# planner on a correlated index probe rather than hashing all 85k rows.
+# planner on a correlated index probe.
 _PENTIMENTO_SAMPLE_LATERAL = """
 LEFT JOIN LATERAL (
     SELECT p.sample_accession, p.cells, p.genes, p.unfiltered, p.assay_display,
@@ -5996,8 +6025,8 @@ LEFT JOIN LATERAL (
 def _sample_search_filter(filters: dict, include_descendants: bool) -> tuple[str, dict]:
     """The whole WHERE for the cohort, shared by the page query and its count.
 
-    FROM is ontology_samples_v4 alone; the pentimento filters appear here as
-    semi-joins so they narrow that scan instead of decorating its output."""
+    FROM is ontology_samples_v5 alone; the pentimento filters appear here as
+    semi-joins so they narrow that scan before output decoration."""
     where, params = _sample_search_where(filters, include_descendants)
     where += _pentimento_semi(filters, params) + _microbe_semi(filters, params)
     return where, params
@@ -6011,11 +6040,11 @@ def build_enriched_sample_search_sql(
     offset: int = 0,
     include_descendants: bool = True,
 ) -> tuple[str, dict]:
-    """Cross-project sample cohort search over ontology_samples_v4 -> (sql, params).
+    """Cross-project sample cohort search over ontology_samples_v5.
 
-    Every pentimento filter -- `microbe*`, the flags, and the matrix-count bounds
-    -- also restricts the cohort, so `total` shrinks with them. Pair with the
-    count builder, which applies the identical WHERE."""
+    Every pentimento filter, including `microbe*`, flags, and matrix-count bounds,
+    also restricts the cohort, so `total` shrinks with them. Pair with the count
+    builder, which applies the identical WHERE."""
     if sort not in SAMPLE_SEARCH_SORTABLE:
         raise ValueError(f"unsortable column: {sort}")
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
@@ -6044,7 +6073,7 @@ def build_enriched_sample_search_sql(
         return f"ORDER BY {expr} {direction} NULLS LAST{tiebreak}"
 
     # The page is cut before the LATERALs run, so they decorate at most `limit`
-    # rows rather than every row the filters matched.
+    # rows matched by filters.
     if sort in _PENTIMENTO_SORT_COLS:
         measured_only = _wants_pentimento_sample(filters)
         if not measured_only:
@@ -6061,7 +6090,7 @@ def build_enriched_sample_search_sql(
     else:
         page_body = f"""
     SELECT {_SAMPLE_SEARCH_SELECT}
-    FROM ontology_samples_v4 s
+    FROM ontology_samples_v5 s
     WHERE {where}
     {order_by(f"s.{sort}")}
     LIMIT %(limit)s OFFSET %(offset)s"""
@@ -6087,7 +6116,7 @@ def build_enriched_sample_count_sql(
     """Cohort total. Same WHERE as the page, none of its per-row decoration."""
     where, params = _sample_search_filter(filters, include_descendants)
     return (
-        f"SELECT COUNT(*)::bigint AS total\nFROM ontology_samples_v4 s\nWHERE {where};",
+        f"SELECT COUNT(*)::bigint AS total\nFROM ontology_samples_v5 s\nWHERE {where};",
         params,
     )
 
@@ -6193,30 +6222,26 @@ ORDER BY sample_accession
 LIMIT %s OFFSET %s;
 """
 
-# --- single-cell status and summary -------------------------------------------
+# Single-cell status and summary
 #
-# Three things these queries exist to keep straight, because the raw columns
-# invite the opposite reading:
+# These queries keep raw columns from inviting the opposite reading:
 #
-# 1. `unified_metadata.single_cell_status` is a CACHED label, recomputed by the
-#    recall_fix recipe in seqout-ingestion, not by this server. It lags the
-#    evidence: measured 2026-08-21 it said 21,934 `measured_single_cell` while
-#    the three evidence sources below resolved to 26,298 studies. So the status
-#    is returned ALONGSIDE the evidence, never instead of it.
+# 1. `unified_metadata.single_cell_status` is a cached label recomputed by the
+#    recall_fix recipe in seqout-ingestion. The endpoint returns status alongside
+#    the evidence.
 #
-# 2. The three evidence sources are INDEPENDENT and are not all attempted on
-#    every study: the matrix route needs supplementary files, the two read
-#    routes need FASTQ plus a preflightx scan. A study scoring 1 of 3 is not
-#    weak evidence, it is usually the only measurement that could be made. A
-#    counted matrix is proof on its own.
+# 2. The evidence sources are independent and attempted only when the required
+#    inputs exist: the matrix route needs supplementary files, and the read routes
+#    need FASTQ plus a preflightx scan. A study with a single evidence source is
+#    usually showing the only measurement that could be made. A counted matrix is
+#    proof on its own.
 #
 # 3. `n_runs_measurable = 0` means the quantifier NEVER RAN. It does not mean
 #    "clean". An empty `flags` list with n_runs_measurable > 0 is the "measured,
 #    found nothing" case. The handler emits an explicit microbe_measured bool so
 #    a caller cannot collapse the two.
-# A SELECT-LIST FRAGMENT, not a CTE. Interpolated into both single-study queries
-# so the definition of "single-cell evidence" exists once. It owns its trailing
-# comma so call sites cannot disagree about it.
+# SELECT-list fragment interpolated into both single-study queries. It owns its
+# trailing comma so call sites cannot disagree about it.
 SINGLE_CELL_EVIDENCE_COLS = """
   (SELECT count(*) FROM pentimento_sample s
     WHERE s.study_accession = %(acc)s AND s.cells > 0)          AS samples_with_matrix,
@@ -6254,12 +6279,10 @@ SINGLE_CELL_EVIDENCE_COLS = """
     WHERE s4.study_accession = %(acc)s AND s4.cells > 0)        AS matrix_accessions,
 """
 
-# Anchored on the ACCESSION, not on unified_metadata, so exactly one row always
-# comes back. 1,359 studies live in pentimento_study but not in unified_metadata
-# (measured 2026-08-21); anchoring on the unified table 404s on precisely the
-# studies this endpoint exists to answer for. `in_unified` / `in_pentimento` tell
-# the caller which side knows about it -- "nothing has measured this" is an
-# answer, not an error.
+# Anchor on ACCESSION so exactly one row always comes back. pentimento_study has
+# studies missing from unified_metadata; anchoring on the unified table returns
+# 404 for studies this endpoint exists to answer for. `in_unified` / `in_pentimento` tell
+# the caller which side knows about it. "nothing has measured this" is an answer.
 SINGLE_CELL_STATUS_SQL = f"""
 SELECT u.canonical_accession, u.source, u.single_cell_status, u.is_single_cell,
        (u.canonical_accession IS NOT NULL)                      AS in_unified,
@@ -6341,7 +6364,7 @@ LIMIT %(limit)s OFFSET %(offset)s;
 
 PENTIMENTO_SAMPLE_TISSUE_SQL = """
 SELECT sample, tissue
-FROM ontology_samples_v4
+FROM ontology_samples_v5
 WHERE study_accession = %(acc)s AND sample = ANY(%(samples)s);
 """
 
@@ -6356,7 +6379,7 @@ classified AS (
            WHEN ev.matrix = 1                              THEN 'matrix_only'
            ELSE 'fastq_only'
          END AS kind,
-         COALESCE(p.n_samples_detailed, p.n_samples_reported, 0) AS n_samples,
+         COALESCE(p.n_samples_detailed, p.n_samples_reported) AS n_samples,
          COALESCE(p.study_cells, 0) AS n_cells
   FROM ev
   LEFT JOIN pentimento_study p ON p.study_accession = ev.study_accession
@@ -6365,13 +6388,16 @@ tissue_organism AS (
   SELECT os.study_accession,
          COALESCE(os.tissue_ontology_name, os.tissue) AS tissue,
          os.organism
-  FROM ontology_samples_v4 os
+  FROM ontology_samples_v5 os
   JOIN classified c ON c.study_accession = os.study_accession
 )
 SELECT
   agg.n_studies, agg.n_samples, agg.n_cells,
   (SELECT json_agg(x) FROM (
-     SELECT kind, count(*) AS n_studies
+     SELECT kind, count(*) AS n_studies,
+            -- a zero total counts as uncounted, same as a missing row
+            count(*) FILTER (WHERE n_samples > 0) AS n_studies_counted,
+            COALESCE(sum(n_samples), 0) AS n_samples
      FROM classified GROUP BY kind
    ) x)                                            AS by_kind,
   (SELECT json_agg(x) FROM (
@@ -6411,6 +6437,127 @@ LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
 WHERE (r.gsm_accession = %(acc)s OR r.sample_accession = %(acc)s)
 ORDER BY m.kmer_mass DESC NULLS LAST, m.breadth_frac DESC NULLS LAST
 LIMIT %(limit)s;
+"""
+
+
+PENTIMENTO_OVERVIEW_SQL = f"""
+WITH rollup AS (
+  -- one pass over pentimento_run. min/max answer "none, or more than one"
+  -- without the sort count(DISTINCT) forces, and GROUPING SETS gets the study
+  -- count in the same scan; a sample can span studies, so min(study_accession)
+  -- would undercount.
+  SELECT COALESCE(gsm_accession, sample_accession) AS sample,
+         study_accession,
+         grouping(study_accession) AS is_sample_row,
+         bool_or(measurable) AS measurable,
+         min(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_lo,
+         max(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_hi,
+         min(assay) AS assay_lo,
+         max(assay) AS assay_hi
+  FROM pentimento_run
+  WHERE gsm_accession IS NOT NULL OR sample_accession IS NOT NULL
+  GROUP BY GROUPING SETS ((1), (2))
+),
+per_sample AS (SELECT * FROM rollup WHERE is_sample_row = 1),
+scanned AS (
+  SELECT count(*) FILTER (WHERE is_sample_row = 1) AS n_samples,
+         count(*) FILTER (WHERE is_sample_row = 1 AND measurable) AS n_measurable,
+         count(*) FILTER (WHERE is_sample_row = 0
+                          AND study_accession IS NOT NULL) AS n_studies
+  FROM rollup
+),
+sex AS (
+  -- runs that disagree are their own bucket, never folded into one sex
+  SELECT CASE WHEN sex_lo IS NULL     THEN 'no_verdict'
+              WHEN sex_lo <> sex_hi   THEN 'conflicting'
+              ELSE sex_lo END AS verdict,
+         count(*) AS n_samples
+  FROM per_sample GROUP BY 1
+),
+assay AS (
+  SELECT CASE WHEN assay_lo IS NULL     THEN 'No call'
+              WHEN assay_lo <> assay_hi THEN 'Mixed'
+              ELSE assay_lo END AS assay,
+         count(*) AS n_samples
+  FROM per_sample GROUP BY 1
+),
+hits AS (
+  SELECT m.class, m.organism,
+         COALESCE(r.gsm_accession, r.sample_accession) AS sample
+  FROM pentimento_microbe m
+  JOIN pentimento_run r ON r.run_accession = m.run_accession
+  WHERE {_MICROBE_VALIDATED_EXPR}
+    AND (r.gsm_accession IS NOT NULL OR r.sample_accession IS NOT NULL)
+),
+-- assay_lo = assay_hi is the agreement test; split samples drop out
+sc_sample AS (
+  SELECT sample, assay_lo AS assay
+  FROM per_sample
+  WHERE assay_lo IS NOT NULL AND assay_lo = assay_hi
+    AND assay_lo <> 'Not single-cell'
+),
+-- one tissue per sample; one filed under two studies stacks twice
+sample_tissue AS (
+  SELECT sc.sample, sc.assay,
+         min(COALESCE(os.tissue_ontology_name, os.tissue)) AS tissue,
+         min(os.study_accession) AS study_accession
+  FROM sc_sample sc
+  JOIN ontology_samples_v5 os ON os.sample = sc.sample
+  WHERE COALESCE(os.tissue_ontology_name, os.tissue) IS NOT NULL
+  GROUP BY 1, 2
+),
+-- count studies; plate-based studies file one sample per well and dominate
+-- a sample count
+tissue_cell AS (
+  SELECT assay, tissue, count(DISTINCT study_accession) AS n_studies
+  FROM sample_tissue GROUP BY 1, 2
+),
+top_assay AS (
+  SELECT assay, sum(n_studies) AS n_studies
+  FROM tissue_cell GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+),
+-- eight matches the palette width
+top_tissue AS (
+  SELECT tissue FROM tissue_cell
+  GROUP BY 1 ORDER BY sum(n_studies) DESC LIMIT 8
+)
+SELECT
+  scanned.n_samples, scanned.n_measurable, scanned.n_studies,
+  (SELECT count(DISTINCT sample) FROM hits)             AS n_samples_with_hit,
+  (SELECT json_agg(x) FROM (
+     SELECT verdict, n_samples FROM sex ORDER BY n_samples DESC
+   ) x)                                                 AS sex,
+  (SELECT json_agg(x) FROM (
+     SELECT class, count(DISTINCT sample) AS n_samples,
+            count(DISTINCT organism) AS n_organisms
+     FROM hits GROUP BY class ORDER BY n_samples DESC
+   ) x)                                                 AS microbe_by_class,
+  (SELECT json_agg(x) FROM (
+     SELECT organism, class, count(DISTINCT sample) AS n_samples
+     FROM hits GROUP BY organism, class ORDER BY n_samples DESC LIMIT 12
+   ) x)                                                 AS top_microbes,
+  (SELECT json_agg(x) FROM (
+     SELECT assay, n_samples FROM assay
+     WHERE assay NOT IN ('No call', 'Not single-cell', 'Mixed')
+     ORDER BY n_samples DESC LIMIT 12
+   ) x)                                                 AS by_assay,
+  -- the shares that partition every scanned sample. Runs that disagree about
+  -- being single-cell answer "unknown", so Mixed sits with No call.
+  (SELECT json_agg(x) FROM (
+     SELECT CASE WHEN assay IN ('No call', 'Mixed') THEN 'no_call'
+                 WHEN assay = 'Not single-cell' THEN 'not_single_cell'
+                 ELSE 'single_cell' END AS group_name,
+            sum(n_samples) AS n_samples
+     FROM assay GROUP BY 1
+   ) x)                                                 AS assay_groups,
+  (SELECT json_agg(x) FROM (
+     SELECT tc.assay, tc.tissue, tc.n_studies
+     FROM tissue_cell tc
+     WHERE tc.assay IN (SELECT assay FROM top_assay)
+       AND tc.tissue IN (SELECT tissue FROM top_tissue)
+     ORDER BY tc.n_studies DESC
+   ) x)                                                 AS assay_by_tissue
+FROM scanned;
 """
 
 
@@ -6596,5 +6743,10 @@ if __name__ == "__main__":
     }
     assert _MICROBE_KINGDOM_CASE in PENTIMENTO_MICROBES_SQL
     assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_MICROBES_SQL
+    assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_OVERVIEW_SQL
+    # sex_verdict is NULL when a run was never assessed; the overview keeps
+    # that bucket so the denominator stays visible
+    assert "'no_verdict'" in PENTIMENTO_OVERVIEW_SQL
+    assert "'conflicting'" in PENTIMENTO_OVERVIEW_SQL
 
     print("OK: cohort search + structured multi-value self-checks pass")

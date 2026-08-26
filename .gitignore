@@ -18,3 +18,5 @@ test_*
 data/map_assets/
 schema.sql
 .env
+
+docs/
