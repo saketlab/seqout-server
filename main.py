@@ -168,6 +168,7 @@ from queries import (
     PENTIMENTO_SAMPLE_CELLS_SQL,
     PENTIMENTO_MICROBES_SQL,
     PENTIMENTO_SAMPLES_SQL,
+    PENTIMENTO_STUDY_DETECTIONS_SQL,
     PENTIMENTO_SAMPLE_TISSUE_SQL,
     PENTIMENTO_STUDY_SQL,
     PROJECT_AE_SQL,
@@ -10460,9 +10461,12 @@ def _get_pentimento_overview() -> dict:
         "n_measurable": row["n_measurable"] or 0,
         "n_studies": row["n_studies"] or 0,
         "n_samples_with_hit": row["n_samples_with_hit"] or 0,
+        "n_samples_with_evidence": row["n_samples_with_evidence"] or 0,
         "sex": row["sex"] or [],
         "microbe_by_class": row["microbe_by_class"] or [],
         "top_microbes": row["top_microbes"] or [],
+        "microbe_by_read_end": row["microbe_by_read_end"] or [],
+        "low_breadth_calibration": row["low_breadth_calibration"] or {},
         "by_assay": row["by_assay"] or [],
         "assay_groups": row["assay_groups"] or [],
         "assay_by_tissue": row["assay_by_tissue"] or [],
@@ -11036,6 +11040,8 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
     microbe_min_breadth: float | None = Query(None, ge=0.0, le=1.0),
     microbe_min_kmer_mass: float | None = Query(None, ge=0.0),
     microbe_validated_only: bool = Query(False),
+    microbe_tier: str | None = Query(None, pattern="^(any|low_breadth|high_breadth)$"),
+    microbe_exclude_background: bool = Query(False),
     sort: str = Query(
         "sample", pattern="^(sample|study_accession|age_days|cell_count|gene_count)$"
     ),
@@ -11087,6 +11093,8 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         "microbe_min_breadth": microbe_min_breadth,
         "microbe_min_kmer_mass": microbe_min_kmer_mass,
         "microbe_validated_only": microbe_validated_only,
+        "microbe_tier": microbe_tier,
+        "microbe_exclude_background": microbe_exclude_background,
     }
     active = {
         k: v for k, v in filters.items() if v is not None and v != "" and v is not False
@@ -11420,12 +11428,66 @@ def get_project_single_cell(
                 cur.execute(PENTIMENTO_SAMPLES_SQL, (resolved, limit, offset))
                 samples = cur.fetchall()
                 _attach_pentimento_labels(cur, resolved, samples)
+                _attach_pentimento_detections(cur, resolved, samples)
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_single_cell")
         raise HTTPException(500, "Internal server error")
     return {**study, "samples": samples, "limit": limit, "offset": offset}
+
+
+@api_app.get(
+    "/project/{accession}/pentimento.csv",
+    summary="Download per-organism microbial detections as CSV",
+    description=(
+        "One row per sample per organism, at full taxon resolution: class, "
+        "kingdom, breadth tier, genome breadth, covered bases, reads, k-mer mass "
+        "and unitigs. A screened sample with nothing found emits one row with an "
+        "empty organism, so absence is distinguishable from never having been "
+        "scanned.\n\n"
+        "`all_rows=true` returns every panel organism including trace and "
+        "background hits; the default returns only rows at or above the "
+        "low-breadth reporting tier."
+    ),
+    operation_id="download_pentimento_detections_csv",
+)
+@limiter.limit("20/minute")
+def download_pentimento_detections_csv(
+    request: Request,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+    all_rows: bool = Query(False),
+):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession)
+                if not resolved:
+                    raise HTTPException(404, "Study not in the Pentimento")
+                cur.execute(
+                    PENTIMENTO_STUDY_DETECTIONS_SQL,
+                    {"study": resolved, "all_rows": all_rows},
+                )
+                rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in download_pentimento_detections_csv")
+        raise HTTPException(500, "Internal server error")
+
+    if not rows:
+        raise HTTPException(404, "Study not in the Pentimento")
+    for r in rows:
+        r["study_accession"] = resolved
+    return StreamingResponse(
+        iter([rows_to_csv(rows)]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{resolved}_pentimento_detections.csv"'
+            )
+        },
+    )
 
 
 _CONTROL_KINGDOMS = frozenset({"spike_in_control", "negative_control"})
@@ -11449,7 +11511,7 @@ def get_sample_microbes(
     min_breadth: float | None = Query(None, ge=0.0, le=1.0),
     min_kmer_mass: float | None = Query(None, ge=0.0),
     validated_only: bool = Query(False),
-    include_background: bool = Query(False),
+    exclude_background: bool = Query(False),
     limit: int = Query(500, ge=1, le=1000),
 ):
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
@@ -11465,7 +11527,7 @@ def get_sample_microbes(
                         "min_breadth": min_breadth,
                         "min_kmer_mass": min_kmer_mass,
                         "validated_only": validated_only,
-                        "include_background": include_background,
+                        "exclude_background": exclude_background,
                         "limit": limit,
                     },
                 )
@@ -11531,7 +11593,7 @@ def get_sample_microbes(
             "min_breadth": min_breadth,
             "min_kmer_mass": min_kmer_mass,
             "validated_only": validated_only,
-            "include_background": include_background,
+            "exclude_background": exclude_background,
         },
         "measurable": None if not rows else any(r["measurable"] for r in rows),
         "n_runs": len({r["run_accession"] for r in rows}),
@@ -11541,6 +11603,29 @@ def get_sample_microbes(
         "by_organism": organisms,
         "detections": detections,
     }
+
+
+def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
+    """Attach per-organism detections, in place, keyed by sample accession.
+
+    The grid used to badge from a hardcoded 24-taxon list, so anything outside it
+    read as "none detected" no matter how strong the signal. `screened` separates
+    a sample with no detections from one that was never scanned.
+    """
+    if not samples:
+        return
+    cur.execute(PENTIMENTO_STUDY_DETECTIONS_SQL, {"study": study, "all_rows": False})
+    by_sample: defaultdict[str, list[dict]] = defaultdict(list)
+    screened: set[str] = set()
+    for row in cur.fetchall():
+        acc = row.pop("sample")
+        screened.add(acc)
+        if row["organism"] is not None:
+            by_sample[acc].append(row)
+    for s in samples:
+        acc = s["sample_accession"]
+        s["detections"] = by_sample.get(acc, [])
+        s["screened"] = acc in screened
 
 
 def _resolve_enrichment_accession(cur, accession: str) -> str:
@@ -12327,13 +12412,36 @@ Read-derived (Pentimento) filters, layered on the same query:
   organism name, so `papillomavirus` catches every HPV type in one call.
   `microbe_min_breadth`, `microbe_min_kmer_mass`, `microbe_class` and
   `microbe_validated_only` tighten it.
+- ROUTE INFECTION QUESTIONS HERE, NOT to `has_viral_reads`/`has_bacterial_reads`.
+  Those two read a precomputed column on a 150k-sample subset and are true on
+  ~370 samples each, so "samples with HPV" answered that way understates the
+  cohort by more than 10x. Use `microbe="HPV"` (9x more samples) or
+  `microbe_class="pathogen"` for "any bacterial infection".
+- `microbe_tier` sets the breadth-of-coverage floor and defaults to
+  `low_breadth`:
+    - `high_breadth` - the strict per-kingdom flags. Use when the user wants
+      confident calls: HPV 323 samples, pathogen 998.
+    - `low_breadth` (default) - includes bacteria at >=1% genome breadth.
+      HPV 1,338, pathogen 14,345.
+    - `any` - no floor at all. Matches trace k-mer noise: `microbe_class=
+      "pathogen"` alone returns 370k samples. Only use when the user explicitly
+      asks for unfiltered detections.
+  Breadth is a FRACTION of genome, and viral genomes are ~250x smaller than
+  bacterial, so a given percentage is far weaker evidence for a virus than for a
+  bacterium. Never compare a viral and a bacterial breadth number directly.
 - So "all cervical scRNA with HPV quantification" is ONE call:
   `search_enriched_samples(tissue="cervi", assay="single cell rna",
   microbe="papillomavirus", single_cell_only=true)`.
 - The `microbes` array is capped at 50 rows per sample with `microbes_truncated`
   set, but every aggregate is computed over ALL detections, so the counts stay
   correct even when the array is short.
-- Detections are evidence, not diagnosis. Carry the same caveats as the
+- Detections are evidence, not diagnosis, and the tiers are breadth thresholds
+  rather than validated calls. Measured against reagent/skin-flora background
+  organisms clearing the same bar, `low_breadth` bacterial rows are only ~1.3x
+  enriched over contamination; `high_breadth` is ~3x. Say "reference signal
+  consistent with X", never "infected with X". Culture contaminants (Mycoplasma)
+  and vector-derived E. coli signal dominate raw bacterial counts, so report
+  `class` alongside any bacterial number. Carry the same caveats as the
   single-cell section: panel-alignment gates only, no replicate confirmation,
   and a null result means unscreened rather than absent.
 

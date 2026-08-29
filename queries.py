@@ -5727,10 +5727,18 @@ _SAMPLE_SEARCH_MICROBE_KEYS = frozenset(
         "microbe_min_breadth",
         "microbe_min_kmer_mass",
         "microbe_validated_only",
+        "microbe_tier",
+        "microbe_exclude_background",
     }
 )
 
 # Resolved by semi-join against the small pentimento tables, not by a column compare
+# microbe_tier only narrows a microbe match, so it must not by itself pull the
+# pentimento join into an otherwise plain sample search
+_SAMPLE_SEARCH_MICROBE_SELECTORS = _SAMPLE_SEARCH_MICROBE_KEYS - {
+    "microbe_tier",
+    "microbe_exclude_background",
+}
 _SAMPLE_SEARCH_PENTIMENTO_KEYS = _SAMPLE_SEARCH_MICROBE_KEYS | set(
     _SAMPLE_SEARCH_PENTIMENTO
 )
@@ -5758,6 +5766,40 @@ _MICROBE_KINGDOM_CASE = """CASE m.class
 
 _MICROBE_VALIDATED_EXPR = (
     "(m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)"
+)
+
+# is_background is a PREVALENCE flag, not a contamination call: any organism seen
+# across more than a threshold fraction of runs trips it. In scRNA-seq no microbe
+# is expected at all, so prevalence is a poor proxy for artifact -- it catches
+# M. tuberculosis at 98.7% genome breadth alongside reagent kitome. So it is
+# surfaced as a label, never used to filter rows out. Kept as an opt-in predicate
+# for callers that explicitly ask to drop prevalence-flagged taxa.
+_MICROBE_NOT_BACKGROUND = "m.is_background IS NOT TRUE"
+
+# The upstream flags gate on breadth of coverage, and a single fraction is not
+# comparable across kingdoms: the median viral genome is 8.8 kb and the median
+# bacterial one 2.2 Mb, so is_validated_bacterial's 30% asks for 652 kb where the
+# viral tiers ask for 2.6 kb. Bacteria get a relaxed tier of their own at 1%,
+# which is the p99 of bacterial breadth and where the noise floor stops falling.
+_MICROBE_LOW_BREADTH = "m.breadth_frac >= 0.01"
+# The is_validated_viral / is_viral_evidence flags carry a taxon-aware policy:
+# endogenous retroviruses (MMTV, MLV, HIV1) are held out of the evidence tier and
+# need the 50% gate, and herpesviruses are excluded from both flags entirely --
+# 94 rows sit above 50% breadth with neither flag set, EBV at 0.87 among them, and
+# pentimento_sample.flags is the only place those calls surfaced. Backstop on
+# breadth so a herpesvirus at 87% genome coverage is not reported as nothing.
+_MICROBE_VIRAL_HIGH_BREADTH = "(m.class = 'virus' AND m.breadth_frac >= 0.50)"
+_MICROBE_BACTERIAL_EVIDENCE = (
+    f"(m.class IN ('pathogen', 'culture') AND {_MICROBE_LOW_BREADTH})"
+)
+_MICROBE_EVIDENCE_EXPR = (
+    f"({_MICROBE_VALIDATED_EXPR} OR {_MICROBE_BACTERIAL_EVIDENCE}"
+    f" OR {_MICROBE_VIRAL_HIGH_BREADTH})"
+)
+# confirmed is the strict flag only; is_viral_evidence (20-50% breadth) is evidence
+_MICROBE_CONFIRMED_EXPR = (
+    f"(m.is_validated_viral OR m.is_validated_bacterial"
+    f" OR {_MICROBE_VIRAL_HIGH_BREADTH})"
 )
 
 _MICROBE_ROW_CAP = 50
@@ -5885,7 +5927,9 @@ def _sample_search_where(filters: dict, include_descendants: bool) -> tuple[str,
 
 def _microbe_conds(filters: dict, params: dict) -> str:
     """The detection-matching predicate, shared by the LATERAL and the semi-join."""
-    conds = ["NOT m.is_background"]
+    conds: list[str] = []
+    if filters.get("microbe_exclude_background"):
+        conds.append(_MICROBE_NOT_BACKGROUND)
     if filters.get("microbe"):
         conds.append("m.organism ILIKE %(f_microbe)s")
         params["f_microbe"] = f"%{filters['microbe']}%"
@@ -5898,9 +5942,17 @@ def _microbe_conds(filters: dict, params: dict) -> str:
     if filters.get("microbe_min_kmer_mass") is not None:
         conds.append("m.kmer_mass >= %(f_microbe_min_kmer_mass)s::double precision")
         params["f_microbe_min_kmer_mass"] = filters["microbe_min_kmer_mass"]
-    if filters.get("microbe_validated_only"):
-        conds.append(_MICROBE_VALIDATED_EXPR)
-    return " AND ".join(conds)
+    # Without a breadth floor `microbe_class=pathogen` matches 370k samples of
+    # trace k-mer noise, so the default tier is low_breadth, not `any`.
+    tier = filters.get("microbe_tier") or (
+        "high_breadth" if filters.get("microbe_validated_only") else "low_breadth"
+    )
+    if tier == "high_breadth":
+        conds.append(_MICROBE_CONFIRMED_EXPR)
+    elif tier == "low_breadth":
+        conds.append(_MICROBE_EVIDENCE_EXPR)
+    # background is no longer an unconditional cond, so this list can be empty
+    return " AND ".join(conds) if conds else "TRUE"
 
 
 def _is_set(value) -> bool:
@@ -6004,7 +6056,8 @@ def _wants_pentimento_sample(filters: dict) -> bool:
 
 def _wants_microbes(filters: dict) -> bool:
     return any(
-        filters.get(k) not in (None, "", False) for k in _SAMPLE_SEARCH_MICROBE_KEYS
+        filters.get(k) not in (None, "", False)
+        for k in _SAMPLE_SEARCH_MICROBE_SELECTORS
     )
 
 
@@ -6015,6 +6068,7 @@ LEFT JOIN LATERAL (
     SELECT p.sample_accession, p.cells, p.genes, p.unfiltered, p.assay_display,
            p.assay_is_single_cell,
            p.hpv_top_type, p.hpv_ambiguous, p.has_viral_reads,
+           p.has_viral_evidence,
            p.has_bacterial_reads, p.viral_kmer_mass, p.bacterial_kmer_mass
     FROM pentimento_sample p
     WHERE p.sample_accession = s.sample
@@ -6102,7 +6156,7 @@ SELECT {_SAMPLE_SEARCH_SELECT},
        (ps.sample_accession IS NOT NULL) AS pentimento_screened,
        ps.unfiltered, ps.assay_display AS pentimento_assay,
        ps.assay_is_single_cell, ps.hpv_top_type, ps.hpv_ambiguous,
-       ps.has_viral_reads, ps.has_bacterial_reads,
+       ps.has_viral_reads, ps.has_viral_evidence, ps.has_bacterial_reads,
        ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols}
 FROM page s{joins}
 {order_by(f"s.{sort}")};
@@ -6214,7 +6268,7 @@ SELECT sample_accession, cells, genes, nnz, file_format, unfiltered,
        y_xist_ratio, sex_panel_status, sex_mixed_suspected, deep_n_reads,
        assay, assay_display, assay_is_single_cell,
        calls_ambiguous, flags, n_flags, hpv_top_type, hpv_ambiguous,
-       has_viral_reads, has_bacterial_reads,
+       has_viral_reads, has_viral_evidence, has_bacterial_reads,
        viral_kmer_mass, bacterial_kmer_mass
 FROM pentimento_sample
 WHERE study_accession = %s
@@ -6416,6 +6470,56 @@ FROM (
 ) agg;
 """
 
+# Per (sample, organism) detections for one study. The project grid badged from a
+# hardcoded 24-taxon list, so organisms outside it -- M. tuberculosis at 98% genome
+# breadth among them -- rendered as "none detected". This drives the badges and the
+# CSV from the real panel instead. LEFT JOIN so a screened sample with nothing found
+# still emits a row: "screened, nothing found" and "never screened" are different
+# answers and the grid has to tell them apart.
+PENTIMENTO_STUDY_DETECTIONS_SQL = f"""
+WITH runs AS (
+  -- pentimento_run keys on the SRP, pentimento_sample on the GSE, so accept
+  -- either namespace rather than making the caller resolve first
+  SELECT COALESCE(gsm_accession, sample_accession) AS sample, run_accession
+  FROM pentimento_run
+  WHERE study_accession = %(study)s
+    AND (gsm_accession IS NOT NULL OR sample_accession IS NOT NULL)
+  UNION
+  SELECT ps.sample_accession, pr.run_accession
+  FROM pentimento_sample ps
+  JOIN pentimento_run pr ON pr.gsm_accession = ps.sample_accession
+  WHERE ps.study_accession = %(study)s
+  UNION
+  SELECT ps.sample_accession, pr.run_accession
+  FROM pentimento_sample ps
+  JOIN pentimento_run pr ON pr.sample_accession = ps.sample_accession
+  WHERE ps.study_accession = %(study)s
+)
+SELECT r.sample,
+       m.organism,
+       m.class,
+       CASE WHEN m.organism IS NULL THEN NULL
+            ELSE {_MICROBE_KINGDOM_CASE} END                    AS kingdom,
+       CASE WHEN m.organism IS NULL THEN NULL
+            WHEN bool_or({_MICROBE_CONFIRMED_EXPR}) THEN 'high_breadth'
+            ELSE 'low_breadth' END                              AS tier,
+       count(DISTINCT m.run_accession) FILTER (
+         WHERE m.organism IS NOT NULL)                          AS n_runs,
+       max(m.breadth_frac)                                      AS breadth_frac,
+       max(m.ref_bp)                                            AS ref_bp,
+       max(m.covered_bp)                                        AS covered_bp,
+       sum(m.reads)                                             AS reads,
+       sum(m.kmer_mass)                                         AS kmer_mass,
+       sum(m.n_unitigs)                                         AS n_unitigs,
+       -- prevalence label, carried so the UI can mark rather than hide the row
+       bool_or(m.is_background)                                 AS is_background
+FROM runs r
+LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
+  AND (%(all_rows)s OR {_MICROBE_EVIDENCE_EXPR})
+GROUP BY 1, 2, 3, 4
+ORDER BY r.sample, max(m.breadth_frac) DESC NULLS LAST;
+"""
+
 PENTIMENTO_MICROBES_SQL = f"""
 SELECT r.run_accession, r.gsm_accession, r.sample_accession, r.study_accession,
        r.measurable, r.total_reads,
@@ -6425,7 +6529,7 @@ SELECT r.run_accession, r.gsm_accession, r.sample_accession, r.study_accession,
        {_MICROBE_KINGDOM_CASE} AS kingdom
 FROM pentimento_run r
 LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
-  AND (%(include_background)s OR NOT m.is_background)
+  AND (NOT %(exclude_background)s OR {_MICROBE_NOT_BACKGROUND})
   AND (%(kind)s = 'all'
        OR (%(kind)s = 'viral'     AND m.class = 'virus')
        OR (%(kind)s = 'bacterial' AND m.class IN ('pathogen', 'culture'))
@@ -6453,7 +6557,9 @@ WITH rollup AS (
          min(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_lo,
          max(sex_verdict) FILTER (WHERE sex_verdict IN ('male','female')) AS sex_hi,
          min(assay) AS assay_lo,
-         max(assay) AS assay_hi
+         max(assay) AS assay_hi,
+         min(read_end) AS end_lo,
+         max(read_end) AS end_hi
   FROM pentimento_run
   WHERE gsm_accession IS NOT NULL OR sample_accession IS NOT NULL
   GROUP BY GROUPING SETS ((1), (2))
@@ -6482,12 +6588,64 @@ assay AS (
   FROM per_sample GROUP BY 1
 ),
 hits AS (
-  SELECT m.class, m.organism,
+  -- only virus/pathogen/culture clear the evidence bar, so the shared kingdom
+  -- map collapses to viral/bacterial here; reusing it keeps that a consequence
+  -- of the WHERE rather than a second class->kingdom truth
+  SELECT m.class, m.organism, r.read_end,
+         {_MICROBE_KINGDOM_CASE} AS kingdom,
+         {_MICROBE_CONFIRMED_EXPR} AS confirmed,
          COALESCE(r.gsm_accession, r.sample_accession) AS sample
   FROM pentimento_microbe m
   JOIN pentimento_run r ON r.run_accession = m.run_accession
-  WHERE {_MICROBE_VALIDATED_EXPR}
+  WHERE {_MICROBE_EVIDENCE_EXPR}
     AND (r.gsm_accession IS NOT NULL OR r.sample_accession IS NOT NULL)
+),
+-- bucketed here rather than in the client the way assay_groups is: read_end is
+-- an open column, so a closed CASE is what stops a new value vanishing silently
+sample_read_end AS (
+  SELECT sample,
+         CASE WHEN end_lo = end_hi AND end_lo IN ('3''', '5''', 'full-length')
+              THEN end_lo ELSE 'no_call' END AS read_end
+  FROM per_sample
+),
+-- What the low-breadth cut is worth, measured rather than asserted: kitome and
+-- flora are reagent/skin background at bacterial genome scale, so the rate at
+-- which they clear the same bar is this tier's noise floor. Scanned here so the
+-- number moves with the data instead of living in a caption.
+calibration AS (
+  SELECT count(*) FILTER (WHERE class IN ('kitome', 'flora'))  AS background_rows,
+         count(*) FILTER (WHERE class IN ('kitome', 'flora')
+                          AND {_MICROBE_LOW_BREADTH})           AS background_pass,
+         count(*) FILTER (WHERE class IN ('pathogen', 'culture')) AS target_rows,
+         count(*) FILTER (WHERE class IN ('pathogen', 'culture')
+                          AND {_MICROBE_LOW_BREADTH})           AS target_pass,
+         -- E. coli (vector/plasmid) and M. hyorhinis (culture contaminant) are
+         -- the two most artifact-prone organisms on the panel; if they carry the
+         -- tier, the headline is an artifact count wearing a biology label
+         count(*) FILTER (WHERE class IN ('pathogen', 'culture')
+                          AND {_MICROBE_LOW_BREADTH}
+                          AND organism IN ('Escherichia_coli',
+                                           'Mycoplasma_hyorhinis'))
+                                                                AS target_pass_artifact_prone
+  FROM pentimento_microbe m
+  WHERE class IN ('kitome', 'flora', 'pathogen', 'culture')
+),
+-- one row per (sample, kingdom) so a sample with two hits is not counted twice
+hit_sample AS (
+  SELECT sample, kingdom, bool_or(confirmed) AS confirmed
+  FROM hits GROUP BY 1, 2
+),
+-- a hit COUNT per read end is not a rate: 3' and 5' have very different numbers
+-- of screened samples, so the denominator has to travel with the numerator
+read_end_rate AS (
+  SELECT k.kingdom, sre.read_end,
+         count(*) AS n_screened,
+         count(hs.sample) AS n_samples,
+         count(*) FILTER (WHERE hs.confirmed) AS n_samples_confirmed
+  FROM sample_read_end sre
+  CROSS JOIN (SELECT unnest(ARRAY['viral', 'bacterial']) AS kingdom) k
+  LEFT JOIN hit_sample hs ON hs.sample = sre.sample AND hs.kingdom = k.kingdom
+  GROUP BY 1, 2
 ),
 -- assay_lo = assay_hi is the agreement test; split samples drop out
 sc_sample AS (
@@ -6520,22 +6678,42 @@ top_assay AS (
 top_tissue AS (
   SELECT tissue FROM tissue_cell
   GROUP BY 1 ORDER BY sum(n_studies) DESC LIMIT 8
+),
+-- top per kingdom, not overall: viruses outnumber bacteria and a flat limit
+-- leaves one bacterial row on the chart. No QUALIFY in Postgres, so rn needs
+-- its own level; a CTE keeps the final SELECT flat like the two above.
+top_microbe AS (
+  SELECT organism, class, kingdom, count(DISTINCT sample) AS n_samples,
+         count(DISTINCT sample) FILTER (WHERE confirmed) AS n_samples_confirmed,
+         row_number() OVER (PARTITION BY kingdom
+                            ORDER BY count(DISTINCT sample) DESC) AS rn
+  FROM hits GROUP BY organism, class, kingdom
 )
 SELECT
   scanned.n_samples, scanned.n_measurable, scanned.n_studies,
-  (SELECT count(DISTINCT sample) FROM hits)             AS n_samples_with_hit,
+  (SELECT count(DISTINCT sample) FROM hits WHERE confirmed)
+                                                        AS n_samples_with_hit,
+  (SELECT count(DISTINCT sample) FROM hits)             AS n_samples_with_evidence,
   (SELECT json_agg(x) FROM (
      SELECT verdict, n_samples FROM sex ORDER BY n_samples DESC
    ) x)                                                 AS sex,
+  -- every count below is the relaxed total with its confirmed subset alongside,
+  -- so a chart can show both without a second round trip
   (SELECT json_agg(x) FROM (
      SELECT class, count(DISTINCT sample) AS n_samples,
+            count(DISTINCT sample) FILTER (WHERE confirmed) AS n_samples_confirmed,
             count(DISTINCT organism) AS n_organisms
      FROM hits GROUP BY class ORDER BY n_samples DESC
    ) x)                                                 AS microbe_by_class,
   (SELECT json_agg(x) FROM (
-     SELECT organism, class, count(DISTINCT sample) AS n_samples
-     FROM hits GROUP BY organism, class ORDER BY n_samples DESC LIMIT 12
+     SELECT organism, class, kingdom, n_samples, n_samples_confirmed
+     FROM top_microbe WHERE rn <= 12 ORDER BY n_samples DESC
    ) x)                                                 AS top_microbes,
+  (SELECT json_agg(x) FROM (
+     SELECT kingdom, read_end, n_screened, n_samples, n_samples_confirmed
+     FROM read_end_rate
+   ) x)                                                 AS microbe_by_read_end,
+  (SELECT to_json(c) FROM calibration c)                AS low_breadth_calibration,
   (SELECT json_agg(x) FROM (
      SELECT assay, n_samples FROM assay
      WHERE assay NOT IN ('No call', 'Not single-cell', 'Mixed')
@@ -6742,8 +6920,42 @@ if __name__ == "__main__":
         f"{f}_ontology_id" for f in ONTOLOGY_FIELDS
     }
     assert _MICROBE_KINGDOM_CASE in PENTIMENTO_MICROBES_SQL
+    assert _MICROBE_KINGDOM_CASE in PENTIMENTO_OVERVIEW_SQL
     assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_MICROBES_SQL
     assert _MICROBE_VALIDATED_EXPR in PENTIMENTO_OVERVIEW_SQL
+    # the one not-background predicate, or search and sample detail disagree
+    assert _MICROBE_NOT_BACKGROUND in PENTIMENTO_MICROBES_SQL
+    # prevalence must never silently drop rows; only an explicit opt-in filters
+    assert _MICROBE_NOT_BACKGROUND not in _microbe_conds({"microbe": "HPV"}, {})
+    assert _MICROBE_NOT_BACKGROUND in _microbe_conds(
+        {"microbe": "HPV", "microbe_exclude_background": True}, {}
+    )
+    assert not _wants_microbes({"microbe_exclude_background": True})
+    assert _microbe_conds({"microbe_tier": "any"}, {}) == "TRUE"
+    # read_end is bucketed in SQL, so the client never sees a raw pipeline value
+    assert "'mixed'" not in PENTIMENTO_OVERVIEW_SQL
+
+    for _sql in (_PENTIMENTO_SAMPLE_LATERAL, PENTIMENTO_SAMPLES_SQL):
+        assert "has_viral_evidence" in _sql, _sql
+
+    # a herpesvirus above the strict breadth gate carries neither viral flag
+    assert _MICROBE_VIRAL_HIGH_BREADTH in _MICROBE_EVIDENCE_EXPR
+    assert _MICROBE_VIRAL_HIGH_BREADTH in _MICROBE_CONFIRMED_EXPR
+
+    # a bare microbe filter must carry a breadth floor, or microbe_class=pathogen
+    # matches every trace k-mer hit in the table
+    assert _MICROBE_EVIDENCE_EXPR in _microbe_conds({"microbe": "HPV"}, {})
+    assert _MICROBE_CONFIRMED_EXPR in _microbe_conds(
+        {"microbe": "HPV", "microbe_tier": "high_breadth"}, {}
+    )
+    assert _MICROBE_CONFIRMED_EXPR in _microbe_conds(
+        {"microbe": "HPV", "microbe_validated_only": True}, {}
+    )
+    _any = _microbe_conds({"microbe": "HPV", "microbe_tier": "any"}, {})
+    assert "breadth_frac" not in _any and "is_validated" not in _any, _any
+    # the tier alone must not drag the microbe join into a plain sample search
+    assert not _wants_microbes({"microbe_tier": "low_breadth"})
+    assert _wants_microbes({"microbe": "HPV"})
     # sex_verdict is NULL when a run was never assessed; the overview keeps
     # that bucket so the denominator stays visible
     assert "'no_verdict'" in PENTIMENTO_OVERVIEW_SQL
