@@ -58,6 +58,7 @@ from grid_filters import (
 from queries import (
     SC_STATS_SAMPLES_SQL,
     SC_STATS_STUDY_SQL,
+    SC_QUALITY_BY_YEAR_SQL,
     TISSUE_MICROBE_RATES_SQL,
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_SEARCH_SQL,
@@ -688,6 +689,8 @@ _pentimento_overview_cache_lock = threading.Lock()
 _pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _tissue_microbes_cache_lock = threading.Lock()
 _tissue_microbes_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_sc_quality_cache_lock = threading.Lock()
+_sc_quality_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
@@ -3040,6 +3043,8 @@ def purge_cache(request: Request):
         _pentimento_overview_cache["ready"] = False
     with _tissue_microbes_cache_lock:
         _tissue_microbes_cache["ready"] = False
+    with _sc_quality_cache_lock:
+        _sc_quality_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
@@ -10558,6 +10563,89 @@ def get_tissue_microbes(request: Request):
         raise HTTPException(503, "Tissue microbe stats are being prepared.")
     except Exception:
         logger.exception("Database error in get_tissue_microbes")
+        raise HTTPException(500, "Internal server error")
+
+
+def _get_sc_quality() -> dict:
+    with _sc_quality_cache_lock:
+        if (
+            _sc_quality_cache["ready"]
+            and (time.time() - _sc_quality_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _sc_quality_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "sc_quality_by_year"):
+                raise _NotBuiltYet("sc_quality_by_year")
+            cur.execute(SC_QUALITY_BY_YEAR_SQL)
+            points = cur.fetchall()
+
+    quantiles = (
+        "p25_ncount",
+        "median_ncount",
+        "p75_ncount",
+        "p25_nfeature",
+        "median_nfeature",
+        "p75_nfeature",
+    )
+    for p in points:
+        for k in quantiles:
+            if p[k] is not None:
+                p[k] = float(p[k])
+
+    techs: dict[str, dict] = {}
+    for p in points:
+        t = techs.setdefault(
+            p["technology"],
+            {"technology": p["technology"], "n_matrices": 0, "evidence": set()},
+        )
+        t["n_matrices"] += p["n_matrices"]
+        t["evidence"].add(p["evidence"])
+
+    # ordered by weight
+    technologies = sorted(techs.values(), key=lambda t: -t["n_matrices"])
+    for t in technologies:
+        t["evidence"] = sorted(t["evidence"])
+
+    data = {
+        "points": points,
+        "technologies": technologies,
+        "min_matrices": 20,
+        "min_studies": 3,
+    }
+    with _sc_quality_cache_lock:
+        _sc_quality_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/sc-quality",
+    summary="Single-cell QC quantiles by release year and technology",
+    description=(
+        "One point per (year, technology, evidence): the 25th, 50th and 75th "
+        "percentile of per-matrix median UMI counts (`ncount`) and detected "
+        "genes (`nfeature`) across single-cell matrices released that year.\n\n"
+        "Quantiles come from the filtered (`_f_`) matrix columns, so they "
+        "describe cells that clear the matrix's own `min_counts` threshold. "
+        "`year` is the study's first published date across archives.\n\n"
+        "`technology` collapses chemistry versions to the family a reader "
+        "compares, splitting 10x 3' from 10x 5' because the two capture "
+        "different ends. `evidence` is `read` where Pentimento called the "
+        "chemistry off the FASTQs, and `declared` where that call was absent "
+        "and the submitter's own assay string supplied it."
+        "Points need 20 or more matrices from 3 or more studies."
+    ),
+    operation_id="get_sc_quality",
+)
+@limiter.limit("60/minute")
+def get_sc_quality(request: Request):
+    try:
+        return _get_sc_quality()
+    except _NotBuiltYet:
+        raise HTTPException(503, "Single-cell QC stats are being prepared.")
+    except Exception:
+        logger.exception("Database error in get_sc_quality")
         raise HTTPException(500, "Internal server error")
 
 

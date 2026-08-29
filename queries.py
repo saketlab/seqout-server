@@ -5681,6 +5681,17 @@ ORDER BY tissue, organism
 """
 
 
+# Backs /stats/sc-quality. The matview carries its own n_matrices >= 20 and
+# n_studies >= 3 gates; see sql/tables/sc_quality_by_year_pg.sql.
+SC_QUALITY_BY_YEAR_SQL = """
+SELECT year, technology, evidence, n_matrices, n_studies,
+       p25_ncount, median_ncount, p75_ncount,
+       p25_nfeature, median_nfeature, p75_nfeature
+FROM sc_quality_by_year
+ORDER BY technology, year
+"""
+
+
 def _pentimento_counts_lateral(sample_expr: str) -> str:
     """Per-sample matrix counts for a study page."""
     return f"""
