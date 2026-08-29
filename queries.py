@@ -2887,22 +2887,15 @@ def build_structured_search(
 
     # pub_date is free-text mixed-granularity; only full "YYYY Mon DD" rows are
     # parseable, so year/month-only pubs and unlinked studies are excluded.
+    # study_pub_dates holds them parsed and indexed.
     def _pub_date_clause(acc_expr: str) -> str:
-        conds = [
-            f"sp.accession = {acc_expr}",
-            "pub->>'pub_date' ~ '^[0-9]{4} [A-Z][a-z]{2} [0-9]{2}$'",
-        ]
+        conds = [f"spd.accession = {acc_expr}"]
         if pub_date_after:
-            conds.append(
-                "to_date(pub->>'pub_date', 'YYYY Mon DD') >= %(pub_date_after)s::date"
-            )
+            conds.append("spd.pub_date >= %(pub_date_after)s::date")
         if pub_date_before:
-            conds.append(
-                "to_date(pub->>'pub_date', 'YYYY Mon DD') <= %(pub_date_before)s::date"
-            )
+            conds.append("spd.pub_date <= %(pub_date_before)s::date")
         return (
-            "EXISTS (SELECT 1 FROM study_publications sp"
-            " CROSS JOIN LATERAL jsonb_array_elements(sp.publications) pub"
+            "EXISTS (SELECT 1 FROM study_pub_dates spd"
             " WHERE " + " AND ".join(conds) + ")"
         )
 
@@ -5629,6 +5622,65 @@ WHERE st.accession = %s;
 """
 
 
+# One row per matrix; per-matrix quantiles differ.
+# _f_ columns are filtered at min_counts. The unfiltered pair counts ambient
+# barcodes in raw droplet space, which is_raw_barcode_space flags.
+SC_STATS_SAMPLES_SQL = """
+SELECT sample_accession AS sample,
+       file,
+       n_cells,
+       n_barcodes,
+       is_raw_barcode_space,
+       species        AS matrix_species,
+       n_mito_genes,
+       min_counts,
+       n_cells_filtered,
+       ncount_median,
+       nfeature_median,
+       ncount_f_median,
+       nfeature_f_median,
+       ncount_f_mean,
+       nfeature_f_mean,
+       pct_mito_f_median
+FROM sc_stats_matrix
+WHERE sample_accession = ANY(%(samples)s)
+ORDER BY sample_accession, file
+"""
+
+# medians of per-matrix medians, not per-cell figures
+SC_STATS_STUDY_SQL = """
+SELECT s.accession,
+       s.state,
+       s.n_matrices,
+       s.n_failures,
+       s.species                AS matrix_species,
+       s.any_raw_barcode_space,
+       m.n_matrices_measured,
+       m.median_ncount,
+       m.median_nfeature,
+       m.median_pct_mito
+FROM sc_stats_study s
+LEFT JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE ncount_f_median IS NOT NULL) AS n_matrices_measured,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY ncount_f_median)   AS median_ncount,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY nfeature_f_median) AS median_nfeature,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY pct_mito_f_median) AS median_pct_mito
+    FROM sc_stats_matrix x WHERE x.accession = s.accession
+) m ON TRUE
+WHERE s.accession = %(acc)s
+"""
+
+
+# Backs /stats/tissue-microbes. The matview carries its own studies >= 2 and
+# screened >= 200 gates; see sql/tissue_microbe_rates.sql.
+TISSUE_MICROBE_RATES_SQL = """
+SELECT tissue, uberon, organism, class, is_background, is_endogenous,
+       screened, positives, positives_confirmed, studies, rate_pct
+FROM tissue_microbe_rates
+ORDER BY tissue, organism
+"""
+
+
 def _pentimento_counts_lateral(sample_expr: str) -> str:
     """Per-sample matrix counts for a study page."""
     return f"""
@@ -6025,14 +6077,16 @@ LEFT JOIN LATERAL (
                 'covered_bp', d.covered_bp, 'ref_bp', d.ref_bp,
                 'is_validated_viral', d.is_validated_viral,
                 'is_viral_evidence', d.is_viral_evidence,
-                'is_validated_bacterial', d.is_validated_bacterial
+                'is_validated_bacterial', d.is_validated_bacterial,
+                -- prevalence label; nothing filters on it, so the client must see it
+                'is_background', d.is_background
             ) ORDER BY d.kmer_mass DESC NULLS LAST
         ) FILTER (WHERE d.rn <= {_MICROBE_ROW_CAP}) AS microbes
     FROM (
         SELECT m.organism, m.class, m.reads, m.kmer_mass, m.n_unitigs,
                m.covered_bp, m.ref_bp, m.breadth_frac, r.run_accession,
                m.is_validated_viral, m.is_viral_evidence,
-               m.is_validated_bacterial,
+               m.is_validated_bacterial, m.is_background,
                {_MICROBE_KINGDOM_CASE} AS kingdom,
                ROW_NUMBER() OVER (
                    ORDER BY m.kmer_mass DESC NULLS LAST
@@ -6932,6 +6986,10 @@ if __name__ == "__main__":
     )
     assert not _wants_microbes({"microbe_exclude_background": True})
     assert _microbe_conds({"microbe_tier": "any"}, {}) == "TRUE"
+    # every microbe payload carries the prevalence label, sample search included
+    _p, _ = build_enriched_sample_search_sql({"microbe": "HPV"})
+    assert "'is_background', d.is_background" in _p, _p
+
     # read_end is bucketed in SQL, so the client never sees a raw pipeline value
     assert "'mixed'" not in PENTIMENTO_OVERVIEW_SQL
 

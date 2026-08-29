@@ -56,6 +56,9 @@ from grid_filters import (
     _parse_grid_filters,
 )
 from queries import (
+    SC_STATS_SAMPLES_SQL,
+    SC_STATS_STUDY_SQL,
+    TISSUE_MICROBE_RATES_SQL,
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_SEARCH_SQL,
     BATCH_DRA_SAMPLES_SQL,
@@ -683,6 +686,8 @@ _single_cell_overview_cache_lock = threading.Lock()
 _single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _pentimento_overview_cache_lock = threading.Lock()
 _pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_tissue_microbes_cache_lock = threading.Lock()
+_tissue_microbes_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
@@ -3033,6 +3038,8 @@ def purge_cache(request: Request):
         _single_cell_overview_cache["ready"] = False
     with _pentimento_overview_cache_lock:
         _pentimento_overview_cache["ready"] = False
+    with _tissue_microbes_cache_lock:
+        _tissue_microbes_cache["ready"] = False
     with _last_updated_cache_lock:
         _last_updated_cache["ready"] = False
     with _enriched_crosstab_cache_lock:
@@ -10494,6 +10501,66 @@ def get_pentimento_overview(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+def _get_tissue_microbes() -> dict:
+    with _tissue_microbes_cache_lock:
+        if (
+            _tissue_microbes_cache["ready"]
+            and (time.time() - _tissue_microbes_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _tissue_microbes_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "tissue_microbe_rates"):
+                raise _NotBuiltYet("tissue_microbe_rates")
+            cur.execute(TISSUE_MICROBE_RATES_SQL)
+            cells = cur.fetchall()
+
+    for c in cells:
+        c["rate_pct"] = float(c["rate_pct"])
+    tissues = {}
+    for c in cells:
+        tissues.setdefault(
+            c["tissue"],
+            {"tissue": c["tissue"], "uberon": c["uberon"], "screened": c["screened"]},
+        )
+    data = {
+        "cells": cells,
+        "tissues": sorted(tissues.values(), key=lambda t: -t["screened"]),
+        "min_studies": 2,
+        "min_screened": 200,
+    }
+    with _tissue_microbes_cache_lock:
+        _tissue_microbes_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/tissue-microbes",
+    summary="Microbial detection rate per tissue",
+    description=(
+        "One cell per (tissue, organism): `positives` samples of `screened` "
+        "carry that organism, over samples the Pentimento actually quantified. "
+        "`positives_confirmed` is the high-breadth subset. Cells need 2 or more "
+        "contributing studies and a tissue with 200 or more screened samples.\n\n"
+        "Contaminants are labelled, not withheld: `is_background` marks an "
+        "organism the prevalence sweep flags (E. coli, C. acnes), `class` of "
+        "`culture` marks cell-culture organisms such as M. hyorhinis, and "
+        "`is_endogenous` marks retroviruses read off the host genome."
+    ),
+    operation_id="get_tissue_microbes",
+)
+@limiter.limit("60/minute")
+def get_tissue_microbes(request: Request):
+    try:
+        return _get_tissue_microbes()
+    except _NotBuiltYet:
+        raise HTTPException(503, "Tissue microbe stats are being prepared.")
+    except Exception:
+        logger.exception("Database error in get_tissue_microbes")
+        raise HTTPException(500, "Internal server error")
+
+
 @api_app.get(
     "/stats/project-overlap",
     summary="Cross-archive project overlap",
@@ -11398,11 +11465,18 @@ def list_single_cell_studies(
 
 @api_app.get(
     "/project/{accession}/single-cell",
-    summary="Get single-cell cell counts, read-derived calls and microbe flags",
+    summary="Get single-cell counts, QC statistics, read-derived calls and microbe flags",
     description=(
         "Per-sample cell/gene counts joined to read-derived (preflightx) "
         "species, sex and assay calls and to viral/microbial presence flags. "
         "404s when the study is not in the Pentimento.\n\n"
+        "`sc_stats` adds matrix-grained QC from the sc_stats sweep: one entry "
+        "per matrix with median counts and genes per cell. The `_f_` columns "
+        "are filtered at `min_counts`; the unfiltered pair counts ambient "
+        "barcodes in raw droplet space, which `is_raw_barcode_space` flags. "
+        "`sc_stats_scanned` is false only when the sweep never reached the "
+        "sample, and `sc_stats_study` is null only when it never reached the "
+        "study.\n\n"
     ),
     operation_id="get_project_single_cell",
 )
@@ -11429,12 +11503,22 @@ def get_project_single_cell(
                 samples = cur.fetchall()
                 _attach_pentimento_labels(cur, resolved, samples)
                 _attach_pentimento_detections(cur, resolved, samples)
+                _attach_sc_stats(cur, samples)
+                cur.execute(SC_STATS_STUDY_SQL, {"acc": resolved})
+                sc_stats_study = cur.fetchone()
     except HTTPException:
         raise
     except Exception:
         logger.exception("Database error in get_project_single_cell")
         raise HTTPException(500, "Internal server error")
-    return {**study, "samples": samples, "limit": limit, "offset": offset}
+    return {
+        **study,
+        "samples": samples,
+        # None means never scanned; a scanned study with no matrices still returns a row
+        "sc_stats_study": sc_stats_study,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @api_app.get(
@@ -11603,6 +11687,26 @@ def get_sample_microbes(
         "by_organism": organisms,
         "detections": detections,
     }
+
+
+def _attach_sc_stats(cur, samples: list[dict]) -> None:
+    """Attach per-matrix QC quantiles from the sc_stats sweep, in place.
+
+    A list per sample; one sample can publish several matrices.
+    sc_stats_scanned is False only when the sweep never reached the sample.
+    """
+    if not samples:
+        return
+    cur.execute(
+        SC_STATS_SAMPLES_SQL,
+        {"samples": [s["sample_accession"] for s in samples]},
+    )
+    by_sample: defaultdict[str, list[dict]] = defaultdict(list)
+    for row in cur.fetchall():
+        by_sample[row.pop("sample")].append(row)
+    for s in samples:
+        s["sc_stats"] = by_sample.get(s["sample_accession"], [])
+        s["sc_stats_scanned"] = bool(s["sc_stats"])
 
 
 def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
@@ -12358,6 +12462,11 @@ For enriched aggregate exploration:
   cell_type, disease, assay, etc.
 - `get_enriched_crosstab`: call with `group=...` and `breakdown=...` for cross-tabs
   such as organism by tissue or disease by assay.
+- `get_tissue_microbes`: per (tissue, organism) detection rate from the reads.
+  Answers "which tissues carry HPV", "how much of lung is SARS-CoV-2 positive".
+  Rates are over quantified samples only. Report `is_background`, a `class` of
+  `culture`, or `is_endogenous` alongside the rate: those organisms are
+  contamination or host genome, not infection.
 
 ## Sample Cohorts (cross-project)
 
@@ -12728,6 +12837,7 @@ def _prewarm_caches() -> None:
         _get_global_contributions_filters,
         _get_single_cell_overview,
         _get_pentimento_overview,
+        _get_tissue_microbes,
     ):
         try:
             warm()

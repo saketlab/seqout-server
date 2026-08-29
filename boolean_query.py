@@ -115,5 +115,5 @@ if __name__ == "__main__":
     # So the rewrite runs only for a query that will actually be expanded.
     assert replace_query_hyphens("scrna-seq liver") == "scrna seq liver"
     assert replace_query_hyphens("scrna-seq liver", expand=False) == "scrna-seq liver"
-    assert replace_query_hyphens('"scrna-seq" OR liver') == '"scrna-seq" OR liver' 
+    assert replace_query_hyphens('"scrna-seq" OR liver') == '"scrna-seq" OR liver'
     print("ok")
