@@ -5681,8 +5681,6 @@ ORDER BY tissue, organism
 """
 
 
-# Backs /stats/sc-quality. The matview carries its own n_matrices >= 20 and
-# n_studies >= 3 gates; see sql/tables/sc_quality_by_year_pg.sql.
 SC_QUALITY_BY_YEAR_SQL = """
 SELECT year, technology, evidence, n_matrices, n_studies,
        p25_ncount, median_ncount, p75_ncount,

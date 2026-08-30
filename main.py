@@ -10611,7 +10611,7 @@ def _get_sc_quality() -> dict:
     data = {
         "points": points,
         "technologies": technologies,
-        "min_matrices": 20,
+        "min_matrices": 10,
         "min_studies": 3,
     }
     with _sc_quality_cache_lock:
@@ -10634,7 +10634,8 @@ def _get_sc_quality() -> dict:
         "different ends. `evidence` is `read` where Pentimento called the "
         "chemistry off the FASTQs, and `declared` where that call was absent "
         "and the submitter's own assay string supplied it."
-        "Points need 20 or more matrices from 3 or more studies."
+        "Thin cells are dropped; the thresholds actually applied are on the "
+        "response as `min_matrices` and `min_studies`."
     ),
     operation_id="get_sc_quality",
 )
