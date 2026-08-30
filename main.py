@@ -10594,6 +10594,9 @@ def _get_sc_quality() -> dict:
             if p[k] is not None:
                 p[k] = float(p[k])
 
+    overall = [p for p in points if p["technology"] == "All"]
+    points = [p for p in points if p["technology"] != "All"]
+
     techs: dict[str, dict] = {}
     for p in points:
         t = techs.setdefault(
@@ -10610,6 +10613,7 @@ def _get_sc_quality() -> dict:
 
     data = {
         "points": points,
+        "overall": overall,
         "technologies": technologies,
         "min_matrices": 10,
         "min_studies": 3,
