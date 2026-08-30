@@ -5469,7 +5469,14 @@ authors AS (
 # one investigator.
 _PI_RANK_TAIL = """
 SELECT
-    a.pi,
+    -- group case-insensitively; one person deposited under several spellings
+    -- otherwise ranks as several. the commonest mixed-case variant keeps
+    -- McDonald and O'Brien, with initcap only when every variant is uniform.
+    COALESCE(
+        mode() WITHIN GROUP (ORDER BY a.pi)
+            FILTER (WHERE a.pi <> lower(a.pi) AND a.pi <> upper(a.pi)),
+        initcap(min(a.pi))
+    ) AS pi,
     count(DISTINCT a.canonical_accession) AS n_projects,
     count(DISTINCT a.pmid) AS n_papers,
     mode() WITHIN GROUP (ORDER BY a.center_name) AS center_name,
@@ -5480,8 +5487,8 @@ SELECT
     (SELECT count(*) FROM proj) AS scoped_projects
 FROM authors a
 WHERE a.pi LIKE '%% %%'
-GROUP BY a.pi
-ORDER BY n_projects DESC, a.pi
+GROUP BY lower(a.pi)
+ORDER BY n_projects DESC, 1
 LIMIT {limit};
 """
 
@@ -5687,6 +5694,21 @@ SELECT year, technology, evidence, n_matrices, n_studies,
        p25_nfeature, median_nfeature, p75_nfeature
 FROM sc_quality_by_year
 ORDER BY technology, year
+"""
+
+
+SC_QUALITY_SAMPLES_SQL = """
+SELECT year, technology, ncount_f_median AS ncount, nfeature_f_median AS nfeature
+FROM (
+    SELECT year, technology, ncount_f_median, nfeature_f_median,
+           row_number() OVER (
+               PARTITION BY year, technology
+               ORDER BY md5(accession || '/' || file)
+           ) AS rn
+    FROM sc_quality_matrix
+) t
+WHERE rn <= %(per_cell)s
+ORDER BY year, technology
 """
 
 

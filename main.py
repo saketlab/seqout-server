@@ -59,6 +59,7 @@ from queries import (
     SC_STATS_SAMPLES_SQL,
     SC_STATS_STUDY_SQL,
     SC_QUALITY_BY_YEAR_SQL,
+    SC_QUALITY_SAMPLES_SQL,
     TISSUE_MICROBE_RATES_SQL,
     AE_EXPERIMENT_SAMPLES_SQL,
     AE_SEARCH_SQL,
@@ -691,6 +692,8 @@ _tissue_microbes_cache_lock = threading.Lock()
 _tissue_microbes_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sc_quality_cache_lock = threading.Lock()
 _sc_quality_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_sc_quality_samples_lock = threading.Lock()
+_sc_quality_samples_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _last_updated_cache_lock = threading.Lock()
 _last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sitemap_counts_cache_lock = threading.Lock()
@@ -10651,6 +10654,69 @@ def get_sc_quality(request: Request):
         raise HTTPException(503, "Single-cell QC stats are being prepared.")
     except Exception:
         logger.exception("Database error in get_sc_quality")
+        raise HTTPException(500, "Internal server error")
+
+
+_SC_QUALITY_PER_CELL = 60
+
+
+def _get_sc_quality_samples() -> dict:
+    with _sc_quality_samples_lock:
+        if (
+            _sc_quality_samples_cache["ready"]
+            and (time.time() - _sc_quality_samples_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _sc_quality_samples_cache["data"]
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if not _relation_exists(cur, "sc_quality_matrix"):
+                raise _NotBuiltYet("sc_quality_matrix")
+            cur.execute(SC_QUALITY_SAMPLES_SQL, {"per_cell": _SC_QUALITY_PER_CELL})
+            points = cur.fetchall()
+            cur.execute("SELECT count(*) AS n FROM sc_quality_matrix")
+            total = cur.fetchone()["n"]
+
+    for p in points:
+        for k in ("ncount", "nfeature"):
+            if p[k] is not None:
+                p[k] = float(p[k])
+
+    data = {
+        "points": points,
+        "n_shown": len(points),
+        "n_total": total,
+        "per_technology_year": _SC_QUALITY_PER_CELL,
+    }
+    with _sc_quality_samples_lock:
+        _sc_quality_samples_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/stats/sc-quality/samples",
+    summary="Individual single-cell matrices behind the QC quantiles",
+    description=(
+        "One point per matrix, giving that matrix's median UMI count "
+        "(`ncount`) and detected genes (`nfeature`), its release `year` and "
+        "its `technology`.\n\n"
+        "These are the matrices `/stats/sc-quality` aggregates, so a dot here "
+        "and a percentile there describe one population. The response is a "
+        "stratified subsample: each (year, technology) contributes at most "
+        "`per_technology_year` rows, chosen by a stable hash so repeat calls "
+        "return the same dots. `n_shown` and `n_total` give the sampling rate."
+    ),
+    operation_id="get_sc_quality_samples",
+)
+@limiter.limit("60/minute")
+def get_sc_quality_samples(request: Request):
+    try:
+        return _get_sc_quality_samples()
+    except _NotBuiltYet:
+        raise HTTPException(503, "Single-cell QC stats are being prepared.")
+    except Exception:
+        logger.exception("Database error in get_sc_quality_samples")
         raise HTTPException(500, "Internal server error")
 
 
