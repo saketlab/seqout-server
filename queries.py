@@ -1790,10 +1790,14 @@ LIMIT 1;
 """
 
 # Get SRA study by PRJ accession (for PRJNA, PRJDA, PRJEB, etc.)
+# some submissions get two BioProject accessions; sra_studies has only the
+# SRA XML one, bioproject_sra_links maps the other
 PRJ_TO_SRA_STUDY_SQL = """
-SELECT accession
-FROM sra_studies
-WHERE bioproject_id = %s
+WITH q AS (SELECT %s::text AS prj)
+SELECT accession FROM sra_studies, q WHERE bioproject_id = q.prj
+UNION ALL
+SELECT canonical_study FROM bioproject_sra_links, q
+WHERE bioproject = q.prj AND canonical_study IS NOT NULL
 LIMIT 1;
 """
 

@@ -1633,6 +1633,24 @@ def _reject_gea_study(study: str) -> None:
         )
 
 
+def _canonical_study(cur, study: str) -> str:
+    """PRJ* with no rows of its own -> the SRA study that holds them.
+
+    some submissions get two BioProject accessions; only the SRA XML one
+    reaches sra_studies.
+    """
+    if not study.startswith("PRJ"):
+        return study
+    cur.execute(
+        "SELECT 1 FROM ena_experiments WHERE study_accession = %s LIMIT 1", (study,)
+    )
+    if cur.fetchone():
+        return study
+    cur.execute(PRJ_TO_SRA_STUDY_SQL, (study,))
+    row = cur.fetchone()
+    return row["accession"] if row else study
+
+
 def _study_experiments_sql(cur, study: str) -> tuple[str, bool]:
     """Pick the per-archive experiment SQL. Returns (sql, ena_style)."""
     if _is_gsa_study(study):
@@ -5974,6 +5992,7 @@ def get_study_experiments(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                study = _canonical_study(cur, study)
                 # Count is a cheap indexed query; the page fetch uses SQL
                 # LIMIT/OFFSET so large studies do not time out.
                 total = _count_study_experiments(cur, study)
@@ -6009,7 +6028,9 @@ def find_study_experiments(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                rows = _find_study_experiments(cur, study, filters)
+                rows = _find_study_experiments(
+                    cur, _canonical_study(cur, study), filters
+                )
     except Exception:
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
