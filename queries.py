@@ -3803,7 +3803,8 @@ ORDER BY i.ord;
 # the FASTQ/BAM rows that live under the SRP). Single %s: the input accession.
 # The same two hops run against dra_studies, since a DDBJ-exclusive DRP is absent
 # from sra_studies. E-GEAD needs a third: it names only a BioProject, whose reads
-# live in the DRA study wrapping it.
+# live in the DRA study wrapping it. bioproject_sra_links covers submissions that
+# got two BioProject accessions, where sra_studies has only the SRA XML one.
 _RESOLVE_DL_STUDY = """
 WITH input AS (SELECT %s::text AS acc),
 candidates AS (
@@ -3826,6 +3827,9 @@ candidates AS (
     JOIN dra_studies d ON d.bioproject_id = g.bioproject
     CROSS JOIN input
     WHERE g.accession = input.acc
+    UNION
+    SELECT l.canonical_study FROM bioproject_sra_links l, input
+    WHERE l.bioproject = input.acc AND l.canonical_study IS NOT NULL
 )
 """
 
