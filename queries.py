@@ -3065,7 +3065,8 @@ def build_structured_search(
         w = []
         joins = ""
         if geo_cte:
-            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = ae.accession AND ga.source = 'arrayexpress'"
+            # unified_metadata stores this source as 'ae'
+            joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = ae.accession AND ga.source = 'ae'"
         from_q = ", q" if q else ""
         if q:
             w.append("ae.tsv @@ q.match_q")
