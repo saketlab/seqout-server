@@ -6446,13 +6446,22 @@ SELECT {_PENTIMENTO_STUDY_COLS},
        p.flags,
        u.single_cell_status,
        {SINGLE_CELL_EVIDENCE_COLS}
+       -- Same namespace split as barcode_whitelist_hit above: pentimento_run
+       -- keys on the SRP, so a GEO study reaches its own runs only through the
+       -- GSM link or the study alias.
        (SELECT count(DISTINCT m.organism) FROM pentimento_microbe m
           JOIN pentimento_run r ON r.run_accession = m.run_accession
-         WHERE r.study_accession = %(acc)s
+          LEFT JOIN pentimento_sample s4 ON s4.sample_accession = r.gsm_accession
+          LEFT JOIN sra_studies ss4 ON ss4.accession = r.study_accession
+         WHERE (r.study_accession = %(acc)s OR s4.study_accession = %(acc)s
+                OR ss4.alias = %(acc)s)
            AND m.is_viral_evidence)                             AS n_viral_organisms,
        (SELECT count(DISTINCT m.organism) FROM pentimento_microbe m
           JOIN pentimento_run r ON r.run_accession = m.run_accession
-         WHERE r.study_accession = %(acc)s
+          LEFT JOIN pentimento_sample s5 ON s5.sample_accession = r.gsm_accession
+          LEFT JOIN sra_studies ss5 ON ss5.accession = r.study_accession
+         WHERE (r.study_accession = %(acc)s OR s5.study_accession = %(acc)s
+                OR ss5.alias = %(acc)s)
            AND m.is_validated_bacterial)                        AS n_bacterial_organisms
 FROM pentimento_study p
 LEFT JOIN unified_metadata u ON u.canonical_accession = p.study_accession
@@ -6588,6 +6597,15 @@ WITH runs AS (
   FROM pentimento_sample ps
   JOIN pentimento_run pr ON pr.sample_accession = ps.sample_accession
   WHERE ps.study_accession = %(study)s
+  UNION
+  -- Both bridges above run through pentimento_sample, so a GSE whose samples
+  -- were never counted reaches none of its own runs. The study alias is the
+  -- only route that does not need a counted matrix.
+  SELECT COALESCE(pr.gsm_accession, pr.sample_accession), pr.run_accession
+  FROM sra_studies ss
+  JOIN pentimento_run pr ON pr.study_accession = ss.accession
+  WHERE ss.alias = %(study)s
+    AND (pr.gsm_accession IS NOT NULL OR pr.sample_accession IS NOT NULL)
 )
 SELECT r.sample,
        m.organism,
