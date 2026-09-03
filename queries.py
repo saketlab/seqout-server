@@ -590,13 +590,10 @@ LIMIT 200;
 
 
 # Boolean/structured queries
-# Every FTS path shares one CTE header: plainto_tsquery core_q + a Neo4j-expanded
-# OR-union match_q. Boolean mode swaps that header for a literal to_tsquery on both
-# core_q and match_q (the user's exact terms, no expansion). structured_search_sql()
-# does the swap on ANY search SQL so the 7-source union body never drifts. Two param
-# styles: positional %s (unified/per-source SQL) and named %(q)s (filtered/sorted
-# builders). After the swap both tsquery slots read the same q, so positional params
-# become (tsq, tsq, ...) and named params just need q = tsq (q_variants unused).
+# Boolean mode swaps the shared plainto_tsquery + expansion header for a literal
+# to_tsquery on core_q and match_q; structured_search_sql() applies the swap to any
+# search SQL so the 7-source union body cannot drift. Both slots then read the same
+# q: positional params become (tsq, tsq, ...), named need only q = tsq.
 _PLAINTO_HEADER_POS = """    SELECT plainto_tsquery('english', %s) AS core_q,
            (
                SELECT string_agg('(' || term_q::text || ')', ' | ')::tsquery
@@ -780,12 +777,12 @@ def _search_filter_clauses(
     date_from=None,
     date_to=None,
 ):
-    """Build sidebar-filter SQL over the `matched` CTE columns.
+    """Build sidebar-filter SQL over the matched CTE columns.
 
-    Mutates `params` with the bound values and returns
-    (dim_clauses: {dimension -> sql}, always_clauses: [sql]). `dim_clauses` is
+    Mutates params with the bound values and returns
+    (dim_clauses: {dimension -> sql}, always_clauses: [sql]). dim_clauses is
     keyed by facet dimension so a facet can exclude its own clause (exclude-self
-    narrowing); `always_clauses` (year range) apply everywhere. Multi-value
+    narrowing); always_clauses (year range) apply everywhere. Multi-value
     filters accept lists and match on array overlap / ANY.
     """
     dim_clauses = {}
@@ -855,7 +852,7 @@ def _search_filter_clauses(
 
 
 def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
-    """CREATE TEMP TABLE `matched` (ON COMMIT DROP) holding the q+db match set,
+    """CREATE TEMP TABLE matched (ON COMMIT DROP) holding the q+db match set,
     deduped. This is the single expensive FTS pass; the count and facet queries
     then read this materialized table, so a slow facet can't kill the total and
     the FTS is never computed twice. Caller must run inside a transaction.
@@ -882,7 +879,7 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
 
 
 def build_search_total_over_matched(**filters):
-    """Exact result total over the materialized `matched` temp table, with every
+    """Exact result total over the materialized matched temp table, with every
     active filter applied (no exclude-self). Filtered scan/count with no FTS.
     """
     params = {}
@@ -899,7 +896,7 @@ def build_search_max_rank_over_matched():
     has to be the query's own ceiling. Computing it over the FILTERED set would
     defeat the badge exactly where it matters: filter an SMA search down to
     Arabidopsis and every remaining row is a weak match, so the filtered max is
-    itself weak and nothing looks unusual. `matched` is the pre-filter set (the
+    itself weak and nothing looks unusual. matched is the pre-filter set (the
     filters live in the count/facet queries), which is what we want.
     """
     return "SELECT MAX(rank)::float8 AS max_rank FROM matched;", {}
@@ -907,7 +904,7 @@ def build_search_max_rank_over_matched():
 
 def build_search_facets_over_matched(**filters):
     """Filter-aware sidebar facet counts (exclude-self narrowing) over the
-    materialized `matched` temp table.
+    materialized matched temp table.
 
     Each facet is counted over the match set narrowed by every *other* active
     sidebar filter plus the year range, so selecting one filter narrows the
@@ -932,12 +929,9 @@ def build_search_facets_over_matched(**filters):
             f" GROUP BY {value_expr}"
         )
 
-    # Ordered by summed match rank. A query can match many studies
-    # in one organism for an unrelated reason, and those matches all score near
-    # zero. Summing the ranks keeps the ordering count-weighted, so a big
-    # well-matched value still beats a single lucky hit. rank is NULL on a
-    # query-less search, so score collapses to 0 there and the count tiebreak
-    # carries the order.
+    # ranks are summed so a value matching many studies for an unrelated
+    # reason scores near zero. rank is NULL query-less, so the count tiebreak
+    # carries the order there.
     sql = (
         "WITH facets AS (\n"
         + "\n    UNION ALL\n".join(branches)
@@ -974,7 +968,7 @@ def build_search_results(
     """Paginated result list over the same filtered match set as the facet/total
     queries, so the list and the sidebar counts always agree.
 
-    Default order is relevance (rank). `sortby` (year|citations|journal) overrides
+    Default order is relevance (rank). sortby (year|citations|journal) overrides
     it with the same sort expression as build_sorted_search_sql, so filtered and
     unfiltered results order identically. All active filters apply (no
     exclude-self). Offset-paginated, 200/page. total_count is NULL; the exact
@@ -1753,8 +1747,7 @@ BIO_PROJECT_GEO_SERIES_SQL = """
 SELECT accession FROM geo_series WHERE bioproject_id = %s;
 """
 
-# Get SRA study accession from sample accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 SRA_SAMPLE_TO_STUDY_SQL = """
 SELECT DISTINCT s.accession
 FROM sra_experiments e
@@ -1763,8 +1756,7 @@ WHERE e.samples @> ARRAY[%s]
 LIMIT 1;
 """
 
-# Get GEO series accession from GSM sample accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 GEO_SAMPLE_TO_SERIES_SQL = """
 SELECT accession
 FROM geo_series
@@ -1772,8 +1764,7 @@ WHERE samples_ref @> ARRAY[%s]
 LIMIT 1;
 """
 
-# Get SRA study accession from experiment accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 SRA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT study
 FROM sra_experiments
@@ -1781,7 +1772,6 @@ WHERE accession = %s
 LIMIT 1;
 """
 
-# Get GEO series by PRJNA bioproject_id
 PRJNA_TO_GEO_SERIES_SQL = """
 SELECT accession
 FROM geo_series
@@ -1789,7 +1779,6 @@ WHERE bioproject_id = %s
 LIMIT 1;
 """
 
-# Get SRA study by PRJ accession (for PRJNA, PRJDA, PRJEB, etc.)
 # some submissions get two BioProject accessions; sra_studies has only the
 # SRA XML one, bioproject_sra_links maps the other
 PRJ_TO_SRA_STUDY_SQL = """
@@ -1841,8 +1830,7 @@ ORDER BY s.published_at DESC NULLS LAST, s.accession;
 
 # Sample detail queries
 
-# Get a single SRA experiment by accession (SRX/DRX/ERX)
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 SRA_EXPERIMENT_SQL = """
 SELECT
     accession,
@@ -1863,8 +1851,7 @@ WHERE accession = %s
 LIMIT 1;
 """
 
-# Get a single ENA experiment by accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 ENA_EXPERIMENT_SQL = """
 SELECT DISTINCT ON (e.experiment_accession)
     e.experiment_accession AS accession,
@@ -1889,8 +1876,7 @@ ORDER BY e.experiment_accession, e.run_accession NULLS LAST
 LIMIT 1;
 """
 
-# Get a single GSA experiment by accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 GSA_EXPERIMENT_SQL = """
 SELECT DISTINCT ON (e.experiment_accession)
     e.experiment_accession AS accession,
@@ -1915,8 +1901,7 @@ ORDER BY e.experiment_accession, e.run_accession NULLS LAST
 LIMIT 1;
 """
 
-# Get a single GEO sample by accession (GSM)
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 GEO_SAMPLE_SQL = """
 SELECT s.*
 FROM geo_samples s
@@ -1924,14 +1909,10 @@ WHERE s.accession = %s
 LIMIT 1;
 """
 
-# ENA only mirrors runs that NCBI normalised into an .sra object. A run whose
-# submitter uploaded originals that were never normalised has no fastq_ftp, even
-# though its original fastq.gz files are already listed in ncbi_files.
-#
-# Direct https URLs qualify. The rest are requester-pays s3 alternatives from
-# "Use Cloud Data Delivery"; those runs keep showing no FASTQ.
-#
-# Every query reading fastq_ftp off sra_run_download_links needs this, or the
+# ENA mirrors only runs NCBI normalised into an .sra object; originals never
+# normalised have no fastq_ftp but are listed in ncbi_files. https URLs only, the
+# rest being requester-pays s3 alternatives.
+# Every query reading fastq_ftp off sra_run_download_links needs this join, or the
 # same run gains files on one page and stays empty on another.
 _ORIGINAL_FASTQ_JOIN = """
 LEFT JOIN LATERAL (
@@ -1959,9 +1940,8 @@ LEFT JOIN LATERAL (
 ) orig ON NULLIF(dl.fastq_ftp, '') IS NULL
 """
 
-# All four switch on fastq_ftp together: the lists are
-# positional, so taking urls from ENA and bytes from ncbi_files would silently
-# mis-pair them. A run with ENA FASTQ is left exactly as it was.
+# all four switch on fastq_ftp together; the lists are positional, so urls from
+# ENA with bytes from ncbi_files would silently mis-pair
 _FASTQ_FTP_EXPR = (
     "CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL "
     "THEN dl.fastq_ftp ELSE orig.fastq_ftp END"
@@ -1975,16 +1955,12 @@ _FASTQ_MD5_EXPR = (
     "THEN dl.fastq_md5 ELSE orig.fastq_md5 END"
 )
 
-# NCBI's object keys carry a version suffix the real file does not have
-# (..._R1_001.fastq.gz.1), so a name taken from the URL is wrong for
-# fallback entries. ncbi_files already stores the true filename; use it.
-#
-# Total by construction where fastq_ftp is set: the ENA arm is just
-# the URL basename, which is byte-for-byte what callers derived themselves, so
-# reading this column can never change an ENA run's name. ORDINALITY keeps that
-# arm in url order; the fallback arm shares the aggregate's ORDER BY. Keep regex
-# out of this; names like YCS122B_control.1.fastq.gz end in a numeric component
-# legitimately, and would be corrupted.
+# NCBI object keys carry a version suffix the file does not have
+# (..._R1_001.fastq.gz.1), so a name off the URL is wrong for fallback rows;
+# ncbi_files stores the true one. The ENA arm is the plain URL basename, so this
+# column can never change an ENA run's name. ORDINALITY keeps that arm in url
+# order. No regex here: YCS122B_control.1.fastq.gz ends in a numeric component
+# legitimately.
 _FASTQ_FILENAMES_EXPR = """
 CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL
      THEN (SELECT string_agg(split_part(u, '/', -1), ';' ORDER BY ord)
@@ -1993,8 +1969,7 @@ CASE WHEN NULLIF(dl.fastq_ftp, '') IS NOT NULL
      ELSE orig.fastq_filenames END
 """
 
-# Get runs for a specific experiment accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 EXPERIMENT_RUNS_SQL = f"""
 SELECT
     dl.run_accession,
@@ -2024,8 +1999,7 @@ WHERE dl.experiment_accession = %s
 ORDER BY dl.run_accession;
 """
 
-# Get ENA experiment accession from sample accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 ENA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT DISTINCT experiment_accession
 FROM ena_experiments
@@ -2033,8 +2007,7 @@ WHERE sample_accession = %s
 LIMIT 1;
 """
 
-# Get GSA experiment accession from sample accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 GSA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT DISTINCT experiment_accession
 FROM gsa_experiments
@@ -2042,8 +2015,7 @@ WHERE sample_accession = %s
 LIMIT 1;
 """
 
-# Get SRA experiment accession from sample accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 SRA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT accession
 FROM sra_experiments
@@ -2051,8 +2023,7 @@ WHERE samples @> ARRAY[%s]
 LIMIT 1;
 """
 
-# Get ENA study accession from experiment accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 ENA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT DISTINCT study_accession AS study
 FROM ena_experiments
@@ -2060,8 +2031,7 @@ WHERE experiment_accession = %s
 LIMIT 1;
 """
 
-# Get GSA study accession from experiment accession
-# Caller must pass accession already uppercased
+# caller must pass accession already uppercased
 GSA_EXPERIMENT_TO_STUDY_SQL = """
 SELECT DISTINCT study_accession AS study
 FROM gsa_experiments
@@ -2791,14 +2761,14 @@ def build_structured_search(
 
     Returns (sql_string, params_dict) using %(name)s named parameters.
 
-    `published_after`/`published_before` accept ISO date strings (YYYY-MM-DD) and
+    published_after/published_before accept ISO date strings (YYYY-MM-DD) and
     filter the source's publication-date column (geo.published_at,
     sra.published_at, ae.release_date, ena.first_public).
 
-    `sample_tissue`/`sample_disease`/`sample_cell_type` filter to studies that
+    sample_tissue/sample_disease/sample_cell_type filter to studies that
     have at least one matching row in ontology_samples_v5 (ILIKE substring match).
 
-    `count_by` switches the final SELECT to aggregation mode. Supported values:
+    count_by switches the final SELECT to aggregation mode. Supported values:
     "year", "source", "organism", "country". Returns one row per bucket with
     {bucket, count}.
     """
@@ -3795,16 +3765,12 @@ ORDER BY i.ord;
 """
 
 
-# Resolve study_accession(s) used in sra_run_download_links for a given
-# SRP/ERP/DRP accession.
-# Resolve a study/project accession to every accession the download links may be
-# keyed under. Cross-archive links go BOTH ways: an SRP -> its BioProject, and a
-# PRJ* -> the SRA study it wraps (so ENA project pages, addressed by PRJ*, find
-# the FASTQ/BAM rows that live under the SRP). Single %s: the input accession.
-# The same two hops run against dra_studies, since a DDBJ-exclusive DRP is absent
-# from sra_studies. E-GEAD needs a third: it names only a BioProject, whose reads
-# live in the DRA study wrapping it. bioproject_sra_links covers submissions that
-# got two BioProject accessions, where sra_studies has only the SRA XML one.
+# Resolve a study/project accession to every accession sra_run_download_links may
+# be keyed under. Links go both ways: SRP -> its BioProject, and PRJ* -> the SRA
+# study it wraps, so ENA project pages find rows living under the SRP. The same two
+# hops run against dra_studies for DDBJ-exclusive DRPs. E-GEAD needs a third: it
+# names only a BioProject, whose reads live in the wrapping DRA study.
+# bioproject_sra_links covers submissions that got two BioProject accessions.
 _RESOLVE_DL_STUDY = """
 WITH input AS (SELECT %s::text AS acc),
 candidates AS (
@@ -3970,8 +3936,8 @@ ORDER BY ge.experiment_accession, ge.run_accession
 LIMIT 500;
 """
 
-# Unbounded GSA runs, for the full TSV export. Derived from the preview rather
-# than copied, so the column list can't drift between the two.
+# Unbounded GSA runs for the full TSV export; derived from the preview so the
+# column lists cannot drift.
 GSA_STUDY_RUNS_SQL = GSA_STUDY_RUNS_PREVIEW_SQL.replace("\nLIMIT 500;", ";")
 
 # Same columns as STUDY_RUNS_PREVIEW_SQL plus dl.study_accession; filtered to one run.
@@ -4587,7 +4553,7 @@ def build_global_contributions_sql(
     """Build the global contributions SQL with optional filters.
 
     Filter values go into the params list (safe from injection).
-    The template already has ``latitude IS NOT NULL AND longitude IS NOT NULL``
+    The template already has "latitude IS NOT NULL AND longitude IS NOT NULL"
     in the WHERE clause, so we only add column-level filters here.
     """
     conditions: list[str] = ["TRUE"]
@@ -5285,7 +5251,7 @@ def build_disease_projects_sql(
     One page of studies, filtered and sorted.
 
     Both the column list and the ORDER BY are assembled from module constants;
-    `sort` is validated against SORTABLE and never reaches the SQL as text.
+    sort is validated against SORTABLE and never reaches the SQL as text.
     """
     coll = DISEASE_COLLECTIONS[collection]
     prefix, label, label_col = coll["prefix"], coll["label"], coll["label_col"]
@@ -5532,7 +5498,7 @@ def build_search_investigators_sql(
     senior_only: bool = True,
     **filters,
 ) -> tuple[str, dict]:
-    """Rank investigators across the materialized `matched` temp table."""
+    """Rank investigators across the materialized matched temp table."""
     params: dict = {}
     dim_clauses, always_clauses = _search_filter_clauses(params, **filters)
     conds = list(dim_clauses.values()) + always_clauses
@@ -5574,8 +5540,8 @@ _ENRICHED_SAMPLES_BASE_COLS = [
     "cell_line",
     "treatment",
 ]
-# cell_count/gene_count are deliberately absent: they are NULL on every row of
-# enriched_samples too, and come from pentimento_sample via the lateral below.
+# cell_count/gene_count are absent here: NULL on every enriched_samples row too,
+# and come from pentimento_sample via the lateral below.
 _ENRICHED_SAMPLES_NEW_COLS = [
     "development_stage",
     "sample_type",
@@ -5788,18 +5754,14 @@ _SAMPLE_SEARCH_RANGE_COLS = {
     "age_max_days": ("age_days", "<="),
 }
 
-# Every pentimento_sample filter: key -> (clause over alias `p`, param value).
-# The value callable is None for flags that bind nothing. Matrix counts live
-# here; ontology_samples_v5 cell_count/gene_count are NULL placeholders.
+# Every pentimento_sample filter: key -> (clause over alias p, param value). The
+# value callable is None for flags that bind nothing. Matrix counts live here;
+# ontology_samples_v5 cell_count/gene_count are NULL placeholders.
 _SAMPLE_SEARCH_PENTIMENTO = {
-    # `has_matrix` is the PROOF tier: a cell-by-gene matrix was parsed for this
-    # sample. Prefer it over single_cell_only when you want data you can
-    # reanalyse without realignment.
-    #
-    # single_cell_only is a read-derived call (10x barcode-whitelist hits) and
-    # needs FASTQ plus a completed preflightx scan, so it is NULL on most
-    # verified single-cell samples. The two filters answer different questions
-    # and neither subsumes the other.
+    # has_matrix is the proof tier: a cell-by-gene matrix was parsed, so the data
+    # is reanalysable without realignment. single_cell_only is a read-derived call
+    # (10x barcode-whitelist hits) needing FASTQ plus a completed preflightx scan,
+    # so it is NULL on most verified single-cell samples.
     "has_matrix": ("p.cells > 0", None),
     "single_cell_only": ("p.assay_is_single_cell IS TRUE", None),
     "has_viral_reads": ("p.has_viral_reads IS TRUE", None),
@@ -5859,26 +5821,20 @@ _MICROBE_VALIDATED_EXPR = (
     "(m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)"
 )
 
-# is_background is a PREVALENCE flag: any organism seen
-# across more than a threshold fraction of runs trips it. In scRNA-seq no microbe
-# is expected at all, so prevalence is a poor proxy for artifact -- it catches
-# M. tuberculosis at 98.7% genome breadth alongside reagent kitome. So it is
-# surfaced as a label. Kept as an opt-in predicate
-# for callers that explicitly ask to drop prevalence-flagged taxa.
+# is_background is a prevalence flag: any organism seen across more than a
+# threshold fraction of runs. In scRNA-seq no microbe is expected, so prevalence
+# catches real high-breadth hits alongside reagent kitome; surfaced as a label and
+# applied as a predicate only on explicit opt-in.
 _MICROBE_NOT_BACKGROUND = "m.is_background IS NOT TRUE"
 
-# The upstream flags gate on breadth of coverage, and a single fraction is not
-# comparable across kingdoms: the median viral genome is 8.8 kb and the median
-# bacterial one 2.2 Mb, so is_validated_bacterial's 30% asks for 652 kb where the
-# viral tiers ask for 2.6 kb. Bacteria get a relaxed tier of their own at 1%,
-# which is the p99 of bacterial breadth and where the noise floor stops falling.
+# Breadth is a fraction of a genome, and bacterial genomes are orders of magnitude
+# larger, so is_validated_bacterial's 30% demands far more absolute coverage than
+# the viral tiers. Bacteria get a relaxed 1% tier.
 _MICROBE_LOW_BREADTH = "m.breadth_frac >= 0.01"
-# The is_validated_viral / is_viral_evidence flags carry a taxon-aware policy:
-# endogenous retroviruses (MMTV, MLV, HIV1) are held out of the evidence tier and
-# need the 50% gate, and herpesviruses are excluded from both flags entirely --
-# 94 rows sit above 50% breadth with neither flag set, EBV at 0.87 among them, and
-# pentimento_sample.flags is the only place those calls surfaced. Backstop on
-# breadth so a herpesvirus at 87% genome coverage is not reported as nothing.
+# is_validated_viral / is_viral_evidence carry a taxon-aware policy: endogenous
+# retroviruses (MMTV, MLV, HIV1) are held out of the evidence tier and need the
+# 50% gate, herpesviruses are excluded from both. Backstop on breadth so a
+# herpesvirus above the strict gate still reports.
 _MICROBE_VIRAL_HIGH_BREADTH = "(m.class = 'virus' AND m.breadth_frac >= 0.50)"
 _MICROBE_BACTERIAL_EVIDENCE = (
     f"(m.class IN ('pathogen', 'culture') AND {_MICROBE_LOW_BREADTH})"
@@ -5936,7 +5892,7 @@ def _pentimento_sort_page(
     offset+limit and the outer ORDER BY re-sorts at most 2*(offset+limit) rows,
     so correctness never relies on UNION ALL preserving branch order.
 
-    `measured_only` drops the second branch entirely. A pentimento_sample filter
+    measured_only drops the second branch entirely. A pentimento_sample filter
     and a missing pentimento_sample row are contradictory, so that branch is
     guaranteed empty. Postgres cannot prove it and scans for it anyway."""
     if measured_only:
@@ -6033,8 +5989,8 @@ def _microbe_conds(filters: dict, params: dict) -> str:
     if filters.get("microbe_min_kmer_mass") is not None:
         conds.append("m.kmer_mass >= %(f_microbe_min_kmer_mass)s::double precision")
         params["f_microbe_min_kmer_mass"] = filters["microbe_min_kmer_mass"]
-    # Without a breadth floor `microbe_class=pathogen` matches 370k samples of
-    # trace k-mer noise, so the default tier is low_breadth.
+    # without a breadth floor microbe_class=pathogen matches trace k-mer noise,
+    # so the default tier is low_breadth
     tier = filters.get("microbe_tier") or (
         "high_breadth" if filters.get("microbe_validated_only") else "low_breadth"
     )
@@ -6042,23 +5998,21 @@ def _microbe_conds(filters: dict, params: dict) -> str:
         conds.append(_MICROBE_CONFIRMED_EXPR)
     elif tier == "low_breadth":
         conds.append(_MICROBE_EVIDENCE_EXPR)
-    # background is no longer an unconditional cond, so this list can be empty
+    # background is conditional, so this list can be empty
     return " AND ".join(conds) if conds else "TRUE"
 
 
 def _is_set(value) -> bool:
-    """A filter counts as set unless it is absent. `is`-comparisons, not
-    truthiness: min_cell_count=0 is a real bound, and `0 in (None, "", False)`
-    is True in Python."""
+    """A filter counts as set unless absent: min_cell_count=0 is a real bound,
+    and 0 in (None, "", False) is True."""
     return value is not None and value is not False and value != ""
 
 
 def _sample_semi(inner: str) -> str:
-    """Wrap a sub-select as a cohort-narrowing semi-join over `s.sample`.
+    """Wrap a sub-select as a cohort-narrowing semi-join over s.sample.
 
-    `= ANY(ARRAY(...))` builds the small side once. `IN (...)` can let the planner
-    drive the semi-join from ontology_samples_v5 and probe pentimento once per
-    ontology row."""
+    = ANY(ARRAY(...)) builds the small side once. IN (...) can let the planner drive
+    the semi-join from ontology_samples_v5 and probe pentimento per ontology row."""
     return f"\n  AND s.sample = ANY(ARRAY(\n    {inner}\n  ))"
 
 
@@ -6097,7 +6051,7 @@ def _pentimento_semi(filters: dict, params: dict) -> str:
 
 def _microbe_lateral(filters: dict, params: dict) -> str:
     """LATERAL attaching microbial detections to one sample. Aggregates over every
-    matching detection; only `microbes` is capped, per `microbes_truncated`."""
+    matching detection; only microbes is capped, per microbes_truncated."""
     conds = _microbe_conds(filters, params)
     return f"""
 LEFT JOIN LATERAL (
@@ -6189,8 +6143,8 @@ def build_enriched_sample_search_sql(
 ) -> tuple[str, dict]:
     """Cross-project sample cohort search over ontology_samples_v5.
 
-    Every pentimento filter, including `microbe*`, flags, and matrix-count bounds,
-    also restricts the cohort, so `total` shrinks with them. Pair with the count
+    Every pentimento filter, including microbe*, flags, and matrix-count bounds,
+    also restricts the cohort, so total shrinks with them. Pair with the count
     builder, which applies the identical WHERE."""
     if sort not in SAMPLE_SEARCH_SORTABLE:
         raise ValueError(f"unsortable column: {sort}")
@@ -6219,7 +6173,7 @@ def build_enriched_sample_search_sql(
     def order_by(expr: str) -> str:
         return f"ORDER BY {expr} {direction} NULLS LAST{tiebreak}"
 
-    # The page is cut before the LATERALs run, so they decorate at most `limit`
+    # The page is cut before the LATERALs run, so they decorate at most limit
     # rows matched by filters.
     if sort in _PENTIMENTO_SORT_COLS:
         measured_only = _wants_pentimento_sample(filters)
@@ -6302,12 +6256,23 @@ ORDER BY n DESC
 LIMIT 1;
 """
 
+# gates the Pentimento tab; same run-row fallback as PENTIMENTO_SAMPLES_SQL
 PENTIMENTO_SAMPLE_CELLS_SQL = """
-WITH s AS (
+WITH counted AS (
     SELECT sample_accession, cells, genes, nnz, unfiltered
     FROM pentimento_sample
     WHERE study_accession = %(acc)s
-    ORDER BY sample_accession
+), s AS (
+    SELECT * FROM counted
+    UNION ALL
+    SELECT DISTINCT COALESCE(r.gsm_accession, r.sample_accession),
+           NULL::bigint, NULL::bigint, NULL::bigint, NULL::boolean
+    FROM pentimento_run r
+    LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
+    WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
+      AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM counted)
+    ORDER BY 1
     LIMIT %(limit)s
 ), x AS (
     SELECT sample_accession,
@@ -6333,10 +6298,9 @@ LEFT JOIN x ON x.sample_accession = s.sample_accession
 ORDER BY s.sample_accession;
 """
 
-# The pentimento_study projection, shared by the study endpoint and the
-# single-cell summary. pentimento_study is rebuilt whole by the ingestion side
-# and gains columns; two hand-maintained copies of this list would drift
-# silently, so it lives in one place.
+# The pentimento_study projection, shared by the study endpoint and the single-cell
+# summary. pentimento_study is rebuilt whole by the ingestion side and gains
+# columns.
 _PENTIMENTO_STUDY_COLS = """p.study_accession, p.source, p.title, p.study_cells,
        p.cells_unfiltered, p.single_cell_file_format, p.n_samples_reported,
        p.n_samples_detailed, p.sample_cells_total, p.unassigned_cells,
@@ -6428,34 +6392,22 @@ LIMIT %(limit)s OFFSET %(offset)s;
 """
 
 # Single-cell status and summary
-#
-# These queries keep raw columns from inviting the opposite reading:
-#
-# 1. `unified_metadata.single_cell_status` is a cached label recomputed by the
-#    recall_fix recipe in seqout-ingestion. The endpoint returns status alongside
-#    the evidence.
-#
-# 2. The evidence sources are independent and attempted only when the required
-#    inputs exist: the matrix route needs supplementary files, and the read routes
-#    need FASTQ plus a preflightx scan. A study with a single evidence source is
-#    usually showing the only measurement that could be made. A counted matrix is
-#    proof on its own.
-#
-# 3. `n_runs_measurable = 0` means the quantifier NEVER RAN. It does not mean
-#    "clean". An empty `flags` list with n_runs_measurable > 0 is the "measured,
-#    found nothing" case. The handler emits an explicit microbe_measured bool so
-#    a caller cannot collapse the two.
-# SELECT-list fragment interpolated into both single-study queries. It owns its
-# trailing comma so call sites cannot disagree about it.
+# unified_metadata.single_cell_status is a cached label recomputed by the recall_fix
+# recipe in seqout-ingestion; the endpoint returns it alongside the evidence.
+# Evidence sources are independent and attempted only where their inputs exist: the
+# matrix route needs supplementary files, the read routes FASTQ plus a preflightx
+# scan.
+# n_runs_measurable = 0 means the quantifier never ran; empty flags with
+# n_runs_measurable > 0 is measured-found-nothing. The handler emits an explicit
+# microbe_measured bool.
+# SELECT-list fragment for both single-study queries; owns its trailing comma.
 SINGLE_CELL_EVIDENCE_COLS = """
   (SELECT count(*) FROM pentimento_sample s
     WHERE s.study_accession = %(acc)s AND s.cells > 0)          AS samples_with_matrix,
-  -- Runs reach a study by EITHER its own accession or its GSM link. The two
-  -- evidence tables do not share an accession space: pentimento_sample is 100%
-  -- GSE, pentimento_run is mostly SRP (9,144 SRP vs 908 GSE on the barcode
-  -- call). Matching on study_accession alone misses every GEO study whose reads
-  -- are filed under an SRP, which is most of them -- it undercounted studies
-  -- carrying BOTH kinds of evidence 7-fold, 783 against a true 5,721.
+  -- Runs reach a study by either its own accession or its GSM link. The two
+  -- evidence tables share no accession space: pentimento_sample keys on the GSE,
+  -- pentimento_run mostly on the SRP. Matching on study_accession alone misses
+  -- every GEO study whose reads are filed under an SRP, which is most of them.
   EXISTS (SELECT 1 FROM pentimento_run r
            LEFT JOIN pentimento_sample s2 ON s2.sample_accession = r.gsm_accession
            WHERE (r.study_accession = %(acc)s OR s2.study_accession = %(acc)s)
@@ -6484,10 +6436,10 @@ SINGLE_CELL_EVIDENCE_COLS = """
     WHERE s4.study_accession = %(acc)s AND s4.cells > 0)        AS matrix_accessions,
 """
 
-# Anchor on ACCESSION so exactly one row always comes back. pentimento_study has
-# studies missing from unified_metadata; anchoring on the unified table returns
-# 404 for studies this endpoint exists to answer for. `in_unified` / `in_pentimento` tell
-# the caller which side knows about it. "nothing has measured this" is an answer.
+# Anchor on the accession so exactly one row always comes back. pentimento_study holds
+# studies missing from unified_metadata; anchoring on the unified table 404s the
+# studies this endpoint exists to answer for. in_unified / in_pentimento tell the
+# caller which side knows about it.
 SINGLE_CELL_STATUS_SQL = f"""
 SELECT u.canonical_accession, u.source, u.single_cell_status, u.is_single_cell,
        (u.canonical_accession IS NOT NULL)                      AS in_unified,
@@ -6630,12 +6582,10 @@ FROM (
 ) agg;
 """
 
-# Per (sample, organism) detections for one study. The project grid badged from a
-# hardcoded 24-taxon list, so organisms outside it -- M. tuberculosis at 98% genome
-# breadth among them -- rendered as "none detected". This drives the badges and the
-# CSV from the real panel instead. LEFT JOIN so a screened sample with nothing found
-# still emits a row: "screened, nothing found" and "never screened" are different
-# answers and the grid has to tell them apart.
+# Per (sample, organism) detections for one study, driving the badges and the CSV
+# from the real panel rather than a hardcoded taxon list. LEFT JOIN so a screened
+# sample with nothing found still emits a row: "screened, nothing found" and
+# "never screened" are different answers.
 PENTIMENTO_STUDY_DETECTIONS_SQL = f"""
 WITH runs AS (
   -- pentimento_run keys on the SRP, pentimento_sample on the GSE, so accept
