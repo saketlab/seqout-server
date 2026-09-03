@@ -135,7 +135,7 @@ def build_biosample_where(filters: list[dict]) -> tuple[str, list]:
                     clauses.append(f"{col} {op} %s")
                 params.append(val)
         else:
-            clauses.append("FALSE")  # unknown term -> empty result, not an error
+            clauses.append("FALSE")  # unknown term -> empty result
     where = " AND ".join(clauses) if clauses else "TRUE"
     return where, params
 

@@ -153,8 +153,8 @@ FROM unified_metadata
 WHERE canonical_accession = ANY(%(acc)s);
 """
 
-# GSA's submitter/org live on the linked BioProject, not unified_metadata (which
-# has no GSA rows), same join GSA_PROJECT_SQL uses, batched for result rows.
+# GSA's submitter/org live on the linked BioProject (unified_metadata has no GSA
+# rows), same join GSA_PROJECT_SQL uses, batched for result rows.
 GSA_SUBMITTER_BATCH_SQL = """
 SELECT es.study_accession AS accession,
        NULLIF(btrim(p.submitter), '') AS submitter_person,
@@ -554,7 +554,7 @@ all_matches AS (
     UNION ALL
 
     -- GEA (DDBJ E-GEAD) full-text search. Like ArrayExpress the tsv lives on the
-    -- experiment table itself; organism is a single column, not an array.
+    -- experiment table itself; organism is a single text column.
     SELECT accession, title, description AS summary, release_date AS updated_at,
            CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
                 THEN ARRAY[organism] END::text[] AS organisms,
@@ -1139,7 +1139,7 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f"SELECT {_GEO_FIELDS} FROM geo_series g"
         f" WHERE g.samples_ref @> ARRAY[%(acc)s] LIMIT 1"
     ),
-    # A pattern match resolving to nothing returns empty, never full-text search.
+    # A pattern match resolving to nothing returns empty without falling back to FTS.
     # DDBJ-exclusive DRPs need their own arm; dra_studies_search holds exactly those.
     "srp": (
         f"SELECT {_SRA_FIELDS} FROM sra_studies s WHERE s.accession = %(acc)s"
@@ -1159,8 +1159,8 @@ SEARCH_BY_ACCESSION_SQL_BY_KIND: dict[str, str] = {
         f" WHERE e.samples @> ARRAY[%(acc)s]"
         f" ORDER BY s.accession LIMIT 1"
     ),
-    # ena_experiments.study_accession holds the BioProject ID (PRJ*), not an
-    # SRP/ERP/DRP; the joins below match it against sra_studies.bioproject_id
+    # ena_experiments.study_accession holds the BioProject ID (PRJ*); the joins
+    # below match it against sra_studies.bioproject_id
     # and ena_studies_search.accession (also PRJ-keyed).
     "srr": (
         f"SELECT {_SRA_FIELDS} FROM ena_experiments ee"
@@ -1423,7 +1423,7 @@ SELECT
             THEN ARRAY[es.scientific_name]
         END
     )::text[] AS organisms,
-    -- GSA records a single submitting person, not an author roster; the linked
+    -- GSA records a single submitting person; the linked
     -- BioProject carries them along with the organisation. Both live on the join
     -- below and were previously discarded.
     CASE WHEN NULLIF(btrim(p.submitter), '') IS NOT NULL
@@ -1946,7 +1946,7 @@ LEFT JOIN LATERAL (
                f->>'size'     AS size,
                f->>'md5'      AS md5
         FROM jsonb_array_elements(
-                 -- ncbi_files can be a JSONB 'null' scalar, not an array
+                 -- ncbi_files can be a JSONB 'null' scalar where an array is expected
                  CASE WHEN jsonb_typeof(dl.ncbi_files) = 'array'
                       THEN dl.ncbi_files ELSE '[]'::jsonb END
              ) AS f
@@ -1959,7 +1959,7 @@ LEFT JOIN LATERAL (
 ) orig ON NULLIF(dl.fastq_ftp, '') IS NULL
 """
 
-# All four switch on fastq_ftp together, never column-by-column: the lists are
+# All four switch on fastq_ftp together: the lists are
 # positional, so taking urls from ENA and bytes from ncbi_files would silently
 # mis-pair them. A run with ENA FASTQ is left exactly as it was.
 _FASTQ_FTP_EXPR = (
@@ -1979,7 +1979,7 @@ _FASTQ_MD5_EXPR = (
 # (..._R1_001.fastq.gz.1), so a name taken from the URL is wrong for
 # fallback entries. ncbi_files already stores the true filename; use it.
 #
-# Total by construction, never NULL where fastq_ftp is set: the ENA arm is just
+# Total by construction where fastq_ftp is set: the ENA arm is just
 # the URL basename, which is byte-for-byte what callers derived themselves, so
 # reading this column can never change an ENA run's name. ORDINALITY keeps that
 # arm in url order; the fallback arm shares the aggregate's ORDER BY. Keep regex
@@ -2252,7 +2252,7 @@ expanded AS (
     SELECT
         (n->>'accession')::text AS accession,
         COALESCE((n->>'distance')::float, (n->>'score')::float, 0.0) AS distance
-    -- neighbors is jsonb[] (a Postgres array), not a jsonb array: jsonb_array_elements() errors on it
+    -- neighbors is jsonb[] (a Postgres array): jsonb_array_elements() errors on it
     FROM base, unnest(base.neighbors) AS n
     ORDER BY 2 ASC
     LIMIT %(limit)s
@@ -2343,7 +2343,7 @@ u AS (
     -- @> uses the GIN index on the text[] column; unnest ... IN would seq-scan.
     -- institute: best-effort affiliation per source, shown per card + summarized.
     -- GEO stores it as organizations text[]; noise (incl. "GEO") is filtered by
-    -- the _INSTITUTE_NOISE blocklist downstream, not here.
+    -- the _INSTITUTE_NOISE blocklist downstream.
     SELECT gs.accession, gs.title, gs.summary, gs.updated_at, gs.published_at,
            array_to_string(gs.organizations, '; ') AS institute
       FROM geo_series gs
@@ -2363,8 +2363,8 @@ u AS (
      WHERE geo_contrib_text(gs.contributors) ~* %(re)s
     UNION ALL
     -- SRA center_project_name / ENA center_name are submitting-center metadata
-    -- (often a sequencing vendor, e.g. "Illumina Inc."), not an author
-    -- affiliation, leave institute NULL rather than mislead.
+    -- (often a sequencing vendor, e.g. "Illumina Inc."), so institute stays NULL
+    -- rather than mislead.
     SELECT s.accession, s.title, s.abstract, s.updated_at, s.published_at,
            NULL::text
       FROM sra_studies s
@@ -2483,7 +2483,7 @@ SELECT
     END AS relation,
     -- AE stores processed archives in processed_data_files and the raw-data
     -- archive inside each sample's comment[arrayexpress ftp file] attribute (one
-    -- experiment-level file repeated across samples). Show both, not either/or.
+    -- experiment-level file repeated across samples). Show both.
     NULLIF(
         COALESCE(
             CASE WHEN jsonb_typeof(ae.processed_data_files) = 'array'
@@ -3772,8 +3772,7 @@ matched AS (
 
     UNION ALL
 
-    -- E-GEAD lives in gea_experiments, not arrayexpress_experiments, and stores
-    -- one organism as text rather than an array.
+    -- E-GEAD lives in gea_experiments and stores one organism as text.
     SELECT
         gea.accession,
         gea.title,
@@ -4023,7 +4022,7 @@ SELECT
     COUNT(*) OVER()                   AS total_bams,
     COALESCE(SUM((f->>'size')::bigint) OVER(), 0)::text AS total_bam_bytes
 FROM sra_run_download_links dl,
-     -- ncbi_files can be a JSONB 'null' scalar, not an array
+     -- ncbi_files can be a JSONB 'null' scalar where an array is expected
      jsonb_array_elements(
          CASE WHEN jsonb_typeof(dl.ncbi_files) = 'array'
               THEN dl.ncbi_files ELSE '[]'::jsonb END
@@ -5197,7 +5196,7 @@ DISEASE_ALIAS_LOOKUP_SQL = f"""
 SELECT display_name, alias, mondo_ids, sources,
        COUNT(*) OVER () AS total_count
 FROM disease_alias
--- the %% operator, not similarity(): only the operator uses
+-- the %% operator: only it uses
 -- idx_disease_alias_trgm; both forms select the same
 -- rows. Every literal percent is doubled; psycopg scans comments for
 -- placeholders too
@@ -5234,7 +5233,7 @@ SELECT count(*)                        AS studies,
        count(*) FILTER (WHERE n_human_primary > 0)   AS studies_human_primary,
        count(*) FILTER (WHERE n_model > 0)           AS studies_model,
        count(*) FILTER (WHERE n_cell_line > 0)       AS studies_cell_line,
-       -- reported ethnicity, not inferred ancestry; see the matview comment
+       -- reported ethnicity; see the matview comment
        count(*) FILTER (WHERE ancestries IS NOT NULL) AS studies_with_ancestry,
        sum(stated_male)                AS stated_male,
        sum(stated_female)              AS stated_female,
@@ -5431,7 +5430,7 @@ def build_country_accessions_sql(
 
 
 # Senior-author attribution: use the last publication author by convention.
-# GEO contributor order is submitter order, not author order, so PI ranking uses
+# GEO contributor order is submitter order, so PI ranking uses
 # publications only and reports reduced coverage.
 _PI_SENIOR_AUTHORS_CTE = """
 authors AS (
@@ -5663,7 +5662,7 @@ WHERE sample_accession = ANY(%(samples)s)
 ORDER BY sample_accession, file
 """
 
-# medians of per-matrix medians, not per-cell figures
+# medians of per-matrix medians
 SC_STATS_STUDY_SQL = """
 SELECT s.accession,
        s.state,
@@ -5824,7 +5823,7 @@ _SAMPLE_SEARCH_MICROBE_KEYS = frozenset(
     }
 )
 
-# Resolved by semi-join against the small pentimento tables, not by a column compare
+# Resolved by semi-join against the small pentimento tables
 # microbe_tier only narrows a microbe match, so it must not by itself pull the
 # pentimento join into an otherwise plain sample search
 _SAMPLE_SEARCH_MICROBE_SELECTORS = _SAMPLE_SEARCH_MICROBE_KEYS - {
@@ -5860,11 +5859,11 @@ _MICROBE_VALIDATED_EXPR = (
     "(m.is_validated_viral OR m.is_viral_evidence OR m.is_validated_bacterial)"
 )
 
-# is_background is a PREVALENCE flag, not a contamination call: any organism seen
+# is_background is a PREVALENCE flag: any organism seen
 # across more than a threshold fraction of runs trips it. In scRNA-seq no microbe
 # is expected at all, so prevalence is a poor proxy for artifact -- it catches
 # M. tuberculosis at 98.7% genome breadth alongside reagent kitome. So it is
-# surfaced as a label, never used to filter rows out. Kept as an opt-in predicate
+# surfaced as a label. Kept as an opt-in predicate
 # for callers that explicitly ask to drop prevalence-flagged taxa.
 _MICROBE_NOT_BACKGROUND = "m.is_background IS NOT TRUE"
 
@@ -6035,7 +6034,7 @@ def _microbe_conds(filters: dict, params: dict) -> str:
         conds.append("m.kmer_mass >= %(f_microbe_min_kmer_mass)s::double precision")
         params["f_microbe_min_kmer_mass"] = filters["microbe_min_kmer_mass"]
     # Without a breadth floor `microbe_class=pathogen` matches 370k samples of
-    # trace k-mer noise, so the default tier is low_breadth, not `any`.
+    # trace k-mer noise, so the default tier is low_breadth.
     tier = filters.get("microbe_tier") or (
         "high_breadth" if filters.get("microbe_validated_only") else "low_breadth"
     )
@@ -6352,22 +6351,80 @@ WHERE p.study_accession = %s;
 """
 
 # ORDER BY keeps LIMIT/OFFSET paging stable
+# pentimento_sample exists only where a matrix was counted, so a study with run
+# rows and no sample rows falls back to rolling those runs up per sample
+# matrix and run-only columns are NULL in that branch
+# pentimento_run keys on the SRP, so a GEO study reaches its runs via ss.alias
 PENTIMENTO_SAMPLES_SQL = """
-SELECT sample_accession, cells, genes, nnz, file_format, unfiltered,
-       n_runs, n_runs_measurable,
-       species_called, species_confidence, species_hit_reads,
-       species_hit_fraction, species_runner_up, species_margin,
-       species_ambiguous, species_mislabel,
-       sex_verdict, sex_confidence, sex_reads_scanned, y_hits, xist_hits,
-       y_xist_ratio, sex_panel_status, sex_mixed_suspected, deep_n_reads,
-       assay, assay_display, assay_is_single_cell,
-       calls_ambiguous, flags, n_flags, hpv_top_type, hpv_ambiguous,
-       has_viral_reads, has_viral_evidence, has_bacterial_reads,
-       viral_kmer_mass, bacterial_kmer_mass
-FROM pentimento_sample
-WHERE study_accession = %s
+WITH counted AS (
+    SELECT sample_accession, cells, genes, nnz, file_format, unfiltered,
+           n_runs, n_runs_measurable,
+           species_called, species_confidence, species_hit_reads,
+           species_hit_fraction, species_runner_up, species_margin,
+           species_ambiguous, species_mislabel,
+           sex_verdict, sex_confidence, sex_reads_scanned, y_hits, xist_hits,
+           y_xist_ratio, sex_panel_status, sex_mixed_suspected, deep_n_reads,
+           assay, assay_display, assay_is_single_cell,
+           calls_ambiguous, flags, n_flags, hpv_top_type, hpv_ambiguous,
+           has_viral_reads, has_viral_evidence, has_bacterial_reads,
+           viral_kmer_mass, bacterial_kmer_mass
+    FROM pentimento_sample
+    WHERE study_accession = %(acc)s
+),
+from_runs AS (
+    SELECT COALESCE(r.gsm_accession, r.sample_accession)      AS sample_accession,
+           NULL::bigint AS cells, NULL::bigint AS genes, NULL::bigint AS nnz,
+           NULL::text AS file_format, NULL::boolean AS unfiltered,
+           count(*)::int                                      AS n_runs,
+           count(*) FILTER (WHERE r.measurable)::int           AS n_runs_measurable,
+           mode() WITHIN GROUP (ORDER BY r.species_called)     AS species_called,
+           mode() WITHIN GROUP (ORDER BY r.species_confidence) AS species_confidence,
+           NULL::bigint AS species_hit_reads,
+           NULL::double precision AS species_hit_fraction,
+           NULL::text AS species_runner_up,
+           NULL::double precision AS species_margin,
+           NULL::boolean AS species_ambiguous,
+           bool_or(r.species_mislabel)                        AS species_mislabel,
+           mode() WITHIN GROUP (ORDER BY r.sex_verdict)        AS sex_verdict,
+           mode() WITHIN GROUP (ORDER BY r.sex_confidence)     AS sex_confidence,
+           NULL::bigint AS sex_reads_scanned, NULL::integer AS y_hits,
+           NULL::integer AS xist_hits,
+           NULL::double precision AS y_xist_ratio, NULL::text AS sex_panel_status,
+           NULL::boolean AS sex_mixed_suspected, NULL::bigint AS deep_n_reads,
+           mode() WITHIN GROUP (ORDER BY r.assay)              AS assay,
+           NULL::text AS assay_display,
+           bool_or(r.assay_is_single_cell)                    AS assay_is_single_cell,
+           NULL::boolean AS calls_ambiguous,
+           NULL::jsonb AS flags,
+           NULL::integer AS n_flags,
+           NULL::text AS hpv_top_type, NULL::boolean AS hpv_ambiguous,
+           bool_or(mb.has_reads)                              AS has_viral_reads,
+           bool_or(mb.has_viral_evidence)                     AS has_viral_evidence,
+           bool_or(mb.has_bacterial)                          AS has_bacterial_reads,
+           sum(mb.viral_kmer_mass)                            AS viral_kmer_mass,
+           sum(mb.bacterial_kmer_mass)                        AS bacterial_kmer_mass
+    FROM pentimento_run r
+    LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
+    LEFT JOIN LATERAL (
+        SELECT bool_or(m.organism IS NOT NULL)                 AS has_reads,
+               bool_or(m.is_viral_evidence)                    AS has_viral_evidence,
+               bool_or(m.is_validated_bacterial)               AS has_bacterial,
+               sum(m.kmer_mass) FILTER (WHERE m.class = 'virus') AS viral_kmer_mass,
+               sum(m.kmer_mass) FILTER (
+                   WHERE m.class IN ('pathogen', 'culture'))   AS bacterial_kmer_mass
+        FROM pentimento_microbe m
+        WHERE m.run_accession = r.run_accession
+    ) mb ON TRUE
+    WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
+      AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM counted)
+    GROUP BY 1
+)
+SELECT * FROM counted
+UNION ALL
+SELECT * FROM from_runs
 ORDER BY sample_accession
-LIMIT %s OFFSET %s;
+LIMIT %(limit)s OFFSET %(offset)s;
 """
 
 # Single-cell status and summary
@@ -6415,7 +6472,7 @@ SINGLE_CELL_EVIDENCE_COLS = """
              WHERE p2.study_accession = %(acc)s), 0)            AS n_runs_linked_ev,
   -- WHERE each kind of evidence actually lives. A GEO study's matrix sits under
   -- its GSE while its reads sit under an SRP, so a caller that wants to fetch
-  -- the reads needs the read-side accession, not the one it asked about.
+  -- the reads needs the read-side accession.
   (SELECT array_agg(DISTINCT r.study_accession)
      FROM pentimento_run r
      LEFT JOIN pentimento_sample s3 ON s3.sample_accession = r.gsm_accession
@@ -6685,7 +6742,7 @@ scanned AS (
   FROM rollup
 ),
 sex AS (
-  -- runs that disagree are their own bucket, never folded into one sex
+  -- runs that disagree get their own bucket
   SELECT CASE WHEN sex_lo IS NULL     THEN 'no_verdict'
               WHEN sex_lo <> sex_hi   THEN 'conflicting'
               ELSE sex_lo END AS verdict,
@@ -6791,7 +6848,7 @@ top_tissue AS (
   SELECT tissue FROM tissue_cell
   GROUP BY 1 ORDER BY sum(n_studies) DESC LIMIT 8
 ),
--- top per kingdom, not overall: viruses outnumber bacteria and a flat limit
+-- top per kingdom: viruses outnumber bacteria and a flat limit
 -- leaves one bacterial row on the chart. No QUALIFY in Postgres, so rn needs
 -- its own level; a CTE keeps the final SELECT flat like the two above.
 top_microbe AS (
@@ -6927,7 +6984,7 @@ if __name__ == "__main__":
     )
     assert "FROM pentimento_sample pv" not in by_study, by_study
 
-    # matrix counts come from pentimento, never from the all-NULL ontology columns
+    # matrix counts come from pentimento; the ontology columns are all NULL
     for key, (clause, _to_param) in _SAMPLE_SEARCH_PENTIMENTO.items():
         csql, cparams = build_enriched_sample_count_sql({key: 100})
         assert clause in csql and "pentimento_sample p" in csql, (key, csql)

@@ -2528,7 +2528,7 @@ def _growth_relation_name(mode: str) -> str | None:
 
 
 class _NotBuiltYet(Exception):
-    """Precomputed relation missing or empty; a 503, not a 500."""
+    """Precomputed relation missing or empty; raised as a 503."""
 
 
 def _relation_exists(cur, name: str) -> bool:
@@ -2775,7 +2775,7 @@ def _run_search(cur, sql: str, params, q: str) -> list:
 
 
 # After a Neo4j failure, skip expansion for the cooldown so an outage costs
-# one timed-out request per window, not one per search.
+# one timed-out request per window.
 _neo4j_expand_circuit = {"open_until": 0.0}
 _NEO4J_EXPAND_COOLDOWN = 30.0
 
@@ -4715,8 +4715,8 @@ def _headline_words(marked: str | None) -> list[str]:
 # Which expanded term put a highlighted word on the page. ts_headline marks the
 # surface word but says nothing about WHY it matched, and after expansion the
 # why is the interesting part: "activates" lighting up in an Arabidopsis abstract
-# came from the synonym "s methyltransferase activity", not from anything the
-# user typed. Stem each marked word the same way the index did, drop the ones the
+# came from the synonym "s methyltransferase activity". Stem each marked word
+# the same way the index did, drop the ones the
 # typed query already accounts for, and attribute the rest to the first variant
 # that contains them (variants come back most-relevant-first).
 _ATTRIBUTION_SQL = """
@@ -5561,7 +5561,7 @@ def search_facets(
     # shows. /search runs the correction in "augmented" mode, the corrected
     # results are the paginated stream AND the literal-typo matches ride along in
     # correction.extra_results, so the count must be over the UNION of both
-    # match sets, not the corrected one alone. Hence extra_variants: counting only
+    # match sets. Hence extra_variants: counting only
     # the corrected set undercounts the page by however many extras render.
     # Cached below under the original cache_key so repeat typo searches stay fast.
     # Applies with an active filter too. Search's filtered path auto-corrects
@@ -6035,7 +6035,7 @@ def find_study_experiments(
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
     # filtered=false means no supplied column maps to SQL here, so an empty
-    # list is "we did not narrow", not "no matches"; the grid must keep showing
+    # list means "we did not narrow"; the grid must keep showing
     # its own rows rather than blanking. See the superset rule in grid_filters.
     if rows is None:
         return {"experiments": [], "capped": False, "filtered": False}
@@ -6475,9 +6475,8 @@ def find_study_runs(
         if is_gsa
         else "WHERE dl.study_accession IN (SELECT acc FROM candidates)\n"
     )
-    # Injected into the WHERE, not wrapped around the query: the preview SQL
-    # carries its own LIMIT 500, and filtering outside it would only ever search
-    # the first 500 runs.
+    # Injected into the WHERE: the preview SQL carries its own LIMIT 500, so
+    # filtering outside it would only ever search the first 500 runs.
     find_sql = base.replace(marker, f"{marker}  AND {where}\n", 1)
     try:
         with pool.connection() as conn:
@@ -8803,7 +8802,7 @@ def _stream_results_csv(sql: str, params: dict):
     """Yield the entire match set as CSV, a row at a time.
 
     Server-side cursor: a broad query matches too many datasets to hold in
-    memory. itersize batches, not cur.stream(), which costs a round trip per row.
+    memory. itersize batches; cur.stream() costs a round trip per row.
 
     Errors mid-stream cannot become an HTTP status; they are logged and the CSV
     ends. Holds one pooled connection (max_size=20) for the whole download, so
@@ -8826,8 +8825,8 @@ def _stream_results_csv(sql: str, params: dict):
         # server-side cursor is destroyed the moment its DECLARE statement ends.
         # Both need a real transaction.
         with pool.connection() as conn, conn.transaction():
-            # Bounds the initial query and each FETCH, not the download's total
-            # wall-clock; a broad CSV is legitimately slow to ship. Also
+            # Bounds the initial query and each FETCH; the download's total
+            # wall-clock stays open, since a broad CSV is legitimately slow. Also
             # lifts the pool default, which alone would kill a big download.
             conn.execute("SET LOCAL statement_timeout = '300s'")
             with conn.cursor(name="download_query", row_factory=dict_row) as cur:
@@ -9061,7 +9060,7 @@ _KIND_INFO = {
 # other shape -- see _archive_of_accession.
 _SED_ARCHIVE = {"S": "ncbi-sra", "E": "ena", "D": "ddbj", "C": "gsa", "H": "gsa"}
 
-# Kinds whose archive is fixed by the kind itself, not by any letter.
+# Kinds whose archive follows from the kind itself.
 _KIND_ARCHIVE = {
     "gse": "geo",
     "gsm": "geo",
@@ -9087,7 +9086,7 @@ def _archive_of_accession(acc: str, kind: str, database: str | None) -> str | No
     Order matters. The first-letter _SED_ARCHIVE rule is a last resort because
     plenty of accessions start with one of those letters without meaning it:
     E-MTAB-/E-GEAD- begin with "E" (for "Experiment", an ArrayExpress naming
-    convention, not ENA), and every SAM* begins with "S" regardless of archive.
+    convention), and every SAM* begins with "S" regardless of archive.
     """
     if kind in _KIND_ARCHIVE:
         return _KIND_ARCHIVE[kind]
@@ -9181,7 +9180,7 @@ def _author_name_regex(q: str) -> str | None:
         body = f"{esc[0]}( [^,]*)? {esc[-1]}"
     else:
         # A single token matches a whole word anywhere in the name (given,
-        # middle, or surname), not just the surname, so "saket" finds
+        # middle, or surname), so "saket" finds
         # "Saket Choudhary". Leading/trailing spaces enforce word boundaries.
         body = f"([^,]* )?{esc[0]}( [^,]*)?"
     return f"(^|, ){body}(,|$)"
@@ -9253,7 +9252,7 @@ def search_author_projects(
                     facets.values(), key=lambda e: (-e["count"], e["name"])
                 )
 
-                # Enrich only the page we return, not the whole fetched set.
+                # Enrich only the page we return.
                 results = rows[:limit]
                 _enrich_with_publications(results, cur)
     except Exception:
@@ -9947,8 +9946,8 @@ def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
     and are simply unreachable by following links. Resolving through the shared
     PMID recovers them.
 
-    This is an INFERENCE, not a cross-reference: a PMID names a paper, and a paper
-    can describe several studies. Rows are tagged
+    This is an INFERENCE: a PMID names a paper, and a paper can describe several
+    studies. Rows are tagged
     source='pmid' and carry `via_pmid` so callers can label the provenance and,
     when several come back, let the user choose rather than guessing.
     """
@@ -10030,7 +10029,7 @@ def get_project_xref(
 
 
 # Cross-database links exist only at the project level (cross_ref_* is keyed on
-# GSE/SRP/E-*, never GSM/SRR), so conversion resolves to the project, then fans
+# GSE/SRP/E-*), so conversion resolves to the project, then fans
 # out to sibling projects via RELATED_SQL.
 MAX_CONVERT_ACCESSIONS = 200
 
@@ -10957,7 +10956,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "assay_category": assay_category,
         "organism": organism,
     }
-    # rejected, not dropped: ignoring one returns an unfiltered page that looks filtered
+    # rejected: ignoring one returns an unfiltered page that looks filtered
     if bad := sorted(
         k for k, v in supplied.items() if v is not None and k not in allowed
     ):
@@ -11679,7 +11678,10 @@ def get_project_single_cell(
                 study = cur.fetchone()
                 if not study:
                     raise HTTPException(404, "Study not in the Pentimento")
-                cur.execute(PENTIMENTO_SAMPLES_SQL, (resolved, limit, offset))
+                cur.execute(
+                    PENTIMENTO_SAMPLES_SQL,
+                    {"acc": resolved, "limit": limit, "offset": offset},
+                )
                 samples = cur.fetchall()
                 _attach_pentimento_labels(cur, resolved, samples)
                 _attach_pentimento_detections(cur, resolved, samples)
@@ -11915,7 +11917,7 @@ def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
 def _resolve_enrichment_accession(cur, accession: str) -> str:
     """Map a PRJ* to the accession enrichment is keyed under (GSE or SRP).
 
-    Enrichment keys on the GEO series / SRA study, not the bare PRJ, so a raw PRJ*
+    Enrichment keys on the GEO series / SRA study, so a raw PRJ*
     404s even when the study is enriched. Unchanged for non-PRJ / unmapped input.
     """
     if not accession.upper().startswith("PRJ"):

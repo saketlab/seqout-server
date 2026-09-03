@@ -50,10 +50,10 @@ FROM ts_stat('SELECT tsv FROM gsa_studies_search')
 WHERE ndoc > 50 AND LENGTH(word) >= 3
 ON CONFLICT (term) DO UPDATE SET frequency = GREATEST(search_vocabulary.frequency, EXCLUDED.frequency);
 
--- 3c-3f. SURFACE words (real words, not FTS stems) harvested from the same free
+-- 3c-3f. SURFACE words (the forms as written) harvested from the same free
 -- text the tsv columns are built from. Blocks 1-3b store STEMS ('express',
 -- 'obes'), which the known-check and prefix fallback need but which pollute
--- spelling suggestions (a typo "corrects" to a stem, not a word). These blocks
+-- spelling suggestions (a typo "corrects" to a stem). These blocks
 -- add the real surface forms ('expression', 'obese') so SymSpell/trigram suggest
 -- words. term_type 'text' marks them; a stem that is ALSO a real word (its own
 -- stem, e.g. 'health') is flipped corpus->text so it stays a spell candidate.
