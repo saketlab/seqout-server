@@ -8,6 +8,7 @@ import logging
 import os
 from collections import defaultdict
 import pathlib
+import contextvars
 import re
 import shutil
 import threading
@@ -101,6 +102,11 @@ from queries import (
     DEFAULT_SCOPE,
     SCOPES,
     SORTABLE,
+    LONGREAD_FACETS_SQL,
+    LONGREAD_SORTABLE,
+    LONGREAD_SUMMARY_SQL,
+    build_longread_count_sql,
+    build_longread_projects_sql,
     build_disease_count_sql,
     build_disease_facets_sql,
     build_disease_projects_sql,
@@ -2787,16 +2793,83 @@ _EXCLUDE_ONTOLOGY_DOC = (
     + ", ".join(o for o, _ in ONTOLOGIES)
     + ". Unknown ids are ignored."
 )
+_LONG_READ_DOC = "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
+
+
+# X-Search-Total/X-Search-Expansion feed the Nginx log contract; threadpool
+# copies the context per request, so each request gets its own dict.
+_SEARCH_NOTES: contextvars.ContextVar = contextvars.ContextVar(
+    "search_notes", default=None
+)
+# escaped form also matches "total" quoted inside an MCP JSON-RPC payload
+_SEARCH_TOTAL = re.compile(rb'total\\?":\s*(\d+)')
+
+
+def _note_expansion(outcome: str) -> None:
+    notes = _SEARCH_NOTES.get()
+    if notes is not None:
+        notes["expansion"] = outcome
+
+
+class SearchHeadersMiddleware:
+    """Adds X-Search-Total / X-Search-Expansion to /search* and /mcp responses.
+    Single-chunk JSON only, streamed bodies pass through."""
+
+    PATHS = (
+        "/search",
+        "/api/search",
+        "/mcp",
+        "/api/mcp",
+        "/samples/search",
+        "/api/samples/search",
+    )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith(self.PATHS):
+            return await self.app(scope, receive, send)
+        notes: dict = {}
+        _SEARCH_NOTES.set(notes)
+        held = None
+
+        async def write(message):
+            nonlocal held
+            if message["type"] == "http.response.start":
+                held = message
+                return
+            if message["type"] == "http.response.body" and held is not None:
+                if not message.get("more_body"):
+                    headers = list(held["headers"])
+                    found = _SEARCH_TOTAL.findall(message.get("body", b"")[-4096:])
+                    if found:
+                        headers.append((b"x-search-total", found[-1]))
+                    if notes.get("expansion"):
+                        headers.append(
+                            (b"x-search-expansion", notes["expansion"].encode())
+                        )
+                    held["headers"] = headers
+                start = held
+                held = None
+                await send(start)
+            await send(message)
+
+        await self.app(scope, receive, write)
 
 
 def _search_query_variants(q: str, disabled=()) -> list[str]:
     """`disabled` is the ontology ids the caller switched off (expansions.ONTOLOGIES)."""
     # Best-effort synonym expansion via Neo4j; degrade to the raw query on failure.
     if time.time() < _neo4j_expand_circuit["open_until"]:
+        _note_expansion("circuit_open")
         return [q]
     try:
-        return list(dict.fromkeys(expand_terms(neo4j_driver, q, disabled)))
+        variants = list(dict.fromkeys(expand_terms(neo4j_driver, q, disabled)))
+        _note_expansion("applied" if len(variants) > 1 else "no_match")
+        return variants
     except Exception:
+        _note_expansion("error")
         _neo4j_expand_circuit["open_until"] = time.time() + _NEO4J_EXPAND_COOLDOWN
         logger.warning(
             "Neo4j term expansion failed; skipping synonyms for %.0fs",
@@ -4973,6 +5046,7 @@ def search(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     date_from: date | None = Query(None),
@@ -4990,6 +5064,7 @@ def search(
         "platform": platform,
         "journal": journal,
         "multi_platform": multi_platform,
+        "long_read": long_read,
         "year_from": year_from,
         "year_to": year_to,
         "date_from": date_from,
@@ -5497,6 +5572,7 @@ def search_facets(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
@@ -5526,6 +5602,7 @@ def search_facets(
         tuple(sorted(platform or [])),
         tuple(sorted(journal or [])),
         multi_platform,
+        long_read,
         year_from,
         year_to,
     )
@@ -5553,6 +5630,7 @@ def search_facets(
         platform=platform,
         journal=journal,
         multi_platform=multi_platform,
+        long_read=long_read,
         year_from=year_from,
         year_to=year_to,
     )
@@ -8866,6 +8944,7 @@ def download_by_query(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     date_from: date | None = Query(None),
@@ -8891,6 +8970,7 @@ def download_by_query(
         "platform": platform,
         "journal": journal,
         "multi_platform": multi_platform,
+        "long_read": long_read,
         "year_from": year_from,
         "year_to": year_to,
         "date_from": date_from,
@@ -10859,6 +10939,132 @@ def get_disease_facets(request: Request, collection: str):
     return out
 
 
+_LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
+
+
+@api_app.get(
+    "/longread/summary",
+    summary="Long-read corpus totals",
+    description=(
+        "Corpus-wide totals for studies with at least one PacBio or Oxford "
+        "Nanopore experiment, across GEO, SRA, ENA, DDBJ DRA and GSA. A study "
+        "mirrored in more than one archive counts once. `studies_hybrid` are "
+        "studies that also sequenced on a short-read platform; "
+        "`studies_long_read_only` had no other platform; the remainder have no "
+        "experiment rows to judge by (GEO-only entries)."
+    ),
+    operation_id="get_longread_summary",
+)
+@limiter.limit("60/minute")
+def get_longread_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(LONGREAD_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_longread_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "long-read stats not available")
+    return row
+
+
+@api_app.get(
+    "/longread/facets",
+    summary="Long-read facet counts",
+    description=(
+        "Study counts per technology, platform, instrument model, library "
+        "strategy, organism, archive, assay category, year and long-read-only "
+        "status. Values feed the filters of /longread/projects."
+    ),
+    operation_id="get_longread_facets",
+)
+@limiter.limit("60/minute")
+def get_longread_facets(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(LONGREAD_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_longread_facets")
+        raise HTTPException(500, "Internal server error")
+    out: dict[str, list] = {}
+    for r in rows:
+        out.setdefault(r["facet"], []).append(
+            {"value": r["value"], "studies": r["studies"]}
+        )
+    return out
+
+
+@api_app.get(
+    "/longread/projects",
+    summary="Studies with long-read sequencing",
+    description=(
+        "One row per study with a PacBio or Oxford Nanopore experiment: "
+        "technologies, platforms, instrument models, library strategies, "
+        "organisms, the archives it appears in, long-read experiment count "
+        "against the study's total (`long_read_only` is NULL when no experiment "
+        "rows exist to compare), sample and run counts, FASTQ and .sra "
+        "availability (NULL means unknown), assay category, year. Filters take "
+        "values from /longread/facets; `year` is the publication year. Sort "
+        "with sort= and order=. `total` is the filtered study count; `count` "
+        "is this page. For a free-text search restricted to long reads use "
+        "/search with long_read=true instead."
+    ),
+    operation_id="get_longread_projects",
+)
+@limiter.limit("60/minute")
+def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    technology: str | None = None,
+    platform: str | None = None,
+    instrument_model: str | None = None,
+    library_strategy: str | None = None,
+    organism: str | None = None,
+    archive: str | None = None,
+    assay_l1: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    long_read_only: bool | None = None,
+    sort: str = Query("n_experiments", pattern=_LONGREAD_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "technology": technology,
+        "platform": platform,
+        "instrument_model": instrument_model,
+        "library_strategy": library_strategy,
+        "organism": organism,
+        "archive": archive,
+        "assay_l1": assay_l1,
+        "year": str(year) if year is not None else None,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "long_read_only": long_read_only,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_longread_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_longread_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_longread_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
 @api_app.get(
     "/disease/aliases",
     summary="Resolve a disease name to its MONDO ids",
@@ -12743,6 +12949,21 @@ means narrow it with organism or tissue rather than retrying unchanged.
 
 ## Disease Cohorts
 
+## Long-Read Sequencing
+
+For "long-read datasets" (PacBio, Oxford Nanopore), add `long_read=true` to
+`search_all` to restrict any keyword search to studies with a long-read
+experiment in any archive. For the corpus itself use the collection tools:
+- `get_longread_summary()`: totals, split by technology and hybrid status.
+- `get_longread_facets()`: the valid filter values (technology, platform,
+  instrument_model, library_strategy, organism, archive, assay_l1, year,
+  long_read_only).
+- `get_longread_projects(...)`: one row per study, mirrors folded into one.
+  `long_read_only` false means the study also used a short-read platform; NULL
+  means no experiment rows exist to tell (GEO-only entries). `n_experiments`
+  counts long-read experiments; `n_experiments_total` the study's total.
+Onso, PacBio's short-read instrument, is excluded from long read.
+
 For "what data exists on <disease>", use the disease tools rather than a keyword
 search -- they resolve through MONDO ids and their descendants, so they find
 studies whose samples were annotated with a child term the user did not name.
@@ -13007,6 +13228,7 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(EnrichmentDisabledMiddleware)
 combined_app.add_middleware(AnalyticsMiddleware)
+combined_app.add_middleware(SearchHeadersMiddleware)
 
 app = combined_app
 

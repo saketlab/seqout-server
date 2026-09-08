@@ -772,6 +772,7 @@ def _search_filter_clauses(
     platform=None,
     journal=None,
     multi_platform=False,
+    long_read=False,
     year_from=None,
     year_to=None,
     date_from=None,
@@ -825,6 +826,13 @@ def _search_filter_clauses(
         if multi_platform:
             platform_parts.append("array_length(matched.platforms, 1) >= 2")
         dim_clauses["platform"] = "(" + " AND ".join(platform_parts) + ")"
+    if long_read:
+        # SRA/GEO carry platforms[] on the study; other archives resolve via longread_study.
+        dim_clauses["long_read"] = (
+            "(matched.platforms && ARRAY['PACBIO_SMRT','OXFORD_NANOPORE']::text[]"
+            " OR EXISTS (SELECT 1 FROM longread_study l"
+            " WHERE l.accessions && ARRAY[matched.accession, matched.dedup_key]))"
+        )
     if journal:
         dim_clauses["journal"] = (
             "EXISTS (SELECT 1 FROM study_publications sp2"
@@ -5337,6 +5345,100 @@ def disease_projects_params(collection: str) -> tuple[str, ...]:
         *_BOOL_FILTERS,
         "disease",
     )
+
+
+# Long-read collection, built by scripts/create_longread_matview.sh: one row
+# per study with a PacBio or Oxford Nanopore experiment, any archive.
+
+LONGREAD_ARRAY_FILTERS = {
+    "technology": "technologies",
+    "platform": "platforms",
+    "instrument_model": "instrument_models",
+    "library_strategy": "library_strategies",
+    "organism": "organisms",
+    "archive": "archives",
+}
+LONGREAD_SCALAR_FILTERS = ("assay_l1", "year")
+LONGREAD_BOOL_FILTERS = ("has_fastq", "has_sra", "long_read_only")
+LONGREAD_SORTABLE = frozenset(
+    {
+        "n_experiments",
+        "n_samples",
+        "n_runs",
+        "first_published",
+        "title",
+        "study_accession",
+        "organism",
+    }
+)
+LONGREAD_SUMMARY_SQL = """
+SELECT count(*)                                              AS studies,
+       sum(n_experiments)                                    AS experiments,
+       sum(n_samples)                                        AS samples,
+       count(*) FILTER (WHERE 'PacBio' = ANY(technologies))  AS studies_pacbio,
+       count(*) FILTER (WHERE 'Oxford Nanopore' = ANY(technologies))
+                                                             AS studies_nanopore,
+       count(*) FILTER (WHERE array_length(technologies, 1) > 1)
+                                                             AS studies_both,
+       count(*) FILTER (WHERE long_read_only)                AS studies_long_read_only,
+       count(*) FILTER (WHERE long_read_only IS FALSE)       AS studies_hybrid,
+       count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms)) AS studies_human,
+       count(*) FILTER (WHERE has_fastq)                     AS studies_with_fastq,
+       count(*) FILTER (WHERE is_single_cell)                AS studies_single_cell,
+       min(year)                                             AS first_year,
+       max(year)                                             AS last_year
+FROM longread_study;
+"""
+
+LONGREAD_FACETS_SQL = (
+    "SELECT facet, value, studies FROM longread_facet ORDER BY facet, studies DESC;"
+)
+
+
+# Shared by the page and count queries; scalars compare as text so year
+# needs no cast on the caller's side. Static, so built once at import time.
+_LONGREAD_WHERE = (
+    "".join(
+        f"\n      AND (%({param})s::text IS NULL"
+        f"\n           OR r.{col} @> ARRAY[%({param})s::text])"
+        for param, col in LONGREAD_ARRAY_FILTERS.items()
+    )
+    + "".join(
+        f"\n      AND (%({c})s::text IS NULL OR r.{c}::text = %({c})s::text)"
+        for c in LONGREAD_SCALAR_FILTERS
+    )
+    + "".join(
+        f"\n      AND (%({c})s::boolean IS NOT TRUE OR r.{c})"
+        for c in LONGREAD_BOOL_FILTERS
+    )
+)
+
+
+def build_longread_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM longread_study r WHERE TRUE{_LONGREAD_WHERE};"  # noqa: S608
+
+
+def build_longread_projects_sql(
+    sort: str = "n_experiments", descending: bool = True
+) -> str:
+    """One page of long-read studies; sort is validated against LONGREAD_SORTABLE
+    before it reaches this string."""
+    if sort not in LONGREAD_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    return f"""
+SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
+       r.instrument_models, r.library_strategies,
+       r.n_experiments, r.n_experiments_total, r.long_read_only,
+       r.title, r.organism, r.organisms, r.n_samples, r.assay_l1, r.is_single_cell,
+       r.country, r.pmid, r.first_published, r.year,
+       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs
+FROM longread_study r
+WHERE TRUE{_LONGREAD_WHERE}
+ORDER BY r.{sort} {direction}, r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
 
 
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary_v5;"
