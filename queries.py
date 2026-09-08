@@ -5415,7 +5415,9 @@ _LONGREAD_WHERE = (
 
 
 def build_longread_count_sql() -> str:
-    return f"SELECT count(*) AS total FROM longread_study r WHERE TRUE{_LONGREAD_WHERE};"  # noqa: S608
+    return (
+        f"SELECT count(*) AS total FROM longread_study r WHERE TRUE{_LONGREAD_WHERE};"  # noqa: S608
+    )
 
 
 def build_longread_projects_sql(
@@ -6125,12 +6127,14 @@ def _microbe_semi(filters: dict, params: dict) -> str:
     # DISTINCT + NOT NULL: unnest emits both accessions per run, with repeats and
     # NULLs, so the raw array is larger than the represented sample set and would
     # be materialised twice per request.
-    return _sample_semi(f"""SELECT DISTINCT x FROM (
+    return _sample_semi(
+        f"""SELECT DISTINCT x FROM (
         SELECT unnest(ARRAY[r.gsm_accession, r.sample_accession]) AS x
         FROM pentimento_run r
         JOIN pentimento_microbe m ON m.run_accession = r.run_accession
         WHERE {_microbe_conds(filters, params)}
-    ) t WHERE x IS NOT NULL""")
+    ) t WHERE x IS NOT NULL"""
+    )
 
 
 def _pentimento_semi(filters: dict, params: dict) -> str:

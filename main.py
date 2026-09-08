@@ -2793,7 +2793,9 @@ _EXCLUDE_ONTOLOGY_DOC = (
     + ", ".join(o for o, _ in ONTOLOGIES)
     + ". Unknown ids are ignored."
 )
-_LONG_READ_DOC = "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
+_LONG_READ_DOC = (
+    "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
+)
 
 
 # X-Search-Total/X-Search-Expansion feed the Nginx log contract; threadpool
