@@ -10979,8 +10979,9 @@ def get_longread_summary(request: Request):
     summary="Long-read facet counts",
     description=(
         "Study counts per technology, platform, instrument model, library "
-        "strategy, organism, archive, assay category, year and long-read-only "
-        "status. Values feed the filters of /longread/projects."
+        "strategy, organism, archive, chemistry, has_exact_chemistry, assay "
+        "category, year and long-read-only status. Values feed the filters "
+        "of /longread/projects."
     ),
     operation_id="get_longread_facets",
 )
@@ -11013,7 +11014,10 @@ def get_longread_facets(request: Request):
         "availability (NULL means unknown), assay category, year, and "
         "`chemistries`/`n_chemistry_exact` (per-run PacBio/ONT chemistry, see "
         "/longread/summary). Filters take "
-        "values from /longread/facets; `year` is the publication year. Sort "
+        "values from /longread/facets; `year` is the publication year. "
+        "`chemistry=` filters on a value from the `chemistry` facet; "
+        "`has_exact_chemistry=true` restricts to studies with at least one "
+        "BAM-header-measured run. Sort "
         "with sort= and order=. `total` is the filtered study count; `count` "
         "is this page. For a free-text search restricted to long reads use "
         "/search with long_read=true instead."
@@ -11029,11 +11033,13 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
     library_strategy: str | None = None,
     organism: str | None = None,
     archive: str | None = None,
+    chemistry: str | None = None,
     assay_l1: str | None = None,
     year: int | None = Query(None, ge=1900, le=2100),
     has_fastq: bool | None = None,
     has_sra: bool | None = None,
     long_read_only: bool | None = None,
+    has_exact_chemistry: bool | None = None,
     sort: str = Query("n_experiments", pattern=_LONGREAD_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
@@ -11046,11 +11052,13 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
         "library_strategy": library_strategy,
         "organism": organism,
         "archive": archive,
+        "chemistry": chemistry,
         "assay_l1": assay_l1,
         "year": str(year) if year is not None else None,
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "long_read_only": long_read_only,
+        "has_exact_chemistry": has_exact_chemistry,
     }
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11871,8 +11879,9 @@ def list_single_cell_studies(
         "study.\n\n"
         "`longread_chemistry` lists every PacBio/Oxford Nanopore run in the "
         "study: `chemistry_confidence` is `exact` when read from the "
-        "submitted BAM's own header, `bucket`/`bucket-low` when inferred "
-        "only from instrument_model and publication date. Empty when the "
+        "submitted BAM's own header, `bucket` when inferred from "
+        "instrument_model alone (never publication date, which does not "
+        "reflect sequencing date), `unknown` otherwise. Empty when the "
         "study has no long-read runs.\n\n"
     ),
     operation_id="get_project_single_cell",

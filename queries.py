@@ -5357,9 +5357,15 @@ LONGREAD_ARRAY_FILTERS = {
     "library_strategy": "library_strategies",
     "organism": "organisms",
     "archive": "archives",
+    "chemistry": "chemistries",
 }
 LONGREAD_SCALAR_FILTERS = ("assay_l1", "year")
-LONGREAD_BOOL_FILTERS = ("has_fastq", "has_sra", "long_read_only")
+LONGREAD_BOOL_FILTERS = (
+    "has_fastq",
+    "has_sra",
+    "long_read_only",
+    "has_exact_chemistry",
+)
 LONGREAD_SORTABLE = frozenset(
     {
         "n_experiments",
@@ -5758,7 +5764,7 @@ WHERE s.accession = %(acc)s
 """
 
 
-# chemistry_confidence: bucket/bucket-low (model+date guess) or exact (BAM header @RG DS: tag)
+# chemistry_confidence: bucket (instrument_model), unknown, or exact (BAM header @RG DS: tag)
 LONGREAD_CHEMISTRY_SQL = """
 SELECT run_accession, instrument_platform, instrument_model,
        chemistry, chemistry_confidence, chemistry_source,
