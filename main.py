@@ -57,6 +57,8 @@ from grid_filters import (
     _parse_grid_filters,
 )
 from queries import (
+    LONGREAD_CHEMISTRY_ANY_SQL,
+    LONGREAD_CHEMISTRY_EXISTS_SQL,
     LONGREAD_CHEMISTRY_SQL,
     SC_STATS_SAMPLES_SQL,
     SC_STATS_STUDY_SQL,
@@ -5961,6 +5963,8 @@ def get_project(
                         row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
                     else:
                         row["has_enriched"] = False
+                    cur.execute(LONGREAD_CHEMISTRY_EXISTS_SQL, {"acc": enrich_acc})
+                    row["has_long_read"] = bool(cur.fetchone()["has_long_read"])
                     _attach_single_cell_samples(cur, row, enrich_acc)
     except Exception as e:
         logger.exception("Database error in get_project")
@@ -11864,6 +11868,39 @@ def list_single_cell_studies(
 
 
 @api_app.get(
+    "/project/{accession}/longread-chemistry",
+    summary="Get PacBio/Oxford Nanopore chemistry calls for this study's runs",
+    description=(
+        "Every PacBio/Oxford Nanopore run in the study, independent of "
+        "single-cell status and Pentimento linkage. "
+        "`chemistry_confidence` is `exact` when read from the submitted "
+        "BAM's own header, `declared` (ONT only) when parsed from the "
+        "depositor's own protocol text, `bucket` when inferred from "
+        "instrument_model alone (never publication date), `unknown` "
+        "otherwise. `runs` is `[]`, not a 404, when the study has no "
+        "long-read runs.\n\n"
+    ),
+    operation_id="get_project_longread_chemistry",
+)
+@limiter.limit("100/minute")
+def get_project_longread_chemistry(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(LONGREAD_CHEMISTRY_ANY_SQL, {"acc": accession.upper()})
+                runs = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_project_longread_chemistry")
+        raise HTTPException(500, "Internal server error")
+    return {"accession": accession.upper(), "runs": runs}
+
+
+@api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell counts, QC statistics, read-derived calls and microbe flags",
     description=(
@@ -11879,9 +11916,10 @@ def list_single_cell_studies(
         "study.\n\n"
         "`longread_chemistry` lists every PacBio/Oxford Nanopore run in the "
         "study: `chemistry_confidence` is `exact` when read from the "
-        "submitted BAM's own header, `bucket` when inferred from "
-        "instrument_model alone (never publication date, which does not "
-        "reflect sequencing date), `unknown` otherwise. Empty when the "
+        "submitted BAM's own header, `declared` (ONT only) when parsed "
+        "from the depositor's own protocol text, `bucket` when inferred "
+        "from instrument_model alone (never publication date, which does "
+        "not reflect sequencing date), `unknown` otherwise. Empty when the "
         "study has no long-read runs.\n\n"
     ),
     operation_id="get_project_single_cell",

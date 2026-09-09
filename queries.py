@@ -5764,7 +5764,8 @@ WHERE s.accession = %(acc)s
 """
 
 
-# chemistry_confidence: bucket (instrument_model), unknown, or exact (BAM header @RG DS: tag)
+# chemistry_confidence: bucket (instrument_model), declared (ONT-only,
+# author-written protocol text), exact (BAM header @RG DS: tag), or unknown
 LONGREAD_CHEMISTRY_SQL = """
 SELECT run_accession, instrument_platform, instrument_model,
        chemistry, chemistry_confidence, chemistry_source,
@@ -5776,6 +5777,45 @@ FROM longread_chemistry
 WHERE study_accession = %(acc)s
 ORDER BY run_accession
 """
+
+_RESOLVE_LONGREAD_STUDY = """
+WITH resolved AS (
+    SELECT %(acc)s::text AS study_accession
+    UNION
+    SELECT target_accession FROM cross_ref_geo WHERE geo_accession = %(acc)s
+    UNION
+    SELECT accession FROM sra_studies WHERE bioproject_id = %(acc)s
+    UNION
+    SELECT canonical_study FROM bioproject_sra_links
+    WHERE bioproject = %(acc)s AND canonical_study IS NOT NULL
+)
+"""
+
+LONGREAD_CHEMISTRY_ANY_SQL = (
+    _RESOLVE_LONGREAD_STUDY
+    + """
+SELECT run_accession, study_accession, instrument_platform, instrument_model,
+       chemistry, chemistry_confidence, chemistry_source,
+       basecaller_software, basecaller_software_version, flow_cell_id,
+       ont_pore, ont_kit, ont_speed_bps, ont_model_tier,
+       pacbio_platform_model, pacbio_chemistry_code,
+       pacbio_binding_kit, pacbio_sequencing_kit, pacbio_smrtcell_kit
+FROM longread_chemistry
+WHERE study_accession IN (SELECT study_accession FROM resolved)
+ORDER BY run_accession
+"""
+)
+
+# Cheap existence check backing the base project payload's has_long_read flag.
+LONGREAD_CHEMISTRY_EXISTS_SQL = (
+    _RESOLVE_LONGREAD_STUDY
+    + """
+SELECT EXISTS(
+    SELECT 1 FROM longread_chemistry
+    WHERE study_accession IN (SELECT study_accession FROM resolved)
+) AS has_long_read
+"""
+)
 
 
 # Backs /stats/tissue-microbes. The matview carries its own studies >= 2 and
