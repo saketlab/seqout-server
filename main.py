@@ -57,6 +57,7 @@ from grid_filters import (
     _parse_grid_filters,
 )
 from queries import (
+    LONGREAD_CHEMISTRY_SQL,
     SC_STATS_SAMPLES_SQL,
     SC_STATS_STUDY_SQL,
     SC_QUALITY_BY_YEAR_SQL,
@@ -10953,7 +10954,9 @@ _LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
         "mirrored in more than one archive counts once. `studies_hybrid` are "
         "studies that also sequenced on a short-read platform; "
         "`studies_long_read_only` had no other platform; the remainder have no "
-        "experiment rows to judge by (GEO-only entries)."
+        "experiment rows to judge by (GEO-only entries). "
+        "`studies_exact_chemistry` had at least one run whose chemistry came "
+        "from the submitted BAM's own header, not a model/date guess."
     ),
     operation_id="get_longread_summary",
 )
@@ -11007,7 +11010,9 @@ def get_longread_facets(request: Request):
         "organisms, the archives it appears in, long-read experiment count "
         "against the study's total (`long_read_only` is NULL when no experiment "
         "rows exist to compare), sample and run counts, FASTQ and .sra "
-        "availability (NULL means unknown), assay category, year. Filters take "
+        "availability (NULL means unknown), assay category, year, and "
+        "`chemistries`/`n_chemistry_exact` (per-run PacBio/ONT chemistry, see "
+        "/longread/summary). Filters take "
         "values from /longread/facets; `year` is the publication year. Sort "
         "with sort= and order=. `total` is the filtered study count; `count` "
         "is this page. For a free-text search restricted to long reads use "
@@ -11864,6 +11869,11 @@ def list_single_cell_studies(
         "`sc_stats_scanned` is false only when the sweep never reached the "
         "sample, and `sc_stats_study` is null only when it never reached the "
         "study.\n\n"
+        "`longread_chemistry` lists every PacBio/Oxford Nanopore run in the "
+        "study: `chemistry_confidence` is `exact` when read from the "
+        "submitted BAM's own header, `bucket`/`bucket-low` when inferred "
+        "only from instrument_model and publication date. Empty when the "
+        "study has no long-read runs.\n\n"
     ),
     operation_id="get_project_single_cell",
 )
@@ -11896,6 +11906,10 @@ def get_project_single_cell(
                 _attach_sc_stats(cur, samples)
                 cur.execute(SC_STATS_STUDY_SQL, {"acc": resolved})
                 sc_stats_study = cur.fetchone()
+                longread_chemistry = []
+                if not offset:
+                    cur.execute(LONGREAD_CHEMISTRY_SQL, {"acc": resolved})
+                    longread_chemistry = cur.fetchall()
     except HTTPException:
         raise
     except Exception:
@@ -11906,6 +11920,8 @@ def get_project_single_cell(
         "samples": samples,
         # None means never scanned; a scanned study with no matrices still returns a row
         "sc_stats_study": sc_stats_study,
+        # [] means no long-read runs
+        "longread_chemistry": longread_chemistry,
         "limit": limit,
         "offset": offset,
     }

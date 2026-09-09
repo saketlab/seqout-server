@@ -5385,6 +5385,7 @@ SELECT count(*)                                              AS studies,
        count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms)) AS studies_human,
        count(*) FILTER (WHERE has_fastq)                     AS studies_with_fastq,
        count(*) FILTER (WHERE is_single_cell)                AS studies_single_cell,
+       count(*) FILTER (WHERE n_chemistry_exact > 0)         AS studies_exact_chemistry,
        min(year)                                             AS first_year,
        max(year)                                             AS last_year
 FROM longread_study;
@@ -5435,7 +5436,8 @@ SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.n_experiments, r.n_experiments_total, r.long_read_only,
        r.title, r.organism, r.organisms, r.n_samples, r.assay_l1, r.is_single_cell,
        r.country, r.pmid, r.first_published, r.year,
-       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs
+       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs,
+       r.chemistries, r.n_chemistry_runs, r.n_chemistry_exact
 FROM longread_study r
 WHERE TRUE{_LONGREAD_WHERE}
 ORDER BY r.{sort} {direction}, r.study_accession
@@ -5753,6 +5755,20 @@ LEFT JOIN LATERAL (
     FROM sc_stats_matrix x WHERE x.accession = s.accession
 ) m ON TRUE
 WHERE s.accession = %(acc)s
+"""
+
+
+# chemistry_confidence: bucket/bucket-low (model+date guess) or exact (BAM header @RG DS: tag)
+LONGREAD_CHEMISTRY_SQL = """
+SELECT run_accession, instrument_platform, instrument_model,
+       chemistry, chemistry_confidence, chemistry_source,
+       basecaller_software, basecaller_software_version, flow_cell_id,
+       ont_pore, ont_kit, ont_speed_bps, ont_model_tier,
+       pacbio_platform_model, pacbio_chemistry_code,
+       pacbio_binding_kit, pacbio_sequencing_kit, pacbio_smrtcell_kit
+FROM longread_chemistry
+WHERE study_accession = %(acc)s
+ORDER BY run_accession
 """
 
 
