@@ -5623,16 +5623,24 @@ WHERE es.study_accession = %s
 ORDER BY es.sample;
 """
 
+# st.n_samples counts enrichment input rows, which are per GEO channel: a
+# two-colour array study reports double its sample count. Count the rows we
+# actually serve instead; study_accession is indexed, so it is free.
 ENRICHED_STUDY_SQL = """
-SELECT st.accession, st.title, st.n_samples,
+SELECT st.accession, st.title,
+       (SELECT count(*) FROM enriched_samples es
+        WHERE es.study_accession = st.accession) AS n_samples,
        NULL AS single_cell_modality
 FROM enriched_studies st
 WHERE st.accession = %s;
 """
 
 
+# n_samples counted from the served rows; see ENRICHED_STUDY_SQL above.
 ENRICHED_STUDY_V4_SQL = """
-SELECT st.accession, st.title, st.n_samples, st.single_cell_modality
+SELECT st.accession, st.title, st.single_cell_modality,
+       (SELECT count(*) FROM ontology_samples_v5 os
+        WHERE os.study_accession = st.accession) AS n_samples
 FROM enriched_studies_v5 st
 WHERE st.accession = %s;
 """
