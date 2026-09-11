@@ -108,8 +108,13 @@ from queries import (
     LONGREAD_FACETS_SQL,
     LONGREAD_SORTABLE,
     LONGREAD_SUMMARY_SQL,
+    SINGLECELL_FACETS_SQL,
+    SINGLECELL_SORTABLE,
+    SINGLECELL_SUMMARY_SQL,
     build_longread_count_sql,
     build_longread_projects_sql,
+    build_singlecell_count_sql,
+    build_singlecell_projects_sql,
     build_disease_count_sql,
     build_disease_facets_sql,
     build_disease_projects_sql,
@@ -10918,6 +10923,15 @@ def get_disease_summary(request: Request, collection: str):
     return row
 
 
+def _facet_rows_to_dict(rows) -> dict[str, list]:
+    out: dict[str, list] = {}
+    for r in rows:
+        out.setdefault(r["facet"], []).append(
+            {"value": r["value"], "studies": r["studies"]}
+        )
+    return out
+
+
 @api_app.get(
     "/disease/{collection}/facets",
     summary="Disease-collection facet counts",
@@ -10938,12 +10952,7 @@ def get_disease_facets(request: Request, collection: str):
     except Exception:
         logger.exception("Database error in get_disease_facets")
         raise HTTPException(500, "Internal server error")
-    out: dict[str, list] = {}
-    for r in rows:
-        out.setdefault(r["facet"], []).append(
-            {"value": r["value"], "studies": r["studies"]}
-        )
-    return out
+    return _facet_rows_to_dict(rows)
 
 
 _LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
@@ -10998,12 +11007,7 @@ def get_longread_facets(request: Request):
     except Exception:
         logger.exception("Database error in get_longread_facets")
         raise HTTPException(500, "Internal server error")
-    out: dict[str, list] = {}
-    for r in rows:
-        out.setdefault(r["facet"], []).append(
-            {"value": r["value"], "studies": r["studies"]}
-        )
-    return out
+    return _facet_rows_to_dict(rows)
 
 
 @api_app.get(
@@ -11058,7 +11062,7 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
         "archive": archive,
         "chemistry": chemistry,
         "assay_l1": assay_l1,
-        "year": str(year) if year is not None else None,
+        "year": year,
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "long_read_only": long_read_only,
@@ -11075,6 +11079,135 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
             rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in get_longread_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
+_SINGLECELL_SORT_PATTERN = f"^({'|'.join(sorted(SINGLECELL_SORTABLE))})$"
+
+
+@api_app.get(
+    "/single-cell/summary",
+    summary="Single-cell corpus totals",
+    description=(
+        "Corpus-wide totals for studies with matrix or read-derived single-cell "
+        "evidence, or a declared single-cell classification (same population as "
+        "/single-cell/projects). `cells` excludes studies whose only matrix is "
+        "unfiltered (raw 10x barcodes, not real cells)."
+    ),
+    operation_id="get_singlecell_summary",
+)
+@limiter.limit("60/minute")
+def get_singlecell_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SINGLECELL_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_singlecell_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "single-cell stats not available")
+    return row
+
+
+@api_app.get(
+    "/single-cell/facets",
+    summary="Single-cell facet counts",
+    description=(
+        "Study counts per chemistry, organism, tissue, modality, assay category, "
+        "year, and has_matrix/has_fastq/is_long_read status. Values feed the "
+        "filters of /single-cell/projects."
+    ),
+    operation_id="get_singlecell_facets",
+)
+@limiter.limit("60/minute")
+def get_singlecell_facets(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SINGLECELL_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_singlecell_facets")
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
+
+
+@api_app.get(
+    "/single-cell/projects",
+    summary="Studies with single-cell evidence, with technology/tissue/FASTQ+matrix",
+    description=(
+        "One row per study with matrix or read-derived single-cell evidence, or a "
+        "declared single-cell classification: modality, chemistries (read-derived "
+        "barcode chemistry), cell_or_nucleus (read-derived from intron fraction / "
+        "mito %, independent of chemistry; null when never scanned or ambiguous), "
+        "tissues, organisms, sample count, matrix availability "
+        "(`has_matrix`/`n_cells`), FASTQ/.sra availability, and whether the study "
+        "also has long-read sequencing. "
+        "perturbation_method is a detected named-method mention (Perturb-seq, "
+        "CROP-seq, ECCITE-seq, Mosaic-seq, sci-Plex, CRISPR-detect) in the study's "
+        "own title/description text, not a confirmed experimental design; null "
+        "means no named method was detected, not that the study has none. "
+        "intervention_kind (genetic/chemical) and is_pooled follow from which "
+        "method matched, never from how many genes/compounds were named. "
+        "Filters take values from /single-cell/facets; `year` is the publication "
+        "year. Sort with sort= and order=. `total` is the filtered study count; "
+        "`count` is this page."
+    ),
+    operation_id="get_singlecell_projects",
+)
+@limiter.limit("60/minute")
+def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    chemistry: str | None = None,
+    organism: str | None = None,
+    tissue: str | None = None,
+    cell_or_nucleus: str | None = None,
+    perturbation_method: str | None = None,
+    intervention_kind: str | None = None,
+    modality: str | None = None,
+    assay_l1: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_matrix: bool | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    is_long_read: bool | None = None,
+    sort: str = Query("n_samples", pattern=_SINGLECELL_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "chemistry": chemistry,
+        "organism": organism,
+        "tissue": tissue,
+        "cell_or_nucleus": cell_or_nucleus,
+        "perturbation_method": perturbation_method,
+        "intervention_kind": intervention_kind,
+        "modality": modality,
+        "assay_l1": assay_l1,
+        "year": year,
+        "has_matrix": has_matrix,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_long_read": is_long_read,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_singlecell_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_singlecell_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_singlecell_projects")
         raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],

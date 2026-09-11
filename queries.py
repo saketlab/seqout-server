@@ -5227,22 +5227,43 @@ def build_disease_facets_sql(collection: str) -> str:
     )
 
 
+def build_filtered_where(
+    array_filters: dict[str, str],
+    scalar_filters: dict[str, str] | tuple[str, ...],
+    bool_filters: tuple[str, ...],
+    alias: str = "r",
+) -> str:
+    """AND clauses for array-contains, scalar-equals and bool-is-true filters,
+    skipped when their param is unset."""
+    scalar_items = (
+        scalar_filters.items()
+        if isinstance(scalar_filters, dict)
+        else zip(scalar_filters, scalar_filters)
+    )
+    return (
+        "".join(
+            f"\n      AND (%({param})s::text IS NULL"
+            f"\n           OR {alias}.{col} @> ARRAY[%({param})s::text])"
+            for param, col in array_filters.items()
+        )
+        + "".join(
+            f"\n      AND (%({param})s::text IS NULL"
+            f"\n           OR {alias}.{col}::text = %({param})s::text)"
+            for param, col in scalar_items
+        )
+        + "".join(
+            f"\n      AND (%({c})s::boolean IS NOT TRUE OR {alias}.{c})"
+            for c in bool_filters
+        )
+    )
+
+
 def _disease_where(collection: str) -> str:
     """Filter clauses shared by the page query and the count that reports it."""
     coll = DISEASE_COLLECTIONS[collection]
     return (
-        "".join(
-            f"\n      AND (%({param})s::text IS NULL"
-            f"\n           OR r.{col} @> ARRAY[%({param})s::text])"
-            for param, col in {**coll["tags"], **_ARRAY_FILTERS}.items()
-        )
-        + "".join(
-            f"\n      AND (%({c})s::text IS NULL OR r.{c} = %({c})s::text)"
-            for c in _SCALAR_FILTERS
-        )
-        + "".join(
-            f"\n      AND (%({c})s::boolean IS NOT TRUE OR r.{c})"
-            for c in _BOOL_FILTERS
+        build_filtered_where(
+            {**coll["tags"], **_ARRAY_FILTERS}, _SCALAR_FILTERS, _BOOL_FILTERS
         )
         + "\n      AND (%(disease)s::text IS NULL"
         f"\n           OR r.resolved_mondo_ids && {DISEASE_MONDO_SET})"
@@ -5402,22 +5423,9 @@ LONGREAD_FACETS_SQL = (
 )
 
 
-# Shared by the page and count queries; scalars compare as text so year
-# needs no cast on the caller's side. Static, so built once at import time.
-_LONGREAD_WHERE = (
-    "".join(
-        f"\n      AND (%({param})s::text IS NULL"
-        f"\n           OR r.{col} @> ARRAY[%({param})s::text])"
-        for param, col in LONGREAD_ARRAY_FILTERS.items()
-    )
-    + "".join(
-        f"\n      AND (%({c})s::text IS NULL OR r.{c}::text = %({c})s::text)"
-        for c in LONGREAD_SCALAR_FILTERS
-    )
-    + "".join(
-        f"\n      AND (%({c})s::boolean IS NOT TRUE OR r.{c})"
-        for c in LONGREAD_BOOL_FILTERS
-    )
+# Shared by the page and count queries. Static, so built once at import time.
+_LONGREAD_WHERE = build_filtered_where(
+    LONGREAD_ARRAY_FILTERS, LONGREAD_SCALAR_FILTERS, LONGREAD_BOOL_FILTERS
 )
 
 
@@ -5446,6 +5454,88 @@ SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.chemistries, r.n_chemistry_runs, r.n_chemistry_exact
 FROM longread_study r
 WHERE TRUE{_LONGREAD_WHERE}
+ORDER BY r.{sort} {direction}, r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
+
+
+# Single-cell collection from singlecell_matview_v2.sql; see its header for
+# the excluded Drop-seq-label caveat.
+
+SINGLECELL_ARRAY_FILTERS = {
+    "chemistry": "chemistries",
+    "organism": "organisms",
+    "tissue": "tissues",
+    "cell_or_nucleus": "cell_or_nucleus",
+    "perturbation_method": "perturbation_method",
+    "intervention_kind": "intervention_kind",
+}
+SINGLECELL_SCALAR_FILTERS = {
+    "modality": "single_cell_modality",
+    "assay_l1": "assay_l1",
+    "year": "year",
+}
+SINGLECELL_BOOL_FILTERS = ("has_matrix", "has_fastq", "has_sra", "is_long_read")
+SINGLECELL_SORTABLE = frozenset(
+    {
+        "n_samples",
+        "n_cells",
+        "n_runs",
+        "n_fastq_runs",
+        "year",
+        "title",
+        "study_accession",
+        "organism",
+    }
+)
+SINGLECELL_SUMMARY_SQL = """
+SELECT count(*)                                            AS studies,
+       sum(n_samples)                                      AS samples,
+       sum(n_cells)                                        AS cells,
+       count(*) FILTER (WHERE has_matrix)                  AS studies_with_matrix,
+       count(*) FILTER (WHERE has_fastq)                   AS studies_with_fastq,
+       count(*) FILTER (WHERE is_long_read)                AS studies_long_read,
+       count(*) FILTER (WHERE perturbation_method IS NOT NULL)
+                                                             AS studies_with_perturbation,
+       count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms))
+                                                             AS studies_human,
+       count(DISTINCT single_cell_modality)                AS n_modalities,
+       min(year)                                            AS first_year,
+       max(year)                                            AS last_year
+FROM singlecell_study;
+"""
+
+SINGLECELL_FACETS_SQL = (
+    "SELECT facet, value, studies FROM singlecell_facet ORDER BY facet, studies DESC;"
+)
+
+# Shared by the page and count queries. Static, so built once at import time.
+_SINGLECELL_WHERE = build_filtered_where(
+    SINGLECELL_ARRAY_FILTERS, SINGLECELL_SCALAR_FILTERS, SINGLECELL_BOOL_FILTERS
+)
+
+
+def build_singlecell_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM singlecell_study r WHERE TRUE{_SINGLECELL_WHERE};"  # noqa: S608
+
+
+def build_singlecell_projects_sql(
+    sort: str = "n_samples", descending: bool = True
+) -> str:
+    """One page of single-cell studies; sort is validated against
+    SINGLECELL_SORTABLE before it reaches this string."""
+    if sort not in SINGLECELL_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
+       r.single_cell_modality, r.chemistries, r.cell_or_nucleus, r.assay_l1,
+       r.n_samples, r.has_matrix, r.n_cells, r.has_fastq, r.n_fastq_runs,
+       r.has_sra, r.n_runs, r.is_long_read, r.perturbation_method,
+       r.intervention_kind, r.is_pooled, r.country, r.pmid, r.year
+FROM singlecell_study r
+WHERE TRUE{_SINGLECELL_WHERE}
 ORDER BY r.{sort} {direction}, r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
