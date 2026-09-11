@@ -107,8 +107,8 @@ if __name__ == "__main__":
     assert to_tsquery_string("*") == ""  # nothing usable -> caller falls back
 
     # Why /search only rewrites hyphens to spaces while term expansion is on: with
-    # the hyphen kept, a hyphenated term is one adjacency phrase, not two words
-    # that may sit paragraphs apart.
+    # the hyphen kept, a hyphenated term stays one adjacency phrase; dropping it
+    # lets the two words match paragraphs apart.
     assert to_tsquery_string("scrna-seq") == "scrna <-> seq"
     assert to_tsquery_string("scrna seq") == "scrna & seq"
 

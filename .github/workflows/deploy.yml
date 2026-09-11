@@ -59,6 +59,7 @@ jobs:
 
             for i in $(seq 1 20); do
               sleep 5
+              echo "waiting for backend ($i/20)..."
               curl -fs http://127.0.0.1:8000/ >/dev/null && break
             done
 

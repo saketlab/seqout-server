@@ -8,6 +8,7 @@ import logging
 import os
 from collections import defaultdict
 import pathlib
+import contextvars
 import re
 import shutil
 import threading
@@ -56,6 +57,9 @@ from grid_filters import (
     _parse_grid_filters,
 )
 from queries import (
+    LONGREAD_CHEMISTRY_ANY_SQL,
+    LONGREAD_CHEMISTRY_EXISTS_SQL,
+    LONGREAD_CHEMISTRY_SQL,
     SC_STATS_SAMPLES_SQL,
     SC_STATS_STUDY_SQL,
     SC_QUALITY_BY_YEAR_SQL,
@@ -101,6 +105,16 @@ from queries import (
     DEFAULT_SCOPE,
     SCOPES,
     SORTABLE,
+    LONGREAD_FACETS_SQL,
+    LONGREAD_SORTABLE,
+    LONGREAD_SUMMARY_SQL,
+    SINGLECELL_FACETS_SQL,
+    SINGLECELL_SORTABLE,
+    SINGLECELL_SUMMARY_SQL,
+    build_longread_count_sql,
+    build_longread_projects_sql,
+    build_singlecell_count_sql,
+    build_singlecell_projects_sql,
     build_disease_count_sql,
     build_disease_facets_sql,
     build_disease_projects_sql,
@@ -2528,7 +2542,7 @@ def _growth_relation_name(mode: str) -> str | None:
 
 
 class _NotBuiltYet(Exception):
-    """Precomputed relation missing or empty; a 503, not a 500."""
+    """Precomputed relation missing or empty; raised as a 503."""
 
 
 def _relation_exists(cur, name: str) -> bool:
@@ -2775,7 +2789,7 @@ def _run_search(cur, sql: str, params, q: str) -> list:
 
 
 # After a Neo4j failure, skip expansion for the cooldown so an outage costs
-# one timed-out request per window, not one per search.
+# one timed-out request per window.
 _neo4j_expand_circuit = {"open_until": 0.0}
 _NEO4J_EXPAND_COOLDOWN = 30.0
 
@@ -2787,16 +2801,85 @@ _EXCLUDE_ONTOLOGY_DOC = (
     + ", ".join(o for o, _ in ONTOLOGIES)
     + ". Unknown ids are ignored."
 )
+_LONG_READ_DOC = (
+    "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
+)
+
+
+# X-Search-Total/X-Search-Expansion feed the Nginx log contract; threadpool
+# copies the context per request, so each request gets its own dict.
+_SEARCH_NOTES: contextvars.ContextVar = contextvars.ContextVar(
+    "search_notes", default=None
+)
+# escaped form also matches "total" quoted inside an MCP JSON-RPC payload
+_SEARCH_TOTAL = re.compile(rb'total\\?":\s*(\d+)')
+
+
+def _note_expansion(outcome: str) -> None:
+    notes = _SEARCH_NOTES.get()
+    if notes is not None:
+        notes["expansion"] = outcome
+
+
+class SearchHeadersMiddleware:
+    """Adds X-Search-Total / X-Search-Expansion to /search* and /mcp responses.
+    Single-chunk JSON only, streamed bodies pass through."""
+
+    PATHS = (
+        "/search",
+        "/api/search",
+        "/mcp",
+        "/api/mcp",
+        "/samples/search",
+        "/api/samples/search",
+    )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith(self.PATHS):
+            return await self.app(scope, receive, send)
+        notes: dict = {}
+        _SEARCH_NOTES.set(notes)
+        held = None
+
+        async def write(message):
+            nonlocal held
+            if message["type"] == "http.response.start":
+                held = message
+                return
+            if message["type"] == "http.response.body" and held is not None:
+                if not message.get("more_body"):
+                    headers = list(held["headers"])
+                    found = _SEARCH_TOTAL.findall(message.get("body", b"")[-4096:])
+                    if found:
+                        headers.append((b"x-search-total", found[-1]))
+                    if notes.get("expansion"):
+                        headers.append(
+                            (b"x-search-expansion", notes["expansion"].encode())
+                        )
+                    held["headers"] = headers
+                start = held
+                held = None
+                await send(start)
+            await send(message)
+
+        await self.app(scope, receive, write)
 
 
 def _search_query_variants(q: str, disabled=()) -> list[str]:
     """`disabled` is the ontology ids the caller switched off (expansions.ONTOLOGIES)."""
     # Best-effort synonym expansion via Neo4j; degrade to the raw query on failure.
     if time.time() < _neo4j_expand_circuit["open_until"]:
+        _note_expansion("circuit_open")
         return [q]
     try:
-        return list(dict.fromkeys(expand_terms(neo4j_driver, q, disabled)))
+        variants = list(dict.fromkeys(expand_terms(neo4j_driver, q, disabled)))
+        _note_expansion("applied" if len(variants) > 1 else "no_match")
+        return variants
     except Exception:
+        _note_expansion("error")
         _neo4j_expand_circuit["open_until"] = time.time() + _NEO4J_EXPAND_COOLDOWN
         logger.warning(
             "Neo4j term expansion failed; skipping synonyms for %.0fs",
@@ -4715,8 +4798,8 @@ def _headline_words(marked: str | None) -> list[str]:
 # Which expanded term put a highlighted word on the page. ts_headline marks the
 # surface word but says nothing about WHY it matched, and after expansion the
 # why is the interesting part: "activates" lighting up in an Arabidopsis abstract
-# came from the synonym "s methyltransferase activity", not from anything the
-# user typed. Stem each marked word the same way the index did, drop the ones the
+# came from the synonym "s methyltransferase activity". Stem each marked word
+# the same way the index did, drop the ones the
 # typed query already accounts for, and attribute the rest to the first variant
 # that contains them (variants come back most-relevant-first).
 _ATTRIBUTION_SQL = """
@@ -4973,6 +5056,7 @@ def search(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     date_from: date | None = Query(None),
@@ -4990,6 +5074,7 @@ def search(
         "platform": platform,
         "journal": journal,
         "multi_platform": multi_platform,
+        "long_read": long_read,
         "year_from": year_from,
         "year_to": year_to,
         "date_from": date_from,
@@ -5497,6 +5582,7 @@ def search_facets(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
@@ -5526,6 +5612,7 @@ def search_facets(
         tuple(sorted(platform or [])),
         tuple(sorted(journal or [])),
         multi_platform,
+        long_read,
         year_from,
         year_to,
     )
@@ -5553,6 +5640,7 @@ def search_facets(
         platform=platform,
         journal=journal,
         multi_platform=multi_platform,
+        long_read=long_read,
         year_from=year_from,
         year_to=year_to,
     )
@@ -5561,7 +5649,7 @@ def search_facets(
     # shows. /search runs the correction in "augmented" mode, the corrected
     # results are the paginated stream AND the literal-typo matches ride along in
     # correction.extra_results, so the count must be over the UNION of both
-    # match sets, not the corrected one alone. Hence extra_variants: counting only
+    # match sets. Hence extra_variants: counting only
     # the corrected set undercounts the page by however many extras render.
     # Cached below under the original cache_key so repeat typo searches stay fast.
     # Applies with an active filter too. Search's filtered path auto-corrects
@@ -5880,6 +5968,8 @@ def get_project(
                         row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
                     else:
                         row["has_enriched"] = False
+                    cur.execute(LONGREAD_CHEMISTRY_EXISTS_SQL, {"acc": enrich_acc})
+                    row["has_long_read"] = bool(cur.fetchone()["has_long_read"])
                     _attach_single_cell_samples(cur, row, enrich_acc)
     except Exception as e:
         logger.exception("Database error in get_project")
@@ -6035,7 +6125,7 @@ def find_study_experiments(
         logger.exception("Database error in find_study_experiments")
         raise HTTPException(500, "Internal server error")
     # filtered=false means no supplied column maps to SQL here, so an empty
-    # list is "we did not narrow", not "no matches"; the grid must keep showing
+    # list means "we did not narrow"; the grid must keep showing
     # its own rows rather than blanking. See the superset rule in grid_filters.
     if rows is None:
         return {"experiments": [], "capped": False, "filtered": False}
@@ -6475,9 +6565,8 @@ def find_study_runs(
         if is_gsa
         else "WHERE dl.study_accession IN (SELECT acc FROM candidates)\n"
     )
-    # Injected into the WHERE, not wrapped around the query: the preview SQL
-    # carries its own LIMIT 500, and filtering outside it would only ever search
-    # the first 500 runs.
+    # Injected into the WHERE: the preview SQL carries its own LIMIT 500, so
+    # filtering outside it would only ever search the first 500 runs.
     find_sql = base.replace(marker, f"{marker}  AND {where}\n", 1)
     try:
         with pool.connection() as conn:
@@ -8803,7 +8892,7 @@ def _stream_results_csv(sql: str, params: dict):
     """Yield the entire match set as CSV, a row at a time.
 
     Server-side cursor: a broad query matches too many datasets to hold in
-    memory. itersize batches, not cur.stream(), which costs a round trip per row.
+    memory. itersize batches; cur.stream() costs a round trip per row.
 
     Errors mid-stream cannot become an HTTP status; they are logged and the CSV
     ends. Holds one pooled connection (max_size=20) for the whole download, so
@@ -8826,8 +8915,8 @@ def _stream_results_csv(sql: str, params: dict):
         # server-side cursor is destroyed the moment its DECLARE statement ends.
         # Both need a real transaction.
         with pool.connection() as conn, conn.transaction():
-            # Bounds the initial query and each FETCH, not the download's total
-            # wall-clock; a broad CSV is legitimately slow to ship. Also
+            # Bounds the initial query and each FETCH; the download's total
+            # wall-clock stays open, since a broad CSV is legitimately slow. Also
             # lifts the pool default, which alone would kill a big download.
             conn.execute("SET LOCAL statement_timeout = '300s'")
             with conn.cursor(name="download_query", row_factory=dict_row) as cur:
@@ -8867,6 +8956,7 @@ def download_by_query(
     platform: list[str] | None = Query(None),
     journal: list[str] | None = Query(None),
     multi_platform: bool = Query(False),
+    long_read: bool = Query(False, description=_LONG_READ_DOC),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     date_from: date | None = Query(None),
@@ -8892,6 +8982,7 @@ def download_by_query(
         "platform": platform,
         "journal": journal,
         "multi_platform": multi_platform,
+        "long_read": long_read,
         "year_from": year_from,
         "year_to": year_to,
         "date_from": date_from,
@@ -9061,7 +9152,7 @@ _KIND_INFO = {
 # other shape -- see _archive_of_accession.
 _SED_ARCHIVE = {"S": "ncbi-sra", "E": "ena", "D": "ddbj", "C": "gsa", "H": "gsa"}
 
-# Kinds whose archive is fixed by the kind itself, not by any letter.
+# Kinds whose archive follows from the kind itself.
 _KIND_ARCHIVE = {
     "gse": "geo",
     "gsm": "geo",
@@ -9087,7 +9178,7 @@ def _archive_of_accession(acc: str, kind: str, database: str | None) -> str | No
     Order matters. The first-letter _SED_ARCHIVE rule is a last resort because
     plenty of accessions start with one of those letters without meaning it:
     E-MTAB-/E-GEAD- begin with "E" (for "Experiment", an ArrayExpress naming
-    convention, not ENA), and every SAM* begins with "S" regardless of archive.
+    convention), and every SAM* begins with "S" regardless of archive.
     """
     if kind in _KIND_ARCHIVE:
         return _KIND_ARCHIVE[kind]
@@ -9181,7 +9272,7 @@ def _author_name_regex(q: str) -> str | None:
         body = f"{esc[0]}( [^,]*)? {esc[-1]}"
     else:
         # A single token matches a whole word anywhere in the name (given,
-        # middle, or surname), not just the surname, so "saket" finds
+        # middle, or surname), so "saket" finds
         # "Saket Choudhary". Leading/trailing spaces enforce word boundaries.
         body = f"([^,]* )?{esc[0]}( [^,]*)?"
     return f"(^|, ){body}(,|$)"
@@ -9253,7 +9344,7 @@ def search_author_projects(
                     facets.values(), key=lambda e: (-e["count"], e["name"])
                 )
 
-                # Enrich only the page we return, not the whole fetched set.
+                # Enrich only the page we return.
                 results = rows[:limit]
                 _enrich_with_publications(results, cur)
     except Exception:
@@ -9947,8 +10038,8 @@ def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
     and are simply unreachable by following links. Resolving through the shared
     PMID recovers them.
 
-    This is an INFERENCE, not a cross-reference: a PMID names a paper, and a paper
-    can describe several studies. Rows are tagged
+    This is an INFERENCE: a PMID names a paper, and a paper can describe several
+    studies. Rows are tagged
     source='pmid' and carry `via_pmid` so callers can label the provenance and,
     when several come back, let the user choose rather than guessing.
     """
@@ -10030,7 +10121,7 @@ def get_project_xref(
 
 
 # Cross-database links exist only at the project level (cross_ref_* is keyed on
-# GSE/SRP/E-*, never GSM/SRR), so conversion resolves to the project, then fans
+# GSE/SRP/E-*), so conversion resolves to the project, then fans
 # out to sibling projects via RELATED_SQL.
 MAX_CONVERT_ACCESSIONS = 200
 
@@ -10832,6 +10923,15 @@ def get_disease_summary(request: Request, collection: str):
     return row
 
 
+def _facet_rows_to_dict(rows) -> dict[str, list]:
+    out: dict[str, list] = {}
+    for r in rows:
+        out.setdefault(r["facet"], []).append(
+            {"value": r["value"], "studies": r["studies"]}
+        )
+    return out
+
+
 @api_app.get(
     "/disease/{collection}/facets",
     summary="Disease-collection facet counts",
@@ -10852,12 +10952,269 @@ def get_disease_facets(request: Request, collection: str):
     except Exception:
         logger.exception("Database error in get_disease_facets")
         raise HTTPException(500, "Internal server error")
-    out: dict[str, list] = {}
-    for r in rows:
-        out.setdefault(r["facet"], []).append(
-            {"value": r["value"], "studies": r["studies"]}
-        )
-    return out
+    return _facet_rows_to_dict(rows)
+
+
+_LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
+
+
+@api_app.get(
+    "/longread/summary",
+    summary="Long-read corpus totals",
+    description=(
+        "Corpus-wide totals for studies with at least one PacBio or Oxford "
+        "Nanopore experiment, across GEO, SRA, ENA, DDBJ DRA and GSA. A study "
+        "mirrored in more than one archive counts once. `studies_hybrid` are "
+        "studies that also sequenced on a short-read platform; "
+        "`studies_long_read_only` had no other platform; the remainder have no "
+        "experiment rows to judge by (GEO-only entries). "
+        "`studies_exact_chemistry` had at least one run whose chemistry came "
+        "from the submitted BAM's own header, not a model/date guess."
+    ),
+    operation_id="get_longread_summary",
+)
+@limiter.limit("60/minute")
+def get_longread_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(LONGREAD_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_longread_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "long-read stats not available")
+    return row
+
+
+@api_app.get(
+    "/longread/facets",
+    summary="Long-read facet counts",
+    description=(
+        "Study counts per technology, platform, instrument model, library "
+        "strategy, organism, archive, chemistry, has_exact_chemistry, assay "
+        "category, year and long-read-only status. Values feed the filters "
+        "of /longread/projects."
+    ),
+    operation_id="get_longread_facets",
+)
+@limiter.limit("60/minute")
+def get_longread_facets(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(LONGREAD_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_longread_facets")
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
+
+
+@api_app.get(
+    "/longread/projects",
+    summary="Studies with long-read sequencing",
+    description=(
+        "One row per study with a PacBio or Oxford Nanopore experiment: "
+        "technologies, platforms, instrument models, library strategies, "
+        "organisms, the archives it appears in, long-read experiment count "
+        "against the study's total (`long_read_only` is NULL when no experiment "
+        "rows exist to compare), sample and run counts, FASTQ and .sra "
+        "availability (NULL means unknown), assay category, year, and "
+        "`chemistries`/`n_chemistry_exact` (per-run PacBio/ONT chemistry, see "
+        "/longread/summary). Filters take "
+        "values from /longread/facets; `year` is the publication year. "
+        "`chemistry=` filters on a value from the `chemistry` facet; "
+        "`has_exact_chemistry=true` restricts to studies with at least one "
+        "BAM-header-measured run. Sort "
+        "with sort= and order=. `total` is the filtered study count; `count` "
+        "is this page. For a free-text search restricted to long reads use "
+        "/search with long_read=true instead."
+    ),
+    operation_id="get_longread_projects",
+)
+@limiter.limit("60/minute")
+def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    technology: str | None = None,
+    platform: str | None = None,
+    instrument_model: str | None = None,
+    library_strategy: str | None = None,
+    organism: str | None = None,
+    archive: str | None = None,
+    chemistry: str | None = None,
+    assay_l1: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    long_read_only: bool | None = None,
+    has_exact_chemistry: bool | None = None,
+    sort: str = Query("n_experiments", pattern=_LONGREAD_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "technology": technology,
+        "platform": platform,
+        "instrument_model": instrument_model,
+        "library_strategy": library_strategy,
+        "organism": organism,
+        "archive": archive,
+        "chemistry": chemistry,
+        "assay_l1": assay_l1,
+        "year": year,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "long_read_only": long_read_only,
+        "has_exact_chemistry": has_exact_chemistry,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_longread_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_longread_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_longread_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
+_SINGLECELL_SORT_PATTERN = f"^({'|'.join(sorted(SINGLECELL_SORTABLE))})$"
+
+
+@api_app.get(
+    "/single-cell/summary",
+    summary="Single-cell corpus totals",
+    description=(
+        "Corpus-wide totals for studies with matrix or read-derived single-cell "
+        "evidence, or a declared single-cell classification (same population as "
+        "/single-cell/projects). `cells` excludes studies whose only matrix is "
+        "unfiltered (raw 10x barcodes, not real cells)."
+    ),
+    operation_id="get_singlecell_summary",
+)
+@limiter.limit("60/minute")
+def get_singlecell_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SINGLECELL_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_singlecell_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "single-cell stats not available")
+    return row
+
+
+@api_app.get(
+    "/single-cell/facets",
+    summary="Single-cell facet counts",
+    description=(
+        "Study counts per chemistry, organism, tissue, modality, assay category, "
+        "year, and has_matrix/has_fastq/is_long_read status. Values feed the "
+        "filters of /single-cell/projects."
+    ),
+    operation_id="get_singlecell_facets",
+)
+@limiter.limit("60/minute")
+def get_singlecell_facets(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SINGLECELL_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_singlecell_facets")
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
+
+
+@api_app.get(
+    "/single-cell/projects",
+    summary="Studies with single-cell evidence, with technology/tissue/FASTQ+matrix",
+    description=(
+        "One row per study with matrix or read-derived single-cell evidence, or a "
+        "declared single-cell classification: modality, chemistries (read-derived "
+        "barcode chemistry), cell_or_nucleus (read-derived from intron fraction / "
+        "mito %, independent of chemistry; null when never scanned or ambiguous), "
+        "tissues, organisms, sample count, matrix availability "
+        "(`has_matrix`/`n_cells`), FASTQ/.sra availability, and whether the study "
+        "also has long-read sequencing. "
+        "perturbation_method is a detected named-method mention (Perturb-seq, "
+        "CROP-seq, ECCITE-seq, Mosaic-seq, sci-Plex, CRISPR-detect) in the study's "
+        "own title/description text, not a confirmed experimental design; null "
+        "means no named method was detected, not that the study has none. "
+        "intervention_kind (genetic/chemical) and is_pooled follow from which "
+        "method matched, never from how many genes/compounds were named. "
+        "Filters take values from /single-cell/facets; `year` is the publication "
+        "year. Sort with sort= and order=. `total` is the filtered study count; "
+        "`count` is this page."
+    ),
+    operation_id="get_singlecell_projects",
+)
+@limiter.limit("60/minute")
+def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    chemistry: str | None = None,
+    organism: str | None = None,
+    tissue: str | None = None,
+    cell_or_nucleus: str | None = None,
+    perturbation_method: str | None = None,
+    intervention_kind: str | None = None,
+    modality: str | None = None,
+    assay_l1: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_matrix: bool | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    is_long_read: bool | None = None,
+    sort: str = Query("n_samples", pattern=_SINGLECELL_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "chemistry": chemistry,
+        "organism": organism,
+        "tissue": tissue,
+        "cell_or_nucleus": cell_or_nucleus,
+        "perturbation_method": perturbation_method,
+        "intervention_kind": intervention_kind,
+        "modality": modality,
+        "assay_l1": assay_l1,
+        "year": year,
+        "has_matrix": has_matrix,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_long_read": is_long_read,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_singlecell_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_singlecell_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_singlecell_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
 
 
 @api_app.get(
@@ -10957,7 +11314,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "assay_category": assay_category,
         "organism": organism,
     }
-    # rejected, not dropped: ignoring one returns an unfiltered page that looks filtered
+    # rejected: ignoring one returns an unfiltered page that looks filtered
     if bad := sorted(
         k for k, v in supplied.items() if v is not None and k not in allowed
     ):
@@ -11644,6 +12001,39 @@ def list_single_cell_studies(
 
 
 @api_app.get(
+    "/project/{accession}/longread-chemistry",
+    summary="Get PacBio/Oxford Nanopore chemistry calls for this study's runs",
+    description=(
+        "Every PacBio/Oxford Nanopore run in the study, independent of "
+        "single-cell status and Pentimento linkage. "
+        "`chemistry_confidence` is `exact` when read from the submitted "
+        "BAM's own header, `declared` (ONT only) when parsed from the "
+        "depositor's own protocol text, `bucket` when inferred from "
+        "instrument_model alone (never publication date), `unknown` "
+        "otherwise. `runs` is `[]`, not a 404, when the study has no "
+        "long-read runs.\n\n"
+    ),
+    operation_id="get_project_longread_chemistry",
+)
+@limiter.limit("100/minute")
+def get_project_longread_chemistry(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=PROJECT_REGEX),
+):
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(LONGREAD_CHEMISTRY_ANY_SQL, {"acc": accession.upper()})
+                runs = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_project_longread_chemistry")
+        raise HTTPException(500, "Internal server error")
+    return {"accession": accession.upper(), "runs": runs}
+
+
+@api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell counts, QC statistics, read-derived calls and microbe flags",
     description=(
@@ -11657,6 +12047,13 @@ def list_single_cell_studies(
         "`sc_stats_scanned` is false only when the sweep never reached the "
         "sample, and `sc_stats_study` is null only when it never reached the "
         "study.\n\n"
+        "`longread_chemistry` lists every PacBio/Oxford Nanopore run in the "
+        "study: `chemistry_confidence` is `exact` when read from the "
+        "submitted BAM's own header, `declared` (ONT only) when parsed "
+        "from the depositor's own protocol text, `bucket` when inferred "
+        "from instrument_model alone (never publication date, which does "
+        "not reflect sequencing date), `unknown` otherwise. Empty when the "
+        "study has no long-read runs.\n\n"
     ),
     operation_id="get_project_single_cell",
 )
@@ -11679,13 +12076,20 @@ def get_project_single_cell(
                 study = cur.fetchone()
                 if not study:
                     raise HTTPException(404, "Study not in the Pentimento")
-                cur.execute(PENTIMENTO_SAMPLES_SQL, (resolved, limit, offset))
+                cur.execute(
+                    PENTIMENTO_SAMPLES_SQL,
+                    {"acc": resolved, "limit": limit, "offset": offset},
+                )
                 samples = cur.fetchall()
                 _attach_pentimento_labels(cur, resolved, samples)
                 _attach_pentimento_detections(cur, resolved, samples)
                 _attach_sc_stats(cur, samples)
                 cur.execute(SC_STATS_STUDY_SQL, {"acc": resolved})
                 sc_stats_study = cur.fetchone()
+                longread_chemistry = []
+                if not offset:
+                    cur.execute(LONGREAD_CHEMISTRY_SQL, {"acc": resolved})
+                    longread_chemistry = cur.fetchall()
     except HTTPException:
         raise
     except Exception:
@@ -11696,6 +12100,8 @@ def get_project_single_cell(
         "samples": samples,
         # None means never scanned; a scanned study with no matrices still returns a row
         "sc_stats_study": sc_stats_study,
+        # [] means no long-read runs
+        "longread_chemistry": longread_chemistry,
         "limit": limit,
         "offset": offset,
     }
@@ -11915,7 +12321,7 @@ def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
 def _resolve_enrichment_accession(cur, accession: str) -> str:
     """Map a PRJ* to the accession enrichment is keyed under (GSE or SRP).
 
-    Enrichment keys on the GEO series / SRA study, not the bare PRJ, so a raw PRJ*
+    Enrichment keys on the GEO series / SRA study, so a raw PRJ*
     404s even when the study is enriched. Unchanged for non-PRJ / unmapped input.
     """
     if not accession.upper().startswith("PRJ"):
@@ -12741,6 +13147,21 @@ means narrow it with organism or tissue rather than retrying unchanged.
 
 ## Disease Cohorts
 
+## Long-Read Sequencing
+
+For "long-read datasets" (PacBio, Oxford Nanopore), add `long_read=true` to
+`search_all` to restrict any keyword search to studies with a long-read
+experiment in any archive. For the corpus itself use the collection tools:
+- `get_longread_summary()`: totals, split by technology and hybrid status.
+- `get_longread_facets()`: the valid filter values (technology, platform,
+  instrument_model, library_strategy, organism, archive, assay_l1, year,
+  long_read_only).
+- `get_longread_projects(...)`: one row per study, mirrors folded into one.
+  `long_read_only` false means the study also used a short-read platform; NULL
+  means no experiment rows exist to tell (GEO-only entries). `n_experiments`
+  counts long-read experiments; `n_experiments_total` the study's total.
+Onso, PacBio's short-read instrument, is excluded from long read.
+
 For "what data exists on <disease>", use the disease tools rather than a keyword
 search -- they resolve through MONDO ids and their descendants, so they find
 studies whose samples were annotated with a child term the user did not name.
@@ -13005,6 +13426,7 @@ combined_app.state.limiter = limiter
 combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(EnrichmentDisabledMiddleware)
 combined_app.add_middleware(AnalyticsMiddleware)
+combined_app.add_middleware(SearchHeadersMiddleware)
 
 app = combined_app
 
