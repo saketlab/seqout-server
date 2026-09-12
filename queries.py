@@ -6574,10 +6574,29 @@ _PENTIMENTO_STUDY_COLS = """p.study_accession, p.source, p.title, p.study_cells,
        p.n_runs_preflightx, p.n_runs_measurable, p.has_metadata, p.has_celltype,
        p.has_donor, p.has_demographics"""
 
+# Field names of the above, used to build an all-None placeholder study row.
+PENTIMENTO_STUDY_FIELDS = [
+    c.strip().split(".")[-1] for c in _PENTIMENTO_STUDY_COLS.split(",")
+] + ["flags"]
+
 PENTIMENTO_STUDY_SQL = f"""
 SELECT {_PENTIMENTO_STUDY_COLS}, p.flags
 FROM pentimento_study p
 WHERE p.study_accession = %s;
+"""
+
+# Same pentimento_sample/pentimento_run linkage PENTIMENTO_SAMPLE_CELLS_SQL
+# checks, without building sample rows.
+PENTIMENTO_LINKAGE_EXISTS_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM pentimento_sample WHERE study_accession = %(acc)s
+) OR EXISTS (
+    SELECT 1
+    FROM pentimento_run r
+    LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
+    WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
+      AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
+) AS linked;
 """
 
 # ORDER BY keeps LIMIT/OFFSET paging stable

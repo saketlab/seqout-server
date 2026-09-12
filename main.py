@@ -190,6 +190,8 @@ from queries import (
     PENTIMENTO_STUDY_DETECTIONS_SQL,
     PENTIMENTO_SAMPLE_TISSUE_SQL,
     PENTIMENTO_STUDY_SQL,
+    PENTIMENTO_STUDY_FIELDS,
+    PENTIMENTO_LINKAGE_EXISTS_SQL,
     PROJECT_AE_SQL,
     PROJECT_DRA_SQL,
     PROJECT_ENA_SQL,
@@ -12033,6 +12035,11 @@ def get_project_longread_chemistry(
     return {"accession": accession.upper(), "runs": runs}
 
 
+# Study-level fields when pentimento_study hasn't been built yet for a study
+# that only has run-level linkage (see get_project_single_cell).
+_EMPTY_PENTIMENTO_STUDY = dict.fromkeys(PENTIMENTO_STUDY_FIELDS)
+
+
 @api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell counts, QC statistics, read-derived calls and microbe flags",
@@ -12075,7 +12082,12 @@ def get_project_single_cell(
                 cur.execute(PENTIMENTO_STUDY_SQL, (resolved,))
                 study = cur.fetchone()
                 if not study:
-                    raise HTTPException(404, "Study not in the Pentimento")
+                    # Runs are linked but ingestion hasn't summarized the study
+                    # into pentimento_study yet.
+                    cur.execute(PENTIMENTO_LINKAGE_EXISTS_SQL, {"acc": resolved})
+                    if not cur.fetchone()["linked"]:
+                        raise HTTPException(404, "Study not in the Pentimento")
+                    study = {**_EMPTY_PENTIMENTO_STUDY, "study_accession": resolved}
                 cur.execute(
                     PENTIMENTO_SAMPLES_SQL,
                     {"acc": resolved, "limit": limit, "offset": offset},
