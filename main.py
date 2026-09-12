@@ -51,6 +51,11 @@ from deep_dive import (
     fetch_ontology_term,
 )
 from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
+from library_strategy import (
+    is_ena_study as _is_ena_study,
+    is_gsa_study as _is_gsa_study,
+    resolve_study_for_library_strategy as _study_for_library_strategy,
+)
 from grid_filters import (
     _indexed_accession,
     _jsonb_any_element,
@@ -1614,14 +1619,6 @@ def rows_to_csv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
-def _is_ena_study(study: str) -> bool:
-    return study.upper().startswith("PRJ")
-
-
-def _is_gsa_study(study: str) -> bool:
-    return study.upper().startswith(("CRA", "HRA"))
-
-
 def _is_gea_study(study: str) -> bool:
     return study.upper().startswith("E-GEAD-")
 
@@ -1667,21 +1664,36 @@ def _canonical_study(cur, study: str) -> str:
     return row["accession"] if row else study
 
 
-def _study_experiments_sql(cur, study: str) -> tuple[str, bool]:
-    """Pick the per-archive experiment SQL. Returns (sql, ena_style)."""
+def _study_source(cur, study: str) -> str:
+    """Which archive owns this study's experiments: gsa/ena/dra/sra."""
     if _is_gsa_study(study):
-        return GSA_STUDY_EXPERIMENTS_SQL, True
+        return "gsa"
     if _is_ena_study(study):
-        return ENA_STUDY_EXPERIMENTS_SQL, True
+        return "ena"
     if _is_dra_only_study(cur, study):
-        return DRA_STUDY_EXPERIMENTS_SQL, False
-    return STUDY_EXPERIMENTS_SQL, False
+        return "dra"
+    return "sra"
+
+
+_STUDY_EXPERIMENTS_SQL_BY_SOURCE = {
+    "gsa": (GSA_STUDY_EXPERIMENTS_SQL, True),
+    "ena": (ENA_STUDY_EXPERIMENTS_SQL, True),
+    "dra": (DRA_STUDY_EXPERIMENTS_SQL, False),
+    "sra": (STUDY_EXPERIMENTS_SQL, False),
+}
+
+
+def _study_experiments_sql(cur, study: str, source: str | None = None) -> tuple[str, bool]:
+    """Pick the per-archive experiment SQL. Returns (sql, ena_style).
+
+    Pass source to skip re-deriving it, since _is_dra_only_study hits the DB."""
+    return _STUDY_EXPERIMENTS_SQL_BY_SOURCE[source or _study_source(cur, study)]
 
 
 def _fetch_study_experiments(
-    cur, study: str, limit: int | None = None, offset: int = 0
+    cur, study: str, limit: int | None = None, offset: int = 0, source: str | None = None
 ) -> list[dict]:
-    sql, ena_style = _study_experiments_sql(cur, study)
+    sql, ena_style = _study_experiments_sql(cur, study, source)
     if limit is None:
         cur.execute(sql, (study,))
         return cur.fetchall()
@@ -1709,30 +1721,53 @@ def _find_study_experiments(cur, study: str, filters: str) -> list[dict] | None:
     return cur.fetchall()
 
 
-def _count_study_experiments(cur, study: str) -> int:
-    if _is_gsa_study(study):
-        cur.execute(
-            "SELECT COUNT(DISTINCT experiment_accession) AS count "
-            "FROM gsa_experiments WHERE study_accession = UPPER(%s)",
-            (study,),
-        )
-    elif _is_ena_study(study):
-        cur.execute(
-            "SELECT COUNT(DISTINCT experiment_accession) AS count "
-            "FROM ena_experiments WHERE study_accession = UPPER(%s)",
-            (study,),
-        )
-    elif _is_dra_only_study(cur, study):
-        cur.execute(
-            "SELECT COUNT(*) AS count FROM dra_experiments WHERE study = %s",
-            (study,),
-        )
-    else:
-        cur.execute(
-            "SELECT COUNT(*) AS count FROM sra_experiments WHERE study = %s",
-            (study,),
-        )
+# (table, WHERE clause) per archive; gsa/ena need UPPER, dra/sra don't
+_STUDY_TABLE_ROUTES = {
+    "gsa": ("gsa_experiments", "study_accession = UPPER(%s)"),
+    "ena": ("ena_experiments", "study_accession = UPPER(%s)"),
+    "dra": ("dra_experiments", "study = %s"),
+    "sra": ("sra_experiments", "study = %s"),
+}
+
+
+def _count_study_experiments(cur, study: str, source: str | None = None) -> int:
+    table, where = _STUDY_TABLE_ROUTES[source or _study_source(cur, study)]
+    count_expr = (
+        "COUNT(DISTINCT experiment_accession)"
+        if table in ("gsa_experiments", "ena_experiments")
+        else "COUNT(*)"
+    )
+    cur.execute(f"SELECT {count_expr} AS count FROM {table} WHERE {where}", (study,))
     return cur.fetchone()["count"]
+
+
+def _study_library_strategies(cur, study: str) -> list[str]:
+    """Distinct, non-empty library_strategy values for a study; backs the Dataset
+    JSON-LD variableMeasured field on project pages."""
+    study = _canonical_study(cur, study)
+    table, where = _STUDY_TABLE_ROUTES[_study_source(cur, study)]
+    cur.execute(
+        f"SELECT DISTINCT library_strategy FROM {table} "
+        f"WHERE {where} AND library_strategy IS NOT NULL AND library_strategy <> ''",
+        (study,),
+    )
+    return sorted(r["library_strategy"] for r in cur.fetchall())
+
+
+def _attach_library_strategies(project: dict | None, study_acc: str | None, cur) -> None:
+    """Set project["library_strategies"]; a lookup failure yields an empty list,
+    never an exception."""
+    if project is None:
+        return
+    strategy_study = _study_for_library_strategy(study_acc, project)
+    if not strategy_study:
+        project["library_strategies"] = []
+        return
+    try:
+        project["library_strategies"] = _study_library_strategies(cur, strategy_study)
+    except Exception:
+        logger.exception("library_strategies lookup failed for %s", study_acc)
+        project["library_strategies"] = []
 
 
 def _fetch_sample(cur, accession: str) -> dict | None:
@@ -5921,7 +5956,12 @@ def _attach_single_cell_samples(cur, row: dict, accession: str) -> None:
         "must not be summed. The list is capped at 200 samples; when `truncated` "
         "is true, page the rest via /project/{accession}/single-cell, which also "
         "carries the read-derived calls and microbe flags. `single_cell` is null "
-        "when the study is not in the Pentimento."
+        "when the study is not in the Pentimento.\n\n"
+        "`library_strategies` lists the distinct assay types (RNA-Seq, ChIP-Seq, "
+        "etc.) across the study's experiments. For GEO/GEA rows this resolves "
+        "through the linked SRP/ERP/DRP in `alias`, since those archives carry "
+        "no experiments of their own; it is `[]` when no such study is found "
+        "(e.g. ArrayExpress)."
     ),
     operation_id="get_project",
 )
@@ -5943,6 +5983,7 @@ def get_project(
                     # external_id before enrichment (below) reads it as a
                     # publication candidate.
                     enrich_acc = accession
+                    strategy_acc = accession
                     if accession.startswith("PRJ"):
                         gse, srp = (r := _resolve_prj(cur, accession))["gse"], r["srp"]
                         if gse and not row.get("alias"):
@@ -5951,6 +5992,8 @@ def get_project(
                         if xref and not row.get("external_id"):
                             row["external_id"] = xref
                         enrich_acc = gse or srp or accession
+                        # use _canonical_study, not row["alias"] (a display value)
+                        strategy_acc = _canonical_study(cur, accession)
                         # ENA rows carry no embedding/supplementary of their own;
                         # inherit the similarity graph + supplementary from the
                         # linked SRA study / GEO series.
@@ -5973,6 +6016,7 @@ def get_project(
                     cur.execute(LONGREAD_CHEMISTRY_EXISTS_SQL, {"acc": enrich_acc})
                     row["has_long_read"] = bool(cur.fetchone()["has_long_read"])
                     _attach_single_cell_samples(cur, row, enrich_acc)
+                    _attach_library_strategies(row, strategy_acc, cur)
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
@@ -6085,11 +6129,13 @@ def get_study_experiments(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 study = _canonical_study(cur, study)
+                # Resolve once; _is_dra_only_study hits the DB.
+                source = _study_source(cur, study)
                 # Count is a cheap indexed query; the page fetch uses SQL
                 # LIMIT/OFFSET so large studies do not time out.
-                total = _count_study_experiments(cur, study)
+                total = _count_study_experiments(cur, study, source)
                 result = _fetch_study_experiments(
-                    cur, study, limit=limit, offset=offset
+                    cur, study, limit=limit, offset=offset, source=source
                 )
     except Exception:
         logger.exception("Database error in get_study_experiments")
@@ -8196,6 +8242,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, series_acc, cur)
 
         result = {
             "sample_type": "geo_sample",
@@ -8232,6 +8279,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, study_acc, cur)
 
         sample = None
         samples_list = experiment.get("samples") or []
@@ -8305,6 +8353,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, study_acc, cur)
 
     result = {
         "sample_type": "sra_sample",
