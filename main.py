@@ -2740,6 +2740,12 @@ _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def _no_seqscan(cur, sql, params) -> None:
+    with cur.connection.transaction():
+        cur.execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off")
+        cur.execute(sql, params)
+
+
 def _classify_accession_query(q: str) -> tuple[str, str] | None:
     token = q.strip()
     if not token or any(ch.isspace() for ch in token):
@@ -2768,7 +2774,11 @@ def _try_accession_search(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SEARCH_BY_ACCESSION_SQL_BY_KIND[kind], {"acc": acc})
+                sql = SEARCH_BY_ACCESSION_SQL_BY_KIND[kind]
+                if kind in ("gsm", "srs"):
+                    _no_seqscan(cur, sql, {"acc": acc})
+                else:
+                    cur.execute(sql, {"acc": acc})
                 rows = cur.fetchall()
                 if rows:
                     _enrich_with_publications(rows, cur)
@@ -8246,7 +8256,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         if not geo_sample:
             raise HTTPException(404, f"Sample not found: {acc}")
 
-        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        _no_seqscan(cur, GEO_SAMPLE_TO_SERIES_SQL, (acc,))
         series_row = cur.fetchone()
         if not series_row:
             raise HTTPException(404, f"No parent series found for {acc}")
@@ -8351,7 +8361,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     if experiment:
         study_acc = experiment.get("study")
     else:
-        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        _no_seqscan(cur, SRA_SAMPLE_TO_STUDY_SQL, (acc,))
         study_row = cur.fetchone()
         if study_row:
             study_acc = study_row["accession"]
@@ -10246,16 +10256,16 @@ def _resolve_to_project(cur, acc: str) -> str | None:
     Also the single-accession resolver behind resolve_accession_project.
     """
     if GEO_SAMPLE_PATTERN.match(acc):
-        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        _no_seqscan(cur, GEO_SAMPLE_TO_SERIES_SQL, (acc,))
         r = cur.fetchone()
         return r["accession"] if r else None
     if EXPERIMENT_PATTERN.match(acc):
         return _exp_to_study(cur, acc)
     if SAMPLE_PATTERN.match(acc):
-        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        _no_seqscan(cur, SRA_SAMPLE_TO_STUDY_SQL, (acc,))
         r = cur.fetchone()
         if not r:
-            cur.execute(DRA_SAMPLE_TO_STUDY_SQL, (acc,))
+            _no_seqscan(cur, DRA_SAMPLE_TO_STUDY_SQL, (acc,))
             r = cur.fetchone()
         return r["accession"] if r else None
     if RUN_PATTERN.match(acc):

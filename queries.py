@@ -2119,9 +2119,9 @@ LIMIT 1;
 """
 
 DRA_SAMPLE_TO_STUDY_SQL = """
-SELECT DISTINCT e.study AS accession
-FROM dra_experiments e
-WHERE e.samples @> ARRAY[%s]
+SELECT study AS accession
+FROM dra_experiments
+WHERE samples @> ARRAY[%s]
 LIMIT 1;
 """
 
