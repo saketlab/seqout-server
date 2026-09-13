@@ -5403,6 +5403,7 @@ LONGREAD_SORTABLE = frozenset(
         "n_samples",
         "n_runs",
         "first_published",
+        "year",
         "title",
         "study_accession",
         "organism",
@@ -5449,14 +5450,16 @@ def build_longread_count_sql() -> str:
 
 
 def build_longread_projects_sql(
-    sort: str = "n_experiments", descending: bool = True
+    sort: str = "year", descending: bool = True
 ) -> str:
     """One page of long-read studies; sort is validated against LONGREAD_SORTABLE
-    before it reaches this string."""
+    before it reaches this string. Ties break by n_samples, then study_accession,
+    so results are never left in arbitrary/accession-only order."""
     if sort not in LONGREAD_SORTABLE:
         msg = f"unsortable column {sort!r}"
         raise ValueError(msg)
     direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
     return f"""
 SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.instrument_models, r.library_strategies,
@@ -5467,7 +5470,7 @@ SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.chemistries, r.n_chemistry_runs, r.n_chemistry_exact
 FROM longread_study r
 WHERE TRUE{_LONGREAD_WHERE}
-ORDER BY r.{sort} {direction}, r.study_accession
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
@@ -5536,14 +5539,17 @@ def build_singlecell_count_sql() -> str:
 
 
 def build_singlecell_projects_sql(
-    sort: str = "n_samples", descending: bool = True
+    sort: str = "year", descending: bool = True
 ) -> str:
     """One page of single-cell studies; sort is validated against
-    SINGLECELL_SORTABLE before it reaches this string."""
+    SINGLECELL_SORTABLE before it reaches this string. Ties break by n_samples,
+    then study_accession, so results are never left in arbitrary/accession-only
+    order."""
     if sort not in SINGLECELL_SORTABLE:
         msg = f"unsortable column {sort!r}"
         raise ValueError(msg)
     direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
     return f"""
 SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
        r.single_cell_modality, r.chemistries, r.cell_or_nucleus, r.assay_l1,
@@ -5552,7 +5558,7 @@ SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
        r.intervention_kind, r.is_pooled, r.country, r.pmid, r.year
 FROM singlecell_study r
 WHERE TRUE{_SINGLECELL_WHERE}
-ORDER BY r.{sort} {direction}, r.study_accession
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
@@ -5597,13 +5603,16 @@ def build_country_count_sql() -> str:
     return f"SELECT count(*) AS total FROM country_study r WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE};"  # noqa: S608
 
 
-def build_country_projects_sql(sort: str = "n_samples", descending: bool = True) -> str:
+def build_country_projects_sql(sort: str = "year", descending: bool = True) -> str:
     """One page of a country's studies; sort is validated against
-    COUNTRY_SORTABLE before it reaches this string."""
+    COUNTRY_SORTABLE before it reaches this string. Ties break by n_samples,
+    then study_accession, so results are never left in arbitrary/accession-only
+    order."""
     if sort not in COUNTRY_SORTABLE:
         msg = f"unsortable column {sort!r}"
         raise ValueError(msg)
     direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
     return f"""
 SELECT r.study_accession, r.title, r.organism, r.assay_l1, r.assay_l2, r.source,
        r.n_samples, r.n_experiments, r.is_single_cell, r.single_cell_modality,
@@ -5615,7 +5624,7 @@ FROM country_study r
 LEFT JOIN singlecell_study sc ON sc.study_accession = r.study_accession
 LEFT JOIN longread_study lr ON lr.study_accession = r.study_accession
 WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE}
-ORDER BY r.{sort} {direction}, r.study_accession
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
