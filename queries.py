@@ -5258,6 +5258,15 @@ def build_filtered_where(
     )
 
 
+def _search_clause() -> str:
+    """AND clause for a free-text q filter on title/study_accession, skipped when unset."""
+    return (
+        "\n      AND (%(q)s::text IS NULL"
+        "\n           OR r.title ILIKE '%%' || %(q)s || '%%'"
+        "\n           OR r.study_accession ILIKE '%%' || %(q)s || '%%')"
+    )
+
+
 def _disease_where(collection: str) -> str:
     """Filter clauses shared by the page query and the count that reports it."""
     coll = DISEASE_COLLECTIONS[collection]
@@ -5267,6 +5276,7 @@ def _disease_where(collection: str) -> str:
         )
         + "\n      AND (%(disease)s::text IS NULL"
         f"\n           OR r.resolved_mondo_ids && {DISEASE_MONDO_SET})"
+        + _search_clause()
     )
 
 
@@ -5424,8 +5434,11 @@ LONGREAD_FACETS_SQL = (
 
 
 # Shared by the page and count queries. Static, so built once at import time.
-_LONGREAD_WHERE = build_filtered_where(
-    LONGREAD_ARRAY_FILTERS, LONGREAD_SCALAR_FILTERS, LONGREAD_BOOL_FILTERS
+_LONGREAD_WHERE = (
+    build_filtered_where(
+        LONGREAD_ARRAY_FILTERS, LONGREAD_SCALAR_FILTERS, LONGREAD_BOOL_FILTERS
+    )
+    + _search_clause()
 )
 
 
@@ -5510,8 +5523,11 @@ SINGLECELL_FACETS_SQL = (
 )
 
 # Shared by the page and count queries. Static, so built once at import time.
-_SINGLECELL_WHERE = build_filtered_where(
-    SINGLECELL_ARRAY_FILTERS, SINGLECELL_SCALAR_FILTERS, SINGLECELL_BOOL_FILTERS
+_SINGLECELL_WHERE = (
+    build_filtered_where(
+        SINGLECELL_ARRAY_FILTERS, SINGLECELL_SCALAR_FILTERS, SINGLECELL_BOOL_FILTERS
+    )
+    + _search_clause()
 )
 
 
@@ -5540,6 +5556,76 @@ ORDER BY r.{sort} {direction}, r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
+
+# Country collection: any archive/technology, scoped by declared submitter
+# country. Built by scripts/create_country_matview.sh from unified_metadata +
+# study_download_summary; see that script for why it isn't a live query.
+
+COUNTRY_SCALAR_FILTERS = {
+    "organism": "organism",
+    "assay_l1": "assay_l1",
+    "source": "source",
+}
+COUNTRY_BOOL_FILTERS = ("has_fastq", "has_sra", "is_single_cell")
+COUNTRY_SORTABLE = frozenset(
+    {"n_samples", "n_experiments", "year", "title", "study_accession", "organism"}
+)
+
+# Precomputed by scripts/create_country_matview.sh; a live aggregate over
+# country_study costs as much as the largest country.
+COUNTRY_SUMMARY_SQL = """
+SELECT studies, samples, experiments, studies_with_fastq, studies_with_sra,
+       studies_human, studies_single_cell, studies_long_read, n_organisms,
+       first_year, last_year
+FROM country_summary
+WHERE country_code_iso2 = %(code)s;
+"""
+
+COUNTRY_FACETS_SQL = (
+    "SELECT facet, value, studies FROM country_facet "
+    "WHERE country_code_iso2 = %(code)s ORDER BY facet, studies DESC;"
+)
+
+# Shared by the page and count queries. Static, so built once at import time.
+_COUNTRY_WHERE = (
+    build_filtered_where({}, COUNTRY_SCALAR_FILTERS, COUNTRY_BOOL_FILTERS)
+    + _search_clause()
+)
+
+
+def build_country_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM country_study r WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE};"  # noqa: S608
+
+
+def build_country_projects_sql(
+    sort: str = "n_samples", descending: bool = True
+) -> str:
+    """One page of a country's studies; sort is validated against
+    COUNTRY_SORTABLE before it reaches this string."""
+    if sort not in COUNTRY_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.assay_l1, r.assay_l2, r.source,
+       r.n_samples, r.n_experiments, r.is_single_cell, r.single_cell_modality,
+       r.center_name, r.pmid, r.year,
+       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs,
+       sc.has_matrix, sc.n_cells,
+       (lr.study_accession IS NOT NULL) AS has_long_read, lr.technologies
+FROM country_study r
+LEFT JOIN singlecell_study sc ON sc.study_accession = r.study_accession
+LEFT JOIN longread_study lr ON lr.study_accession = r.study_accession
+WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE}
+ORDER BY r.{sort} {direction}, r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
+
+
+COUNTRY_POINTS_SQL = (
+    "SELECT lat, lng, n FROM country_points "
+    "WHERE country_code_iso2 = %(code)s ORDER BY n DESC;"
+)
 
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary_v5;"
 ENRICHED_COLUMN_VALUES_SQL = (

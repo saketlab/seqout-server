@@ -21,7 +21,7 @@ import geoip2.database
 import geoip2.errors
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -116,10 +116,16 @@ from queries import (
     SINGLECELL_FACETS_SQL,
     SINGLECELL_SORTABLE,
     SINGLECELL_SUMMARY_SQL,
+    COUNTRY_FACETS_SQL,
+    COUNTRY_POINTS_SQL,
+    COUNTRY_SORTABLE,
+    COUNTRY_SUMMARY_SQL,
     build_longread_count_sql,
     build_longread_projects_sql,
     build_singlecell_count_sql,
     build_singlecell_projects_sql,
+    build_country_count_sql,
+    build_country_projects_sql,
     build_disease_count_sql,
     build_disease_facets_sql,
     build_disease_projects_sql,
@@ -11076,10 +11082,10 @@ def get_longread_facets(request: Request):
         "values from /longread/facets; `year` is the publication year. "
         "`chemistry=` filters on a value from the `chemistry` facet; "
         "`has_exact_chemistry=true` restricts to studies with at least one "
-        "BAM-header-measured run. Sort "
+        "BAM-header-measured run. `q` matches title or study_accession "
+        "(case-insensitive substring). Sort "
         "with sort= and order=. `total` is the filtered study count; `count` "
-        "is this page. For a free-text search restricted to long reads use "
-        "/search with long_read=true instead."
+        "is this page."
     ),
     operation_id="get_longread_projects",
 )
@@ -11099,6 +11105,7 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
     has_sra: bool | None = None,
     long_read_only: bool | None = None,
     has_exact_chemistry: bool | None = None,
+    q: str | None = Query(None, max_length=200),
     sort: str = Query("n_experiments", pattern=_LONGREAD_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
@@ -11118,6 +11125,7 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
         "has_sra": has_sra,
         "long_read_only": long_read_only,
         "has_exact_chemistry": has_exact_chemistry,
+        "q": q,
     }
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11207,8 +11215,9 @@ def get_singlecell_facets(request: Request):
         "intervention_kind (genetic/chemical) and is_pooled follow from which "
         "method matched, never from how many genes/compounds were named. "
         "Filters take values from /single-cell/facets; `year` is the publication "
-        "year. Sort with sort= and order=. `total` is the filtered study count; "
-        "`count` is this page."
+        "year. `q` matches title or study_accession (case-insensitive "
+        "substring). Sort with sort= and order=. `total` is the filtered "
+        "study count; `count` is this page."
     ),
     operation_id="get_singlecell_projects",
 )
@@ -11228,6 +11237,7 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
     has_fastq: bool | None = None,
     has_sra: bool | None = None,
     is_long_read: bool | None = None,
+    q: str | None = Query(None, max_length=200),
     sort: str = Query("n_samples", pattern=_SINGLECELL_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
@@ -11247,6 +11257,7 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "is_long_read": is_long_read,
+        "q": q,
     }
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11259,6 +11270,145 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
             rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in get_singlecell_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
+def _country_code(code: str) -> str:
+    normalized = code.upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized):
+        raise HTTPException(
+            404, f"'{code}' is not a two-letter ISO-3166-1 country code"
+        )
+    return normalized
+
+
+@api_app.get(
+    "/country/{code}/points",
+    summary="Geocoded institution points for a country",
+    description=(
+        "Rounded lat/lng clusters with study counts for this country's "
+        "submitting institutions, for map rendering (e.g. the OG image). "
+        "Built by scripts/create_country_matview.sh."
+    ),
+    operation_id="get_country_points",
+)
+@limiter.limit("60/minute")
+def get_country_points(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_POINTS_SQL, {"code": code})
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_points")
+        raise HTTPException(500, "Internal server error")
+    return {"points": rows}
+
+
+_COUNTRY_SORT_PATTERN = f"^({'|'.join(sorted(COUNTRY_SORTABLE))})$"
+
+
+@api_app.get(
+    "/country/{code}/summary",
+    summary="Per-country corpus totals",
+    description=(
+        "Corpus-wide totals for studies submitted from one country (ISO-3166-1 "
+        "alpha-2 code, e.g. IN, US), across every archive and technology."
+    ),
+    operation_id="get_country_summary",
+)
+@limiter.limit("60/minute")
+def get_country_summary(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_SUMMARY_SQL, {"code": code})
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_country_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "country stats not available")
+    return row
+
+
+@api_app.get(
+    "/country/{code}/facets",
+    summary="Per-country facet counts",
+    description=(
+        "Study counts per organism, assay category, archive, year and "
+        "single-cell status for one country. Precomputed, capped to the top "
+        "40 values per facet. Values feed the filters of /country/{code}/projects."
+    ),
+    operation_id="get_country_facets",
+)
+@limiter.limit("60/minute")
+def get_country_facets(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_FACETS_SQL, {"code": code})
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_facets")
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
+
+
+@api_app.get(
+    "/country/{code}/projects",
+    summary="Studies submitted from a country",
+    description=(
+        "One row per study submitted from this country: organism, assay "
+        "category, archive, sample/experiment counts, single-cell status, "
+        "FASTQ and .sra availability (NULL means unknown), and publication "
+        "year. Filters take values from /country/{code}/facets. `q` matches "
+        "title or study_accession (case-insensitive substring). Sort with "
+        "sort= and order=. `total` is the filtered study count; `count` is "
+        "this page."
+    ),
+    operation_id="get_country_projects",
+)
+@limiter.limit("60/minute")
+def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    code: str = Depends(_country_code),
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    source: str | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    is_single_cell: bool | None = None,
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("n_samples", pattern=_COUNTRY_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "code": code,
+        "organism": organism,
+        "assay_l1": assay_l1,
+        "source": source,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_single_cell": is_single_cell,
+        "q": q,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_country_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_country_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_projects")
         raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
@@ -11321,7 +11471,8 @@ def get_disease_aliases(
         "samples are not in it. `total` is the filtered study count; `count` "
         "is this page. "
         "Filters take values from /disease/{collection}/facets and are rejected "
-        "if the collection does not carry them. Sort with sort= and order=. "
+        "if the collection does not carry them. `q` matches title or "
+        "study_accession (case-insensitive substring). Sort with sort= and order=. "
         "`scope` defaults to human_primary (human material that is neither an "
         "immortalized line nor a derived model); use patient_derived_model, "
         "cell_line, or all to see what that excludes. Every row carries the "
@@ -11344,6 +11495,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     disease: str | None = None,
     assay_category: str | None = None,
     organism: str | None = None,
+    q: str | None = Query(None, max_length=200),
     scope: str = Query(DEFAULT_SCOPE, pattern=_SCOPE_PATTERN),
     sort: str = Query("cells", pattern=_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
@@ -11375,6 +11527,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
             f"'{collection}'. Available: {', '.join(sorted(allowed))}",
         )
     params = {k: supplied[k] for k in allowed}
+    params["q"] = q
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_disease_count_sql(collection, scope), params)
