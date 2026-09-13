@@ -5597,9 +5597,7 @@ def build_country_count_sql() -> str:
     return f"SELECT count(*) AS total FROM country_study r WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE};"  # noqa: S608
 
 
-def build_country_projects_sql(
-    sort: str = "n_samples", descending: bool = True
-) -> str:
+def build_country_projects_sql(sort: str = "n_samples", descending: bool = True) -> str:
     """One page of a country's studies; sort is validated against
     COUNTRY_SORTABLE before it reaches this string."""
     if sort not in COUNTRY_SORTABLE:

@@ -19,8 +19,7 @@ def is_ena_study(study: str) -> bool:
 
 
 def resolve_study_for_library_strategy(study_acc: str | None, row: dict) -> str | None:
-    """Which SRA-family study's experiments hold this project's library_strategy.
-    """
+    """Which SRA-family study's experiments hold this project's library_strategy."""
     if not study_acc:
         return None
     if (

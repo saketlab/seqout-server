@@ -1689,7 +1689,9 @@ _STUDY_EXPERIMENTS_SQL_BY_SOURCE = {
 }
 
 
-def _study_experiments_sql(cur, study: str, source: str | None = None) -> tuple[str, bool]:
+def _study_experiments_sql(
+    cur, study: str, source: str | None = None
+) -> tuple[str, bool]:
     """Pick the per-archive experiment SQL. Returns (sql, ena_style).
 
     Pass source to skip re-deriving it, since _is_dra_only_study hits the DB."""
@@ -1697,7 +1699,11 @@ def _study_experiments_sql(cur, study: str, source: str | None = None) -> tuple[
 
 
 def _fetch_study_experiments(
-    cur, study: str, limit: int | None = None, offset: int = 0, source: str | None = None
+    cur,
+    study: str,
+    limit: int | None = None,
+    offset: int = 0,
+    source: str | None = None,
 ) -> list[dict]:
     sql, ena_style = _study_experiments_sql(cur, study, source)
     if limit is None:
@@ -1760,7 +1766,9 @@ def _study_library_strategies(cur, study: str) -> list[str]:
     return sorted(r["library_strategy"] for r in cur.fetchall())
 
 
-def _attach_library_strategies(project: dict | None, study_acc: str | None, cur) -> None:
+def _attach_library_strategies(
+    project: dict | None, study_acc: str | None, cur
+) -> None:
     """Set project["library_strategies"]; a lookup failure yields an empty list,
     never an exception."""
     if project is None:
