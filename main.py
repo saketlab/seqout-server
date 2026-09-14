@@ -2801,6 +2801,11 @@ _EXCLUDE_ONTOLOGY_DOC = (
     + ", ".join(o for o, _ in ONTOLOGIES)
     + ". Unknown ids are ignored."
 )
+_CASE_SENSITIVE_DOC = (
+    "Match the query's words with their exact case (whole words, title and "
+    "summary only), so LINE excludes 'cell line'. Follows the same OR/AND/NOT "
+    "structure as the query; no spelling correction."
+)
 _LONG_READ_DOC = (
     "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
 )
@@ -5062,6 +5067,7 @@ def search(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
+    case_sensitive: bool = Query(False, description=_CASE_SENSITIVE_DOC),
 ):
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(400, "date_from must be <= date_to")
@@ -5081,12 +5087,16 @@ def search(
         "date_to": date_to,
     }
     has_filter = any(v not in (None, False, []) for v in sidebar_filters.values())
+    # Case-sensitive matching is a post-filter over the match set, so it rides the
+    # filtered path (list, facets and total all apply it the same way).
+    case_sensitive_q = q if case_sensitive and q else None
 
     # Search arguments an auto-correction re-run must replay. Built once from
     # sidebar_filters so filtered and unfiltered paths cannot drift.
     rerun = {
         "structured": structured,
         "exclude_ontology": exclude_ontology,
+        "case_sensitive": case_sensitive,
         "cursor_rank": cursor_rank,
         "cursor_acc": cursor_acc,
         "cursor_sort": cursor_sort,
@@ -5116,13 +5126,13 @@ def search(
     # Sidebar-filtered search: server-side filters, paginated over the same match
     # set as the facets so list and counts agree. Honors sortby (default
     # relevance) so filtered results order the same as unfiltered.
-    if has_filter:
+    if has_filter or case_sensitive_q:
         filtered = _search_filtered(
             q,
             db,
             cursor_rank,
             cursor_acc,
-            sidebar_filters,
+            {**sidebar_filters, "case_sensitive_q": case_sensitive_q},
             offset,
             sortby,
             order,
@@ -5136,7 +5146,7 @@ def search(
             request,
             filtered,
             replace_query_hyphens(q, expand=not structured) if q else "",
-            user_boolean,
+            user_boolean or case_sensitive,
             rerun,
         )
 
@@ -5497,6 +5507,7 @@ def _compute_search_facets(
                         q_variants=q_variants,
                         db=db,
                         structured=structured_tsq is not None,
+                        with_text=bool(filters.get("case_sensitive_q")),
                     )
                     cur.execute(msql, mparams)
                     # Total: cheap count over the materialized set. Computed before
@@ -5586,6 +5597,7 @@ def search_facets(
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
+    case_sensitive: bool = Query(False, description=_CASE_SENSITIVE_DOC),
 ):
     t0 = time.perf_counter()
     nq = replace_query_hyphens(q, expand=not structured)
@@ -5604,6 +5616,7 @@ def search_facets(
         db,
         boolean_tsq is not None,
         tuple(exclude_ontology or ()),
+        case_sensitive,
         organism,
         tuple(sorted(country or [])),
         tuple(sorted(library_strategy or [])),
@@ -5643,6 +5656,7 @@ def search_facets(
         long_read=long_read,
         year_from=year_from,
         year_to=year_to,
+        case_sensitive_q=q if case_sensitive else None,
     )
     # Mirror /search's auto-correction: when the original query is a low-result
     # typo, swap in the facets + total for what the corrected search actually
@@ -5660,7 +5674,12 @@ def search_facets(
     # corrects, so it needs the union expressed as a literal tsquery -- the
     # structured path takes no q_variants, so ORing the two tsqueries is how the
     # corrected + literal-typo match sets get counted together.
-    if not user_boolean and total is not None and total <= _SUGGESTION_THRESHOLD:
+    if (
+        not user_boolean
+        and not case_sensitive
+        and total is not None
+        and total <= _SUGGESTION_THRESHOLD
+    ):
         _suggestions = _get_suggestions(nq)
         _corrected_q = _suggestions[0]["corrected_query"] if _suggestions else None
         if _corrected_q and _corrected_q != nq:
@@ -8964,6 +8983,7 @@ def download_by_query(
     updated_year_from: int | None = Query(None, ge=1900, le=2100, deprecated=True),
     updated_year_to: int | None = Query(None, ge=1900, le=2100, deprecated=True),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
+    case_sensitive: bool = Query(False, description=_CASE_SENSITIVE_DOC),
 ):
     # updated_year_* were this endpoint's own names for the /search year range.
     year_from = year_from if year_from is not None else updated_year_from
@@ -9000,6 +9020,7 @@ def download_by_query(
     if q and (structured or is_boolean_query(q)):
         if _tsq := to_tsquery_string(replace_query_hyphens(q, expand=not structured)):
             boolean_tsq = _tsq
+    filters["case_sensitive_q"] = q if case_sensitive and q else None
     q = replace_query_hyphens(q, expand=not structured) if q else ""
 
     if boolean_tsq is not None:

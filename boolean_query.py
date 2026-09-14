@@ -53,6 +53,51 @@ def replace_query_hyphens(q: str, expand: bool = True) -> str:
     return q.replace("-", " ") if expand and not is_boolean_query(q) else q
 
 
+def case_sensitive_sql(q: str, col: str) -> tuple[str, dict]:
+    """Case-sensitive twin of to_tsquery_string: the same operands and operators,
+    but each operand is a whole-word regex (`~`, case-sensitive) on `col`.
+
+    Used as a post-filter on top of the FTS match, so "LINE" keeps studies that
+    say LINE and drops ones that only say "cell line". Phrases allow any
+    non-alphanumeric run between words, like the <-> lexemes do; a trailing *
+    drops the end-of-word anchor. Returns ("", {}) when nothing usable is left.
+    """
+    out: list[str] = []
+    params: dict[str, str] = {}
+    prev_operand = False
+    for raw in _TOKEN.findall(q):
+        if raw in ("(", ")"):
+            if raw == "(" and prev_operand:
+                out.append("AND")
+            out.append(raw)
+            prev_operand = raw == ")"
+            continue
+        kw = _BOOL.get(raw)
+        if kw == "!":
+            if prev_operand:
+                out.append("AND")
+            out.append("NOT")
+            prev_operand = False
+            continue
+        if kw:
+            out.append("OR" if kw == "|" else "AND")
+            prev_operand = False
+            continue
+        term = raw.strip('"')
+        parts = [p for p in re.split(r"[^0-9A-Za-z]+", term) if p]
+        if not parts:
+            continue
+        name = f"cs{len(params)}"
+        params[name] = (
+            r"\m" + "[^[:alnum:]]+".join(parts) + ("" if term.endswith("*") else r"\M")
+        )
+        if prev_operand:
+            out.append("AND")
+        out.append(f"{col} ~ %({name})s")
+        prev_operand = True
+    return (" ".join(out), params) if params else ("", {})
+
+
 def to_tsquery_string(q: str) -> str:
     """Translate a google-lite boolean query to a to_tsquery('english', ...) input.
 
@@ -116,4 +161,12 @@ if __name__ == "__main__":
     assert replace_query_hyphens("scrna-seq liver") == "scrna seq liver"
     assert replace_query_hyphens("scrna-seq liver", expand=False) == "scrna-seq liver"
     assert replace_query_hyphens('"scrna-seq" OR liver') == '"scrna-seq" OR liver'
+    sql, params = case_sensitive_sql('LINE-1 NOT ("cell line" OR immun*)', "t")
+    assert sql == "t ~ %(cs0)s AND NOT ( t ~ %(cs1)s OR t ~ %(cs2)s )"
+    assert params == {
+        "cs0": r"\mLINE[^[:alnum:]]+1\M",
+        "cs1": r"\mcell[^[:alnum:]]+line\M",
+        "cs2": r"\mimmun",
+    }
+    assert case_sensitive_sql("*", "t") == ("", {})
     print("ok")

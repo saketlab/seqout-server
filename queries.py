@@ -2,6 +2,8 @@
 
 import math
 
+from boolean_query import case_sensitive_sql
+
 _EARTH_RADIUS_KM = 6371.0088
 
 ONTOLOGY_FIELDS: dict[str, str] = {
@@ -777,6 +779,7 @@ def _search_filter_clauses(
     year_to=None,
     date_from=None,
     date_to=None,
+    case_sensitive_q=None,
 ):
     """Build sidebar-filter SQL over the matched CTE columns.
 
@@ -855,11 +858,22 @@ def _search_filter_clauses(
     elif year_to is not None:
         always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) <= %(year_to)s")
         params["year_to"] = year_to
+    if case_sensitive_q:
+        # Exact-case post-filter on the raw query, over title + summary only
+        # (the FTS also covers sample text; ponytail: add columns if that matters).
+        cs_sql, cs_params = case_sensitive_sql(
+            case_sensitive_q, "concat_ws(' ', matched.title, matched.summary)"
+        )
+        if cs_sql:
+            always_clauses.append(f"({cs_sql})")
+            params.update(cs_params)
 
     return dim_clauses, always_clauses
 
 
-def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
+def build_search_match_temp(
+    q=None, q_variants=None, db=None, structured=False, with_text=False
+):
     """CREATE TEMP TABLE matched (ON COMMIT DROP) holding the q+db match set,
     deduped. This is the single expensive FTS pass; the count and facet queries
     then read this materialized table, so a slow facet can't kill the total and
@@ -867,6 +881,8 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
 
     structured=True: q is already a to_tsquery string (boolean mode); count the
     literal terms with no expansion, so the total matches the boolean result list.
+
+    with_text=True also keeps title/summary, which the case-sensitive filter reads.
     """
     cte = _SEARCH_MATCH_CTE_STRUCTURED if structured else _SEARCH_MATCH_CTE
     # Only the columns the count + facet + filter queries actually read.
@@ -876,7 +892,9 @@ def build_search_match_temp(q=None, q_variants=None, db=None, structured=False):
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
         + "\nSELECT accession, dedup_key, rank, updated_at, organisms, countries,"
-        + " instrument_models, library_strategies, platforms, library_sources\n"
+        + " instrument_models, library_strategies, platforms, library_sources"
+        + (", title, summary" if with_text else "")
+        + "\n"
         + "FROM matched;"
     )
     # no_q is a SQL literal: "FALSE OR tsv @@ q" folds to "tsv @@ q" at plan
