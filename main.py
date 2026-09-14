@@ -21,7 +21,7 @@ import geoip2.database
 import geoip2.errors
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -51,6 +51,11 @@ from deep_dive import (
     fetch_ontology_term,
 )
 from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
+from library_strategy import (
+    is_ena_study as _is_ena_study,
+    is_gsa_study as _is_gsa_study,
+    resolve_study_for_library_strategy as _study_for_library_strategy,
+)
 from grid_filters import (
     _indexed_accession,
     _jsonb_any_element,
@@ -111,10 +116,16 @@ from queries import (
     SINGLECELL_FACETS_SQL,
     SINGLECELL_SORTABLE,
     SINGLECELL_SUMMARY_SQL,
+    COUNTRY_FACETS_SQL,
+    COUNTRY_POINTS_SQL,
+    COUNTRY_SORTABLE,
+    COUNTRY_SUMMARY_SQL,
     build_longread_count_sql,
     build_longread_projects_sql,
     build_singlecell_count_sql,
     build_singlecell_projects_sql,
+    build_country_count_sql,
+    build_country_projects_sql,
     build_disease_count_sql,
     build_disease_facets_sql,
     build_disease_projects_sql,
@@ -190,6 +201,8 @@ from queries import (
     PENTIMENTO_STUDY_DETECTIONS_SQL,
     PENTIMENTO_SAMPLE_TISSUE_SQL,
     PENTIMENTO_STUDY_SQL,
+    PENTIMENTO_STUDY_FIELDS,
+    PENTIMENTO_LINKAGE_EXISTS_SQL,
     PROJECT_AE_SQL,
     PROJECT_DRA_SQL,
     PROJECT_ENA_SQL,
@@ -1612,14 +1625,6 @@ def rows_to_csv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
-def _is_ena_study(study: str) -> bool:
-    return study.upper().startswith("PRJ")
-
-
-def _is_gsa_study(study: str) -> bool:
-    return study.upper().startswith(("CRA", "HRA"))
-
-
 def _is_gea_study(study: str) -> bool:
     return study.upper().startswith("E-GEAD-")
 
@@ -1665,21 +1670,42 @@ def _canonical_study(cur, study: str) -> str:
     return row["accession"] if row else study
 
 
-def _study_experiments_sql(cur, study: str) -> tuple[str, bool]:
-    """Pick the per-archive experiment SQL. Returns (sql, ena_style)."""
+def _study_source(cur, study: str) -> str:
+    """Which archive owns this study's experiments: gsa/ena/dra/sra."""
     if _is_gsa_study(study):
-        return GSA_STUDY_EXPERIMENTS_SQL, True
+        return "gsa"
     if _is_ena_study(study):
-        return ENA_STUDY_EXPERIMENTS_SQL, True
+        return "ena"
     if _is_dra_only_study(cur, study):
-        return DRA_STUDY_EXPERIMENTS_SQL, False
-    return STUDY_EXPERIMENTS_SQL, False
+        return "dra"
+    return "sra"
+
+
+_STUDY_EXPERIMENTS_SQL_BY_SOURCE = {
+    "gsa": (GSA_STUDY_EXPERIMENTS_SQL, True),
+    "ena": (ENA_STUDY_EXPERIMENTS_SQL, True),
+    "dra": (DRA_STUDY_EXPERIMENTS_SQL, False),
+    "sra": (STUDY_EXPERIMENTS_SQL, False),
+}
+
+
+def _study_experiments_sql(
+    cur, study: str, source: str | None = None
+) -> tuple[str, bool]:
+    """Pick the per-archive experiment SQL. Returns (sql, ena_style).
+
+    Pass source to skip re-deriving it, since _is_dra_only_study hits the DB."""
+    return _STUDY_EXPERIMENTS_SQL_BY_SOURCE[source or _study_source(cur, study)]
 
 
 def _fetch_study_experiments(
-    cur, study: str, limit: int | None = None, offset: int = 0
+    cur,
+    study: str,
+    limit: int | None = None,
+    offset: int = 0,
+    source: str | None = None,
 ) -> list[dict]:
-    sql, ena_style = _study_experiments_sql(cur, study)
+    sql, ena_style = _study_experiments_sql(cur, study, source)
     if limit is None:
         cur.execute(sql, (study,))
         return cur.fetchall()
@@ -1707,30 +1733,55 @@ def _find_study_experiments(cur, study: str, filters: str) -> list[dict] | None:
     return cur.fetchall()
 
 
-def _count_study_experiments(cur, study: str) -> int:
-    if _is_gsa_study(study):
-        cur.execute(
-            "SELECT COUNT(DISTINCT experiment_accession) AS count "
-            "FROM gsa_experiments WHERE study_accession = UPPER(%s)",
-            (study,),
-        )
-    elif _is_ena_study(study):
-        cur.execute(
-            "SELECT COUNT(DISTINCT experiment_accession) AS count "
-            "FROM ena_experiments WHERE study_accession = UPPER(%s)",
-            (study,),
-        )
-    elif _is_dra_only_study(cur, study):
-        cur.execute(
-            "SELECT COUNT(*) AS count FROM dra_experiments WHERE study = %s",
-            (study,),
-        )
-    else:
-        cur.execute(
-            "SELECT COUNT(*) AS count FROM sra_experiments WHERE study = %s",
-            (study,),
-        )
+# (table, WHERE clause) per archive; gsa/ena need UPPER, dra/sra don't
+_STUDY_TABLE_ROUTES = {
+    "gsa": ("gsa_experiments", "study_accession = UPPER(%s)"),
+    "ena": ("ena_experiments", "study_accession = UPPER(%s)"),
+    "dra": ("dra_experiments", "study = %s"),
+    "sra": ("sra_experiments", "study = %s"),
+}
+
+
+def _count_study_experiments(cur, study: str, source: str | None = None) -> int:
+    table, where = _STUDY_TABLE_ROUTES[source or _study_source(cur, study)]
+    count_expr = (
+        "COUNT(DISTINCT experiment_accession)"
+        if table in ("gsa_experiments", "ena_experiments")
+        else "COUNT(*)"
+    )
+    cur.execute(f"SELECT {count_expr} AS count FROM {table} WHERE {where}", (study,))
     return cur.fetchone()["count"]
+
+
+def _study_library_strategies(cur, study: str) -> list[str]:
+    """Distinct, non-empty library_strategy values for a study; backs the Dataset
+    JSON-LD variableMeasured field on project pages."""
+    study = _canonical_study(cur, study)
+    table, where = _STUDY_TABLE_ROUTES[_study_source(cur, study)]
+    cur.execute(
+        f"SELECT DISTINCT library_strategy FROM {table} "
+        f"WHERE {where} AND library_strategy IS NOT NULL AND library_strategy <> ''",
+        (study,),
+    )
+    return sorted(r["library_strategy"] for r in cur.fetchall())
+
+
+def _attach_library_strategies(
+    project: dict | None, study_acc: str | None, cur
+) -> None:
+    """Set project["library_strategies"]; a lookup failure yields an empty list,
+    never an exception."""
+    if project is None:
+        return
+    strategy_study = _study_for_library_strategy(study_acc, project)
+    if not strategy_study:
+        project["library_strategies"] = []
+        return
+    try:
+        project["library_strategies"] = _study_library_strategies(cur, strategy_study)
+    except Exception:
+        logger.exception("library_strategies lookup failed for %s", study_acc)
+        project["library_strategies"] = []
 
 
 def _fetch_sample(cur, accession: str) -> dict | None:
@@ -2689,6 +2740,12 @@ _ACCESSION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def _no_seqscan(cur, sql, params) -> None:
+    with cur.connection.transaction():
+        cur.execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off")
+        cur.execute(sql, params)
+
+
 def _classify_accession_query(q: str) -> tuple[str, str] | None:
     token = q.strip()
     if not token or any(ch.isspace() for ch in token):
@@ -2717,7 +2774,11 @@ def _try_accession_search(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SEARCH_BY_ACCESSION_SQL_BY_KIND[kind], {"acc": acc})
+                sql = SEARCH_BY_ACCESSION_SQL_BY_KIND[kind]
+                if kind in ("gsm", "srs"):
+                    _no_seqscan(cur, sql, {"acc": acc})
+                else:
+                    cur.execute(sql, {"acc": acc})
                 rows = cur.fetchall()
                 if rows:
                     _enrich_with_publications(rows, cur)
@@ -5938,7 +5999,12 @@ def _attach_single_cell_samples(cur, row: dict, accession: str) -> None:
         "must not be summed. The list is capped at 200 samples; when `truncated` "
         "is true, page the rest via /project/{accession}/single-cell, which also "
         "carries the read-derived calls and microbe flags. `single_cell` is null "
-        "when the study is not in the Pentimento."
+        "when the study is not in the Pentimento.\n\n"
+        "`library_strategies` lists the distinct assay types (RNA-Seq, ChIP-Seq, "
+        "etc.) across the study's experiments. For GEO/GEA rows this resolves "
+        "through the linked SRP/ERP/DRP in `alias`, since those archives carry "
+        "no experiments of their own; it is `[]` when no such study is found "
+        "(e.g. ArrayExpress)."
     ),
     operation_id="get_project",
 )
@@ -5960,6 +6026,7 @@ def get_project(
                     # external_id before enrichment (below) reads it as a
                     # publication candidate.
                     enrich_acc = accession
+                    strategy_acc = accession
                     if accession.startswith("PRJ"):
                         gse, srp = (r := _resolve_prj(cur, accession))["gse"], r["srp"]
                         if gse and not row.get("alias"):
@@ -5968,6 +6035,8 @@ def get_project(
                         if xref and not row.get("external_id"):
                             row["external_id"] = xref
                         enrich_acc = gse or srp or accession
+                        # use _canonical_study, not row["alias"] (a display value)
+                        strategy_acc = _canonical_study(cur, accession)
                         # ENA rows carry no embedding/supplementary of their own;
                         # inherit the similarity graph + supplementary from the
                         # linked SRA study / GEO series.
@@ -5990,6 +6059,7 @@ def get_project(
                     cur.execute(LONGREAD_CHEMISTRY_EXISTS_SQL, {"acc": enrich_acc})
                     row["has_long_read"] = bool(cur.fetchone()["has_long_read"])
                     _attach_single_cell_samples(cur, row, enrich_acc)
+                    _attach_library_strategies(row, strategy_acc, cur)
     except Exception as e:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
@@ -6102,11 +6172,13 @@ def get_study_experiments(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 study = _canonical_study(cur, study)
+                # Resolve once; _is_dra_only_study hits the DB.
+                source = _study_source(cur, study)
                 # Count is a cheap indexed query; the page fetch uses SQL
                 # LIMIT/OFFSET so large studies do not time out.
-                total = _count_study_experiments(cur, study)
+                total = _count_study_experiments(cur, study, source)
                 result = _fetch_study_experiments(
-                    cur, study, limit=limit, offset=offset
+                    cur, study, limit=limit, offset=offset, source=source
                 )
     except Exception:
         logger.exception("Database error in get_study_experiments")
@@ -8203,7 +8275,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         if not geo_sample:
             raise HTTPException(404, f"Sample not found: {acc}")
 
-        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        _no_seqscan(cur, GEO_SAMPLE_TO_SERIES_SQL, (acc,))
         series_row = cur.fetchone()
         if not series_row:
             raise HTTPException(404, f"No parent series found for {acc}")
@@ -8213,6 +8285,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, series_acc, cur)
 
         result = {
             "sample_type": "geo_sample",
@@ -8249,6 +8322,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, study_acc, cur)
 
         sample = None
         samples_list = experiment.get("samples") or []
@@ -8306,7 +8380,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     if experiment:
         study_acc = experiment.get("study")
     else:
-        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        _no_seqscan(cur, SRA_SAMPLE_TO_STUDY_SQL, (acc,))
         study_row = cur.fetchone()
         if study_row:
             study_acc = study_row["accession"]
@@ -8322,6 +8396,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         project = cur.fetchone()
         if project:
             _enrich_with_publications([project], cur)
+        _attach_library_strategies(project, study_acc, cur)
 
     result = {
         "sample_type": "sra_sample",
@@ -10202,16 +10277,16 @@ def _resolve_to_project(cur, acc: str) -> str | None:
     Also the single-accession resolver behind resolve_accession_project.
     """
     if GEO_SAMPLE_PATTERN.match(acc):
-        cur.execute(GEO_SAMPLE_TO_SERIES_SQL, (acc,))
+        _no_seqscan(cur, GEO_SAMPLE_TO_SERIES_SQL, (acc,))
         r = cur.fetchone()
         return r["accession"] if r else None
     if EXPERIMENT_PATTERN.match(acc):
         return _exp_to_study(cur, acc)
     if SAMPLE_PATTERN.match(acc):
-        cur.execute(SRA_SAMPLE_TO_STUDY_SQL, (acc,))
+        _no_seqscan(cur, SRA_SAMPLE_TO_STUDY_SQL, (acc,))
         r = cur.fetchone()
         if not r:
-            cur.execute(DRA_SAMPLE_TO_STUDY_SQL, (acc,))
+            _no_seqscan(cur, DRA_SAMPLE_TO_STUDY_SQL, (acc,))
             r = cur.fetchone()
         return r["accession"] if r else None
     if RUN_PATTERN.match(acc):
@@ -11046,10 +11121,10 @@ def get_longread_facets(request: Request):
         "values from /longread/facets; `year` is the publication year. "
         "`chemistry=` filters on a value from the `chemistry` facet; "
         "`has_exact_chemistry=true` restricts to studies with at least one "
-        "BAM-header-measured run. Sort "
+        "BAM-header-measured run. `q` matches title or study_accession "
+        "(case-insensitive substring). Sort "
         "with sort= and order=. `total` is the filtered study count; `count` "
-        "is this page. For a free-text search restricted to long reads use "
-        "/search with long_read=true instead."
+        "is this page."
     ),
     operation_id="get_longread_projects",
 )
@@ -11069,7 +11144,8 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
     has_sra: bool | None = None,
     long_read_only: bool | None = None,
     has_exact_chemistry: bool | None = None,
-    sort: str = Query("n_experiments", pattern=_LONGREAD_SORT_PATTERN),
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("year", pattern=_LONGREAD_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -11088,6 +11164,7 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
         "has_sra": has_sra,
         "long_read_only": long_read_only,
         "has_exact_chemistry": has_exact_chemistry,
+        "q": q,
     }
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11177,8 +11254,9 @@ def get_singlecell_facets(request: Request):
         "intervention_kind (genetic/chemical) and is_pooled follow from which "
         "method matched, never from how many genes/compounds were named. "
         "Filters take values from /single-cell/facets; `year` is the publication "
-        "year. Sort with sort= and order=. `total` is the filtered study count; "
-        "`count` is this page."
+        "year. `q` matches title or study_accession (case-insensitive "
+        "substring). Sort with sort= and order=. `total` is the filtered "
+        "study count; `count` is this page."
     ),
     operation_id="get_singlecell_projects",
 )
@@ -11198,7 +11276,8 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
     has_fastq: bool | None = None,
     has_sra: bool | None = None,
     is_long_read: bool | None = None,
-    sort: str = Query("n_samples", pattern=_SINGLECELL_SORT_PATTERN),
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("year", pattern=_SINGLECELL_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -11217,6 +11296,7 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "is_long_read": is_long_read,
+        "q": q,
     }
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11229,6 +11309,145 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
             rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in get_singlecell_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
+def _country_code(code: str) -> str:
+    normalized = code.upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized):
+        raise HTTPException(
+            404, f"'{code}' is not a two-letter ISO-3166-1 country code"
+        )
+    return normalized
+
+
+@api_app.get(
+    "/country/{code}/points",
+    summary="Geocoded institution points for a country",
+    description=(
+        "Rounded lat/lng clusters with study counts for this country's "
+        "submitting institutions, for map rendering (e.g. the OG image). "
+        "Built by scripts/create_country_matview.sh."
+    ),
+    operation_id="get_country_points",
+)
+@limiter.limit("60/minute")
+def get_country_points(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_POINTS_SQL, {"code": code})
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_points")
+        raise HTTPException(500, "Internal server error")
+    return {"points": rows}
+
+
+_COUNTRY_SORT_PATTERN = f"^({'|'.join(sorted(COUNTRY_SORTABLE))})$"
+
+
+@api_app.get(
+    "/country/{code}/summary",
+    summary="Per-country corpus totals",
+    description=(
+        "Corpus-wide totals for studies submitted from one country (ISO-3166-1 "
+        "alpha-2 code, e.g. IN, US), across every archive and technology."
+    ),
+    operation_id="get_country_summary",
+)
+@limiter.limit("60/minute")
+def get_country_summary(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_SUMMARY_SQL, {"code": code})
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_country_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "country stats not available")
+    return row
+
+
+@api_app.get(
+    "/country/{code}/facets",
+    summary="Per-country facet counts",
+    description=(
+        "Study counts per organism, assay category, archive, year and "
+        "single-cell status for one country. Precomputed, capped to the top "
+        "40 values per facet. Values feed the filters of /country/{code}/projects."
+    ),
+    operation_id="get_country_facets",
+)
+@limiter.limit("60/minute")
+def get_country_facets(request: Request, code: str = Depends(_country_code)):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(COUNTRY_FACETS_SQL, {"code": code})
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_facets")
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
+
+
+@api_app.get(
+    "/country/{code}/projects",
+    summary="Studies submitted from a country",
+    description=(
+        "One row per study submitted from this country: organism, assay "
+        "category, archive, sample/experiment counts, single-cell status, "
+        "FASTQ and .sra availability (NULL means unknown), and publication "
+        "year. Filters take values from /country/{code}/facets. `q` matches "
+        "title or study_accession (case-insensitive substring). Sort with "
+        "sort= and order=. `total` is the filtered study count; `count` is "
+        "this page."
+    ),
+    operation_id="get_country_projects",
+)
+@limiter.limit("60/minute")
+def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    code: str = Depends(_country_code),
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    source: str | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    is_single_cell: bool | None = None,
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("year", pattern=_COUNTRY_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "code": code,
+        "organism": organism,
+        "assay_l1": assay_l1,
+        "source": source,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_single_cell": is_single_cell,
+        "q": q,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_country_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_country_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_country_projects")
         raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
@@ -11291,7 +11510,8 @@ def get_disease_aliases(
         "samples are not in it. `total` is the filtered study count; `count` "
         "is this page. "
         "Filters take values from /disease/{collection}/facets and are rejected "
-        "if the collection does not carry them. Sort with sort= and order=. "
+        "if the collection does not carry them. `q` matches title or "
+        "study_accession (case-insensitive substring). Sort with sort= and order=. "
         "`scope` defaults to human_primary (human material that is neither an "
         "immortalized line nor a derived model); use patient_derived_model, "
         "cell_line, or all to see what that excludes. Every row carries the "
@@ -11314,6 +11534,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     disease: str | None = None,
     assay_category: str | None = None,
     organism: str | None = None,
+    q: str | None = Query(None, max_length=200),
     scope: str = Query(DEFAULT_SCOPE, pattern=_SCOPE_PATTERN),
     sort: str = Query("cells", pattern=_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
@@ -11345,6 +11566,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
             f"'{collection}'. Available: {', '.join(sorted(allowed))}",
         )
     params = {k: supplied[k] for k in allowed}
+    params["q"] = q
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_disease_count_sql(collection, scope), params)
@@ -12054,6 +12276,11 @@ def get_project_longread_chemistry(
     return {"accession": accession.upper(), "runs": runs}
 
 
+# Study-level fields when pentimento_study hasn't been built yet for a study
+# that only has run-level linkage (see get_project_single_cell).
+_EMPTY_PENTIMENTO_STUDY = dict.fromkeys(PENTIMENTO_STUDY_FIELDS)
+
+
 @api_app.get(
     "/project/{accession}/single-cell",
     summary="Get single-cell counts, QC statistics, read-derived calls and microbe flags",
@@ -12096,7 +12323,12 @@ def get_project_single_cell(
                 cur.execute(PENTIMENTO_STUDY_SQL, (resolved,))
                 study = cur.fetchone()
                 if not study:
-                    raise HTTPException(404, "Study not in the Pentimento")
+                    # Runs are linked but ingestion hasn't summarized the study
+                    # into pentimento_study yet.
+                    cur.execute(PENTIMENTO_LINKAGE_EXISTS_SQL, {"acc": resolved})
+                    if not cur.fetchone()["linked"]:
+                        raise HTTPException(404, "Study not in the Pentimento")
+                    study = {**_EMPTY_PENTIMENTO_STUDY, "study_accession": resolved}
                 cur.execute(
                     PENTIMENTO_SAMPLES_SQL,
                     {"acc": resolved, "limit": limit, "offset": offset},

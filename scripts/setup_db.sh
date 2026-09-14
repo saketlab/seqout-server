@@ -153,6 +153,10 @@ CREATE INDEX IF NOT EXISTS sra_experiments_accession_upper_idx ON sra_experiment
 -- Index for SRX to SRP lookups (join on study column)
 CREATE INDEX IF NOT EXISTS sra_experiments_study_idx ON sra_experiments (study);
 
+-- GIN indexes for sample to study/series containment lookups (samples @> ARRAY[...]).
+CREATE INDEX IF NOT EXISTS sra_experiments_samples_idx ON sra_experiments USING GIN (samples);
+CREATE INDEX IF NOT EXISTS geo_series_samples_ref_idx ON geo_series USING GIN (samples_ref);
+
 -- ENA Studies (created here so structured search queries don't error if no data transferred yet)
 CREATE TABLE IF NOT EXISTS ena_studies (
     study_accession             TEXT PRIMARY KEY,
@@ -219,6 +223,8 @@ CREATE TABLE IF NOT EXISTS ena_experiments (
 -- Indexes for structured search filters
 CREATE INDEX IF NOT EXISTS idx_sra_exp_library_strategy ON sra_experiments (library_strategy);
 CREATE INDEX IF NOT EXISTS idx_sra_exp_platform ON sra_experiments (platform);
+-- Speeds per-study library_strategy lookups on umbrella studies (e.g. ERP121228).
+CREATE INDEX IF NOT EXISTS idx_sra_exp_study_strategy ON sra_experiments (study, library_strategy);
 CREATE INDEX IF NOT EXISTS idx_geo_series_organisms ON geo_series USING GIN (organisms);
 CREATE INDEX IF NOT EXISTS idx_sra_studies_organisms ON sra_studies USING GIN (organisms);
 CREATE INDEX IF NOT EXISTS idx_geo_contributors_country ON geo_contributors (address_country);
@@ -228,6 +234,8 @@ CREATE INDEX IF NOT EXISTS idx_ena_studies_scientific_name ON ena_studies (scien
 CREATE INDEX IF NOT EXISTS idx_ena_studies_first_public ON ena_studies (first_public);
 CREATE INDEX IF NOT EXISTS idx_ena_studies_geo_accession ON ena_studies (geo_accession);
 CREATE INDEX IF NOT EXISTS idx_ena_studies_center_name ON ena_studies (center_name);
+-- Umbrella-project child lookup in PROJECT_ENA_SQL (queries.py).
+CREATE INDEX IF NOT EXISTS idx_ena_studies_parent ON ena_studies (parent_study_accession);
 CREATE INDEX IF NOT EXISTS idx_ena_exp_study ON ena_experiments (study_accession);
 CREATE INDEX IF NOT EXISTS idx_ena_exp_strategy ON ena_experiments (library_strategy);
 CREATE INDEX IF NOT EXISTS idx_ena_exp_platform ON ena_experiments (instrument_platform);

@@ -2137,9 +2137,9 @@ LIMIT 1;
 """
 
 DRA_SAMPLE_TO_STUDY_SQL = """
-SELECT DISTINCT e.study AS accession
-FROM dra_experiments e
-WHERE e.samples @> ARRAY[%s]
+SELECT study AS accession
+FROM dra_experiments
+WHERE samples @> ARRAY[%s]
 LIMIT 1;
 """
 
@@ -5276,6 +5276,15 @@ def build_filtered_where(
     )
 
 
+def _search_clause() -> str:
+    """AND clause for a free-text q filter on title/study_accession, skipped when unset."""
+    return (
+        "\n      AND (%(q)s::text IS NULL"
+        "\n           OR r.title ILIKE '%%' || %(q)s || '%%'"
+        "\n           OR r.study_accession ILIKE '%%' || %(q)s || '%%')"
+    )
+
+
 def _disease_where(collection: str) -> str:
     """Filter clauses shared by the page query and the count that reports it."""
     coll = DISEASE_COLLECTIONS[collection]
@@ -5285,6 +5294,7 @@ def _disease_where(collection: str) -> str:
         )
         + "\n      AND (%(disease)s::text IS NULL"
         f"\n           OR r.resolved_mondo_ids && {DISEASE_MONDO_SET})"
+        + _search_clause()
     )
 
 
@@ -5411,6 +5421,7 @@ LONGREAD_SORTABLE = frozenset(
         "n_samples",
         "n_runs",
         "first_published",
+        "year",
         "title",
         "study_accession",
         "organism",
@@ -5442,8 +5453,11 @@ LONGREAD_FACETS_SQL = (
 
 
 # Shared by the page and count queries. Static, so built once at import time.
-_LONGREAD_WHERE = build_filtered_where(
-    LONGREAD_ARRAY_FILTERS, LONGREAD_SCALAR_FILTERS, LONGREAD_BOOL_FILTERS
+_LONGREAD_WHERE = (
+    build_filtered_where(
+        LONGREAD_ARRAY_FILTERS, LONGREAD_SCALAR_FILTERS, LONGREAD_BOOL_FILTERS
+    )
+    + _search_clause()
 )
 
 
@@ -5454,14 +5468,16 @@ def build_longread_count_sql() -> str:
 
 
 def build_longread_projects_sql(
-    sort: str = "n_experiments", descending: bool = True
+    sort: str = "year", descending: bool = True
 ) -> str:
     """One page of long-read studies; sort is validated against LONGREAD_SORTABLE
-    before it reaches this string."""
+    before it reaches this string. Ties break by n_samples, then study_accession,
+    so results are never left in arbitrary/accession-only order."""
     if sort not in LONGREAD_SORTABLE:
         msg = f"unsortable column {sort!r}"
         raise ValueError(msg)
     direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
     return f"""
 SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.instrument_models, r.library_strategies,
@@ -5472,7 +5488,7 @@ SELECT r.study_accession, r.accessions, r.archives, r.technologies, r.platforms,
        r.chemistries, r.n_chemistry_runs, r.n_chemistry_exact
 FROM longread_study r
 WHERE TRUE{_LONGREAD_WHERE}
-ORDER BY r.{sort} {direction}, r.study_accession
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
@@ -5528,8 +5544,11 @@ SINGLECELL_FACETS_SQL = (
 )
 
 # Shared by the page and count queries. Static, so built once at import time.
-_SINGLECELL_WHERE = build_filtered_where(
-    SINGLECELL_ARRAY_FILTERS, SINGLECELL_SCALAR_FILTERS, SINGLECELL_BOOL_FILTERS
+_SINGLECELL_WHERE = (
+    build_filtered_where(
+        SINGLECELL_ARRAY_FILTERS, SINGLECELL_SCALAR_FILTERS, SINGLECELL_BOOL_FILTERS
+    )
+    + _search_clause()
 )
 
 
@@ -5538,14 +5557,17 @@ def build_singlecell_count_sql() -> str:
 
 
 def build_singlecell_projects_sql(
-    sort: str = "n_samples", descending: bool = True
+    sort: str = "year", descending: bool = True
 ) -> str:
     """One page of single-cell studies; sort is validated against
-    SINGLECELL_SORTABLE before it reaches this string."""
+    SINGLECELL_SORTABLE before it reaches this string. Ties break by n_samples,
+    then study_accession, so results are never left in arbitrary/accession-only
+    order."""
     if sort not in SINGLECELL_SORTABLE:
         msg = f"unsortable column {sort!r}"
         raise ValueError(msg)
     direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
     return f"""
 SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
        r.single_cell_modality, r.chemistries, r.cell_or_nucleus, r.assay_l1,
@@ -5554,10 +5576,81 @@ SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
        r.intervention_kind, r.is_pooled, r.country, r.pmid, r.year
 FROM singlecell_study r
 WHERE TRUE{_SINGLECELL_WHERE}
-ORDER BY r.{sort} {direction}, r.study_accession
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
+
+# Country collection: any archive/technology, scoped by declared submitter
+# country. Built by scripts/create_country_matview.sh from unified_metadata +
+# study_download_summary; see that script for why it isn't a live query.
+
+COUNTRY_SCALAR_FILTERS = {
+    "organism": "organism",
+    "assay_l1": "assay_l1",
+    "source": "source",
+}
+COUNTRY_BOOL_FILTERS = ("has_fastq", "has_sra", "is_single_cell")
+COUNTRY_SORTABLE = frozenset(
+    {"n_samples", "n_experiments", "year", "title", "study_accession", "organism"}
+)
+
+# Precomputed by scripts/create_country_matview.sh; a live aggregate over
+# country_study costs as much as the largest country.
+COUNTRY_SUMMARY_SQL = """
+SELECT studies, samples, experiments, studies_with_fastq, studies_with_sra,
+       studies_human, studies_single_cell, studies_long_read, n_organisms,
+       first_year, last_year
+FROM country_summary
+WHERE country_code_iso2 = %(code)s;
+"""
+
+COUNTRY_FACETS_SQL = (
+    "SELECT facet, value, studies FROM country_facet "
+    "WHERE country_code_iso2 = %(code)s ORDER BY facet, studies DESC;"
+)
+
+# Shared by the page and count queries. Static, so built once at import time.
+_COUNTRY_WHERE = (
+    build_filtered_where({}, COUNTRY_SCALAR_FILTERS, COUNTRY_BOOL_FILTERS)
+    + _search_clause()
+)
+
+
+def build_country_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM country_study r WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE};"  # noqa: S608
+
+
+def build_country_projects_sql(sort: str = "year", descending: bool = True) -> str:
+    """One page of a country's studies; sort is validated against
+    COUNTRY_SORTABLE before it reaches this string. Ties break by n_samples,
+    then study_accession, so results are never left in arbitrary/accession-only
+    order."""
+    if sort not in COUNTRY_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.assay_l1, r.assay_l2, r.source,
+       r.n_samples, r.n_experiments, r.is_single_cell, r.single_cell_modality,
+       r.center_name, r.pmid, r.year,
+       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs,
+       sc.has_matrix, sc.n_cells,
+       (lr.study_accession IS NOT NULL) AS has_long_read, lr.technologies
+FROM country_study r
+LEFT JOIN singlecell_study sc ON sc.study_accession = r.study_accession
+LEFT JOIN longread_study lr ON lr.study_accession = r.study_accession
+WHERE r.country_code_iso2 = %(code)s{_COUNTRY_WHERE}
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
+
+
+COUNTRY_POINTS_SQL = (
+    "SELECT lat, lng, n FROM country_points "
+    "WHERE country_code_iso2 = %(code)s ORDER BY n DESC;"
+)
 
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary_v5;"
 ENRICHED_COLUMN_VALUES_SQL = (
@@ -6592,10 +6685,29 @@ _PENTIMENTO_STUDY_COLS = """p.study_accession, p.source, p.title, p.study_cells,
        p.n_runs_preflightx, p.n_runs_measurable, p.has_metadata, p.has_celltype,
        p.has_donor, p.has_demographics"""
 
+# Field names of the above, used to build an all-None placeholder study row.
+PENTIMENTO_STUDY_FIELDS = [
+    c.strip().split(".")[-1] for c in _PENTIMENTO_STUDY_COLS.split(",")
+] + ["flags"]
+
 PENTIMENTO_STUDY_SQL = f"""
 SELECT {_PENTIMENTO_STUDY_COLS}, p.flags
 FROM pentimento_study p
 WHERE p.study_accession = %s;
+"""
+
+# Same pentimento_sample/pentimento_run linkage PENTIMENTO_SAMPLE_CELLS_SQL
+# checks, without building sample rows.
+PENTIMENTO_LINKAGE_EXISTS_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM pentimento_sample WHERE study_accession = %(acc)s
+) OR EXISTS (
+    SELECT 1
+    FROM pentimento_run r
+    LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
+    WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
+      AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
+) AS linked;
 """
 
 # ORDER BY keeps LIMIT/OFFSET paging stable
