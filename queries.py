@@ -5467,9 +5467,7 @@ def build_longread_count_sql() -> str:
     )
 
 
-def build_longread_projects_sql(
-    sort: str = "year", descending: bool = True
-) -> str:
+def build_longread_projects_sql(sort: str = "year", descending: bool = True) -> str:
     """One page of long-read studies; sort is validated against LONGREAD_SORTABLE
     before it reaches this string. Ties break by n_samples, then study_accession,
     so results are never left in arbitrary/accession-only order."""
@@ -5556,9 +5554,7 @@ def build_singlecell_count_sql() -> str:
     return f"SELECT count(*) AS total FROM singlecell_study r WHERE TRUE{_SINGLECELL_WHERE};"  # noqa: S608
 
 
-def build_singlecell_projects_sql(
-    sort: str = "year", descending: bool = True
-) -> str:
+def build_singlecell_projects_sql(sort: str = "year", descending: bool = True) -> str:
     """One page of single-cell studies; sort is validated against
     SINGLECELL_SORTABLE before it reaches this string. Ties break by n_samples,
     then study_accession, so results are never left in arbitrary/accession-only
