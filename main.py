@@ -8054,6 +8054,24 @@ _SUPP_AE_SQL = """
 _SUPP_GEA_SQL = (
     "SELECT data_files AS supplementary_data FROM gea_experiments WHERE accession = %s"
 )
+_GENE_CORRUPTION_SQL = (
+    "SELECT url, n_hits, kinds, examples, checked_at "
+    "FROM supplementary_file_gene_corruption WHERE accession = %s"
+)
+
+
+def _gene_corruption_by_url(cur, accession: str) -> dict:
+    """GEO URLs are stored as raw ftp://; normalize like get_supplementary_files or GEO rows never match."""
+    cur.execute(_GENE_CORRUPTION_SQL, (accession,))
+    out = {}
+    for row in cur.fetchall():
+        out[_ftp_to_https(row["url"])] = {
+            "n_hits": row["n_hits"],
+            "kinds": row["kinds"],
+            "examples": row["examples"],
+            "checked_at": row["checked_at"].isoformat() if row["checked_at"] else None,
+        }
+    return out
 
 
 def _ftp_to_https(url: str) -> str:
@@ -8131,6 +8149,9 @@ def get_supplementary_files(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, (accession,))
                 row = cur.fetchone()
+                corruption_by_url = (
+                    _gene_corruption_by_url(cur, accession) if row else {}
+                )
     except Exception:
         logger.exception("Error fetching supplementary data for %s", accession)
         raise HTTPException(500, "Internal server error")
@@ -8149,6 +8170,8 @@ def get_supplementary_files(
                 "filename": f["filename"],
                 "path": path,
                 "download_command": _download_command("curl", f["url"], path),
+                # null means not yet scanned for Excel gene-symbol autocorrupt
+                "gene_corruption": corruption_by_url.get(f["url"]),
             }
         )
 
@@ -12243,6 +12266,21 @@ def list_single_cell_studies(
     }
 
 
+# display spelling of chemistry_confidence ("bucket" -> "estimated")
+_CHEMISTRY_CONFIDENCE_LABELS = {
+    "exact": "exact",
+    "declared": "declared",
+    "bucket": "estimated",
+}
+
+
+def _attach_chemistry_confidence_label(runs: list[dict]) -> None:
+    for r in runs:
+        r["chemistry_confidence_label"] = _CHEMISTRY_CONFIDENCE_LABELS.get(
+            r["chemistry_confidence"], "unknown"
+        )
+
+
 @api_app.get(
     "/project/{accession}/longread-chemistry",
     summary="Get PacBio/Oxford Nanopore chemistry calls for this study's runs",
@@ -12253,7 +12291,9 @@ def list_single_cell_studies(
         "BAM's own header, `declared` (ONT only) when parsed from the "
         "depositor's own protocol text, `bucket` when inferred from "
         "instrument_model alone (never publication date), `unknown` "
-        "otherwise. `runs` is `[]`, not a 404, when the study has no "
+        "otherwise. `chemistry_confidence_label` spells the same tier for "
+        'display (`bucket` -> "estimated"); sort or filter on the raw '
+        "value instead. `runs` is `[]`, not a 404, when the study has no "
         "long-read runs.\n\n"
     ),
     operation_id="get_project_longread_chemistry",
@@ -12273,6 +12313,7 @@ def get_project_longread_chemistry(
     except Exception:
         logger.exception("Database error in get_project_longread_chemistry")
         raise HTTPException(500, "Internal server error")
+    _attach_chemistry_confidence_label(runs)
     return {"accession": accession.upper(), "runs": runs}
 
 
@@ -12300,7 +12341,9 @@ _EMPTY_PENTIMENTO_STUDY = dict.fromkeys(PENTIMENTO_STUDY_FIELDS)
         "submitted BAM's own header, `declared` (ONT only) when parsed "
         "from the depositor's own protocol text, `bucket` when inferred "
         "from instrument_model alone (never publication date, which does "
-        "not reflect sequencing date), `unknown` otherwise. Empty when the "
+        "not reflect sequencing date), `unknown` otherwise. "
+        "`chemistry_confidence_label` spells the same tier for display "
+        '(`bucket` -> "estimated"). Empty when the '
         "study has no long-read runs.\n\n"
     ),
     operation_id="get_project_single_cell",
@@ -12343,6 +12386,7 @@ def get_project_single_cell(
                 if not offset:
                     cur.execute(LONGREAD_CHEMISTRY_SQL, {"acc": resolved})
                     longread_chemistry = cur.fetchall()
+                    _attach_chemistry_confidence_label(longread_chemistry)
     except HTTPException:
         raise
     except Exception:
