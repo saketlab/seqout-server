@@ -101,6 +101,7 @@ from queries import (
     ENRICHED_CROSSTAB_SQL,
     ENRICHED_SAMPLES_SQL,
     ENRICHED_STAT_COLUMNS,
+    ENRICHED_STUDY_FAST_SQL,
     ENRICHED_STUDY_SQL,
     ENRICHED_STUDY_V4_SQL,
     ENRICHED_SUMMARY_SQL,
@@ -180,6 +181,7 @@ from queries import (
     LIST_LIBRARY_STRATEGIES_SQL,
     LIST_ORGANISMS_SQL,
     LIST_ORGANISMS_WITH_COMMON_NAMES_SQL,
+    ONTOLOGY_SAMPLES_FAST_SQL,
     ONTOLOGY_SAMPLES_V4_SQL,
     ORGANISM_SEARCH_SQL,
     ORGANISM_TOTALS_SQL,
@@ -6049,9 +6051,10 @@ def get_project(
                     if ENRICHMENT_ENABLED:
                         cur.execute(
                             "SELECT EXISTS(SELECT 1 FROM ontology_samples_v5 WHERE study_accession = %s)"
+                            " OR EXISTS(SELECT 1 FROM ontology_samples_fast WHERE study_accession = %s)"
                             " OR EXISTS(SELECT 1 FROM enriched_samples WHERE study_accession = %s)"
                             " AS has_enriched",
-                            (enrich_acc, enrich_acc),
+                            (enrich_acc, enrich_acc, enrich_acc),
                         )
                         row["has_enriched"] = bool(cur.fetchone()["has_enriched"])
                     else:
@@ -12033,7 +12036,9 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         "Return structured metadata extracted by LLM with ontology mappings. "
         "Fields include tissue, cell_type, disease, assay, development_stage "
         "each with standardised ontology IDs (UBERON, CL, MONDO, EFO). "
-        "Falls back to legacy enriched_samples if v4 data is unavailable. "
+        "Falls back through the embedding-only tier ('version': 'fast') to "
+        "legacy enriched_samples ('version': 'v1') if the LLM pipeline has "
+        "no row for this accession. "
         "Use alongside metadata/rows when raw run/sample fields or FASTQ links "
         "are also needed."
     ),
@@ -12680,14 +12685,23 @@ def _fetch_project_enriched(
         )
         version = "v4"
     else:
-        cur.execute(ENRICHED_STUDY_SQL, (accession,))
+        # fast transfer commits study and sample rows independently; a study row can land with no samples yet
+        cur.execute(ENRICHED_STUDY_FAST_SQL, (accession,))
         study = cur.fetchone()
-        if not study:
-            raise HTTPException(404, f"No enriched metadata for {accession}")
-        samples = _exec_enriched_samples(
-            cur, ENRICHED_SAMPLES_SQL, accession, page_limit, offset
-        )
-        version = "v1"
+        if study and study["n_samples"] > 0:
+            samples = _exec_enriched_samples(
+                cur, ONTOLOGY_SAMPLES_FAST_SQL, accession, page_limit, offset
+            )
+            version = "fast"
+        else:
+            cur.execute(ENRICHED_STUDY_SQL, (accession,))
+            study = cur.fetchone()
+            if not study:
+                raise HTTPException(404, f"No enriched metadata for {accession}")
+            samples = _exec_enriched_samples(
+                cur, ENRICHED_SAMPLES_SQL, accession, page_limit, offset
+            )
+            version = "v1"
 
     if sample_filter is not None:
         samples = [s for s in samples if s.get("sample") in sample_filter]

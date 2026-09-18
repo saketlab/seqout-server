@@ -5897,27 +5897,26 @@ WHERE es.study_accession = %s
 ORDER BY es.sample;
 """
 
-# st.n_samples counts enrichment input rows, which are per GEO channel: a
-# two-colour array study reports double its sample count. Count the rows we
-# actually serve instead; study_accession is indexed, so it is free.
-ENRICHED_STUDY_SQL = """
-SELECT st.accession, st.title,
-       (SELECT count(*) FROM enriched_samples es
-        WHERE es.study_accession = st.accession) AS n_samples,
-       NULL AS single_cell_modality
-FROM enriched_studies st
+
+def _enriched_study_sql(
+    study_table: str, samples_table: str, modality: str = "NULL"
+) -> str:
+    """Study summary row (accession, title, modality, n_samples) for a study page."""
+    return f"""
+SELECT st.accession, st.title, {modality} AS single_cell_modality,
+       (SELECT count(*) FROM {samples_table} s
+        WHERE s.study_accession = st.accession) AS n_samples
+FROM {study_table} st
 WHERE st.accession = %s;
 """
 
 
-# n_samples counted from the served rows; see ENRICHED_STUDY_SQL above.
-ENRICHED_STUDY_V4_SQL = """
-SELECT st.accession, st.title, st.single_cell_modality,
-       (SELECT count(*) FROM ontology_samples_v5 os
-        WHERE os.study_accession = st.accession) AS n_samples
-FROM enriched_studies_v5 st
-WHERE st.accession = %s;
-"""
+# n_samples counts served rows, not raw input rows: two-colour arrays report per channel and would double-count
+ENRICHED_STUDY_SQL = _enriched_study_sql("enriched_studies", "enriched_samples")
+
+ENRICHED_STUDY_V4_SQL = _enriched_study_sql(
+    "enriched_studies_v5", "ontology_samples_v5", "st.single_cell_modality"
+)
 
 
 # One row per matrix; per-matrix quantiles differ.
@@ -6023,8 +6022,6 @@ SELECT EXISTS(
 )
 
 
-# Backs /stats/tissue-microbes. The matview carries its own studies >= 2 and
-# screened >= 200 gates; see sql/tissue_microbe_rates.sql.
 TISSUE_MICROBE_RATES_SQL = """
 SELECT tissue, uberon, organism, class, is_background, is_endogenous,
        screened, positives, positives_confirmed, studies, rate_pct
@@ -6068,7 +6065,9 @@ LEFT JOIN LATERAL (
 ) pc ON TRUE"""
 
 
-ONTOLOGY_SAMPLES_V4_SQL = f"""
+def _ontology_samples_sql(table: str) -> str:
+    """Ontology-enriched sample rows for a study page, keyed by source table."""
+    return f"""
 SELECT
     os.sample, os.age, os.sex, os.ethnicity, os.phenotype,
     os.cell_type, os.tissue, os.strain, os.disease, os.assay,
@@ -6081,10 +6080,19 @@ SELECT
     os.cell_type_ontology_id, os.cell_type_ontology_name,
     os.assay_ontology_id, os.assay_ontology_name,
     os.development_stage_ontology_id, os.development_stage_ontology_name
-FROM ontology_samples_v5 os{_pentimento_counts_lateral("os.sample")}
+FROM {table} os{_pentimento_counts_lateral("os.sample")}
 WHERE os.study_accession = %s
 ORDER BY os.sample;
 """
+
+
+ONTOLOGY_SAMPLES_V4_SQL = _ontology_samples_sql("ontology_samples_v5")
+
+ENRICHED_STUDY_FAST_SQL = _enriched_study_sql(
+    "enriched_studies_fast", "ontology_samples_fast"
+)
+
+ONTOLOGY_SAMPLES_FAST_SQL = _ontology_samples_sql("ontology_samples_fast")
 # Low-confidence tags per sample within a study
 LOW_CONFIDENCE_TAGS_SQL = """
 SELECT sample_accession, tags
