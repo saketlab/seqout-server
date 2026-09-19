@@ -14036,15 +14036,38 @@ mcp_api_app.router.routes.extend(
     and route.operation_id not in MCP_EXCLUDED_OPERATION_IDS
 )
 
-_MCP_TOOL_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+_MCP_TITLE_ACRONYMS = {
+    "ae": "ArrayExpress",
+    "geo": "GEO",
+    "sra": "SRA",
+    "ena": "ENA",
+    "pi": "PI",
+    "pis": "PIs",
+    "nl": "NL",
+    "sc": "SC",
+    "csv": "CSV",
+    "bams": "BAMs",
+    "xref": "Cross-References",
+    "prj": "PRJ",
+    "l1": "L1",
+    "l2": "L2",
+}
+
+
+def _mcp_annotate(route, component) -> None:
+    title = " ".join(
+        _MCP_TITLE_ACRONYMS.get(w, w.capitalize()) for w in component.name.split("_")
+    )
+    component.annotations = ToolAnnotations(
+        title=title, readOnlyHint=True, openWorldHint=True
+    )
+
 
 mcp = FastMCP.from_fastapi(
     app=mcp_api_app,
     name="seqout MCP",
     instructions=MCP_INSTRUCTIONS_ACTIVE,
-    mcp_component_fn=lambda route, component: setattr(
-        component, "annotations", _MCP_TOOL_ANNOTATIONS
-    ),
+    mcp_component_fn=_mcp_annotate,
 )
 
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
