@@ -107,7 +107,13 @@ from queries import (
     ENRICHED_SUMMARY_SQL,
     DISEASE_ALIAS_LOOKUP_SQL,
     DISEASE_COLLECTIONS,
+    ONTOLOGY_TERM_SORTABLE,
     UPPER_ONTOLOGY_TERMS,
+    build_ontology_term_count_sql,
+    build_ontology_term_facets_sql,
+    build_ontology_term_projects_sql,
+    build_ontology_term_summary_sql,
+    resolve_ontology_term,
     DEFAULT_SCOPE,
     SCOPES,
     SORTABLE,
@@ -719,6 +725,9 @@ _pentimento_overview_cache_lock = threading.Lock()
 _pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _tissue_microbes_cache_lock = threading.Lock()
 _tissue_microbes_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_MAX_ONTOLOGY_TERM_CACHE_ENTRIES = 500
+_ontology_term_cache_lock = threading.Lock()
+_ontology_term_cache: dict[tuple[str, str], dict] = {}
 _sc_quality_cache_lock = threading.Lock()
 _sc_quality_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _sc_quality_samples_lock = threading.Lock()
@@ -3199,6 +3208,8 @@ def purge_cache(request: Request):
         _country_pis_cache.clear()
     with _organism_growth_cache_lock:
         _organism_growth_cache.clear()
+    with _ontology_term_cache_lock:
+        _ontology_term_cache.clear()
     with _organisms_list_cache_lock:
         _organisms_list_cache.clear()
     with _organism_totals_cache_lock:
@@ -11006,16 +11017,78 @@ def get_last_updated(
 
 # Regexes expose valid values in the OpenAPI/MCP schema.
 _SCOPE_PATTERN = f"^({'|'.join(sorted(SCOPES))})$"
-_SORT_PATTERN = f"^({'|'.join(sorted(SORTABLE))})$"
+_SORT_PATTERN = f"^({'|'.join(sorted(SORTABLE | ONTOLOGY_TERM_SORTABLE))})$"
 
 
-def _collection(name: str) -> None:
-    if name not in DISEASE_COLLECTIONS:
-        raise HTTPException(
-            404,
-            f"Unknown disease collection '{name}'. "
-            f"Available: {', '.join(sorted(DISEASE_COLLECTIONS))}",
+def _resolve_ontology_term_cached(cur, kind: str, term: str) -> dict:
+    """Resolution only changes on a matview rebuild, but each page view calls
+    it up to 3 times (summary, facets, projects)."""
+    key = (kind, re.sub(r"[^a-z0-9]+", "", term.lower()))
+    with _ontology_term_cache_lock:
+        hit = _get_bounded_cache_entry(_ontology_term_cache, key, _GROWTH_CACHE_TTL)
+    if hit is not None:
+        return hit
+    resolved = resolve_ontology_term(cur, kind, term)
+    with _ontology_term_cache_lock:
+        _set_bounded_cache_entry(
+            _ontology_term_cache,
+            key,
+            resolved,
+            _MAX_ONTOLOGY_TERM_CACHE_ENTRIES,
+            _GROWTH_CACHE_TTL,
         )
+    return resolved
+
+
+_ONTOLOGY_TERM_404 = {
+    "tissue": "'{term}' does not match any UBERON tissue term.",
+    "disease": (
+        "'{term}' is neither a disease collection "
+        f"({', '.join(sorted(DISEASE_COLLECTIONS))}) nor a MONDO term."
+    ),
+}
+
+
+def _resolve_or_404(cur, kind: str, term: str) -> dict:
+    """404 on no match so a typo is not an empty result."""
+    resolved = _resolve_ontology_term_cached(cur, kind, term)
+    if not resolved["ids"]:
+        raise HTTPException(404, _ONTOLOGY_TERM_404[kind].format(term=term))
+    return resolved
+
+
+def _resolution_meta(resolved: dict) -> dict:
+    return {k: resolved[k] for k in ("resolution", "matched_labels")}
+
+
+def _ontology_summary(kind: str, term: str) -> dict:
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            resolved = _resolve_or_404(cur, kind, term)
+            cur.execute(build_ontology_term_summary_sql(kind), {"ids": resolved["ids"]})
+            row = cur.fetchone()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in %s summary", kind)
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, f"{kind} stats not available")
+    return {**row, "term": term, **_resolution_meta(resolved)}
+
+
+def _ontology_facets(kind: str, term: str) -> dict[str, list]:
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            resolved = _resolve_or_404(cur, kind, term)
+            cur.execute(build_ontology_term_facets_sql(kind), {"ids": resolved["ids"]})
+            rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in %s facets", kind)
+        raise HTTPException(500, "Internal server error")
+    return _facet_rows_to_dict(rows)
 
 
 @api_app.get(
@@ -11031,7 +11104,8 @@ def _collection(name: str) -> None:
 )
 @limiter.limit("60/minute")
 def get_disease_summary(request: Request, collection: str):
-    _collection(collection)
+    if collection not in DISEASE_COLLECTIONS:
+        return _ontology_summary("disease", collection)
     sql = build_disease_summary_sql(collection)
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11065,7 +11139,8 @@ def _facet_rows_to_dict(rows) -> dict[str, list]:
 )
 @limiter.limit("60/minute")
 def get_disease_facets(request: Request, collection: str):
-    _collection(collection)
+    if collection not in DISEASE_COLLECTIONS:
+        return _ontology_facets("disease", collection)
     sql = build_disease_facets_sql(collection)
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -11359,7 +11434,7 @@ def _country_code(code: str) -> str:
     description=(
         "Rounded lat/lng clusters with study counts for this country's "
         "submitting institutions, for map rendering (e.g. the OG image). "
-        "Built by scripts/create_country_matview.sh."
+        "Built by seqout-ingestion's sql/matviews/create_country_matview.sh."
     ),
     operation_id="get_country_points",
 )
@@ -11483,6 +11558,178 @@ def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     }
 
 
+_TISSUE_SORT_PATTERN = f"^({'|'.join(sorted(ONTOLOGY_TERM_SORTABLE))})$"
+
+
+@api_app.get(
+    "/tissue/{term}/summary",
+    summary="Per-tissue corpus totals",
+    description=(
+        "Corpus-wide totals for studies with at least one sample annotated "
+        "with a tissue matching `term`, resolved through UBERON ids and their "
+        "descendants (e.g. 'blood' also reaches 'whole blood', 'peripheral "
+        "blood mononuclear cell', ...). `resolution` says whether the term "
+        "matched an UBERON label exactly or only as a substring; "
+        "`matched_labels` lists the matches. `matched_samples` counts "
+        "samples resolved to one of the matched ids; `samples` is the "
+        "matching studies' total across all annotations."
+    ),
+    operation_id="get_tissue_summary",
+)
+@limiter.limit("60/minute")
+def get_tissue_summary(request: Request, term: str):
+    return _ontology_summary("tissue", term)
+
+
+def _ontology_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    kind: str,
+    term: str,
+    filters: dict,
+    *,
+    q: str | None,
+    sort: str | None,
+    order: str,
+    limit: int,
+    cursor_sort: str | None,
+    cursor_acc: str | None,
+) -> dict:
+    """Keyset-paginated projects page for /tissue/{term} and free-text /disease/{term}."""
+    sort = sort or "pub_date"
+    if sort not in ONTOLOGY_TERM_SORTABLE:
+        raise HTTPException(400, f"sort={sort!r} is not a valid sort for a {kind} term")
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            resolved = _resolve_or_404(cur, kind, term)
+            page = _ontology_term_page(
+                cur,
+                kind,
+                {
+                    **filters,
+                    "ids": resolved["ids"],
+                    "q": q,
+                    "cursor_sort": cursor_sort,
+                    "cursor_acc": cursor_acc,
+                },
+                sort,
+                order == "desc",
+                limit,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Database error in %s projects", kind)
+        raise HTTPException(500, "Internal server error")
+    meta = _resolution_meta(resolved)
+    return {"term": term, "order": order, "sort": sort, **meta, **page}
+
+
+def _ontology_term_page(
+    cur, kind: str, params: dict, sort: str, descending: bool, limit: int
+) -> dict:
+    cur.execute(build_ontology_term_count_sql(kind), params)
+    total = cur.fetchone()["total"]
+    # limit + 1: the extra row proves a next page exists
+    cur.execute(
+        build_ontology_term_projects_sql(kind, sort, descending),
+        {**params, "limit": limit + 1},
+    )
+    rows = cur.fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = {
+            "sort_value": last["sort_val"],
+            "accession": last["study_accession"],
+        }
+    for r in rows:
+        r.pop("sort_val", None)
+    return {
+        "total": total,
+        "count": len(rows),
+        "next_cursor": next_cursor,
+        "results": rows,
+    }
+
+
+@api_app.get(
+    "/tissue/{term}/facets",
+    summary="Per-tissue facet counts",
+    description=(
+        "Study counts per organism, assay category, archive, journal, "
+        "submitter country, year, FASTQ/single-cell/long-read status for "
+        "studies matching `term`. Values feed the filters of "
+        "/tissue/{term}/projects."
+    ),
+    operation_id="get_tissue_facets",
+)
+@limiter.limit("60/minute")
+def get_tissue_facets(request: Request, term: str):
+    return _ontology_facets("tissue", term)
+
+
+@api_app.get(
+    "/tissue/{term}/projects",
+    summary="Studies with samples in a tissue",
+    description=(
+        "One row per study with a sample annotated with a tissue matching "
+        "`term`. `has_fastq`/`has_sra` are NULL when the study is absent from "
+        "the download-links table, which means unknown. `n_samples_with_tissue` "
+        "counts every sample the study has any resolved tissue for; "
+        "/tissue/{term}/summary's matched_samples gives the matching count. "
+        "`q` matches title or study_accession (case-insensitive substring). "
+        "Sort with sort= and order=; `total` is the filtered study count, "
+        "`count` is this page. Paginated by cursor: pass `cursor_sort`/"
+        "`cursor_acc` from the previous page's `next_cursor` (null on the "
+        "last page), as with /search's sortby pagination."
+    ),
+    operation_id="get_tissue_projects",
+)
+@limiter.limit("60/minute")
+def get_tissue_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    term: str,
+    organism: str | None = None,
+    assay_l1: str | None = None,
+    source: str | None = None,
+    journal: str | None = None,
+    country: str | None = None,
+    has_fastq: bool | None = None,
+    has_sra: bool | None = None,
+    is_single_cell: bool | None = None,
+    is_long_read: bool | None = None,
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("pub_date", pattern=_TISSUE_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    cursor_sort: str | None = Query(None),
+    cursor_acc: str | None = Query(None),
+):
+    filters = {
+        "organism": organism,
+        "assay_l1": assay_l1,
+        "source": source,
+        "journal": journal,
+        "country": country,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_single_cell": is_single_cell,
+        "is_long_read": is_long_read,
+    }
+    return _ontology_projects(
+        "tissue",
+        term,
+        filters,
+        q=q,
+        sort=sort,
+        order=order,
+        limit=limit,
+        cursor_sort=cursor_sort,
+        cursor_acc=cursor_acc,
+    )
+
+
 @api_app.get(
     "/disease/aliases",
     summary="Resolve a disease name to its MONDO ids",
@@ -11541,7 +11788,10 @@ def get_disease_aliases(
         "`scope` defaults to human_primary (human material that is neither an "
         "immortalized line nor a derived model); use patient_derived_model, "
         "cell_line, or all to see what that excludes. Every row carries the "
-        "full set of scope counters either way, so nothing is hidden."
+        "full set of scope counters either way, so nothing is hidden. "
+        "A free-text term (not `rare`/`nord`) is paginated by cursor: pass "
+        "`cursor_sort`/`cursor_acc` from the previous page's `next_cursor` "
+        "(null on the last page)."
     ),
     operation_id="get_disease_projects",
 )
@@ -11560,14 +11810,45 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     disease: str | None = None,
     assay_category: str | None = None,
     organism: str | None = None,
+    assay_l1: str | None = None,
+    source: str | None = None,
+    journal: str | None = None,
+    country: str | None = None,
+    is_single_cell: bool | None = None,
+    is_long_read: bool | None = None,
     q: str | None = Query(None, max_length=200),
     scope: str = Query(DEFAULT_SCOPE, pattern=_SCOPE_PATTERN),
-    sort: str = Query("cells", pattern=_SORT_PATTERN),
+    sort: str | None = Query(None, pattern=_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    cursor_sort: str | None = Query(None),
+    cursor_acc: str | None = Query(None),
 ):
-    _collection(collection)
+    filters = {
+        "organism": organism,
+        "assay_l1": assay_l1,
+        "source": source,
+        "journal": journal,
+        "country": country,
+        "has_fastq": has_fastq,
+        "has_sra": has_sra,
+        "is_single_cell": is_single_cell,
+        "is_long_read": is_long_read,
+    }
+    if collection not in DISEASE_COLLECTIONS:
+        page = _ontology_projects(
+            "disease",
+            collection,
+            filters,
+            q=q,
+            sort=sort,
+            order=order,
+            limit=limit,
+            cursor_sort=cursor_sort,
+            cursor_acc=cursor_acc,
+        )
+        return {"collection": collection, **page}
     allowed = disease_projects_params(collection)
     supplied = {
         "category": category,
@@ -11576,11 +11857,9 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "nord_type": nord_type,
         "ancestry": ancestry,
         "inheritance": inheritance,
-        "has_fastq": has_fastq,
-        "has_sra": has_sra,
         "disease": disease,
         "assay_category": assay_category,
-        "organism": organism,
+        **filters,
     }
     # rejected: ignoring one returns an unfiltered page that looks filtered
     if bad := sorted(
@@ -11593,6 +11872,11 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         )
     params = {k: supplied[k] for k in allowed}
     params["q"] = q
+    sort = sort or "cells"
+    if sort not in SORTABLE:
+        raise HTTPException(
+            400, f"sort={sort!r} does not apply to collection '{collection}'"
+        )
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_disease_count_sql(collection, scope), params)
@@ -13456,8 +13740,6 @@ last page), so you can state the real cohort size. At least one filter is
 required. A broad cohort combined with a microbe filter is the slow shape; a 504
 means narrow it with organism or tissue rather than retrying unchanged.
 
-## Disease Cohorts
-
 ## Long-Read Sequencing
 
 For "long-read datasets" (PacBio, Oxford Nanopore), add `long_read=true` to
@@ -13473,6 +13755,8 @@ experiment in any archive. For the corpus itself use the collection tools:
   counts long-read experiments; `n_experiments_total` the study's total.
 Onso, PacBio's short-read instrument, is excluded from long read.
 
+## Disease Cohorts
+
 For "what data exists on <disease>", use the disease tools rather than a keyword
 search -- they resolve through MONDO ids and their descendants, so they find
 studies whose samples were annotated with a child term the user did not name.
@@ -13481,19 +13765,31 @@ Start with `get_disease_aliases(q)` to turn a disease name into MONDO ids. It
 returns `total` and `truncated` alongside the page, so a full page no longer
 hides further matches -- raise `limit` (max 100) or narrow `q` when truncated.
 Feed the MONDO ids to `search_enriched_samples(disease_ontology_id=...)` when
-the user wants the samples. Then
-use `collection=rare` (NIH GARD, matched by exact MONDO xref) or `collection=nord`
-(NORD, matched by name and therefore a looser, larger set). Say which one you
-used; they are not interchangeable.
+the user wants the samples. Otherwise call `get_disease_summary`/`_facets`/
+`_projects(collection, ...)` directly with one of:
+- `collection=rare` (NIH GARD, matched by exact MONDO xref) or `collection=nord`
+  (NORD, matched by name, so a looser and larger set). Say which one you used;
+  they are not interchangeable.
+- a free-text disease name or MONDO id (e.g. `collection="fatty liver
+  disease"`). The server matches the full MONDO ontology (exact label if one
+  exists, else substring) and its descendants. `resolution` in the summary says
+  which; `matched_labels` lists the matches. A 404 means nothing in MONDO
+  matches; try a broader or differently spelled term.
+
+The two modes return different row shapes.
 
 - `get_disease_summary(collection)`: corpus totals for that collection.
 - `get_disease_facets(collection)`: the valid filter values. Call it before
   `get_disease_projects` -- filters a collection does not carry are rejected.
-- `get_disease_projects(collection, ...)`: one row per study with its per-sample
-  rollup. Sort with `sort=` over cells, n_samples, n_diseases, title,
-  study_accession, assay_category, organism, plus `order=`.
+- `get_disease_projects(collection, ...)`: one row per study.
+  - `rare`/`nord`: the per-sample rollup (cells, sex, ancestry, inheritance).
+    Sort with `sort=` over cells, n_samples, n_diseases, title,
+    study_accession, assay_category, organism, plus `order=`.
+  - a free-text term: organism/assay/journal/country/FASTQ/single-cell/
+    long-read, matching `get_tissue_projects` below. Sort with `sort=` over
+    n_samples, n_experiments, pub_date, title, study_accession, organism.
 
-Reading the rows honestly matters more here than elsewhere:
+Reading the `rare`/`nord` rows honestly matters more here than elsewhere:
 - `scope` defaults to `human_primary` (human material that is neither an
   immortalized line nor a derived model). `patient_derived_model`, `cell_line`,
   and `all` show what that excludes. Every row carries all scope counters, so
@@ -13508,6 +13804,36 @@ Reading the rows honestly matters more here than elsewhere:
   such.
 - `inheritance` comes from HPO, Orphanet and GARD. "Not applicable" means the
   disease has no Mendelian pattern, not that nobody looked.
+
+For a free-text term, `matched_samples` in the summary counts samples resolved
+to the matched MONDO ids; `samples` on summary and project rows is the study's
+total across every annotation.
+
+## Tissue Collection
+
+For "what data exists on <tissue>" (e.g. liver, blood, pancreatic islet), use
+`get_tissue_summary`/`_facets`/`_projects(term, ...)` rather than a keyword
+search. `term` resolves like a free-text disease: the full UBERON ontology
+(exact label first, else substring) and its descendants, so "blood" also
+reaches "whole blood" and "peripheral blood mononuclear cell". `resolution` in
+the summary says which matched; `matched_labels` lists the matches. A 404 means
+nothing in UBERON matches.
+
+- `get_tissue_summary(term)`: corpus totals. `matched_samples` counts samples
+  resolved to the matched UBERON ids; `samples` is the matching studies' total
+  across every tissue annotation.
+- `get_tissue_facets(term)`: valid filter values (organism, assay_l1, source,
+  journal, country, year, has_fastq, has_sra, is_single_cell, is_long_read).
+  Call it before `get_tissue_projects`.
+- `get_tissue_projects(term, ...)`: one row per study. `n_samples_with_tissue`
+  counts every sample the study has any resolved tissue for; use the summary's
+  `matched_samples` for the matching count. `has_fastq`/`has_sra` are NULL when
+  the study is absent from the download-links table, which means unknown. Sort
+  with `sort=` over n_samples, n_experiments, pub_date, title, study_accession,
+  organism, plus `order=`.
+
+Every tissue lookup goes through the UBERON resolution; there is no curated
+tissue catalogue.
 
 ## Single-Cell Counts And Microbial Signals
 
@@ -13636,11 +13962,14 @@ MCP_EXCLUDED_OPERATION_IDS = {
 ENRICHMENT_OPERATION_IDS = {
     "search_enriched_samples",
     "get_enriched_coverage",
-    # /disease/* is a rollup of ontology_samples_v5
+    # /disease/* and /tissue/* are rollups of ontology_samples_v5/_fast
     "get_disease_summary",
     "get_disease_facets",
     "get_disease_projects",
     "get_disease_aliases",
+    "get_tissue_summary",
+    "get_tissue_facets",
+    "get_tissue_projects",
     "get_enriched_stats",
     "get_enriched_crosstab",
     "get_enriched_column",

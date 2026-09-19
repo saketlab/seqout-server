@@ -1,6 +1,7 @@
 """SQL queries for pysradb-server"""
 
 import math
+import re
 
 from boolean_query import case_sensitive_sql
 
@@ -860,7 +861,7 @@ def _search_filter_clauses(
         params["year_to"] = year_to
     if case_sensitive_q:
         # Exact-case post-filter on the raw query, over title + summary only
-        # (the FTS also covers sample text; ponytail: add columns if that matters).
+        # (the FTS also covers sample text; add columns if that matters)
         cs_sql, cs_params = case_sensitive_sql(
             case_sensitive_q, "concat_ws(' ', matched.title, matched.summary)"
         )
@@ -5251,7 +5252,7 @@ def build_filtered_where(
     bool_filters: tuple[str, ...],
     alias: str = "r",
 ) -> str:
-    """AND clauses for array-contains, scalar-equals and bool-is-true filters,
+    """AND clauses for array-contains, scalar-equals and boolean-equals filters,
     skipped when their param is unset."""
     scalar_items = (
         scalar_filters.items()
@@ -5270,7 +5271,8 @@ def build_filtered_where(
             for param, col in scalar_items
         )
         + "".join(
-            f"\n      AND (%({c})s::boolean IS NOT TRUE OR {alias}.{c})"
+            f"\n      AND (%({c})s::boolean IS NULL"
+            f"\n           OR {alias}.{c} = %({c})s::boolean)"
             for c in bool_filters
         )
     )
@@ -5578,8 +5580,6 @@ LIMIT %(limit)s OFFSET %(offset)s;
 
 
 # Country collection: any archive/technology, scoped by declared submitter
-# country. Built by scripts/create_country_matview.sh from unified_metadata +
-# study_download_summary; see that script for why it isn't a live query.
 
 COUNTRY_SCALAR_FILTERS = {
     "organism": "organism",
@@ -5591,8 +5591,6 @@ COUNTRY_SORTABLE = frozenset(
     {"n_samples", "n_experiments", "year", "title", "study_accession", "organism"}
 )
 
-# Precomputed by scripts/create_country_matview.sh; a live aggregate over
-# country_study costs as much as the largest country.
 COUNTRY_SUMMARY_SQL = """
 SELECT studies, samples, experiments, studies_with_fastq, studies_with_sra,
        studies_human, studies_single_cell, studies_long_read, n_organisms,
@@ -5647,6 +5645,203 @@ COUNTRY_POINTS_SQL = (
     "SELECT lat, lng, n FROM country_points "
     "WHERE country_code_iso2 = %(code)s ORDER BY n DESC;"
 )
+
+
+# Behind /tissue/{term} and free-text /disease/{term};
+
+_ONTOLOGY_TERM_TABLES = {
+    "tissue": {
+        "ontology": "uberon",
+        "study_table": "tissue_study",
+        "term_table": "tissue_study_term",
+        "id_col": "tissue_ontology_id",
+        "ids_col": "tissue_ontology_ids",
+        "n_col": "n_samples_with_tissue",
+    },
+    "disease": {
+        "ontology": "mondo",
+        "study_table": "disease_study_ontology",
+        "term_table": "disease_study_ontology_term",
+        "id_col": "disease_ontology_id",
+        "ids_col": "disease_ontology_ids",
+        "n_col": "n_samples_with_disease",
+    },
+}
+
+_ONTOLOGY_TERM_SCALAR_FILTERS = {
+    "organism": "organism",
+    "assay_l1": "assay_l1",
+    "source": "source",
+    "journal": "journal",
+    "country": "country_code_iso2",
+}
+_ONTOLOGY_TERM_BOOL_FILTERS = ("has_fastq", "has_sra", "is_single_cell", "is_long_read")
+ONTOLOGY_TERM_SORTABLE = frozenset(
+    {"n_samples", "n_experiments", "pub_date", "title", "study_accession", "organism"}
+)
+
+
+def resolve_ontology_term(cur, kind: str, term: str) -> dict:
+    """Resolve free text to UBERON/MONDO ids plus all closure descendants.
+    Exact normalized-label match first; substring only as a fallback, since
+    "type 1" also matches "type 10".
+
+    Returns {"ids", "resolution" ('exact'|'substring'|'none'), "matched_labels"};
+    matched_labels are the matches before descendant expansion.
+    """
+    ontology = _ONTOLOGY_TERM_TABLES[kind]["ontology"]
+    normalized = re.sub(r"[^a-z0-9]+", "", term.lower())
+    if not normalized:
+        return {"ids": [], "resolution": "none", "matched_labels": []}
+
+    cur.execute(
+        "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
+        "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') = %(term)s",
+        {"ontology": ontology, "term": normalized},
+    )
+    seed = cur.fetchall()
+    resolution = "exact"
+    if not seed:
+        cur.execute(
+            "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
+            "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') "
+            "LIKE '%%' || %(term)s || '%%'",
+            {"ontology": ontology, "term": normalized},
+        )
+        seed = cur.fetchall()
+        resolution = "substring"
+    if not seed:
+        return {"ids": [], "resolution": "none", "matched_labels": []}
+
+    seed_ids = [row["id"] for row in seed]
+    cur.execute(
+        "SELECT DISTINCT descendant_id FROM ontology_closure "
+        "WHERE ontology = %(ontology)s AND ancestor_id = ANY(%(seed)s)",
+        {"ontology": ontology, "seed": seed_ids},
+    )
+    ids = sorted({row["descendant_id"] for row in cur.fetchall()} | set(seed_ids))
+    return {
+        "ids": ids,
+        "resolution": resolution,
+        "matched_labels": sorted({row["label"] for row in seed if row["label"]}),
+    }
+
+
+_ONTOLOGY_TERM_WHERE = (
+    build_filtered_where({}, _ONTOLOGY_TERM_SCALAR_FILTERS, _ONTOLOGY_TERM_BOOL_FILTERS)
+    + _search_clause()
+)
+
+# (sort_val expr, cursor cast); coalesce keeps sort_val non-null for keyset compare
+_ONTOLOGY_TERM_SORT_EXPR = {
+    "n_samples": ("coalesce(r.n_samples, 0)", "::int"),
+    "n_experiments": ("coalesce(r.n_experiments, 0)", "::int"),
+    "pub_date": ("coalesce(r.pub_date, '1970-01-01'::date)", "::date"),
+    "title": ("coalesce(r.title, '')", ""),
+    "organism": ("coalesce(r.organism, '')", ""),
+    "study_accession": ("r.study_accession", ""),
+}
+
+
+def build_ontology_term_summary_sql(kind: str) -> str:
+    """matched_samples is scoped to the resolved ids via *_study_term; the rest
+    are totals over every matching study."""
+    cfg = _ONTOLOGY_TERM_TABLES[kind]
+    return f"""
+SELECT count(*) AS studies,
+       sum(r.n_samples) AS samples,
+       sum(r.n_experiments) AS experiments,
+       (SELECT sum(n_samples) FROM {cfg["term_table"]}
+         WHERE {cfg["id_col"]} = ANY(%(ids)s)) AS matched_samples,
+       count(*) FILTER (WHERE r.has_fastq) AS studies_with_fastq,
+       count(*) FILTER (WHERE r.has_sra) AS studies_with_sra,
+       count(*) FILTER (WHERE r.organism = 'Homo sapiens') AS studies_human,
+       count(*) FILTER (WHERE r.is_single_cell) AS studies_single_cell,
+       count(*) FILTER (WHERE r.is_long_read) AS studies_long_read,
+       count(DISTINCT r.organism) AS n_organisms,
+       min(r.pub_date) AS first_date,
+       max(r.pub_date) AS last_date
+FROM {cfg["study_table"]} r
+WHERE r.{cfg["ids_col"]} && %(ids)s;
+"""  # noqa: S608
+
+
+def build_ontology_term_facets_sql(kind: str) -> str:
+    cfg = _ONTOLOGY_TERM_TABLES[kind]
+    return f"""
+WITH matched AS (
+    SELECT organism, assay_l1, source, journal, country_code_iso2, pub_date,
+           has_fastq, has_sra, is_single_cell, is_long_read
+    FROM {cfg["study_table"]} r WHERE r.{cfg["ids_col"]} && %(ids)s
+)
+SELECT 'organism' AS facet, organism AS value, count(*) AS studies
+FROM matched WHERE organism IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'assay_l1', assay_l1, count(*) FROM matched WHERE assay_l1 IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'source', source, count(*) FROM matched GROUP BY 2
+UNION ALL
+SELECT 'journal', journal, count(*) FROM matched WHERE journal IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'country', country_code_iso2, count(*)
+FROM matched WHERE country_code_iso2 IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'year', extract(year FROM pub_date)::text, count(*)
+FROM matched WHERE pub_date IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'has_fastq', has_fastq::text, count(*) FROM matched WHERE has_fastq IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'has_sra', has_sra::text, count(*) FROM matched WHERE has_sra IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'is_single_cell', is_single_cell::text, count(*)
+FROM matched WHERE is_single_cell IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'is_long_read', is_long_read::text, count(*) FROM matched GROUP BY 2
+ORDER BY facet, studies DESC;
+"""  # noqa: S608
+
+
+def build_ontology_term_count_sql(kind: str) -> str:
+    """Separate from the page query: a count(*) OVER () would materialize every
+    matching row and defeat the keyset seek."""
+    cfg = _ONTOLOGY_TERM_TABLES[kind]
+    return (
+        f"SELECT count(*) AS total FROM {cfg['study_table']} r "
+        f"WHERE r.{cfg['ids_col']} && %(ids)s{_ONTOLOGY_TERM_WHERE};"
+    )  # noqa: S608
+
+
+def build_ontology_term_projects_sql(
+    kind: str, sort: str = "pub_date", descending: bool = True
+) -> str:
+    """One page, keyset-paginated on (sort_val, study_accession); OFFSET would
+    rescan every earlier row on a broad term like "blood". cursor_sort=None
+    starts from the top. Pass limit = page size + 1 so the caller can tell a
+    real next page from a page that merely ends on the last row.
+
+    The matview indexes on (sort_val, study_accession) must match sort_expr.
+    """
+    if sort not in ONTOLOGY_TERM_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    cfg = _ONTOLOGY_TERM_TABLES[kind]
+    sort_expr, cursor_cast = _ONTOLOGY_TERM_SORT_EXPR[sort]
+    direction = "DESC" if descending else "ASC"
+    comp = "<" if descending else ">"
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.assay_l1, r.assay_l2, r.source,
+       r.journal, r.country_code_iso2, r.pub_date, r.n_samples, r.n_experiments,
+       r.is_single_cell, r.single_cell_modality, r.{cfg["n_col"]},
+       r.has_fastq, r.has_sra, r.n_runs, r.n_fastq_runs, r.n_sra_runs, r.is_long_read,
+       {sort_expr} AS sort_val
+FROM {cfg["study_table"]} r
+WHERE r.{cfg["ids_col"]} && %(ids)s{_ONTOLOGY_TERM_WHERE}
+  AND (%(cursor_sort)s::text IS NULL
+       OR ({sort_expr}, r.study_accession) {comp} (%(cursor_sort)s{cursor_cast}, %(cursor_acc)s))
+ORDER BY sort_val {direction}, r.study_accession {direction}
+LIMIT %(limit)s;
+"""  # noqa: S608
+
 
 ENRICHED_SUMMARY_SQL = "SELECT * FROM enriched_summary_v5;"
 ENRICHED_COLUMN_VALUES_SQL = (
@@ -6792,8 +6987,6 @@ LIMIT %(limit)s OFFSET %(offset)s;
 """
 
 # Single-cell status and summary
-# unified_metadata.single_cell_status is a cached label recomputed by the recall_fix
-# recipe in seqout-ingestion; the endpoint returns it alongside the evidence.
 # Evidence sources are independent and attempted only where their inputs exist: the
 # matrix route needs supplementary files, the read routes FASTQ plus a preflightx
 # scan.

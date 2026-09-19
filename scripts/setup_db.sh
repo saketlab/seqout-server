@@ -328,24 +328,26 @@ CREATE INDEX IF NOT EXISTS idx_request_log_device_type ON request_log (device_ty
 
 -- organism_growth_monthly, platform_growth_monthly and
 -- platform_growth_projects_monthly are deliberately NOT defined here. They are
--- built by scripts/create_organism_matview.sh and create_platform_matviews.sh,
--- invoked below. Restating them here drifted: this file's copies were missing
--- the dra and gea sources, and because it used CREATE ... IF NOT EXISTS it won
--- on a fresh bootstrap, silently dropping two databases from /stats.
+-- built by seqout-ingestion's sql/matviews/create_organism_matview.sh and
+-- create_platform_matviews.sh, invoked below. Restating them here drifted:
+-- this file's copies were missing the dra and gea sources, and because it
+-- used CREATE ... IF NOT EXISTS it won on a fresh bootstrap, silently
+-- dropping two databases from /stats.
 
 EOF
 
+MATVIEW_SCRIPTS="${MATVIEW_SCRIPTS:-$(dirname "$0")/../../seqout-ingestion/sql/matviews}"
 
 echo ""
 echo "Building organism + platform growth matviews..."
-bash "$(dirname "$0")/create_organism_matview.sh"
-bash "$(dirname "$0")/create_platform_matviews.sh"
+bash "$MATVIEW_SCRIPTS/create_organism_matview.sh"
+bash "$MATVIEW_SCRIPTS/create_platform_matviews.sh"
 
 echo ""
 echo "Building database growth relations (projects/experiments + data volume)..."
 # Volume build scans sra_run_download_links twice (~47 GB) — expect minutes.
-bash "$(dirname "$0")/create_database_growth_matview.sh"
-bash "$(dirname "$0")/create_database_volume_growth_matview.sh"
+bash "$MATVIEW_SCRIPTS/create_database_growth_matview.sh"
+bash "$MATVIEW_SCRIPTS/create_database_volume_growth_matview.sh"
 
 echo ""
 echo "=== Setup Complete ==="
