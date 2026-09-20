@@ -14044,6 +14044,8 @@ _MCP_TITLE_ACRONYMS = {
     "pi": "PI",
     "pis": "PIs",
     "nl": "NL",
+    "singlecell": "Single-Cell",
+    "longread": "Long-Read",
     "sc": "SC",
     "csv": "CSV",
     "bams": "BAMs",
