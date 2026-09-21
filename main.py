@@ -13754,6 +13754,11 @@ experiment in any archive. For the corpus itself use the collection tools:
   means no experiment rows exist to tell (GEO-only entries). `n_experiments`
   counts long-read experiments; `n_experiments_total` the study's total.
 Onso, PacBio's short-read instrument, is excluded from long read.
+`get_project_longread_chemistry(accession)` lists every PacBio/Oxford Nanopore run in
+one study with its chemistry call. `chemistry_confidence` is `exact` (read from the
+submitted BAM header), `declared` (ONT only, parsed from the depositor's protocol
+text), `bucket` (inferred from instrument_model alone) or `unknown`; report the tier
+beside the call. `runs` is `[]` for a study with no long-read runs.
 
 ## Disease Cohorts
 
