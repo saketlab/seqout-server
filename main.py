@@ -41,7 +41,6 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
 from symspellpy import SymSpell, Verbosity
 from user_agents import parse as parse_ua
 
@@ -123,6 +122,10 @@ from queries import (
     SINGLECELL_FACETS_SQL,
     SINGLECELL_SORTABLE,
     SINGLECELL_SUMMARY_SQL,
+    PERTURBATION_FACETS_SQL,
+    PERTURBATION_MIN_CONFIDENCE_TIERS,
+    PERTURBATION_SORTABLE,
+    PERTURBATION_SUMMARY_SQL,
     COUNTRY_FACETS_SQL,
     COUNTRY_POINTS_SQL,
     COUNTRY_SORTABLE,
@@ -131,6 +134,8 @@ from queries import (
     build_longread_projects_sql,
     build_singlecell_count_sql,
     build_singlecell_projects_sql,
+    build_perturbation_count_sql,
+    build_perturbation_projects_sql,
     build_country_count_sql,
     build_country_projects_sql,
     build_disease_count_sql,
@@ -229,7 +234,6 @@ from queries import (
     SEARCH_AUTHOR_PROJECTS_SQL,
     SEARCH_BY_ACCESSION_SQL_BY_KIND,
     SEARCH_SQL,
-    SEARCH_STRUCTURED_SQL,
     structured_search_sql,
     PENTIMENTO_OVERVIEW_SQL,
     SIMILAR_STUDIES_SQL,
@@ -719,6 +723,8 @@ _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
 _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_perturbation_facets_cache_lock = threading.Lock()
+_perturbation_facets_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _single_cell_overview_cache_lock = threading.Lock()
 _single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _pentimento_overview_cache_lock = threading.Lock()
@@ -1382,7 +1388,7 @@ def _transform_ae_sample_to_geo(sample: dict) -> dict:
     if isinstance(attrs, str):
         try:
             attrs = json.loads(attrs)
-        except:
+        except json.JSONDecodeError:
             attrs = {}
 
     characteristics = [
@@ -2177,7 +2183,6 @@ def _build_atlas_row(
     country_codes, country_labels = _normalize_country_metadata(
         country_pairs, raw_country_codes, raw_country_labels
     )
-    countries_display = ", ".join(country_labels)
     return {
         "accession": accession,
         "archive": archive,
@@ -3220,6 +3225,8 @@ def purge_cache(request: Request):
         _platform_filters_cache.clear()
     with _source_totals_cache_lock:
         _source_totals_cache["ready"] = False
+    with _perturbation_facets_cache_lock:
+        _perturbation_facets_cache["ready"] = False
     with _single_cell_overview_cache_lock:
         _single_cell_overview_cache["ready"] = False
     with _pentimento_overview_cache_lock:
@@ -4586,7 +4593,7 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     q,
                 )
                 _enrich_with_publications(rows, cur)
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in search_geo")
         raise HTTPException(500, "Internal server error")
 
@@ -4649,7 +4656,7 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     q,
                 )
                 _enrich_with_publications(rows, cur)
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in search_sra")
         raise HTTPException(500, "Internal server error")
 
@@ -5424,7 +5431,7 @@ def search(
                         q,
                     )
                     _enrich_with_publications(rows, cur)
-        except Exception as e:
+        except Exception:
             logger.exception("Database error in search")
             raise HTTPException(500, "Internal server error")
 
@@ -6074,7 +6081,7 @@ def get_project(
                     row["has_long_read"] = bool(cur.fetchone()["has_long_read"])
                     _attach_single_cell_samples(cur, row, enrich_acc)
                     _attach_library_strategies(row, strategy_acc, cur)
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
 
@@ -8281,7 +8288,7 @@ def get_sample(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 sample = _fetch_sample(cur, accession)
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
     if sample:
@@ -8720,7 +8727,7 @@ def get_geo_series_samples(
                 rows = _fetch_geo_series_samples(
                     cur, accession, source, limit=limit, offset=offset
                 )
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in get_geo_series_samples")
         raise HTTPException(500, "Internal server error")
     response.headers["X-Total-Count"] = str(total)
@@ -8779,7 +8786,7 @@ def get_ae_experiment_samples(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(AE_EXPERIMENT_SAMPLES_SQL, (accession,))
                 rows = cur.fetchall()
-    except Exception as e:
+    except Exception:
         logger.exception("Database error in get_ae_experiment_samples")
         raise HTTPException(500, "Internal server error")
 
@@ -8881,7 +8888,7 @@ def bulk_metadata(request: Request, payload: AccessionsRequest):
             media_type="application/zip",
             headers={"Content-Disposition": "attachment; filename=bulk_metadata.zip"},
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error in bulk_metadata")
         raise HTTPException(500, "Internal server error")
 
@@ -10113,8 +10120,7 @@ def search_structured(
 
     q_variants = None
     if q:
-        with pool.connection() as conn:
-            q_variants = _search_query_variants(q)
+        q_variants = _search_query_variants(q)
 
     sql, params = build_structured_search(
         q=q,
@@ -11410,6 +11416,171 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
             rows = cur.fetchall()
     except Exception:
         logger.exception("Database error in get_singlecell_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
+_PERTURBATION_SORT_PATTERN = f"^({'|'.join(sorted(PERTURBATION_SORTABLE))})$"
+
+
+@api_app.get(
+    "/perturbation/summary",
+    summary="Perturbation-study corpus totals",
+    description=(
+        "Corpus-wide totals for single-cell studies with genetic or chemical "
+        "perturbation evidence (same population as /perturbation/projects). "
+        "Detection is rule-based. `studies_high_medium` "
+        "counts the studies whose evidence is strong enough to rely on."
+    ),
+    operation_id="get_perturbation_summary",
+)
+@limiter.limit("60/minute")
+def get_perturbation_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(PERTURBATION_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_perturbation_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "perturbation stats not available")
+    return row
+
+
+@api_app.get(
+    "/perturbation/facets",
+    summary="Perturbation-study facet counts",
+    description=(
+        "Study counts per perturbation type, confidence, data availability, "
+        "genetic subtype, perturbation method, compound, organism, tissue, "
+        "readout assay and year, top 100 values per facet. Values feed the "
+        "filters of /perturbation/projects."
+    ),
+    operation_id="get_perturbation_facets",
+)
+@limiter.limit("60/minute")
+def get_perturbation_facets(request: Request):
+    with _perturbation_facets_cache_lock:
+        if (
+            _perturbation_facets_cache["ready"]
+            and (time.time() - _perturbation_facets_cache["built_at"])
+            < _GROWTH_CACHE_TTL
+        ):
+            return _perturbation_facets_cache["data"]
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(PERTURBATION_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_perturbation_facets")
+        raise HTTPException(500, "Internal server error")
+    data = _facet_rows_to_dict(rows)
+    with _perturbation_facets_cache_lock:
+        _perturbation_facets_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/perturbation/projects",
+    summary="Single-cell perturbation studies with type, confidence, assay and data availability",
+    description=(
+        "One row per single-cell study with genetic (CRISPR KO/i/a, RNAi, ORF, "
+        "base/prime editing), chemical (small-molecule or biologic drug) or "
+        "other-stimulus perturbation evidence. `perturbation_type` is "
+        "genetic, chemical, both or other. `confidence` is high, medium or "
+        "low: high needs a named method (Perturb-seq, CROP-seq, sci-Plex, "
+        "...) or corroborated guide libraries or a compound design with a "
+        "control arm; low is a single weak signal. Use `min_confidence` for "
+        "'at least' (medium keeps high and medium); `confidence` matches one "
+        "tier exactly. `evidence` lists the signals that fired. "
+        "`data_availability` is both, matrix_only, fastq_only or neither, "
+        "from `has_matrix` and `has_fastq`. `readout_assays` are the "
+        "sample-level assay categories in the study. "
+        "`compounds` are ChEBI-matched names from sample treatment values, "
+        "empty for designs whose drug arms live in supplementary files "
+        "(e.g. sci-Plex). `title_compounds` are compounds matched in the "
+        "study's own title text, populated whenever the title matches, "
+        "independently of whether `compounds` is also populated; title "
+        "evidence alone never reaches medium/high, so a row whose only "
+        "chemical evidence is title_compounds is chemical/low. "
+        "`cell_lines` and `sample_types` describe the material (named cell "
+        "lines; cell line/primary tissue/organoid/xenograft/iPSC-derived and "
+        "similar from the sample metadata), not the perturbation. "
+        "`is_long_read` marks a study that also has PacBio or Oxford "
+        "Nanopore sequencing. Filters take values from /perturbation/facets; "
+        "`year` is the publication year. `q` matches title or "
+        "study_accession. `total` is the filtered study count; `count` is "
+        "this page."
+    ),
+    operation_id="get_perturbation_projects",
+)
+@limiter.limit("60/minute")
+def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by design
+    request: Request,
+    perturbation_type: str | None = Query(
+        None, pattern="^(genetic|chemical|both|other)$"
+    ),
+    confidence: str | None = Query(None, pattern="^(high|medium|low)$"),
+    min_confidence: str | None = Query(None, pattern="^(high|medium|low)$"),
+    data_availability: str | None = Query(
+        None, pattern="^(both|matrix_only|fastq_only|neither)$"
+    ),
+    genetic_subtype: str | None = Query(None, max_length=100),
+    perturbation_method: str | None = Query(None, max_length=100),
+    compound: str | None = Query(None, max_length=200),
+    readout_assay: str | None = Query(None, max_length=100),
+    cell_line: str | None = Query(None, max_length=200),
+    organism: str | None = Query(None, max_length=200),
+    tissue: str | None = Query(None, max_length=200),
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_matrix: bool | None = None,
+    has_fastq: bool | None = None,
+    has_control_arm: bool | None = None,
+    is_pooled: bool | None = None,
+    is_long_read: bool | None = None,
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("confidence", pattern=_PERTURBATION_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "perturbation_type": perturbation_type,
+        "confidence": confidence,
+        "min_confidence": PERTURBATION_MIN_CONFIDENCE_TIERS.get(min_confidence),
+        "data_availability": data_availability,
+        "genetic_subtype": genetic_subtype,
+        "perturbation_method": perturbation_method,
+        "compound": compound,
+        "readout_assay": readout_assay,
+        "cell_line": cell_line,
+        "organism": organism,
+        "tissue": tissue,
+        "year": year,
+        "has_matrix": has_matrix,
+        "has_fastq": has_fastq,
+        "has_control_arm": has_control_arm,
+        "is_pooled": is_pooled,
+        "is_long_read": is_long_read,
+        "q": q,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_perturbation_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_perturbation_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_perturbation_projects")
         raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
@@ -13813,6 +13984,40 @@ Reading the `rare`/`nord` rows honestly matters more here than elsewhere:
 For a free-text term, `matched_samples` in the summary counts samples resolved
 to the matched MONDO ids; `samples` on summary and project rows is the study's
 total across every annotation.
+
+## Perturbation Studies
+
+For "single-cell CRISPR screens", "Perturb-seq datasets", "drug treatment
+single-cell data" or "which perturbation studies have a count matrix", use
+`get_perturbation_summary`/`_facets`/`_projects` rather than a keyword search.
+Detection is rule-based (named methods, guide-library and control-arm design
+tests, a ChEBI compound lexicon).
+
+- `get_perturbation_facets`: the valid filter values. Call it before
+  `get_perturbation_projects`.
+- `get_perturbation_projects(...)`: one row per study. Filter with
+  `perturbation_type` (genetic, chemical, both, other), `genetic_subtype`,
+  `perturbation_method`, `compound`, `readout_assay`, `cell_line`, `organism`,
+  `tissue`, `data_availability` (both, matrix_only, fastq_only, neither),
+  `has_matrix`, `has_fastq`, `has_control_arm`, `is_pooled`, `is_long_read`,
+  `year`, `q`. `cell_lines`/`sample_types` on each row describe the material
+  (named line; cell line/primary tissue/organoid/xenograft/iPSC-derived), not
+  the perturbation. Don't read a cell-line study as a genetic perturbation.
+- Default to `min_confidence=medium` (high and medium) when the user wants
+  studies to rely on. `low` is a single weak signal and includes many
+  false positives; say so when reporting low-tier results. `evidence` lists
+  the signals behind a row.
+- `compounds` come from sample treatment values, so designs whose drug arms
+  live in supplementary files (e.g. sci-Plex) have a method but no compounds.
+  `title_compounds` are compounds named only in the title (a receptor or
+  resistance mechanism, often, not something applied); that alone never
+  reaches medium/high, so treat a title_compounds-only row as a weak lead.
+  `other` means a cytokine or stimulation design.
+- Germline knockout mice and transgenic lines are not perturbation evidence
+  here. Doxycycline and tamoxifen (Cre/Tet inducers) are never counted as the
+  perturbation.
+- To get the data, use `has_matrix`/`has_fastq` here, then the single-cell and
+  download tools on the returned accession.
 
 ## Tissue Collection
 

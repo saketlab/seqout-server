@@ -4739,7 +4739,7 @@ def build_country_filters_sql(
         select_parts.append(f"SELECT '{kind}' AS kind, value, count FROM {cte_name}")
 
     cte_parts.append(
-        f"totals AS (\n    SELECT COUNT(*) AS count\n    FROM scoped_base\n)"
+        "totals AS (\n    SELECT COUNT(*) AS count\n    FROM scoped_base\n)"
     )
     select_parts.append("SELECT 'total' AS kind, NULL AS value, count FROM totals")
 
@@ -5575,6 +5575,142 @@ SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
 FROM singlecell_study r
 WHERE TRUE{_SINGLECELL_WHERE}
 ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
+
+
+PERTURBATION_ARRAY_FILTERS = {
+    "organism": "organisms",
+    "tissue": "tissues",
+    "genetic_subtype": "genetic_subtypes",
+    # differs from singlecell_study.perturbation_method (title-keyword hit)
+    "perturbation_method": "perturbation_methods",
+    "compound": "compounds",
+    "readout_assay": "readout_assays",
+    "cell_line": "cell_lines",
+}
+PERTURBATION_SCALAR_FILTERS = (
+    "perturbation_type",
+    "confidence",
+    "data_availability",
+    "year",
+)
+PERTURBATION_BOOL_FILTERS = (
+    "has_matrix",
+    "has_fastq",
+    "has_control_arm",
+    "is_pooled",
+    "is_long_read",
+)
+
+# min_confidence is at-least (medium keeps high too)
+_CONFIDENCE_TIERS = ("high", "medium", "low")
+PERTURBATION_MIN_CONFIDENCE_TIERS = {
+    tier: list(_CONFIDENCE_TIERS[: i + 1]) for i, tier in enumerate(_CONFIDENCE_TIERS)
+}
+# confidence sorts alphabetically as high < low < medium
+_CONFIDENCE_RANK = (
+    "(CASE r.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END)"
+)
+PERTURBATION_SORTABLE = frozenset(
+    {
+        "n_samples",
+        "n_cells",
+        "year",
+        "title",
+        "study_accession",
+        "organism",
+        "confidence",
+    }
+)
+
+PERTURBATION_SUMMARY_SQL = """
+SELECT count(*)                                            AS studies,
+       count(*) FILTER (WHERE confidence IN ('high', 'medium'))
+                                                             AS studies_high_medium,
+       count(*) FILTER (WHERE confidence = 'high')         AS studies_high,
+       count(*) FILTER (WHERE perturbation_type IN ('genetic', 'both'))
+                                                             AS studies_genetic,
+       count(*) FILTER (WHERE perturbation_type IN ('chemical', 'both'))
+                                                             AS studies_chemical,
+       count(*) FILTER (WHERE has_matrix)                  AS studies_with_matrix,
+       count(*) FILTER (WHERE has_fastq)                   AS studies_with_fastq,
+       count(*) FILTER (WHERE data_availability = 'both')  AS studies_matrix_and_fastq,
+       count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms))
+                                                             AS studies_human,
+       sum(n_samples)                                      AS samples,
+       sum(n_cells)                                        AS cells,
+       min(year)                                            AS first_year,
+       max(year)                                            AS last_year
+FROM singlecell_perturbation_study;
+"""
+
+# top 100 per facet keeps dropdowns usable
+PERTURBATION_FACETS_SQL = """
+WITH tagged AS (
+    SELECT 'perturbation_type' AS facet, perturbation_type AS value, study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'confidence', confidence, study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'data_availability', data_availability, study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'genetic_subtype', unnest(genetic_subtypes), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'perturbation_method', unnest(perturbation_methods), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'compound', unnest(compounds), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'organism', unnest(organisms), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'tissue', unnest(tissues), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'readout_assay', unnest(readout_assays), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'cell_line', unnest(cell_lines), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'sample_type', unnest(sample_types), study_accession FROM singlecell_perturbation_study
+    UNION ALL SELECT 'is_long_read', CASE WHEN is_long_read THEN 'true' ELSE 'false' END, study_accession
+        FROM singlecell_perturbation_study WHERE is_long_read IS NOT NULL
+    UNION ALL SELECT 'year', year::text, study_accession FROM singlecell_perturbation_study WHERE year IS NOT NULL
+), counted AS (
+    SELECT facet, value, count(DISTINCT study_accession) AS studies
+    FROM tagged WHERE value <> '' GROUP BY facet, value
+), ranked AS (
+    SELECT *, row_number() OVER (PARTITION BY facet ORDER BY studies DESC, value) AS rn
+    FROM counted
+)
+SELECT facet, value, studies FROM ranked WHERE rn <= 100
+ORDER BY facet, studies DESC, value;
+"""
+
+_PERTURBATION_WHERE = (
+    build_filtered_where(
+        PERTURBATION_ARRAY_FILTERS,
+        PERTURBATION_SCALAR_FILTERS,
+        PERTURBATION_BOOL_FILTERS,
+    )
+    + "\n      AND (%(min_confidence)s::text[] IS NULL"
+    "\n           OR r.confidence = ANY(%(min_confidence)s::text[]))" + _search_clause()
+)
+
+
+def build_perturbation_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM singlecell_perturbation_study r WHERE TRUE{_PERTURBATION_WHERE};"  # noqa: S608
+
+
+def build_perturbation_projects_sql(
+    sort: str = "confidence", descending: bool = True
+) -> str:
+    """sort is interpolated into SQL, so it must be in PERTURBATION_SORTABLE."""
+    if sort not in PERTURBATION_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
+    order_expr = _CONFIDENCE_RANK if sort == "confidence" else f"r.{sort}"
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
+       r.single_cell_modality, r.is_long_read, r.assay_l1, r.readout_assays,
+       r.cell_lines, r.sample_types,
+       r.n_samples, r.n_cells, r.has_matrix, r.has_fastq, r.has_sra,
+       r.n_fastq_runs, r.n_runs, r.data_availability,
+       r.perturbation_type, r.confidence, r.genetic_confidence,
+       r.chemical_confidence, r.genetic_subtypes, r.perturbation_methods,
+       r.compounds, r.title_compounds, r.stimuli, r.has_control_arm,
+       r.n_compound_values, r.is_pooled, r.evidence, r.country, r.pmid, r.year
+FROM singlecell_perturbation_study r
+WHERE TRUE{_PERTURBATION_WHERE}
+ORDER BY {order_expr} {direction}, {tiebreak}r.study_accession
 LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
