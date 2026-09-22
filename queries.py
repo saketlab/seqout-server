@@ -5715,6 +5715,97 @@ LIMIT %(limit)s OFFSET %(offset)s;
 """  # noqa: S608
 
 
+SPATIAL_ARRAY_FILTERS = {
+    "organism": "organisms",
+    "tissue": "tissues",
+    "platform": "platforms",
+    "readout_assay": "readout_assays",
+    "cell_line": "cell_lines",
+    "sample_type": "sample_types",
+}
+SPATIAL_SCALAR_FILTERS = ("resolution", "technology", "data_availability", "year")
+SPATIAL_BOOL_FILTERS = ("has_matrix", "has_fastq", "is_long_read")
+SPATIAL_SORTABLE = frozenset(
+    {"n_samples", "n_cells", "year", "title", "study_accession", "organism"}
+)
+
+SPATIAL_SUMMARY_SQL = """
+SELECT count(*)                                            AS studies,
+       count(*) FILTER (WHERE platforms IS NOT NULL)       AS studies_named_platform,
+       count(*) FILTER (WHERE resolution = 'single-cell')  AS studies_single_cell_res,
+       count(*) FILTER (WHERE resolution = 'spot')         AS studies_spot_res,
+       count(*) FILTER (WHERE resolution = 'roi')          AS studies_roi_res,
+       count(*) FILTER (WHERE has_matrix)                  AS studies_with_matrix,
+       count(*) FILTER (WHERE has_fastq)                   AS studies_with_fastq,
+       count(*) FILTER (WHERE data_availability = 'both')  AS studies_matrix_and_fastq,
+       count(*) FILTER (WHERE 'Homo sapiens' = ANY(organisms))
+                                                             AS studies_human,
+       sum(n_samples)                                      AS samples,
+       sum(n_cells)                                        AS cells,
+       min(year)                                            AS first_year,
+       max(year)                                            AS last_year
+FROM spatial_study;
+"""
+
+# top 100 per facet keeps dropdowns usable
+SPATIAL_FACETS_SQL = """
+WITH tagged AS (
+    SELECT 'platform' AS facet, unnest(platforms) AS value, study_accession FROM spatial_study
+    UNION ALL SELECT 'resolution', resolution, study_accession FROM spatial_study
+    UNION ALL SELECT 'technology', technology, study_accession FROM spatial_study
+    UNION ALL SELECT 'data_availability', data_availability, study_accession FROM spatial_study
+    UNION ALL SELECT 'organism', unnest(organisms), study_accession FROM spatial_study
+    UNION ALL SELECT 'tissue', unnest(tissues), study_accession FROM spatial_study
+    UNION ALL SELECT 'readout_assay', unnest(readout_assays), study_accession FROM spatial_study
+    UNION ALL SELECT 'cell_line', unnest(cell_lines), study_accession FROM spatial_study
+    UNION ALL SELECT 'sample_type', unnest(sample_types), study_accession FROM spatial_study
+    UNION ALL SELECT 'is_long_read', CASE WHEN is_long_read THEN 'true' ELSE 'false' END, study_accession
+        FROM spatial_study WHERE is_long_read IS NOT NULL
+    UNION ALL SELECT 'year', year::text, study_accession FROM spatial_study WHERE year IS NOT NULL
+), counted AS (
+    SELECT facet, value, count(DISTINCT study_accession) AS studies
+    FROM tagged WHERE value <> '' GROUP BY facet, value
+), ranked AS (
+    SELECT *, row_number() OVER (PARTITION BY facet ORDER BY studies DESC, value) AS rn
+    FROM counted
+)
+SELECT facet, value, studies FROM ranked WHERE rn <= 100
+ORDER BY facet, studies DESC, value;
+"""
+
+_SPATIAL_WHERE = (
+    build_filtered_where(
+        SPATIAL_ARRAY_FILTERS, SPATIAL_SCALAR_FILTERS, SPATIAL_BOOL_FILTERS
+    )
+    + _search_clause()
+)
+
+
+def build_spatial_count_sql() -> str:
+    return f"SELECT count(*) AS total FROM spatial_study r WHERE TRUE{_SPATIAL_WHERE};"  # noqa: S608
+
+
+def build_spatial_projects_sql(sort: str = "year", descending: bool = True) -> str:
+    """sort is interpolated into SQL, so it must be in SPATIAL_SORTABLE."""
+    if sort not in SPATIAL_SORTABLE:
+        msg = f"unsortable column {sort!r}"
+        raise ValueError(msg)
+    direction = "DESC NULLS LAST" if descending else "ASC NULLS LAST"
+    tiebreak = "r.n_samples DESC NULLS LAST, " if sort != "n_samples" else ""
+    return f"""
+SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
+       r.single_cell_modality, r.is_long_read, r.assay_l1,
+       r.readout_assays, r.cell_lines, r.sample_types,
+       r.n_samples, r.n_cells, r.has_matrix, r.has_fastq, r.has_sra,
+       r.n_fastq_runs, r.n_runs, r.data_availability,
+       r.platforms, r.resolution, r.technology, r.country, r.pmid, r.year
+FROM spatial_study r
+WHERE TRUE{_SPATIAL_WHERE}
+ORDER BY r.{sort} {direction}, {tiebreak}r.study_accession
+LIMIT %(limit)s OFFSET %(offset)s;
+"""  # noqa: S608
+
+
 # Country collection: any archive/technology, scoped by declared submitter
 
 COUNTRY_SCALAR_FILTERS = {

@@ -126,6 +126,9 @@ from queries import (
     PERTURBATION_MIN_CONFIDENCE_TIERS,
     PERTURBATION_SORTABLE,
     PERTURBATION_SUMMARY_SQL,
+    SPATIAL_FACETS_SQL,
+    SPATIAL_SORTABLE,
+    SPATIAL_SUMMARY_SQL,
     COUNTRY_FACETS_SQL,
     COUNTRY_POINTS_SQL,
     COUNTRY_SORTABLE,
@@ -136,6 +139,8 @@ from queries import (
     build_singlecell_projects_sql,
     build_perturbation_count_sql,
     build_perturbation_projects_sql,
+    build_spatial_count_sql,
+    build_spatial_projects_sql,
     build_country_count_sql,
     build_country_projects_sql,
     build_disease_count_sql,
@@ -725,6 +730,8 @@ _source_totals_cache_lock = threading.Lock()
 _source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _perturbation_facets_cache_lock = threading.Lock()
 _perturbation_facets_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_spatial_facets_cache_lock = threading.Lock()
+_spatial_facets_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _single_cell_overview_cache_lock = threading.Lock()
 _single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _pentimento_overview_cache_lock = threading.Lock()
@@ -11590,6 +11597,158 @@ def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by 
     }
 
 
+_SPATIAL_SORT_PATTERN = f"^({'|'.join(sorted(SPATIAL_SORTABLE))})$"
+
+
+@api_app.get(
+    "/spatial/summary",
+    summary="Spatial transcriptomics corpus totals",
+    description=(
+        "Corpus-wide totals for studies flagged single-cell modality "
+        "'Spatial Transcriptomics' (same population as /spatial/projects). "
+        "`studies_named_platform` counts studies whose own text names a "
+        "specific platform (Visium, Xenium, MERFISH, ...); the rest only say "
+        "'spatial transcriptomics' generically."
+    ),
+    operation_id="get_spatial_summary",
+)
+@limiter.limit("60/minute")
+def get_spatial_summary(request: Request):
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SPATIAL_SUMMARY_SQL)
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Database error in get_spatial_summary")
+        raise HTTPException(500, "Internal server error")
+    if not row:
+        raise HTTPException(503, "spatial stats not available")
+    return row
+
+
+@api_app.get(
+    "/spatial/facets",
+    summary="Spatial transcriptomics facet counts",
+    description=(
+        "Study counts per platform, resolution, data availability, organism, "
+        "tissue, readout assay, cell line, sample type and year, top 100 "
+        "values per facet. Values feed the filters of /spatial/projects."
+    ),
+    operation_id="get_spatial_facets",
+)
+@limiter.limit("60/minute")
+def get_spatial_facets(request: Request):
+    with _spatial_facets_cache_lock:
+        if (
+            _spatial_facets_cache["ready"]
+            and (time.time() - _spatial_facets_cache["built_at"]) < _GROWTH_CACHE_TTL
+        ):
+            return _spatial_facets_cache["data"]
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SPATIAL_FACETS_SQL)
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_spatial_facets")
+        raise HTTPException(500, "Internal server error")
+    data = _facet_rows_to_dict(rows)
+    with _spatial_facets_cache_lock:
+        _spatial_facets_cache.update(ready=True, data=data, built_at=time.time())
+    return data
+
+
+@api_app.get(
+    "/spatial/projects",
+    summary="Spatial transcriptomics studies with platform and resolution",
+    description=(
+        "One row per study flagged single-cell modality 'Spatial "
+        "Transcriptomics'. `platforms` are the platform names (Visium, "
+        "Xenium, MERFISH, CosMx, Slide-seq, Slide-seqV2, Curio Seeker, "
+        "Stereo-seq, GeoMx DSP, DBiT-seq, STARmap, osmFISH, HDST, Tomo-seq, "
+        "Pixel-seq, Molecular Cartography, ...) found in the study's own "
+        "title, summary, overall_design, SRA abstract or experiment "
+        "metadata; often null when the study only says 'spatial "
+        "transcriptomics' generically. A named platform reflects a text "
+        "mention, e.g. a comparison paper naming a platform it did not run. "
+        "/perturbation/projects documents the same caveat for "
+        "title_compound. `resolution` "
+        "groups platforms into single-cell (Xenium, MERFISH, CosMx, "
+        "STARmap, osmFISH, Molecular Cartography), spot (coarser than "
+        "single-cell: Visium, Slide-seq, Slide-seqV2, Curio Seeker, "
+        "Stereo-seq, DBiT-seq, HDST, Tomo-seq, Pixel-seq) or roi (GeoMx DSP, "
+        "not single-cell resolution despite reaching this population); null "
+        "when no platform was named. `technology` is imaging, sequencing or "
+        "hybrid (GeoMx DSP: optical ROI selection, sequencing/nCounter "
+        "readout); tracks `resolution` one-to-one (imaging~single-cell, "
+        "sequencing~spot, hybrid~roi) but is a separate column. "
+        "`data_availability` "
+        "is both, matrix_only, fastq_only or neither, from `has_matrix` and "
+        "`has_fastq`. Filters take values from /spatial/facets; `year` is "
+        "the publication year. `q` matches title or study_accession. `total` "
+        "is the filtered study count; `count` is this page."
+    ),
+    operation_id="get_spatial_projects",
+)
+@limiter.limit("60/minute")
+def get_spatial_projects(  # noqa: PLR0913, one query parameter each, by design
+    request: Request,
+    platform: str | None = Query(None, max_length=100),
+    resolution: str | None = Query(None, pattern="^(single-cell|spot|roi)$"),
+    technology: str | None = Query(None, pattern="^(imaging|sequencing|hybrid)$"),
+    data_availability: str | None = Query(
+        None, pattern="^(both|matrix_only|fastq_only|neither)$"
+    ),
+    organism: str | None = Query(None, max_length=200),
+    tissue: str | None = Query(None, max_length=200),
+    readout_assay: str | None = Query(None, max_length=100),
+    cell_line: str | None = Query(None, max_length=200),
+    sample_type: str | None = Query(None, max_length=100),
+    year: int | None = Query(None, ge=1900, le=2100),
+    has_matrix: bool | None = None,
+    has_fastq: bool | None = None,
+    is_long_read: bool | None = None,
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("year", pattern=_SPATIAL_SORT_PATTERN),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    params = {
+        "platform": platform,
+        "resolution": resolution,
+        "technology": technology,
+        "data_availability": data_availability,
+        "organism": organism,
+        "tissue": tissue,
+        "readout_assay": readout_assay,
+        "cell_line": cell_line,
+        "sample_type": sample_type,
+        "year": year,
+        "has_matrix": has_matrix,
+        "has_fastq": has_fastq,
+        "is_long_read": is_long_read,
+        "q": q,
+    }
+    try:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(build_spatial_count_sql(), params)
+            total_row = cur.fetchone()
+            cur.execute(
+                build_spatial_projects_sql(sort, order == "desc"),
+                {**params, "limit": limit, "offset": offset},
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Database error in get_spatial_projects")
+        raise HTTPException(500, "Internal server error")
+    return {
+        "total": total_row["total"],
+        "count": len(rows),
+        "offset": offset,
+        "results": rows,
+    }
+
+
 def _country_code(code: str) -> str:
     normalized = code.upper()
     if not re.fullmatch(r"[A-Z]{2}", normalized):
@@ -14018,6 +14177,37 @@ tests, a ChEBI compound lexicon).
   perturbation.
 - To get the data, use `has_matrix`/`has_fastq` here, then the single-cell and
   download tools on the returned accession.
+
+## Spatial Transcriptomics
+
+For "spatial transcriptomics datasets", "Visium studies", "Xenium data" or
+"which spatial studies use single-cell resolution", use
+`get_spatial_summary`/`_facets`/`_projects` rather than a keyword search.
+Population is the existing single-cell-modality classifier (deterministic,
+not scored per row here); platform naming on top of it is regex over the
+study's own text.
+
+- `get_spatial_facets`: the valid filter values. Call it before
+  `get_spatial_projects`.
+- `get_spatial_projects(...)`: one row per study. Filter with `platform`
+  (see `get_spatial_facets` for values), `resolution` (single-cell, spot,
+  roi), `technology` (imaging, sequencing, hybrid), `data_availability`
+  (both, matrix_only, fastq_only, neither), `organism`, `tissue`,
+  `readout_assay`, `cell_line`, `sample_type`, `has_matrix`, `has_fastq`,
+  `is_long_read`, `year`, `q`.
+- `platforms` is often null: many of these studies only say "spatial
+  transcriptomics" generically, without naming a specific platform. A named
+  platform reflects a text mention (a comparison paper can name a platform
+  it did not run); treat it the same way a `title_compounds`-only
+  perturbation row is a weak lead.
+- `resolution=roi` (GeoMx DSP) is region-level, not single-cell resolution.
+  `technology` tracks `resolution` one-to-one (imaging~single-cell,
+  sequencing~spot, hybrid~roi) but is a separate column; use whichever the
+  user's question is actually about. A study naming platforms from two
+  groups collapses to single-cell/imaging, then spot/sequencing, then
+  roi/hybrid, even though `platforms` still lists every name found.
+- To get the data, use `has_matrix`/`has_fastq` here, then the single-cell
+  and download tools on the returned accession.
 
 ## Tissue Collection
 
