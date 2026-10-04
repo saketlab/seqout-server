@@ -1288,7 +1288,9 @@ SELECT
         c.organization || '|' || COALESCE(c.department,'') || '|' ||
         COALESCE(c.address_line,'') || '|' || COALESCE(c.address_city,'') || '|' ||
         COALESCE(c.address_state,'') || '|' || COALESCE(c.address_country,'')
+     -- Drop GEO's synthetic "GEO" contributor in any case; "Geo" geocodes to NOAA.
      WHERE c.accession = geo_series.accession
+       AND lower(btrim(c.organization)) IS DISTINCT FROM 'geo'
     ) AS center
 FROM geo_series
 WHERE accession = %s;
