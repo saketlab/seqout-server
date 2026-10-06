@@ -179,7 +179,8 @@ def _fuzzy_lucene(q: str) -> str:
     parts = []
     for tok in re.findall(r"\w+", q.lower()):
         n = len(tok)
-        parts.append(tok if n <= 2 else f"{tok}~1" if n <= 5 else f"{tok}~2")
+        # "+" = every word must match, else a rare name matching one word wins.
+        parts.append("+" + (tok if n <= 2 else f"{tok}~1" if n <= 5 else f"{tok}~2"))
     return " ".join(parts)
 
 
@@ -195,7 +196,7 @@ def search_terms_fuzzy(neo4j_driver, q: str, limit: int = 20) -> list[dict]:
 
 
 if __name__ == "__main__":
-    assert _fuzzy_lucene("Brest  Canser") == "brest~1 canser~2"
-    assert _fuzzy_lucene("IL-6") == "il 6"
-    assert _fuzzy_lucene('t (cd4+) AND "x~"') == "t cd4~1 and~1 x"
+    assert _fuzzy_lucene("Brest  Canser") == "+brest~1 +canser~2"
+    assert _fuzzy_lucene("IL-6") == "+il +6"
+    assert _fuzzy_lucene('t (cd4+) AND "x~"') == "+t +cd4~1 +and~1 +x"
     assert _fuzzy_lucene("   ") == ""
