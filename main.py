@@ -49,6 +49,7 @@ from deep_dive import (
     fetch_deep_dive_children,
     fetch_deep_dive_terms,
     fetch_ontology_term,
+    search_terms_fuzzy,
 )
 from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
 from library_strategy import (
@@ -4784,6 +4785,33 @@ def ontology_term(
         raise HTTPException(404, f"Term not found in ontology graph: {term}")
     took_ms = (time.perf_counter() - start) * 1000
     return {**result, "max_hops": max_hops, "took_ms": round(took_ms, 2)}
+
+
+@api_app.get(
+    "/ontology/search",
+    summary="Fuzzy search over ontology graph terms",
+    description=(
+        "Typo-tolerant lookup of ontology graph terms by name (Lucene fuzzy match, "
+        "edit distance scaled to word length), best match first. Use it to find the "
+        "exact `term` to pass to /ontology/term. "
+        "Returns {query, terms: [{name, has_children, xrefs, score}], took_ms}."
+    ),
+    operation_id="ontology_search",
+)
+@limiter.limit("100/minute")
+def ontology_search(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=100),
+):
+    start = time.perf_counter()
+    try:
+        terms = search_terms_fuzzy(neo4j_driver, q, limit=limit)
+    except Exception:
+        logger.exception("ontology_search failed for q=%r", q)
+        raise HTTPException(500, "Internal server error")
+    took_ms = (time.perf_counter() - start) * 1000
+    return {"query": q, "terms": terms, "took_ms": round(took_ms, 2)}
 
 
 @api_app.get(
@@ -13555,8 +13583,10 @@ MONDO:0005148 even though it returns CURIEs -- pass the disease/tissue name
 instead, or use `get_disease_aliases` to go from a name to MONDO ids. A 404 means
 no node carries that exact name, which is weaker than "the concept is absent":
 treat it as "try another surface form", not as proof the search will not expand.
-Pass `children=false` when only the identifiers and synonyms are needed -- it is
-much cheaper.
+`ontology_search(q)` finds those surface forms: a typo-tolerant name match that
+returns candidate node names to feed back into `ontology_term`. Pass
+`children=false` when only the identifiers and synonyms are needed -- it is much
+cheaper.
 
 ## FASTQ, SRA, BAM, And Supplementary Retrieval
 

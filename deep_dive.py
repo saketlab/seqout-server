@@ -6,6 +6,8 @@ Lower only the query parameter so the term_name index stays usable.
 
 from __future__ import annotations
 
+import re
+
 from expansions import extract_graph_terms
 
 # For each query term, count its children (synonym-transparent). Batched over
@@ -76,6 +78,15 @@ LIMIT %d
 RETURN child.name AS name,
        coalesce(child.has_children, false) AS has_children,
        coalesce(child.xrefs, []) AS xrefs
+"""
+
+# Fuzzy name lookup via Lucene. Needs the index, created once:
+#   CREATE FULLTEXT INDEX term_name_fulltext IF NOT EXISTS FOR (t:Term) ON EACH [t.name]
+_CYPHER_FUZZY = """
+CALL db.index.fulltext.queryNodes('term_name_fulltext', $lucene, {limit: $limit})
+YIELD node, score
+RETURN node.name AS name, coalesce(node.has_children, false) AS has_children,
+       coalesce(node.xrefs, []) AS xrefs, score
 """
 
 _HOPS_MAX = 4
@@ -159,3 +170,32 @@ def fetch_deep_dive_children(neo4j_driver, term: str) -> list[dict]:
         _CYPHER_CHILDREN, term=term, database_="neo4j"
     )
     return [{"name": r["name"], "has_children": r["has_children"]} for r in records]
+
+
+def _fuzzy_lucene(q: str) -> str:
+    """Split like Lucene's standard analyzer (fuzzy terms skip analysis, and \\w
+    can't hold query syntax so nothing needs escaping), then make each token
+    fuzzy, edit distance scaled to length so short tokens don't match half the graph."""
+    parts = []
+    for tok in re.findall(r"\w+", q.lower()):
+        n = len(tok)
+        parts.append(tok if n <= 2 else f"{tok}~1" if n <= 5 else f"{tok}~2")
+    return " ".join(parts)
+
+
+def search_terms_fuzzy(neo4j_driver, q: str, limit: int = 20) -> list[dict]:
+    """Typo-tolerant term search: [{name, has_children, xrefs, score}], best first."""
+    lucene = _fuzzy_lucene(q)
+    if not lucene:
+        return []
+    records, _, _ = neo4j_driver.execute_query(
+        _CYPHER_FUZZY, lucene=lucene, limit=limit, database_="neo4j"
+    )
+    return [dict(r) for r in records]
+
+
+if __name__ == "__main__":
+    assert _fuzzy_lucene("Brest  Canser") == "brest~1 canser~2"
+    assert _fuzzy_lucene("IL-6") == "il 6"
+    assert _fuzzy_lucene('t (cd4+) AND "x~"') == "t cd4~1 and~1 x"
+    assert _fuzzy_lucene("   ") == ""
