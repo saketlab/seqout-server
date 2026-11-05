@@ -6647,6 +6647,7 @@ _MICROBE_EVIDENCE_EXPR = (
     f" OR {_MICROBE_VIRAL_HIGH_BREADTH})"
 )
 # confirmed is the strict flag only; is_viral_evidence (20-50% breadth) is evidence
+_MICROBE_TRACE_EXPR = f"(m.class = 'virus' AND {_MICROBE_NOT_BACKGROUND})"
 _MICROBE_CONFIRMED_EXPR = (
     f"(m.is_validated_viral OR m.is_validated_bacterial"
     f" OR {_MICROBE_VIRAL_HIGH_BREADTH})"
@@ -7443,7 +7444,8 @@ SELECT r.sample,
             ELSE {_MICROBE_KINGDOM_CASE} END                    AS kingdom,
        CASE WHEN m.organism IS NULL THEN NULL
             WHEN bool_or({_MICROBE_CONFIRMED_EXPR}) THEN 'high_breadth'
-            ELSE 'low_breadth' END                              AS tier,
+            WHEN bool_or({_MICROBE_EVIDENCE_EXPR}) THEN 'low_breadth'
+            ELSE 'trace' END                                    AS tier,
        count(DISTINCT m.run_accession) FILTER (
          WHERE m.organism IS NOT NULL)                          AS n_runs,
        max(m.breadth_frac)                                      AS breadth_frac,
@@ -7456,7 +7458,8 @@ SELECT r.sample,
        bool_or(m.is_background)                                 AS is_background
 FROM runs r
 LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
-  AND (%(all_rows)s OR {_MICROBE_EVIDENCE_EXPR})
+  AND (%(all_rows)s OR {_MICROBE_EVIDENCE_EXPR}
+       OR (%(viral_trace)s AND {_MICROBE_TRACE_EXPR}))
 GROUP BY 1, 2, 3, 4
 ORDER BY r.sample, max(m.breadth_frac) DESC NULLS LAST;
 """

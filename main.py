@@ -13080,7 +13080,7 @@ def download_pentimento_detections_csv(
                     raise HTTPException(404, "Study not in the Pentimento")
                 cur.execute(
                     PENTIMENTO_STUDY_DETECTIONS_SQL,
-                    {"study": resolved, "all_rows": all_rows},
+                    {"study": resolved, "all_rows": all_rows, "viral_trace": False},
                 )
                 rows = cur.fetchall()
     except HTTPException:
@@ -13248,7 +13248,10 @@ def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
     """
     if not samples:
         return
-    cur.execute(PENTIMENTO_STUDY_DETECTIONS_SQL, {"study": study, "all_rows": False})
+    cur.execute(
+        PENTIMENTO_STUDY_DETECTIONS_SQL,
+        {"study": study, "all_rows": False, "viral_trace": True},
+    )
     by_sample: defaultdict[str, list[dict]] = defaultdict(list)
     screened: set[str] = set()
     for row in cur.fetchall():
