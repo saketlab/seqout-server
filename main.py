@@ -12992,6 +12992,12 @@ _EMPTY_PENTIMENTO_STUDY = dict.fromkeys(PENTIMENTO_STUDY_FIELDS)
         "`chemistry_confidence_label` spells the same tier for display "
         '(`bucket` -> "estimated"). Empty when the '
         "study has no long-read runs.\n\n"
+        "Each `detections` entry has a `tier`. `high_breadth` and "
+        "`low_breadth` entries pass the reporting gate. `trace` entries are "
+        "below the gate. By default, the only `trace` entries are "
+        "non-background viral hits. With `all_rows=true`, the response has "
+        "all panel organisms, with bacterial and background organisms. Each "
+        "entry shows the measured breadth, reads, and k-mer mass.\n\n"
     ),
     operation_id="get_project_single_cell",
 )
@@ -13002,6 +13008,7 @@ def get_project_single_cell(
     accession: str = Path(..., pattern=PROJECT_REGEX),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    all_rows: bool = Query(False),
 ):
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     try:
@@ -13025,7 +13032,7 @@ def get_project_single_cell(
                 )
                 samples = cur.fetchall()
                 _attach_pentimento_labels(cur, resolved, samples)
-                _attach_pentimento_detections(cur, resolved, samples)
+                _attach_pentimento_detections(cur, resolved, samples, all_rows=all_rows)
                 _attach_sc_stats(cur, samples)
                 cur.execute(SC_STATS_STUDY_SQL, {"acc": resolved})
                 sc_stats_study = cur.fetchone()
@@ -13080,7 +13087,12 @@ def download_pentimento_detections_csv(
                     raise HTTPException(404, "Study not in the Pentimento")
                 cur.execute(
                     PENTIMENTO_STUDY_DETECTIONS_SQL,
-                    {"study": resolved, "all_rows": all_rows, "viral_trace": False},
+                    {
+                        "study": resolved,
+                        "all_rows": all_rows,
+                        "viral_trace": False,
+                        "samples": None,
+                    },
                 )
                 rows = cur.fetchall()
     except HTTPException:
@@ -13239,18 +13251,23 @@ def _attach_sc_stats(cur, samples: list[dict]) -> None:
         s["sc_stats_scanned"] = bool(s["sc_stats"])
 
 
-def _attach_pentimento_detections(cur, study: str, samples: list[dict]) -> None:
+def _attach_pentimento_detections(
+    cur, study: str, samples: list[dict], *, all_rows: bool
+) -> None:
     """Attach per-organism detections, in place, keyed by sample accession.
 
-    The grid used to badge from a hardcoded 24-taxon list, so anything outside it
-    read as "none detected" no matter how strong the signal. `screened` separates
-    a sample with no detections from one that was never scanned.
+    screened separates a sample with no detections from one never scanned.
     """
     if not samples:
         return
     cur.execute(
         PENTIMENTO_STUDY_DETECTIONS_SQL,
-        {"study": study, "all_rows": False, "viral_trace": True},
+        {
+            "study": study,
+            "all_rows": all_rows,
+            "viral_trace": True,
+            "samples": [s["sample_accession"] for s in samples],
+        },
     )
     by_sample: defaultdict[str, list[dict]] = defaultdict(list)
     screened: set[str] = set()

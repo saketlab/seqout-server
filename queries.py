@@ -7460,6 +7460,7 @@ FROM runs r
 LEFT JOIN pentimento_microbe m ON m.run_accession = r.run_accession
   AND (%(all_rows)s OR {_MICROBE_EVIDENCE_EXPR}
        OR (%(viral_trace)s AND {_MICROBE_TRACE_EXPR}))
+WHERE %(samples)s::text[] IS NULL OR r.sample = ANY(%(samples)s)
 GROUP BY 1, 2, 3, 4
 ORDER BY r.sample, max(m.breadth_frac) DESC NULLS LAST;
 """
