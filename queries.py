@@ -1,11 +1,14 @@
 """SQL queries for pysradb-server"""
 
+import functools
 import math
 import re
 
 from boolean_query import case_sensitive_sql
 
 _EARTH_RADIUS_KM = 6371.0088
+# search SQL fetches one row past the page (LIMIT 201) to detect a next page
+SEARCH_PAGE_SIZE = 200
 
 ONTOLOGY_FIELDS: dict[str, str] = {
     "disease": "mondo",
@@ -126,6 +129,18 @@ SELECT DISTINCT accession, alias FROM (
     UNION ALL
     SELECT accession, alias FROM arrayexpress_experiments WHERE accession = ANY(%(acc)s)
     UNION ALL
+    SELECT 'GSE' || substr(ae.accession, 8), ae.accession
+        FROM arrayexpress_experiments ae
+       WHERE ae.accession = ANY(ARRAY(
+           SELECT 'E-GEOD-' || substr(a, 4) FROM unnest(%(acc)s::text[]) a
+            WHERE left(a, 3) = 'GSE'))
+    UNION ALL
+    SELECT 'E-GEOD-' || substr(g.accession, 4), g.accession
+        FROM geo_series g
+       WHERE g.accession = ANY(ARRAY(
+           SELECT 'GSE' || substr(a, 8) FROM unnest(%(acc)s::text[]) a
+            WHERE left(a, 7) = 'E-GEOD-'))
+    UNION ALL
     SELECT accession, alias FROM dra_studies WHERE accession = ANY(%(acc)s)
     UNION ALL
     SELECT DISTINCT g.accession, d.accession
@@ -137,7 +152,8 @@ SELECT DISTINCT accession, alias FROM (
         CROSS JOIN LATERAL unnest(alias_values(um.aliases)) AS a(acc)
        WHERE alias_values(um.aliases) && %(acc)s::text[]
          AND a.acc = ANY(%(acc)s)
-) u(accession, alias) WHERE alias IS NOT NULL;
+) u(accession, alias) WHERE alias IS NOT NULL
+ORDER BY accession, alias;
 """
 
 SUBMITTER_BATCH_SQL = """
@@ -198,7 +214,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 4; includes contributors/departments/organizations in geo_series.tsv)
-    SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
+    SELECT accession, title, summary, updated_at, published_at, organisms, countries_iso AS countries,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source, 4 AS priority, instrument_models, library_strategies
     FROM geo_series, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
@@ -213,11 +229,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 
@@ -236,7 +252,7 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 6)
-    SELECT accession, title, abstract AS summary, updated_at, organisms, countries,
+    SELECT accession, title, abstract AS summary, updated_at, published_at, organisms, countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source, 6 AS priority, instrument_models, library_strategies
     FROM sra_studies, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
@@ -251,11 +267,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 
@@ -274,7 +290,8 @@ WITH q AS (
 ),
 all_matches AS (
     -- Full-text search match (priority 4)
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
+    SELECT accession, title, description AS summary, release_date AS updated_at,
+           release_date AS published_at, organisms, countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source, 4 AS priority, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
@@ -289,11 +306,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 
@@ -316,6 +333,7 @@ all_matches AS (
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
+           first_public AS published_at,
            NULL::text[] AS organisms,
            NULL::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source, 4 AS priority,
@@ -334,11 +352,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 
@@ -361,6 +379,7 @@ all_matches AS (
            COALESCE(study_title, project_title, study_name, project_name, accession) AS title,
            COALESCE(study_description, project_summary) AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
+           first_public AS published_at,
            organisms,
            ARRAY['China']::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source, 4 AS priority,
@@ -379,11 +398,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 # db=dra. Only the DDBJ-exclusive studies are indexed (see the DRA arm of SEARCH_SQL).
@@ -405,6 +424,7 @@ all_matches AS (
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
+           first_public AS published_at,
            NULL::text[] AS organisms,
            ARRAY['Japan']::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'dra'::text AS source, 4 AS priority,
@@ -422,11 +442,11 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
 
 # db=gea. Like ArrayExpress, the tsv lives on the experiment table itself.
@@ -448,6 +468,7 @@ all_matches AS (
            title,
            description AS summary,
            release_date AS updated_at,
+           release_date AS published_at,
            CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
                 THEN ARRAY[organism] END::text[] AS organisms,
            ARRAY['Japan']::text[] AS countries,
@@ -466,12 +487,65 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
+
+
+# fold mirrors: E-GEOD-N onto GSEN, an ENA PRJ onto its secondary SRA study
+def _ae_fold_key(acc: str) -> str:
+    return f"CASE WHEN left({acc}, 7) = 'E-GEOD-' THEN 'GSE' || substr({acc}, 8) END"
+
+
+def _ena_fold_join(acc: str) -> str:
+    return (
+        f" LEFT JOIN ena_studies ena_es ON ena_es.study_accession = {acc}"
+        " LEFT JOIN sra_studies ena_ss"
+        " ON ena_ss.accession = ena_es.secondary_study_accession"
+    )
+
+
+_ENA_FOLD_KEY = "COALESCE(ena_ss.alias, ena_ss.accession)"
+_SOURCE_PREF = "CASE source WHEN 'geo' THEN 0 WHEN 'sra' THEN 1 ELSE 2 END"
+
+
+def _sort_spec(sortby: str, order: str, alias: str) -> dict:
+    """Sort value, cursor cast and join shared by every sorted search path."""
+    if sortby == "citations":
+        val, cast = "COALESCE((sp.publications->0->>'citation_count')::int, 0)", "::int"
+    elif sortby == "journal":
+        val, cast = "COALESCE(sp.publications->0->>'journal', '')", ""
+    else:  # year
+        val, cast = f"COALESCE({alias}.published_at, '1970-01-01'::date)", "::date"
+    join = (
+        f" LEFT JOIN study_publications sp ON sp.accession = {alias}.accession"
+        if sortby in ("citations", "journal")
+        else ""
+    )
+    return {
+        "val": val,
+        "cast": cast,
+        "join": join,
+        "direction": "DESC" if order == "desc" else "ASC",
+        "comp": "<" if order == "desc" else ">",
+    }
+
+
+def _with_folding(sql: str, ena: bool = True) -> str:
+    sql = sql.replace("{AE_FOLD}", _ae_fold_key("accession")).replace(
+        "{SOURCE_PREF}", _SOURCE_PREF
+    )
+    return _with_ena_folding(sql, ena) if ena else sql
+
+
+def _with_ena_folding(sql: str, enabled: bool) -> str:
+    # the join scans all of ena_studies when query-less
+    return sql.replace(
+        "{ENA_FOLD_JOIN}", _ena_fold_join("ess.accession") if enabled else ""
+    ).replace("{ENA_FOLD}", _ENA_FOLD_KEY if enabled else "NULL::text")
 
 
 SEARCH_SQL = """
@@ -489,42 +563,46 @@ WITH q AS (
 ),
 all_matches AS (
     -- GEO full-text search (includes contributors/departments/organizations in geo_series.tsv)
-    SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,
+    SELECT accession, title, summary, updated_at, published_at, organisms, countries_iso AS countries,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,
-           accession AS dedup_key, instrument_models, library_strategies
+           accession AS dedup_key, NULL::text AS fold_key, instrument_models, library_strategies
     FROM geo_series, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
     UNION ALL
 
     -- SRA full-text search (lower rank multiplier)
-        SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms, s.countries,
+    SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.published_at, s.organisms, s.countries,
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,
-           COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies
+           COALESCE(s.alias, s.accession) AS dedup_key, NULL::text AS fold_key, s.instrument_models, s.library_strategies
     FROM sra_studies s, q
     WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
 
     UNION ALL
 
     -- ArrayExpress full-text search
-    SELECT accession, title, description AS summary, release_date AS updated_at, organisms, countries,
+    SELECT accession, title, description AS summary, release_date AS updated_at,
+           release_date AS published_at, organisms, countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,
-           COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+           COALESCE(alias, accession) AS dedup_key, {AE_FOLD} AS fold_key,
+           NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM arrayexpress_experiments, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
     UNION ALL
 
     -- ENA full-text search
-    SELECT accession,
-           COALESCE(study_title, study_name, project_name, accession) AS title,
-           study_description AS summary,
-           COALESCE(last_updated, first_public) AS updated_at,
+    SELECT ess.accession,
+           COALESCE(ess.study_title, ess.study_name, ess.project_name, ess.accession) AS title,
+           ess.study_description AS summary,
+           COALESCE(ess.last_updated, ess.first_public) AS updated_at,
+           ess.first_public AS published_at,
            NULL::text[] AS organisms, NULL::text[] AS countries,
-           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,
-           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
-    FROM ena_studies_search, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+           (ts_rank(ess.tsv, q.core_q) + ts_rank(ess.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,
+           ess.accession AS dedup_key, {ENA_FOLD} AS fold_key,
+           NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+    FROM ena_studies_search ess CROSS JOIN q{ENA_FOLD_JOIN}
+    WHERE (ess.tsv @@ q.match_q OR ess.tsv @@ q.core_q)
 
     UNION ALL
 
@@ -534,10 +612,11 @@ all_matches AS (
            COALESCE(gss.study_title, gss.project_title, gss.study_name, gss.project_name, gss.accession) AS title,
            COALESCE(gss.study_description, gss.project_summary) AS summary,
            COALESCE(gss.last_updated, gss.first_public) AS updated_at,
+           gss.first_public AS published_at,
            gss.organisms,
            ARRAY['China']::text[] AS countries,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,
-           gss.accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+           gss.accession AS dedup_key, NULL::text AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM gsa_studies_search gss, q
     WHERE (gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
 
@@ -548,9 +627,10 @@ all_matches AS (
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
+           first_public AS published_at,
            NULL::text[] AS organisms, ARRAY['Japan']::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'dra'::text AS source,
-           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+           accession AS dedup_key, NULL::text AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM dra_studies_search, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 
@@ -559,19 +639,20 @@ all_matches AS (
     -- GEA (DDBJ E-GEAD) full-text search. Like ArrayExpress the tsv lives on the
     -- experiment table itself; organism is a single text column.
     SELECT accession, title, description AS summary, release_date AS updated_at,
+           release_date AS published_at,
            CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
                 THEN ARRAY[organism] END::text[] AS organisms,
            ARRAY['Japan']::text[] AS countries,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gea'::text AS source,
-           accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
+           accession AS dedup_key, NULL::text AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
     FROM gea_experiments, q
     WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
 ),
 deduped AS (
-    SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies
+    SELECT DISTINCT ON (COALESCE(fold_key, dedup_key))
+        accession, title, summary, updated_at, published_at, organisms, countries, rank, source, instrument_models, library_strategies
     FROM all_matches
-    ORDER BY dedup_key, rank DESC
+    ORDER BY COALESCE(fold_key, dedup_key), {SOURCE_PREF}, rank DESC
 ),
 counted AS (
     -- total deferred to /search/facets so this path returns the top page via a
@@ -584,12 +665,13 @@ paged AS (
     WHERE (%s::float8 IS NULL OR (rank, accession) < (%s::float8, %s::text))
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
-LIMIT 200;
+LIMIT 201;
 """
+SEARCH_SQL = _with_folding(SEARCH_SQL)
 
 
 # Boolean/structured queries
@@ -641,42 +723,45 @@ WITH q AS (
            ) AS match_q
 ),
 all_matches AS (
-    SELECT accession, title, summary, updated_at, organisms,
+    SELECT accession, title, summary, updated_at, published_at, organisms,
            countries_iso AS countries, instrument_models, library_strategies,
            platforms, NULL::text[] AS library_sources,
-           'geo'::text AS source, accession AS dedup_key,
+           'geo'::text AS source, accession AS dedup_key, NULL::text AS fold_key,
            ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank
     FROM geo_series, q
     WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,
+           s.published_at,
            s.organisms, s.countries, s.instrument_models, s.library_strategies,
            s.platforms, s.library_sources,
-           'sra'::text, COALESCE(s.alias, s.accession),
+           'sra'::text, COALESCE(s.alias, s.accession), NULL::text,
            (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7
     FROM sra_studies s, q
     WHERE (%(no_q)s OR s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
     UNION ALL
     SELECT accession, title, description AS summary, release_date AS updated_at,
+           release_date,
            organisms, countries, NULL::text[], NULL::text[], NULL::text[],
            NULL::text[],
-           'arrayexpress'::text, COALESCE(alias, accession),
+           'arrayexpress'::text, COALESCE(alias, accession), {AE_FOLD},
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM arrayexpress_experiments, q
     WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
     UNION ALL
     -- organisms materialized onto ena_studies_search by transfer.ena_organisms
     -- (DISTINCT ena_samples.scientific_name), so the organism facet includes ENA.
-    SELECT accession,
-           COALESCE(study_title, study_name, project_name, accession) AS title,
-           study_description AS summary,
-           COALESCE(last_updated, first_public) AS updated_at,
-           organisms, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
+    SELECT ess.accession,
+           COALESCE(ess.study_title, ess.study_name, ess.project_name, ess.accession) AS title,
+           ess.study_description AS summary,
+           COALESCE(ess.last_updated, ess.first_public) AS updated_at,
+           ess.first_public,
+           ess.organisms, NULL::text[], NULL::text[], NULL::text[], NULL::text[],
            NULL::text[],
-           'ena'::text, accession,
-           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
-    FROM ena_studies_search, q
-    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
+           'ena'::text, ess.accession, {ENA_FOLD},
+           (ts_rank(ess.tsv, q.core_q) + ts_rank(ess.tsv, q.match_q) * 0.2) * 0.7
+    FROM ena_studies_search ess CROSS JOIN q{ENA_FOLD_JOIN}
+    WHERE (%(no_q)s OR ess.tsv @@ q.match_q OR ess.tsv @@ q.core_q)
     UNION ALL
     -- title/abstract/organisms enriched from the BioProject and materialized
     -- onto gsa_studies_search by transfer.gsa_search, so the organism facet
@@ -686,10 +771,11 @@ all_matches AS (
            COALESCE(gss.study_title, gss.project_title, gss.study_name, gss.project_name, gss.accession) AS title,
            COALESCE(gss.study_description, gss.project_summary) AS summary,
            COALESCE(gss.last_updated, gss.first_public) AS updated_at,
+           gss.first_public,
            gss.organisms,
            ARRAY['China']::text[], NULL::text[], NULL::text[], NULL::text[],
            NULL::text[],
-           'gsa'::text, gss.accession,
+           'gsa'::text, gss.accession, NULL::text,
            (ts_rank(gss.tsv, q.core_q) + ts_rank(gss.tsv, q.match_q) * 0.2) * 0.7
     FROM gsa_studies_search gss, q
     WHERE (%(no_q)s OR gss.tsv @@ q.match_q OR gss.tsv @@ q.core_q)
@@ -701,9 +787,10 @@ all_matches AS (
            COALESCE(study_title, study_name, project_name, accession) AS title,
            study_description AS summary,
            COALESCE(last_updated, first_public) AS updated_at,
+           first_public,
            organisms, ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
            NULL::text[],
-           'dra'::text, accession,
+           'dra'::text, accession, NULL::text,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM dra_studies_search, q
     WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
@@ -711,11 +798,12 @@ all_matches AS (
     -- GEA: per-sample organisms (transfer.gea_organisms) with the single-column
     -- organism as fallback, so multi-organism studies join the facet fully.
     SELECT accession, title, description AS summary, release_date AS updated_at,
+           release_date,
            COALESCE(organisms, CASE WHEN NULLIF(btrim(organism), '') IS NOT NULL
                 THEN ARRAY[organism] END)::text[],
            ARRAY['Japan']::text[], NULL::text[], NULL::text[], NULL::text[],
            NULL::text[],
-           'gea'::text, accession,
+           'gea'::text, accession, NULL::text,
            (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
     FROM gea_experiments, q
     WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
@@ -731,18 +819,29 @@ deduped AS (
     -- (COALESCE(alias, accession) for SRA/AE, accession elsewhere). Some SRA studies
     -- are canonicalised to their GSE alias, so joining unified_metadata on accession
     -- would drop them; the investigator ranking joins on dedup_key instead.
-    SELECT DISTINCT ON (dedup_key)
-        accession, dedup_key, title, summary, updated_at, organisms, countries,
+    SELECT DISTINCT ON (COALESCE(fold_key, dedup_key))
+        accession, dedup_key, title, summary, updated_at, published_at,
+        organisms, countries,
         instrument_models, library_strategies, platforms, library_sources,
         source, rank
     FROM all_matches
     WHERE (%(db)s::text IS NULL OR source = %(db)s)
-    ORDER BY dedup_key, rank DESC
+    ORDER BY COALESCE(fold_key, dedup_key), {SOURCE_PREF}, rank DESC
 ),
 matched AS (
     SELECT * FROM deduped
 )
 """
+
+_SEARCH_MATCH_CTE = _with_folding(_SEARCH_MATCH_CTE, ena=False)
+
+
+def _inline_match_q(sql: str, q) -> str:
+    """Inline the q-dependent literals of _SEARCH_MATCH_CTE: no_q and ENA folding."""
+    return _with_ena_folding(
+        sql.replace("%(no_q)s", "TRUE" if not q else "FALSE"), bool(q)
+    )
+
 
 # Boolean-mode twin of the match CTE, for the facet/count path, so the header
 # total counts the SAME set the boolean result list returns.
@@ -846,18 +945,18 @@ def _search_filter_clauses(
         params["journal"] = list(journal)
 
     always_clauses = []
-    # day-level range wins when given; year_* stays for the structured endpoint.
+    # release date, as in search_structured; day-level range wins
     if date_from is not None:
-        always_clauses.append("matched.updated_at::date >= %(date_from)s")
+        always_clauses.append("matched.published_at >= %(date_from)s::date")
         params["date_from"] = date_from
     elif year_from is not None:
-        always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) >= %(year_from)s")
+        always_clauses.append("matched.published_at >= make_date(%(year_from)s, 1, 1)")
         params["year_from"] = year_from
     if date_to is not None:
-        always_clauses.append("matched.updated_at::date <= %(date_to)s")
+        always_clauses.append("matched.published_at <= %(date_to)s::date")
         params["date_to"] = date_to
     elif year_to is not None:
-        always_clauses.append("EXTRACT(YEAR FROM matched.updated_at) <= %(year_to)s")
+        always_clauses.append("matched.published_at <= make_date(%(year_to)s, 12, 31)")
         params["year_to"] = year_to
     if case_sensitive_q:
         # Exact-case post-filter on the raw query, over title + summary only
@@ -892,7 +991,8 @@ def build_search_match_temp(
     sql = (
         "CREATE TEMP TABLE matched ON COMMIT DROP AS\n"
         + cte
-        + "\nSELECT accession, dedup_key, rank, updated_at, organisms, countries,"
+        + "\nSELECT accession, dedup_key, rank, updated_at, published_at,"
+        + " organisms, countries,"
         + " instrument_models, library_strategies, platforms, library_sources"
         + (", title, summary" if with_text else "")
         + "\n"
@@ -901,7 +1001,7 @@ def build_search_match_temp(
     # no_q is a SQL literal: "FALSE OR tsv @@ q" folds to "tsv @@ q" at plan
     # time, keeping the FTS index in generic/prepared plans too. "TRUE OR ..."
     # folds to TRUE for the query-less full scan.
-    sql = sql.replace("%(no_q)s", "TRUE" if not q else "FALSE")
+    sql = _inline_match_q(sql, q)
     return sql, {"q": q, "q_variants": q_variants, "db": db}
 
 
@@ -990,6 +1090,7 @@ def build_search_results(
     offset=None,
     sortby=None,
     order="desc",
+    cursor_sort=None,
     **filters,
 ):
     """Paginated result list over the same filtered match set as the facet/total
@@ -998,7 +1099,7 @@ def build_search_results(
     Default order is relevance (rank). sortby (year|citations|journal) overrides
     it with the same sort expression as build_sorted_search_sql, so filtered and
     unfiltered results order identically. All active filters apply (no
-    exclude-self). Offset-paginated, 200/page. total_count is NULL; the exact
+    exclude-self). Pages of 200 plus one probe row. total_count is NULL; the exact
     total is deferred to /search/facets. Returns (sql, params) with %(name)s
     params and the same column layout as SEARCH_SQL.
     """
@@ -1014,39 +1115,31 @@ def build_search_results(
     conds = list(dim_clauses.values()) + always_clauses
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
 
-    # Sort mirrors build_sorted_search_sql. Offset paginates (the keyset cursor
-    # below is only exercised by the unsorted geo path), so re-ordering the final
-    # SELECT is all that's needed.
+    # same sort and keyset as build_sorted_search_sql
+    sort_val = "NULL::text"
+    join_clause = ""
     if sortby in ("citations", "journal", "year"):
-        direction = "DESC" if order == "desc" else "ASC"
-        if sortby == "citations":
-            sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
-            join_clause = (
-                " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
-            )
-        elif sortby == "journal":
-            sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
-            join_clause = (
-                " LEFT JOIN study_publications sp ON sp.accession = paged.accession"
-            )
-        else:  # year
-            sort_expr = "COALESCE(paged.updated_at::date, '1970-01-01'::date)"
-            join_clause = ""
+        spec = _sort_spec(sortby, order, "filtered")
+        sort_val, join_clause = spec["val"], spec["join"]
+        params["cursor_sort"] = cursor_sort
         order_by = (
-            f"ORDER BY {sort_expr} {direction} NULLS LAST, paged.accession {direction}"
+            f"ORDER BY paged.sort_val {spec['direction']} NULLS LAST,"
+            f" paged.accession {spec['direction']}"
         )
-        paged_where = _RANK_KEYSET_WHERE
+        paged_where = (
+            "    WHERE (%(cursor_sort)s::text IS NULL OR %(cursor_acc)s::text IS NULL\n"
+            f"           OR (sort_val, accession) {spec['comp']}"
+            f" (%(cursor_sort)s{spec['cast']}, %(cursor_acc)s::text))\n"
+        )
     elif not q:
         # query-less: rank is NULL on every row, so a (rank, accession) keyset
         # guard is always-true and paging never advances (infinite loop). Page by
         # accession alone, the real sort order when all ranks are NULL.
-        join_clause = ""
         order_by = "ORDER BY paged.accession DESC"
         paged_where = (
             "    WHERE (%(cursor_acc)s::text IS NULL OR accession < %(cursor_acc)s)\n"
         )
     else:
-        join_clause = ""
         order_by = "ORDER BY paged.rank DESC, paged.accession DESC"
         paged_where = _RANK_KEYSET_WHERE
 
@@ -1059,30 +1152,31 @@ def build_search_results(
         + "),\n"
         + "counted AS (\n"
         # total deferred to /search/facets; see SEARCH_SQL note.
-        + "    SELECT *, NULL::bigint AS total_count FROM filtered\n"
+        + "    SELECT filtered.*, NULL::bigint AS total_count,\n"
+        + f"           {sort_val} AS sort_val\n"
+        + "    FROM filtered"
+        + join_clause
+        + "\n"
         + "),\n"
         + "paged AS (\n"
         + "    SELECT * FROM counted\n"
         + paged_where
         + ")\n"
         + "SELECT paged.accession, paged.title, paged.summary, paged.updated_at,\n"
-        + "       paged.organisms, paged.countries, paged.rank, paged.source,\n"
-        + "       paged.total_count, paged.instrument_models, paged.library_strategies\n"
-        + "FROM paged"
-        + join_clause
-        + "\n"
+        + "       paged.published_at, paged.organisms, paged.countries, paged.rank,\n"
+        + "       paged.source, paged.total_count, paged.instrument_models,\n"
+        + "       paged.library_strategies, paged.sort_val\n"
+        + "FROM paged\n"
         + order_by
-        + "\n"
-        + "OFFSET COALESCE(%(offset)s::bigint, 0)\n"
-        + "LIMIT 200;"
+        + _RESULTS_PAGE_TAIL
     )
     # no_q inlined as a literal so "FALSE OR tsv @@ q" folds to the FTS index
     # scan at plan time (no bind-param plan surprises); see build_search_match_temp.
-    sql = sql.replace("%(no_q)s", "TRUE" if not q else "FALSE")
+    sql = _inline_match_q(sql, q)
     return sql, params
 
 
-_RESULTS_PAGE_TAIL = "\nOFFSET COALESCE(%(offset)s::bigint, 0)\nLIMIT 200;"
+_RESULTS_PAGE_TAIL = "\nOFFSET COALESCE(%(offset)s::bigint, 0)\nLIMIT 201;"
 
 
 def strip_result_paging(sql):
@@ -1096,22 +1190,34 @@ def strip_result_paging(sql):
     return sql.replace(_RESULTS_PAGE_TAIL, ";")
 
 
+_GRAPH_COLUMN = re.compile(r"^(\s*)((?:\w+\.)?(coords_2d|coords_3d|neighbors)),$", re.M)
+
+
+@functools.lru_cache(maxsize=32)
+def slim_project_sql(sql: str, keep_truthiness: bool = False) -> str:
+    """Drop the similarity-graph arrays; keep_truthiness selects whether each is
+    non-empty, which is all _graft_linked_project reads on a PRJ row."""
+    repl = r"\1(cardinality(\2) > 0) AS \3," if keep_truthiness else r"\1NULL AS \3,"
+    return _GRAPH_COLUMN.sub(repl, sql)
+
+
 # Per-kind dispatch (vs. one giant UNION CTE) so each lookup gets its own plan;
 # bind-param values can't be constant-folded across union branches in a prepared
 # statement. Column layout matches SEARCH_SQL so rows flow straight into responses.
 _SRA_FIELDS = (
-    "s.accession, s.title, s.abstract AS summary, s.updated_at, s.organisms,"
+    "s.accession, s.title, s.abstract AS summary, s.updated_at, s.published_at, s.organisms,"
     " s.countries, 100.0::float8 AS rank, 'sra'::text AS source,"
     " s.instrument_models, s.library_strategies"
 )
 _GEO_FIELDS = (
-    "g.accession, g.title, g.summary, g.updated_at, g.organisms,"
+    "g.accession, g.title, g.summary, g.updated_at, g.published_at, g.organisms,"
     " g.countries_iso AS countries, 100.0::float8 AS rank, 'geo'::text AS source,"
     " g.instrument_models, g.library_strategies"
 )
 _AE_FIELDS = (
     "ae.accession, ae.title, ae.description AS summary,"
-    " ae.release_date AS updated_at, ae.organisms, ae.countries,"
+    " ae.release_date AS updated_at, ae.release_date AS published_at,"
+    " ae.organisms, ae.countries,"
     " 100.0::float8 AS rank, 'arrayexpress'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
 )
@@ -1120,6 +1226,7 @@ _ENA_FIELDS = (
     " COALESCE(es.study_title, es.study_name, es.project_name, es.accession) AS title,"
     " es.study_description AS summary,"
     " COALESCE(es.last_updated, es.first_public) AS updated_at,"
+    " es.first_public AS published_at,"
     " NULL::text[] AS organisms, NULL::text[] AS countries,"
     " 100.0::float8 AS rank, 'ena'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
@@ -1129,13 +1236,14 @@ _DRA_FIELDS = (
     " COALESCE(ds.study_title, ds.study_name, ds.project_name, ds.accession) AS title,"
     " ds.study_description AS summary,"
     " COALESCE(ds.last_updated, ds.first_public) AS updated_at,"
+    " ds.first_public AS published_at,"
     " NULL::text[] AS organisms, ARRAY['Japan']::text[] AS countries,"
     " 100.0::float8 AS rank, 'dra'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
 )
 _GEA_FIELDS = (
     "ge.accession, ge.title, ge.description AS summary,"
-    " ge.release_date AS updated_at,"
+    " ge.release_date AS updated_at, ge.release_date AS published_at,"
     " CASE WHEN NULLIF(btrim(ge.organism), '') IS NOT NULL"
     " THEN ARRAY[ge.organism] END::text[] AS organisms,"
     " ARRAY['Japan']::text[] AS countries,"
@@ -1147,6 +1255,7 @@ _GSA_FIELDS = (
     " COALESCE(es.study_title, es.project_title, es.study_name, es.project_name, es.accession) AS title,"
     " COALESCE(es.study_description, es.project_summary) AS summary,"
     " COALESCE(es.last_updated, es.first_public) AS updated_at,"
+    " es.first_public AS published_at,"
     " es.organisms, ARRAY['China']::text[] AS countries,"
     " 100.0::float8 AS rank, 'gsa'::text AS source,"
     " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
@@ -1371,7 +1480,7 @@ SELECT
     NULL::text AS study_type,
     NULL::text AS external_id,
     NULL::jsonb AS links,
-    NULL::date AS published_at,
+    es.first_public AS published_at,
     es.last_updated AS updated_at,
     -- Most ENA projects have no embedding of their own and inherit one from the
     -- SRA/GEO study they wrap (_graft_linked_project); the minority that do have
@@ -1432,7 +1541,7 @@ SELECT
     NULL::text AS study_type,
     NULL::text AS external_id,
     NULL::jsonb AS links,
-    NULL::date AS published_at,
+    es.first_public AS published_at,
     es.last_updated AS updated_at,
     es.coords_2d,
     es.coords_3d,
@@ -2058,6 +2167,18 @@ SELECT DISTINCT study_accession AS study
 FROM ena_experiments
 WHERE experiment_accession = %s
 LIMIT 1;
+"""
+
+ENA_SAMPLE_TO_STUDY_SQL = """
+SELECT study_accession AS study FROM ena_experiments WHERE sample_accession = %s LIMIT 1;
+"""
+
+GSA_SAMPLE_TO_STUDY_SQL = """
+SELECT study_accession AS study FROM gsa_experiments WHERE sample_accession = %s LIMIT 1;
+"""
+
+GSA_RUN_TO_STUDY_SQL = """
+SELECT study_accession AS study FROM gsa_experiments WHERE run_accession = %s LIMIT 1;
 """
 
 # caller must pass accession already uppercased
@@ -2973,9 +3094,9 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT g.accession, g.title, g.summary,"
-            f" g.updated_at, g.organisms, g.countries_iso AS countries,"
+            f" g.updated_at, g.published_at, g.organisms, g.countries_iso AS countries,"
             f" {rank} AS rank, 'geo'::text AS source,"
-            f" g.accession AS dedup_key, g.instrument_models, g.library_strategies, g.platforms"
+            f" g.accession AS dedup_key, NULL::text AS fold_key, g.instrument_models, g.library_strategies, g.platforms"
             f" FROM geo_series g{joins}{from_q}{where}"
         )
 
@@ -3054,9 +3175,9 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT s.accession, s.title, s.abstract AS summary,"
-            f" s.updated_at, s.organisms, s.countries,"
+            f" s.updated_at, s.published_at, s.organisms, s.countries,"
             f" {rank} AS rank, 'sra'::text AS source,"
-            f" COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies, s.platforms"
+            f" COALESCE(s.alias, s.accession) AS dedup_key, NULL::text AS fold_key, s.instrument_models, s.library_strategies, s.platforms"
             f" FROM sra_studies s{joins}{from_q}{where}"
         )
 
@@ -3118,9 +3239,11 @@ def build_structured_search(
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
             f"SELECT ae.accession, ae.title, ae.description AS summary,"
-            f" ae.release_date AS updated_at, ae.organisms, ae.countries,"
+            f" ae.release_date AS updated_at, ae.release_date AS published_at,"
+            f" ae.organisms, ae.countries,"
             f" {rank} AS rank, 'arrayexpress'::text AS source,"
-            f" COALESCE(ae.alias, ae.accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
+            f" COALESCE(ae.alias, ae.accession) AS dedup_key,"
+            f" {_ae_fold_key('ae.accession')} AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
             f" FROM arrayexpress_experiments ae{joins}{from_q}{where}"
         )
 
@@ -3129,14 +3252,14 @@ def build_structured_search(
         joins = ""
         if geo_cte:
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = es.study_accession AND ga.source = 'ena'"
-        from_q = ", q" if q else ""
-        ena_tsv = (
-            "to_tsvector('english',"
-            " coalesce(es.study_title, '') || ' ' ||"
-            " coalesce(es.study_description, ''))"
-        )
         if q:
-            w.append(f"{ena_tsv} @@ q.match_q")
+            # the fold join scans all of ena_studies when query-less
+            joins += (
+                " LEFT JOIN sra_studies ena_ss"
+                " ON ena_ss.accession = es.secondary_study_accession"
+            )
+            joins += " JOIN ena_studies_search ess ON ess.accession = es.study_accession CROSS JOIN q"
+            w.append("ess.tsv @@ q.match_q")
         if organism:
             # GIN-indexed array containment (idx_ena_studies_organisms_gin); the
             # scalar scientific_name only sees the study-level organism and misses
@@ -3192,7 +3315,7 @@ def build_structured_search(
             w.append(_pub_date_clause("es.study_accession"))
 
         rank = (
-            f"(ts_rank({ena_tsv}, q.core_q) + ts_rank({ena_tsv}, q.match_q) * 0.2) * 0.7"
+            "(ts_rank(ess.tsv, q.core_q) + ts_rank(ess.tsv, q.match_q) * 0.2) * 0.7"
             if q
             else "COALESCE(EXTRACT(EPOCH FROM es.first_public), 0)"
         )
@@ -3201,13 +3324,16 @@ def build_structured_search(
             f"SELECT es.study_accession AS accession,"
             f" es.study_title AS title,"
             f" es.study_description AS summary,"
-            f" es.first_public AS updated_at,"
+            f" COALESCE(es.last_updated, es.first_public) AS updated_at,"
+            f" es.first_public AS published_at,"
             f" COALESCE(es.organisms, CASE WHEN es.scientific_name IS NOT NULL"
             f" THEN ARRAY[es.scientific_name] END) AS organisms,"
             f" NULL::text[] AS countries,"
             f" {rank} AS rank, 'ena'::text AS source,"
-            f" es.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
-            f" FROM ena_studies es{joins}{from_q}{where}"
+            f" es.study_accession AS dedup_key,"
+            f" {_ENA_FOLD_KEY if q else 'NULL::text'} AS fold_key,"
+            f" NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
+            f" FROM ena_studies es{joins}{where}"
         )
 
     if include_gsa:
@@ -3288,19 +3414,20 @@ def build_structured_search(
             f"SELECT gs.study_accession AS accession,"
             f" COALESCE(gs.study_title, gss.project_title, gs.study_name, gs.project_name, gs.study_accession) AS title,"
             f" COALESCE(gs.study_description, gss.project_summary) AS summary,"
-            f" gs.first_public AS updated_at,"
+            f" COALESCE(gs.last_updated, gs.first_public) AS updated_at,"
+            f" gs.first_public AS published_at,"
             f" COALESCE(gs.organisms, CASE WHEN gs.scientific_name IS NOT NULL"
             f" THEN ARRAY[gs.scientific_name] END) AS organisms,"
             f" ARRAY['China']::text[] AS countries,"
             f" {rank} AS rank, 'gsa'::text AS source,"
-            f" gs.study_accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
+            f" gs.study_accession AS dedup_key, NULL::text AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
             f" FROM gsa_studies gs{joins}{from_q}{where}"
         )
 
     if not cte_parts:
         return (
             "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
-            " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL AS updated_at, NULL AS published_at, NULL::text[] AS organisms,"
             " NULL::text[] AS countries,"
             " NULL::float8 AS rank, NULL AS source,"
             " 0::bigint AS total_count, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies WHERE FALSE",
@@ -3338,7 +3465,7 @@ def build_structured_search(
     geo_cte_prefix = f"{geo_cte},\n" if geo_cte else ""
 
     _COUNT_BUCKETS = {
-        "year": "EXTRACT(YEAR FROM updated_at)::int",
+        "year": "EXTRACT(YEAR FROM published_at)::int",
         "source": "source",
         "organism": "unnest(organisms)",
         "country": "unnest(countries)",
@@ -3356,11 +3483,11 @@ WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
     {all_matches}
 ),
 deduped AS (
-    SELECT DISTINCT ON (dedup_key)
-        accession, updated_at, organisms, countries, source,
+    SELECT DISTINCT ON (COALESCE(fold_key, dedup_key))
+        accession, updated_at, published_at, organisms, countries, source,
         library_strategies, instrument_models
     FROM all_matches
-    ORDER BY dedup_key, rank DESC
+    ORDER BY COALESCE(fold_key, dedup_key), {_SOURCE_PREF}, rank DESC
 )
 SELECT bucket, COUNT(*)::bigint AS count
 FROM (SELECT {bucket_expr} AS bucket FROM deduped) buckets
@@ -3375,10 +3502,10 @@ WITH {query_cte_prefix}{geo_cte_prefix}all_matches AS (
     {all_matches}
 ),
 deduped AS (
-    SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies
+    SELECT DISTINCT ON (COALESCE(fold_key, dedup_key))
+        accession, title, summary, updated_at, published_at, organisms, countries, rank, source, instrument_models, library_strategies
     FROM all_matches
-    ORDER BY dedup_key, rank DESC
+    ORDER BY COALESCE(fold_key, dedup_key), {_SOURCE_PREF}, rank DESC
 ),
 counted AS (
     SELECT *, COUNT(*) OVER () AS total_count FROM deduped
@@ -3389,11 +3516,11 @@ paged AS (
     {cursor_where}
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, total_count, instrument_models, library_strategies
 FROM paged
 ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%(offset)s::bigint, 0)
-LIMIT 200;"""
+LIMIT 201;"""
 
     params["offset"] = None
     return sql, params
@@ -3418,19 +3545,19 @@ def build_sorted_search_sql(
 
     if db in (None, "geo"):
         cte_parts.append(
-            "SELECT accession, title, summary, updated_at, organisms, countries_iso AS countries,"
+            "SELECT accession, title, summary, updated_at, published_at, organisms, countries_iso AS countries,"
             " ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2 AS rank, 'geo'::text AS source,"
-            " accession AS dedup_key, instrument_models, library_strategies"
+            " accession AS dedup_key, NULL::text AS fold_key, instrument_models, library_strategies"
             " FROM geo_series, q"
             " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if db in (None, "sra"):
         cte_parts.append(
-            "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at,"
+            "SELECT s.accession, s.title, s.abstract AS summary, s.updated_at, s.published_at,"
             " s.organisms, s.countries,"
             " (ts_rank(s.tsv, q.core_q) + ts_rank(s.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'sra'::text AS source,"
-            " COALESCE(s.alias, s.accession) AS dedup_key, s.instrument_models, s.library_strategies"
+            " COALESCE(s.alias, s.accession) AS dedup_key, NULL::text AS fold_key, s.instrument_models, s.library_strategies"
             " FROM sra_studies s, q"
             " WHERE (s.tsv @@ q.match_q OR s.tsv @@ q.core_q)"
         )
@@ -3438,24 +3565,27 @@ def build_sorted_search_sql(
     if db in (None, "arrayexpress"):
         cte_parts.append(
             "SELECT accession, title, description AS summary,"
-            " release_date AS updated_at, organisms, countries,"
+            " release_date AS updated_at, release_date AS published_at, organisms, countries,"
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,"
-            " COALESCE(alias, accession) AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            f" COALESCE(alias, accession) AS dedup_key, {_ae_fold_key('accession')} AS fold_key,"
+            " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM arrayexpress_experiments, q"
             " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
 
     if db in (None, "ena"):
         cte_parts.append(
-            "SELECT accession,"
-            " COALESCE(study_title, study_name, project_name, accession) AS title,"
-            " study_description AS summary,"
-            " COALESCE(last_updated, first_public) AS updated_at,"
+            "SELECT ess.accession,"
+            " COALESCE(ess.study_title, ess.study_name, ess.project_name, ess.accession) AS title,"
+            " ess.study_description AS summary,"
+            " COALESCE(ess.last_updated, ess.first_public) AS updated_at,"
+            " ess.first_public AS published_at,"
             " NULL::text[] AS organisms, NULL::text[] AS countries,"
-            " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,"
-            " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
-            " FROM ena_studies_search, q"
-            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
+            " (ts_rank(ess.tsv, q.core_q) + ts_rank(ess.tsv, q.match_q) * 0.2) * 0.7 AS rank, 'ena'::text AS source,"
+            f" ess.accession AS dedup_key, {_ENA_FOLD_KEY} AS fold_key,"
+            " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            f" FROM ena_studies_search ess CROSS JOIN q{_ena_fold_join('ess.accession')}"
+            " WHERE (ess.tsv @@ q.match_q OR ess.tsv @@ q.core_q)"
         )
 
     if db in (None, "gsa"):
@@ -3464,9 +3594,10 @@ def build_sorted_search_sql(
             " COALESCE(study_title, project_title, study_name, project_name, accession) AS title,"
             " COALESCE(study_description, project_summary) AS summary,"
             " COALESCE(last_updated, first_public) AS updated_at,"
+            " first_public AS published_at,"
             " organisms, ARRAY['China']::text[] AS countries,"
             " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'gsa'::text AS source,"
-            " accession AS dedup_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
+            " accession AS dedup_key, NULL::text AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
             " FROM gsa_studies_search, q"
             " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
         )
@@ -3474,7 +3605,7 @@ def build_sorted_search_sql(
     if not cte_parts:
         return (
             "SELECT NULL AS accession, NULL AS title, NULL AS summary,"
-            " NULL AS updated_at, NULL::text[] AS organisms,"
+            " NULL AS updated_at, NULL AS published_at, NULL::text[] AS organisms,"
             " NULL::text[] AS countries,"
             " NULL::float8 AS rank, NULL AS source,"
             " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies,"
@@ -3484,25 +3615,9 @@ def build_sorted_search_sql(
 
     all_matches = "\n    UNION ALL\n    ".join(cte_parts)
 
-    if sortby == "citations":
-        sort_expr = "COALESCE((sp.publications->0->>'citation_count')::int, 0)"
-        join_clause = (
-            "\n    LEFT JOIN study_publications sp ON sp.accession = d.accession"
-        )
-        cursor_cast = "::int"
-    elif sortby == "journal":
-        sort_expr = "COALESCE(sp.publications->0->>'journal', '')"
-        join_clause = (
-            "\n    LEFT JOIN study_publications sp ON sp.accession = d.accession"
-        )
-        cursor_cast = ""
-    else:  # year
-        sort_expr = "COALESCE(d.updated_at::date, '1970-01-01'::date)"
-        join_clause = ""
-        cursor_cast = "::date"
-
-    direction = "DESC" if order == "desc" else "ASC"
-    comp = "<" if order == "desc" else ">"
+    spec = _sort_spec(sortby, order, "d")
+    sort_expr, join_clause, cursor_cast = spec["val"], spec["join"], spec["cast"]
+    direction, comp = spec["direction"], spec["comp"]
 
     if cursor_sort is not None and cursor_acc is not None:
         params["cursor_sort"] = cursor_sort
@@ -3531,10 +3646,10 @@ all_matches AS (
     {all_matches}
 ),
 deduped AS (
-    SELECT DISTINCT ON (dedup_key)
-        accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies
+    SELECT DISTINCT ON (COALESCE(fold_key, dedup_key))
+        accession, title, summary, updated_at, published_at, organisms, countries, rank, source, instrument_models, library_strategies
     FROM all_matches
-    ORDER BY dedup_key, rank DESC
+    ORDER BY COALESCE(fold_key, dedup_key), {_SOURCE_PREF}, rank DESC
 ),
 sorted AS (
     SELECT d.*,
@@ -3550,12 +3665,12 @@ paged AS (
     {cursor_where}
 )
 SELECT
-    accession, title, summary, updated_at, organisms, countries, rank, source, instrument_models, library_strategies,
+    accession, title, summary, updated_at, published_at, organisms, countries, rank, source, instrument_models, library_strategies,
     sort_val, total_count
 FROM paged
 ORDER BY sort_val {direction} NULLS LAST, accession {direction}
 OFFSET COALESCE(%(offset)s::bigint, 0)
-LIMIT 200;"""
+LIMIT 201;"""
 
     params["offset"] = offset
     return sql, params

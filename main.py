@@ -51,6 +51,21 @@ from deep_dive import (
     search_terms_fuzzy,
 )
 from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
+from mcp_support import (
+    MCP_DEPRECATED_TOOLS,
+    MCP_EXCLUDED_OPERATION_IDS,
+    MCP_INSTRUCTIONS,
+    MCP_TOOL_NAMES,
+    MCP_TOOL_NOTES,
+    SEARCH_PAGE_SIZE,
+    SeqoutMcpMiddleware,
+    alias_accessions,
+    annotate_tool,
+    finish_page,
+    set_path_tools,
+    shape_search,
+    sql_total,
+)
 from library_strategy import (
     is_ena_study as _is_ena_study,
     is_gsa_study as _is_gsa_study,
@@ -210,6 +225,10 @@ from queries import (
     PRJNA_TO_GEO_SERIES_SQL,
     PRJ_TO_ENA_STUDY_SQL,
     SUBMISSION_TO_STUDIES_SQL,
+    ENA_SAMPLE_TO_STUDY_SQL,
+    GSA_SAMPLE_TO_STUDY_SQL,
+    GSA_RUN_TO_STUDY_SQL,
+    GSA_EXPERIMENT_TO_STUDY_SQL,
     PRJ_TO_GSA_STUDY_SQL,
     PRJ_TO_SRA_STUDY_SQL,
     PENTIMENTO_RESOLVE_SQL,
@@ -286,6 +305,7 @@ from queries import (
     build_search_match_temp,
     build_search_results,
     strip_result_paging,
+    slim_project_sql,
     build_search_total_over_matched,
     build_sorted_search_sql,
     build_structured_search,
@@ -373,11 +393,14 @@ class AccessionsRequest(BaseModel):
 class ConvertRequest(BaseModel):
     """Body for POST /convert (batch accession conversion)."""
 
-    accessions: list[str] = Field(
-        ...,
+    accessions: list[str] | None = Field(
+        None,
         min_length=1,
         description="Any accessions (run/sample/experiment/project, any archive).",
         examples=[["GSM4996084", "SRR13333614", "E-MTAB-8142"]],
+    )
+    accession: str | None = Field(
+        None, description="One accession; same as a one-element `accessions`."
     )
     db: str | None = Field(
         None,
@@ -762,7 +785,6 @@ _broad_facets_cache: dict[tuple, dict] = {}
 _search_results_cache_lock = threading.Lock()
 _search_results_cache: dict[tuple, dict] = {}
 _MAX_SEARCH_RESULTS_CACHE_ENTRIES = 300
-_SEARCH_RESULTS_PAGE = 200
 _author_projects_cache_lock = threading.Lock()
 _author_projects_cache: dict[tuple, dict] = {}
 _AUTHOR_PROJECTS_CACHE_TTL = 24 * 3600
@@ -772,6 +794,19 @@ _STATS_SOURCES = ("geo", "sra", "arrayexpress", "ena", "gsa", "dra", "gea")
 
 
 _DEFAULT_STATEMENT_TIMEOUT = "30s"
+
+
+def _read_server_version() -> str:
+    # deploy workflow writes VERSION
+    try:
+        return (
+            pathlib.Path(__file__).with_name("VERSION").read_text().strip()
+        ) or "dev"
+    except OSError:
+        return "dev"
+
+
+SERVER_VERSION = _read_server_version()
 
 
 def _configure_connection(conn) -> None:
@@ -1282,6 +1317,8 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             if cites:
                 pubs = [_citation_pub(c) for c in cites if c] or None
         row["publications"] = pubs
+        if "alias" not in row:
+            row["alias"] = alias_accessions(row_candidates.get(acc, [])[1:], acc)
         if pubs and len(pubs) > 0:
             primary = pubs[0]
             row["pmid"] = primary.get("pmid")
@@ -1328,12 +1365,16 @@ def _project_sql(accession: str) -> str:
     return PROJECT_SRA_SQL
 
 
-def _fetch_project_row(cur, accession: str):
+def _fetch_project_row(cur, accession: str, slim: bool = False):
     """Project row for any source; a DDBJ-exclusive DRP has no sra_studies twin."""
-    cur.execute(_project_sql(accession), (accession,))
+
+    def pick(sql):
+        return slim_project_sql(sql, accession.startswith("PRJ")) if slim else sql
+
+    cur.execute(pick(_project_sql(accession)), (accession,))
     row = cur.fetchone()
     if not row and accession.startswith("DRP"):
-        cur.execute(PROJECT_DRA_SQL, (accession,))
+        cur.execute(pick(PROJECT_DRA_SQL), (accession,))
         row = cur.fetchone()
     return row
 
@@ -2805,7 +2846,7 @@ def _try_accession_search(
                     cur.execute(sql, {"acc": acc})
                 rows = cur.fetchall()
                 if rows:
-                    _enrich_with_publications(rows, cur)
+                    _enrich_page(rows, cur)
     except Exception:
         logger.exception("Database error in accession search")
         raise HTTPException(500, "Internal server error")
@@ -2815,6 +2856,8 @@ def _try_accession_search(
     return {
         "results": rows,
         "total": len(rows),
+        "total_is_known": True,
+        "has_more": False,
         "took_ms": round(took_ms, 2),
         "next_cursor": None,
     }
@@ -2894,6 +2937,78 @@ _CASE_SENSITIVE_DOC = (
 _LONG_READ_DOC = (
     "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
 )
+_Q_DOC = (
+    'Keywords, or a boolean query such as ("aging" OR aged) immun*. Plain '
+    "keywords are expanded with ontology synonyms; boolean queries are not."
+)
+_CURSOR_RANK_DOC = (
+    "Relevance paging: `next_cursor.rank` of the previous page, sent with cursor_acc."
+)
+_CURSOR_ACC_DOC = "`next_cursor.accession` of the previous page."
+_CURSOR_SORT_DOC = (
+    "Sorted paging (with sortby): `next_cursor.sort_value` of the previous page, "
+    "sent with cursor_acc."
+)
+_OFFSET_DOC = "Rows to skip, an alternative to the cursors."
+_SORTBY_DOC = (
+    "Replaces relevance order; year is the release date. Use only when the user "
+    "asks for newest, oldest, most cited or by journal."
+)
+_ORDER_DOC = "Sort direction for sortby."
+_LIMIT_DOC = f"Rows per page, 1-{SEARCH_PAGE_SIZE}. Default {SEARCH_PAGE_SIZE}."
+_FIELDS_DOC = (
+    "compact: core fields with the summary cut to 300 characters; full: every "
+    "field, with publications and submitter."
+)
+_ORGANISM_DOC = "Exact scientific name, e.g. Homo sapiens (case-insensitive)."
+_LIBRARY_STRATEGY_DOC = (
+    "Library strategies (RNA-Seq, ChIP-Seq, WGS, ...); a study matches any of "
+    "them. Values: list_library_strategies."
+)
+_INSTRUMENT_DOC = "Exact instrument models, e.g. Illumina NovaSeq 6000. Values: list_instrument_models."
+_PLATFORM_DOC = "Platform codes such as ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT."
+_MULTI_PLATFORM_DOC = "Only studies with 2+ sequencing platforms."
+_YEAR_FROM_DOC = "Lower bound on the release year (first public), inclusive."
+_YEAR_TO_DOC = "Upper bound on the release year (first public), inclusive."
+_DATE_FROM_DOC = (
+    "YYYY-MM-DD; lower bound on the release date (first public). Overrides year_from."
+)
+_DATE_TO_DOC = (
+    "YYYY-MM-DD; upper bound on the release date (first public). Overrides year_to."
+)
+_COUNT_BY_DOC = "Return bucket counts instead of rows; year buckets the release year."
+_GEO_DOC = "Submitter location from unified_metadata (case-insensitive exact match)."
+_FILTERED_RETRY = "Retry with a more specific q or narrower filters."
+_STRUCTURED_RETRY = (
+    "Retry without the slowest filter (sample_*, geo_*, center), or use "
+    "search_all with the same q and date_to."
+)
+
+
+def _check_cursor_sort(
+    sortby: str | None, cursor_sort: str, cursor_acc: str | None
+) -> None:
+    """400 on a sort cursor the sort column cannot cast, instead of a SQL error."""
+    if not sortby or cursor_acc is None:
+        raise HTTPException(400, "cursor_sort needs sortby and cursor_acc")
+    try:
+        if sortby == "year":
+            date.fromisoformat(cursor_sort)
+        elif sortby == "citations":
+            int(cursor_sort)
+    except ValueError:
+        raise HTTPException(
+            400, f"cursor_sort {cursor_sort!r} does not fit sortby={sortby}"
+        )
+
+
+def _first_page(*cursors) -> bool:
+    return all(c is None for c in cursors)
+
+
+def _timeout_detail(hint: str, seconds: int | None = None) -> str:
+    seconds = seconds or int(_DEFAULT_STATEMENT_TIMEOUT.rstrip("s"))
+    return f"Timed out after {seconds} s. This is not an empty result. {hint}"
 
 
 # X-Search-Total/X-Search-Expansion feed the Nginx log contract; threadpool
@@ -2903,6 +3018,54 @@ _SEARCH_NOTES: contextvars.ContextVar = contextvars.ContextVar(
 )
 # escaped form also matches "total" quoted inside an MCP JSON-RPC payload
 _SEARCH_TOTAL = re.compile(rb'total\\?":\s*(\d+)')
+
+
+# enrichment skips rows past the request's limit
+_ENRICH_LIMIT: contextvars.ContextVar = contextvars.ContextVar(
+    "enrich_limit", default=None
+)
+
+
+# set on paths that cache a full first page
+_CACHE_FULL_PAGE: contextvars.ContextVar = contextvars.ContextVar(
+    "cache_full_page", default=False
+)
+
+
+def _enrich_page(rows: list[dict], cur) -> None:
+    n = _ENRICH_LIMIT.get()
+    if n is None or (_CACHE_FULL_PAGE.get() and len(rows) > SEARCH_PAGE_SIZE):
+        n = SEARCH_PAGE_SIZE
+    _enrich_with_publications(rows[:n], cur)
+
+
+def _enrich_missing(result: dict) -> None:
+    """Enrich rows the limit skipped that a response still carries."""
+    corr = result.get("correction") or {}
+    rows = [
+        r
+        for r in [*(result.get("results") or []), *(corr.get("extra_results") or [])]
+        if "publications" not in r
+    ]
+    if rows:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            _enrich_with_publications(rows, cur)
+
+
+def _limited_search(run, limit: int | None, fields: str, sorted_page: bool) -> dict:
+    """Run a search with enrichment bounded by limit, then apply limit and fields."""
+    token = _ENRICH_LIMIT.set(limit)
+    cache_token = _CACHE_FULL_PAGE.set(False)
+    try:
+        result = run()
+    finally:
+        _ENRICH_LIMIT.reset(token)
+        _CACHE_FULL_PAGE.reset(cache_token)
+    if "results" not in result:
+        return result
+    result = shape_search(result, limit, "full", sorted_page)
+    _enrich_missing(result)
+    return shape_search(result, None, fields, sorted_page)
 
 
 def _note_expansion(outcome: str) -> None:
@@ -3182,7 +3345,11 @@ def _get_suggestions(q: str) -> list[dict]:
     operation_id="health_check",
 )
 def hello():
-    return {"message": "pysradb-server is up and running!", "errors": None}
+    return {
+        "message": "pysradb-server is up and running!",
+        "errors": None,
+        "version": SERVER_VERSION,
+    }
 
 
 @api_app.post(
@@ -4600,26 +4767,22 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                     q,
                 )
-                _enrich_with_publications(rows, cur)
+                _enrich_page(rows, cur)
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
     except Exception:
         logger.exception("Database error in search_geo")
         raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
-    total = rows[0]["total_count"] if rows else 0
-
     return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {
-                "rank": rows[-1]["rank"],
-                "accession": rows[-1]["accession"],
-            }
+        **finish_page(
+            rows,
+            sorted_page=False,
+            first_page=_first_page(cursor_rank, cursor_acc),
+            offset=offset,
         ),
+        "took_ms": round(took_ms, 2),
     }
 
 
@@ -4663,26 +4826,22 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                     q,
                 )
-                _enrich_with_publications(rows, cur)
+                _enrich_page(rows, cur)
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
     except Exception:
         logger.exception("Database error in search_sra")
         raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
-    total = rows[0]["total_count"] if rows else 0
-
     return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {
-                "rank": rows[-1]["rank"],
-                "accession": rows[-1]["accession"],
-            }
+        **finish_page(
+            rows,
+            sorted_page=False,
+            first_page=_first_page(cursor_rank, cursor_acc),
+            offset=offset,
         ),
+        "took_ms": round(took_ms, 2),
     }
 
 
@@ -4698,7 +4857,12 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
 @limiter.limit("100/minute")
 def search_suggest(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=500),
+    q: str = Query(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="The query that returned few results.",
+    ),
 ):
     start = time.perf_counter()
     search_q = replace_query_hyphens(q)
@@ -4843,7 +5007,12 @@ def ontology_search(
 @limiter.limit("100/minute")
 def search_expansion(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=500),
+    q: str = Query(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="The search_all query to explain.",
+    ),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
     start = time.perf_counter()
@@ -4976,8 +5145,10 @@ def _derived_words(cur, q: str, variants: list[str], words: list[str]) -> dict:
 def search_highlight(
     request: Request,
     response: Response,
-    q: str = Query(..., min_length=1, max_length=500),
-    accession: str = Query(..., pattern=PROJECT_REGEX),
+    q: str = Query(..., min_length=1, max_length=500, description="The search query."),
+    accession: str = Query(
+        ..., pattern=PROJECT_REGEX, description="Project accession from the results."
+    ),
     structured: bool = Query(
         False,
         description="Mark only the words as typed, no ontology synonyms — the "
@@ -5081,10 +5252,8 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
     Shared by the filtered and unfiltered paths of /search so a sidebar filter
     doesn't silently turn auto-correction off.
 
-    `rerun` is every parameter of search() except `request` and `q`. It must be
-    COMPLETE: an omitted parameter falls back to search()'s signature default,
-    which is the FastAPI Query() object rather than the value inside it and
-    Query(False) is truthy, so a missing flag reads as True.
+    rerun is every parameter of _search_impl() except request and q; it has no
+    defaults, so an omitted one fails loudly.
     """
     # No "did you mean" when the user typed boolean operators: those are
     # deliberate, so silently rewriting them would be wrong. Structured mode
@@ -5109,7 +5278,7 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
             result["suggestions"] = suggestions
         return result
 
-    corrected = search.__wrapped__(request, q=corrected_q, **rerun)
+    corrected = _search_impl(request, q=corrected_q, **rerun)
     orig_results = result.get("results", [])
     if not corrected.get("results"):
         # Correction didn't help either; fall back to the suggestion link.
@@ -5117,13 +5286,10 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
         return result
 
     result["results"] = corrected["results"]
-    result["total"] = corrected.get("total")
-    result["next_cursor"] = corrected.get("next_cursor")
-    first_page = (
-        rerun["offset"] is None
-        and rerun["cursor_rank"] is None
-        and rerun["cursor_acc"] is None
-        and rerun["cursor_sort"] is None
+    for key in ("total", "total_is_known", "has_more", "next_cursor"):
+        result[key] = corrected.get(key)
+    first_page = _first_page(
+        rerun["offset"], rerun["cursor_rank"], rerun["cursor_acc"], rerun["cursor_sort"]
     )
     if first_page:
         corrected_accs = {r["accession"] for r in corrected["results"]}
@@ -5148,45 +5314,128 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
         "Optionally sort by sortby=citations|journal|year with order=desc(default)|asc. "
         "For default relevance sort, use cursor_rank + cursor_acc for pagination. "
         "For custom sortby, use cursor_sort + cursor_acc for pagination. "
-        "Returns {results: object[], total: int, took_ms: float, "
-        "next_cursor: {rank, accession} or {sort_value, accession} | null}."
+        "Each row has `published_at` (release date) and `alias` (the same dataset "
+        "in other archives); mirrors of one dataset are folded into one row. "
+        "Returns {results: object[], total: int | null, total_is_known: bool, "
+        "has_more: bool, took_ms: float, "
+        "next_cursor: {rank, accession} or {sort_value, accession} | null}. "
+        "`total` is null when the server does not count the match set; "
+        "`next_cursor` is null on the last page."
     ),
     operation_id="search_all",
 )
 @limiter.limit("100/minute")
 def search(
     request: Request,
-    q: str | None = Query(None, max_length=500),
-    cursor_rank: float | None = Query(None),
-    cursor_acc: str | None = Query(None),
-    cursor_sort: str | None = Query(None),
-    offset: int | None = Query(None, ge=0),
-    db: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$"),
-    sortby: str | None = Query(None, pattern="^(citations|journal|year)$"),
-    order: str = Query("desc", pattern="^(asc|desc)$"),
+    q: str | None = Query(None, max_length=500, description=_Q_DOC),
+    cursor_rank: float | None = Query(None, description=_CURSOR_RANK_DOC),
+    cursor_acc: str | None = Query(None, description=_CURSOR_ACC_DOC),
+    cursor_sort: str | None = Query(None, description=_CURSOR_SORT_DOC),
+    offset: int | None = Query(None, ge=0, description=_OFFSET_DOC),
+    db: str | None = Query(
+        None,
+        pattern="^(geo|sra|arrayexpress|ena|gsa|dra|gea)$",
+        description="Restrict to one archive. Omit to search all.",
+    ),
+    sortby: str | None = Query(
+        None, pattern="^(citations|journal|year)$", description=_SORTBY_DOC
+    ),
+    order: str = Query("desc", pattern="^(asc|desc)$", description=_ORDER_DOC),
+    limit: int | None = Query(None, ge=1, le=SEARCH_PAGE_SIZE, description=_LIMIT_DOC),
+    fields: str = Query("full", pattern="^(compact|full)$", description=_FIELDS_DOC),
     structured: bool = Query(
         False,
         description="Force boolean/structured parsing of q even without operators "
         "(auto-detected otherwise). Uses the exact terms; no ontology expansion.",
     ),
-    organism: str | None = Query(None),
-    country: list[str] | None = Query(None),
-    library_strategy: list[str] | None = Query(None),
-    library_source: list[str] | None = Query(None),
-    instrument_model: list[str] | None = Query(None),
-    platform: list[str] | None = Query(None),
-    journal: list[str] | None = Query(None),
-    multi_platform: bool = Query(False),
+    organism: str | None = Query(None, description=_ORGANISM_DOC),
+    country: list[str] | None = Query(
+        None, description="Country names; a study matches any of them."
+    ),
+    library_strategy: list[str] | None = Query(None, description=_LIBRARY_STRATEGY_DOC),
+    library_source: list[str] | None = Query(
+        None,
+        description="Library sources (GENOMIC, TRANSCRIPTOMIC, ...), any case; any of them.",
+    ),
+    instrument_model: list[str] | None = Query(None, description=_INSTRUMENT_DOC),
+    platform: list[str] | None = Query(None, description=_PLATFORM_DOC),
+    journal: list[str] | None = Query(
+        None, description="Exact journal names of the linked paper; any of them."
+    ),
+    multi_platform: bool = Query(False, description=_MULTI_PLATFORM_DOC),
     long_read: bool = Query(False, description=_LONG_READ_DOC),
-    year_from: int | None = Query(None, ge=1900, le=2100),
-    year_to: int | None = Query(None, ge=1900, le=2100),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    year_from: int | None = Query(None, ge=1900, le=2100, description=_YEAR_FROM_DOC),
+    year_to: int | None = Query(None, ge=1900, le=2100, description=_YEAR_TO_DOC),
+    date_from: date | None = Query(None, description=_DATE_FROM_DOC),
+    date_to: date | None = Query(None, description=_DATE_TO_DOC),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
     case_sensitive: bool = Query(False, description=_CASE_SENSITIVE_DOC),
 ):
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(400, "date_from must be <= date_to")
+    if cursor_sort is not None:
+        _check_cursor_sort(sortby, cursor_sort, cursor_acc)
+
+    def run():
+        return _search_impl(
+            request,
+            q=q,
+            cursor_rank=cursor_rank,
+            cursor_acc=cursor_acc,
+            cursor_sort=cursor_sort,
+            offset=offset,
+            db=db,
+            sortby=sortby,
+            order=order,
+            structured=structured,
+            organism=organism,
+            country=country,
+            library_strategy=library_strategy,
+            library_source=library_source,
+            instrument_model=instrument_model,
+            platform=platform,
+            journal=journal,
+            multi_platform=multi_platform,
+            long_read=long_read,
+            year_from=year_from,
+            year_to=year_to,
+            date_from=date_from,
+            date_to=date_to,
+            exclude_ontology=exclude_ontology,
+            case_sensitive=case_sensitive,
+        )
+
+    return _limited_search(run, limit, fields, sorted_page=bool(sortby))
+
+
+def _search_impl(
+    request,
+    *,
+    q,
+    cursor_rank,
+    cursor_acc,
+    cursor_sort,
+    offset,
+    db,
+    sortby,
+    order,
+    structured,
+    organism,
+    country,
+    library_strategy,
+    library_source,
+    instrument_model,
+    platform,
+    journal,
+    multi_platform,
+    long_read,
+    year_from,
+    year_to,
+    date_from,
+    date_to,
+    exclude_ontology,
+    case_sensitive,
+):
     sidebar_filters = {
         "organism": organism,
         "country": country,
@@ -5254,6 +5503,7 @@ def search(
             order,
             boolean_tsq=boolean_tsq,
             disabled=exclude_ontology or (),
+            cursor_sort=cursor_sort,
         )
         # Same auto-correction as the unfiltered path: a typo is still a typo with
         # a sidebar filter on, and leaving it uncorrected here made the result
@@ -5275,15 +5525,11 @@ def search(
 
     original_q = replace_query_hyphens(q, expand=not structured)
     q = original_q
+    first_page = _first_page(cursor_rank, cursor_acc, cursor_sort)
 
     # First-page unfiltered searches are cacheable (filtered/accession returned above).
     results_cache_key = None
-    if (
-        cursor_rank is None
-        and cursor_acc is None
-        and cursor_sort is None
-        and not offset
-    ):
+    if first_page and not offset:
         results_cache_key = (
             q,
             db,
@@ -5298,6 +5544,7 @@ def search(
             )
         if _cached_results is not None:
             return _cached_results
+        _CACHE_FULL_PAGE.set(True)
 
     if boolean_tsq is not None:
         start = time.perf_counter()
@@ -5336,32 +5583,25 @@ def search(
                             ),
                         )
                     rows = cur.fetchall()
-                    _enrich_with_publications(rows, cur)
+                    _enrich_page(rows, cur)
         except PgSyntaxError:
             raise HTTPException(400, "could not parse boolean query")
+        except QueryCanceled:
+            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
         except Exception:
             logger.exception("Database error in search (boolean)")
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
         result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else (
-                    {
-                        "sort_value": rows[-1].get("sort_val"),
-                        "accession": rows[-1]["accession"],
-                    }
-                    if sortby
-                    else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
-                )
+            **finish_page(
+                rows,
+                sorted_page=bool(sortby),
+                first_page=first_page,
+                offset=offset,
+                total=sql_total(rows) if sortby else None,
             ),
+            "took_ms": round(took_ms, 2),
         }
     elif sortby:
         start = time.perf_counter()
@@ -5381,26 +5621,23 @@ def search(
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute("SET LOCAL statement_timeout = '60s'")
                     rows = _run_search(cur, sql, params, q)
-                    _enrich_with_publications(rows, cur)
+                    _enrich_page(rows, cur)
+        except QueryCanceled:
+            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
         except Exception:
             logger.exception("Database error in search (sorted)")
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
         result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else {
-                    "sort_value": rows[-1].get("sort_val"),
-                    "accession": rows[-1]["accession"],
-                }
+            **finish_page(
+                rows,
+                sorted_page=True,
+                first_page=first_page,
+                offset=offset,
+                total=sql_total(rows),
             ),
+            "took_ms": round(took_ms, 2),
         }
     elif db == "geo":
         result = _search_geo_impl(
@@ -5423,26 +5660,19 @@ def search(
                         (q, q_variants, cursor_rank, cursor_rank, cursor_acc, offset),
                         q,
                     )
-                    _enrich_with_publications(rows, cur)
+                    _enrich_page(rows, cur)
+        except QueryCanceled:
+            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
         except Exception:
             logger.exception("Database error in search_%s", db)
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
         result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else {
-                    "rank": rows[-1]["rank"],
-                    "accession": rows[-1]["accession"],
-                }
+            **finish_page(
+                rows, sorted_page=False, first_page=first_page, offset=offset
             ),
+            "took_ms": round(took_ms, 2),
         }
     else:
         start = time.perf_counter()
@@ -5465,32 +5695,25 @@ def search(
                         ),
                         q,
                     )
-                    _enrich_with_publications(rows, cur)
+                    _enrich_page(rows, cur)
+        except QueryCanceled:
+            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
         except Exception:
             logger.exception("Database error in search")
             raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
-        total = rows[0]["total_count"] if rows else 0
-
         result = {
-            "results": rows,
-            "total": total,
-            "took_ms": round(took_ms, 2),
-            "next_cursor": (
-                None
-                if not rows
-                else {
-                    "rank": rows[-1]["rank"],
-                    "accession": rows[-1]["accession"],
-                }
+            **finish_page(
+                rows, sorted_page=False, first_page=first_page, offset=offset
             ),
+            "took_ms": round(took_ms, 2),
         }
 
     result = _autocorrect_search(request, result, original_q, user_boolean, rerun)
 
     # Pin broad (full-page) results until /cache/purge.
-    if results_cache_key and len(result.get("results", [])) >= _SEARCH_RESULTS_PAGE:
+    if results_cache_key and result.get("has_more"):
         with _search_results_cache_lock:
             _set_bounded_cache_entry(
                 _search_results_cache,
@@ -5513,6 +5736,7 @@ def _search_filtered(
     order="desc",
     boolean_tsq=None,
     disabled=(),
+    cursor_sort=None,
 ):
     """Run a sidebar-filtered search via build_search_results and shape the
     response like the unfiltered /search path (results, total, took_ms,
@@ -5543,6 +5767,7 @@ def _search_filtered(
                 offset=offset,
                 sortby=sortby,
                 order=order,
+                cursor_sort=cursor_sort,
                 **filters,
             )
             if boolean_tsq:
@@ -5550,26 +5775,25 @@ def _search_filtered(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-                _enrich_with_publications(rows, cur)
+                _enrich_page(rows, cur)
     except PgSyntaxError:
         raise HTTPException(400, "could not parse boolean query")
     except QueryCanceled:
         raise HTTPException(
-            504, "query-less search timed out; add a query term or a narrower filter"
+            504, _timeout_detail(_FILTERED_RETRY, 60 if query_less else None)
         )
     except Exception:
         logger.exception("Database error in filtered search")
         raise HTTPException(500, "Internal server error")
 
     return {
-        "results": rows,
-        "total": rows[0]["total_count"] if rows else 0,
-        "took_ms": round((time.perf_counter() - start) * 1000, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
+        **finish_page(
+            rows,
+            sorted_page=bool(sortby),
+            first_page=_first_page(cursor_rank, cursor_acc, cursor_sort),
+            offset=offset,
         ),
+        "took_ms": round((time.perf_counter() - start) * 1000, 2),
     }
 
 
@@ -5985,33 +6209,38 @@ def get_search_investigators(
     }
 
 
-def _graft_linked_project(cur, row: dict, srp: str | None, gse: str | None) -> None:
+def _graft_linked_project(
+    cur, row: dict, srp: str | None, gse: str | None, slim: bool = False
+) -> None:
     """Fill an ENA project row with data it lacks natively by inheriting it from
     the SRA study / GEO series it wraps. The similarity graph (coords_3d +
     neighbors) is built only for SRA/GEO/AE, and supplementary_data is a GEO
     concept — an ENA (PRJ*) row has neither. Existing values are never
     overwritten. Cheap: two PK lookups, only for PRJ* pages."""
-    if srp and not (row.get("coords_3d") and row.get("neighbors")):
+    # slim callers drop the graph, so only links and supplementary_data matter
+    graph = "" if slim else ", coords_3d, neighbors"
+    needs_sra = not (row.get("coords_3d") and row.get("neighbors"))
+    if srp and needs_sra and not (slim and row.get("links")):
         cur.execute(
-            "SELECT coords_3d, neighbors, links FROM sra_studies WHERE accession = %s",
-            (srp,),
+            f"SELECT links{graph} FROM sra_studies WHERE accession = %s", (srp,)
         )
         if g := cur.fetchone():
-            row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
-            row["neighbors"] = row.get("neighbors") or g["neighbors"]
+            if not slim:
+                row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
+                row["neighbors"] = row.get("neighbors") or g["neighbors"]
             row["links"] = row.get("links") or g["links"]
     if gse:
         cur.execute(
-            "SELECT supplementary_data, coords_3d, neighbors"
-            " FROM geo_series WHERE accession = %s",
+            f"SELECT supplementary_data{graph} FROM geo_series WHERE accession = %s",
             (gse,),
         )
         if g := cur.fetchone():
             row["supplementary_data"] = (
                 row.get("supplementary_data") or g["supplementary_data"]
             )
-            row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
-            row["neighbors"] = row.get("neighbors") or g["neighbors"]
+            if not slim:
+                row["coords_3d"] = row.get("coords_3d") or g["coords_3d"]
+                row["neighbors"] = row.get("neighbors") or g["neighbors"]
 
 
 _SINGLE_CELL_INLINE_LIMIT = 200
@@ -6059,7 +6288,11 @@ def _attach_single_cell_samples(cur, row: dict, accession: str) -> None:
         "etc.) across the study's experiments. For GEO/GEA rows this resolves "
         "through the linked SRP/ERP/DRP in `alias`, since those archives carry "
         "no experiments of their own; it is `[]` when no such study is found "
-        "(e.g. ArrayExpress)."
+        "(e.g. ArrayExpress).\n\n"
+        "Returns 404 when the accession is not in seqout. `include_neighbors=false` "
+        "drops the similarity graph (`neighbors`, `coords_2d`, `coords_3d`), which "
+        "is most of the response; for similar studies call `get_project_similar`. "
+        "`fields=summary` returns only accession, title and description."
     ),
     operation_id="get_project",
 )
@@ -6068,13 +6301,24 @@ def get_project(
     request: Request,
     response: Response,
     accession: str = Path(..., pattern=PROJECT_REGEX),
+    include_neighbors: bool = Query(
+        True,
+        description="Include the similarity graph: neighbors, coords_2d, coords_3d.",
+    ),
+    fields: str = Query(
+        "full",
+        pattern="^(full|summary)$",
+        description="summary: accession, title and description only.",
+    ),
 ):
     accession = accession.upper()
+    if fields == "summary":
+        return _project_metadata(accession)
 
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                row = _fetch_project_row(cur, accession)
+                row = _fetch_project_row(cur, accession, slim=not include_neighbors)
                 if row:
                     # PRJ* wrappers: enrichment + cross-links key on the GSE/SRP,
                     # Resolve FIRST so the linked accession is set in
@@ -6095,7 +6339,9 @@ def get_project(
                         # ENA rows carry no embedding/supplementary of their own;
                         # inherit the similarity graph + supplementary from the
                         # linked SRA study / GEO series.
-                        _graft_linked_project(cur, row, srp, gse)
+                        _graft_linked_project(
+                            cur, row, srp, gse, slim=not include_neighbors
+                        )
                     # _enrich_with_publications resolves authors (publication ->
                     # geo_series.contributors -> center_name) uniformly for every
                     # project type.
@@ -6120,10 +6366,14 @@ def get_project(
         logger.exception("Database error in get_project")
         raise HTTPException(500, "Internal server error")
 
-    if row:
-        response.headers["Cache-Control"] = (
-            _PROJECT_CACHE_CONTROL if ENRICHMENT_ENABLED else "no-store"
-        )
+    if not row:
+        raise HTTPException(404, f"Project not found: {accession}")
+    response.headers["Cache-Control"] = (
+        _PROJECT_CACHE_CONTROL if ENRICHMENT_ENABLED else "no-store"
+    )
+    if not include_neighbors:
+        for key in ("neighbors", "coords_2d", "coords_3d"):
+            row.pop(key, None)
     return row
 
 
@@ -6141,6 +6391,10 @@ def get_project_metadata(
     request: Request,
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
+    return _project_metadata(accession)
+
+
+def _project_metadata(accession: str) -> dict:
     accession = accession.upper()
     if accession.startswith("G"):
         sql = """
@@ -8708,7 +8962,7 @@ def get_common_name_by_scientific_name(
     "/common-names",
     summary="Get common names for many scientific names",
     description=(
-        "Batch variant of /common-name: pass scientific_name repeatedly to "
+        "Common names for scientific names: pass scientific_name repeatedly to "
         "resolve a whole list in one request. Missing names are simply absent "
         "from the result (no 404)."
     ),
@@ -9045,6 +9299,7 @@ _DOWNLOAD_COLUMNS = (
     "source",
     "title",
     "summary",
+    "published_at",
     "updated_at",
     "organisms",
     "countries",
@@ -9412,8 +9667,13 @@ def classify_accession(
 @limiter.limit("100/minute")
 def search_by_author(
     request: Request,
-    q: str = Query(..., min_length=2, max_length=100),
-    limit: int = Query(default=20, ge=1, le=100),
+    q: str = Query(
+        ...,
+        min_length=2,
+        max_length=100,
+        description="Author name or part of it (substring).",
+    ),
+    limit: int = Query(default=20, ge=1, le=100, description="Maximum publications."),
 ):
     pattern = f"%{q}%"
     try:
@@ -9468,8 +9728,13 @@ def _author_name_regex(q: str) -> str | None:
 @limiter.limit("20/minute")
 def search_author_projects(
     request: Request,
-    q: str = Query(..., min_length=3, max_length=100),
-    limit: int = Query(default=200, ge=1, le=200),
+    q: str = Query(
+        ...,
+        min_length=3,
+        max_length=100,
+        description="Person name, first and last, e.g. Saket Choudhary.",
+    ),
+    limit: int = Query(default=200, ge=1, le=200, description="Maximum projects."),
 ):
     regex = _author_name_regex(q)
     if regex is None:
@@ -9603,50 +9868,63 @@ def find_publication(
 def _execute_structured(sql: str, params: dict, count_by: str | None) -> dict:
     """Run a build_structured_search() (sql, params) and shape the response.
 
-    Shared by /search/structured and /search/nl.
+    Shared by /search/structured and /search/nl; first pages cached until /cache/purge.
     """
+    first_page = params.get("cursor_rank") is None
+    cache_key = None
+    if first_page:
+        digest = hashlib.sha256(
+            (sql + json.dumps(params, sort_keys=True, default=str)).encode()
+        ).hexdigest()
+        cache_key = ("structured", digest)
+        with _search_results_cache_lock:
+            cached = _get_bounded_cache_entry(
+                _search_results_cache, cache_key, float("inf")
+            )
+        if cached is not None:
+            return cached
+        _CACHE_FULL_PAGE.set(True)
     start = time.perf_counter()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET LOCAL statement_timeout = '30s'")
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 if not count_by:
-                    _enrich_with_publications(rows, cur)
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "canceling statement" in err_msg or "timeout" in err_msg:
-            logger.warning("structured search timed out: %s", params)
-            raise HTTPException(
-                504,
-                "Query timed out. Try narrowing your search with more filters, "
-                "adding a text query (q=), or restricting to a single source.",
-            )
+                    _enrich_page(rows, cur)
+    except QueryCanceled:
+        logger.warning("structured search timed out: %s", params)
+        raise HTTPException(504, _timeout_detail(_STRUCTURED_RETRY))
+    except Exception:
         logger.exception("Database error in structured search")
         raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
 
     if count_by:
-        return {
+        result = {
             "count_by": count_by,
             "total_buckets": len(rows),
             "took_ms": round(took_ms, 2),
             "buckets": rows,
         }
-
-    total = rows[0]["total_count"] if rows else 0
-    return {
-        "results": rows,
-        "total": total,
-        "took_ms": round(took_ms, 2),
-        "next_cursor": (
-            None
-            if not rows
-            else {"rank": rows[-1]["rank"], "accession": rows[-1]["accession"]}
-        ),
-    }
+    else:
+        result = {
+            **finish_page(
+                rows, sorted_page=False, first_page=first_page, total=sql_total(rows)
+            ),
+            "took_ms": round(took_ms, 2),
+        }
+    if cache_key is not None and result.get("has_more"):
+        with _search_results_cache_lock:
+            _set_bounded_cache_entry(
+                _search_results_cache,
+                cache_key,
+                result,
+                _MAX_SEARCH_RESULTS_CACHE_ENTRIES,
+                float("inf"),
+            )
+    return result
 
 
 _NL_STRATEGY = {
@@ -9951,13 +10229,16 @@ def search_nl(
         pattern="^(geo|sra|arrayexpress|ena|gsa|all)$",
         description="Override the parsed source",
     ),
-    cursor_rank: float | None = Query(None),
-    cursor_acc: str | None = Query(None),
+    cursor_rank: float | None = Query(None, description=_CURSOR_RANK_DOC),
+    cursor_acc: str | None = Query(None, description=_CURSOR_ACC_DOC),
     count_by: str | None = Query(
         None,
         pattern="^(year|source|organism|country|library_strategy|instrument_model)$",
+        description=_COUNT_BY_DOC,
     ),
     dry_run: bool = Query(False, description="Return parsed filters without querying"),
+    limit: int | None = Query(None, ge=1, le=SEARCH_PAGE_SIZE, description=_LIMIT_DOC),
+    fields: str = Query("full", pattern="^(compact|full)$", description=_FIELDS_DOC),
 ):
     parsed = _parse_nl_query(q, date.today().year)
     filters = parsed["filters"]
@@ -9985,9 +10266,10 @@ def search_nl(
         count_by=count_by,
         **filters,
     )
-    result = _execute_structured(sql, params, count_by)
-    result["parsed"] = parsed
-    return result
+    result = _limited_search(
+        lambda: _execute_structured(sql, params, count_by), limit, fields, False
+    )
+    return {**result, "parsed": parsed}
 
 
 @api_app.get(
@@ -10004,37 +10286,64 @@ def search_nl(
         "combined with full-text search. "
         "At least one of q or a filter parameter is required. "
         "Use cursors (rank + accession) for pagination. "
-        "Returns {results: object[], total: int, took_ms: float, "
-        "next_cursor: {rank: float, accession: string} | null}."
+        "Each row has `published_at` (release date) and `alias` (the same dataset "
+        "in other archives). "
+        "Returns {results: object[], total: int, total_is_known: bool, "
+        "has_more: bool, took_ms: float, "
+        "next_cursor: {rank: float, accession: string} | null}; "
+        "`next_cursor` is null on the last page."
     ),
     operation_id="search_structured",
 )
 @limiter.limit("100/minute")
 def search_structured(
     request: Request,
-    q: str | None = Query(None, max_length=500),
-    organism: str | None = Query(None),
-    library_strategy: str | None = Query(None),
-    platform: str | None = Query(None),
-    country: str | None = Query(None),
-    center: str | None = Query(None),
-    year_from: int | None = Query(None, ge=1900, le=2100),
-    year_to: int | None = Query(None, ge=1900, le=2100),
-    source: str | None = Query(None, pattern="^(geo|sra|arrayexpress|ena|gsa|all)$"),
-    cursor_rank: float | None = Query(None),
-    cursor_acc: str | None = Query(None),
-    journal: str | None = Query(None),
-    instrument_model: str | None = Query(None),
-    geo_country: str | None = Query(None),
-    geo_country_code: str | None = Query(None),
-    geo_country_code_iso2: str | None = Query(None),
-    geo_city: str | None = Query(None),
-    geo_state: str | None = Query(None),
-    geo_district: str | None = Query(None),
-    geo_postcode: str | None = Query(None),
-    geo_lat: float | None = Query(None, ge=-90, le=90),
-    geo_lng: float | None = Query(None, ge=-180, le=180),
-    geo_radius_km: float | None = Query(None, ge=0.1, le=20000),
+    q: str | None = Query(None, max_length=500, description=_Q_DOC),
+    organism: list[str] | None = Query(
+        None, description="Exact scientific names, e.g. Homo sapiens; any of them."
+    ),
+    library_strategy: list[str] | None = Query(
+        None, description=_LIBRARY_STRATEGY_DOC + " Excludes GEO."
+    ),
+    platform: str | None = Query(
+        None, description=_PLATFORM_DOC + " Excludes GEO and ArrayExpress."
+    ),
+    country: str | None = Query(
+        None, description="Submitter country name. Excludes ArrayExpress."
+    ),
+    center: str | None = Query(
+        None, description="Submitting center or organization (substring)."
+    ),
+    year_from: int | None = Query(None, ge=1900, le=2100, description=_YEAR_FROM_DOC),
+    year_to: int | None = Query(None, ge=1900, le=2100, description=_YEAR_TO_DOC),
+    source: str | None = Query(
+        None,
+        pattern="^(geo|sra|arrayexpress|ena|gsa|all)$",
+        description="Restrict to one archive; DRA and GEA are not available here.",
+    ),
+    cursor_rank: float | None = Query(None, description=_CURSOR_RANK_DOC),
+    cursor_acc: str | None = Query(None, description=_CURSOR_ACC_DOC),
+    journal: str | None = Query(None, description="Exact journal of the linked paper."),
+    instrument_model: str | None = Query(
+        None,
+        description=_INSTRUMENT_DOC + " Excludes ArrayExpress, ENA and GSA.",
+    ),
+    geo_country: str | None = Query(None, description=_GEO_DOC),
+    geo_country_code: str | None = Query(None, description=_GEO_DOC),
+    geo_country_code_iso2: str | None = Query(None, description=_GEO_DOC),
+    geo_city: str | None = Query(None, description=_GEO_DOC),
+    geo_state: str | None = Query(None, description=_GEO_DOC),
+    geo_district: str | None = Query(None, description=_GEO_DOC),
+    geo_postcode: str | None = Query(None, description=_GEO_DOC),
+    geo_lat: float | None = Query(
+        None, ge=-90, le=90, description="Latitude of a point; needs geo_lng."
+    ),
+    geo_lng: float | None = Query(
+        None, ge=-180, le=180, description="Longitude of a point; needs geo_lat."
+    ),
+    geo_radius_km: float | None = Query(
+        None, ge=0.1, le=20000, description="Radius around geo_lat/geo_lng in km."
+    ),
     assay_l1: str | None = Query(
         None, description="Filter by dominant assay L1 (from unified_metadata)"
     ),
@@ -10047,12 +10356,12 @@ def search_structured(
     published_after: str | None = Query(
         None,
         pattern=r"^\d{4}-\d{2}-\d{2}$",
-        description="Day-granularity lower bound (YYYY-MM-DD)",
+        description="YYYY-MM-DD; lower bound on the release date (first public).",
     ),
     published_before: str | None = Query(
         None,
         pattern=r"^\d{4}-\d{2}-\d{2}$",
-        description="Day-granularity upper bound (YYYY-MM-DD)",
+        description="YYYY-MM-DD; upper bound on the release date (first public).",
     ),
     pub_date_after: str | None = Query(
         None,
@@ -10081,8 +10390,10 @@ def search_structured(
     count_by: str | None = Query(
         None,
         pattern="^(year|source|organism|country|library_strategy|instrument_model)$",
-        description="Aggregation mode: return bucket counts instead of rows",
+        description=_COUNT_BY_DOC,
     ),
+    limit: int | None = Query(None, ge=1, le=SEARCH_PAGE_SIZE, description=_LIMIT_DOC),
+    fields: str = Query("full", pattern="^(compact|full)$", description=_FIELDS_DOC),
 ):
     if q:
         q = replace_query_hyphens(q)
@@ -10195,7 +10506,9 @@ def search_structured(
         count_by=count_by,
     )
 
-    return _execute_structured(sql, params, count_by)
+    return _limited_search(
+        lambda: _execute_structured(sql, params, count_by), limit, fields, False
+    )
 
 
 def _sequence_bearing(acc: str) -> bool:
@@ -10204,7 +10517,13 @@ def _sequence_bearing(acc: str) -> bool:
     return a.startswith(("SRP", "ERP", "DRP")) or a.startswith("PRJ")
 
 
-def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
+def _pmid_xref_fallback(
+    cur,
+    accession: str,
+    seen: set[str],
+    pmids: list[str] | None = None,
+    rows_by_pmid: dict | None = None,
+) -> list[dict]:
     """Sequence-bearing studies reachable from this project's publication.
 
     Many GEO series carry no SRA cross-reference at all (a PMID but no alias),
@@ -10217,18 +10536,22 @@ def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
     source='pmid' and carry `via_pmid` so callers can label the provenance and,
     when several come back, let the user choose rather than guessing.
     """
-    cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": [accession]})
-    pmids = [r["pmid"] for r in cur.fetchall() if r.get("pmid")]
+    if pmids is None:
+        cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": [accession]})
+        pmids = [r["pmid"] for r in cur.fetchall() if r.get("pmid")]
     if not pmids:
         return []
 
     out: list[dict] = []
+    cache = rows_by_pmid if rows_by_pmid is not None else {}
     for pmid in dict.fromkeys(pmids):  # de-dup, keep order
-        cur.execute(
-            PROJECTS_BY_PMID_SQL,
-            {"pmid": pmid, "pmid_json": json.dumps([{"pmid": pmid}])},
-        )
-        for row in cur.fetchall():
+        if pmid not in cache:
+            cur.execute(
+                PROJECTS_BY_PMID_SQL,
+                {"pmid": pmid, "pmid_json": json.dumps([{"pmid": pmid}])},
+            )
+            cache[pmid] = cur.fetchall()
+        for row in cache[pmid]:
             acc = row.get("accession")
             if not acc or acc in seen or acc == accession:
                 continue
@@ -10245,6 +10568,15 @@ def _pmid_xref_fallback(cur, accession: str, seen: set[str]) -> list[dict]:
                 }
             )
     return out
+
+
+def _needs_inference(seen: set[str]) -> bool:
+    """Infer through the paper only when no linked study carries raw data."""
+    return not any(_sequence_bearing(a) for a in seen)
+
+
+def _inferred_xrefs(cur, accession: str, seen: set[str]) -> list[dict]:
+    return _pmid_xref_fallback(cur, accession, seen) if _needs_inference(seen) else []
 
 
 @api_app.get(
@@ -10283,10 +10615,7 @@ def get_project_xref(
                         seen.add(acc)
                         unique.append(row)
 
-                # Only when nothing already links to raw data -- a project with a
-                # real SRA cross-reference needs no inference.
-                if not any(_sequence_bearing(r["accession"]) for r in unique):
-                    unique.extend(_pmid_xref_fallback(cur, accession, seen))
+                unique.extend(_inferred_xrefs(cur, accession, seen))
     except Exception:
         logger.exception("Database error in get_project_xref")
         raise HTTPException(500, "Internal server error")
@@ -10349,7 +10678,7 @@ def _exp_to_study(cur, exp: str) -> str | None:
     return r["study"] if r else None
 
 
-def _resolve_to_project(cur, acc: str) -> str | None:
+def _resolve_to_project(cur, acc: str, known: dict | None = None) -> str | None:
     """Any accession -> its canonical project/study accession (None if unknown).
 
     Also the single-accession resolver behind resolve_accession_project.
@@ -10377,26 +10706,92 @@ def _resolve_to_project(cur, acc: str) -> str | None:
         return _exp_to_study(cur, r["experiment_accession"]) if r else None
     if PRJ_PATTERN.match(acc):
         return _resolve_prj_to_project(cur, acc)
-    return acc
+    if BIOSAMPLE_PATTERN.match(acc) or GSA_SAMPLE_PATTERN.match(acc):
+        lookups = (ENA_SAMPLE_TO_STUDY_SQL, GSA_SAMPLE_TO_STUDY_SQL)
+    elif GSA_RUN_PATTERN.match(acc):
+        lookups = (GSA_RUN_TO_STUDY_SQL,)
+    elif GSA_EXPERIMENT_PATTERN.match(acc):
+        lookups = (GSA_EXPERIMENT_TO_STUDY_SQL,)
+    else:
+        return _existing_project(cur, acc, known)
+    # the study here is a PRJ (ENA) or CRA/HRA (GSA)
+    for sql in lookups:
+        cur.execute(sql, (acc,))
+        r = cur.fetchone()
+        if r and r["study"]:
+            parent = r["study"].upper()
+            if PRJ_PATTERN.match(parent):
+                return _resolve_prj_to_project(cur, parent)
+            return _existing_project(cur, parent)
+    return None
 
 
-def _convert_one(cur, raw: str, target_db: str | None) -> dict:
+# first matching prefix wins; E-GEAD- must precede E-
+_PROJECT_TABLES = (
+    (("GSE",), (("geo_series", "accession"),)),
+    (("E-GEAD-",), (("gea_experiments", "accession"),)),
+    (("E-",), (("arrayexpress_experiments", "accession"),)),
+    (("CRA", "HRA"), (("gsa_studies", "study_accession"),)),
+    (
+        ("SRP", "ERP", "DRP"),
+        (("sra_studies", "accession"), ("dra_studies", "accession")),
+    ),
+)
+
+
+def _project_tables(acc: str) -> tuple:
+    for prefixes, tables in _PROJECT_TABLES:
+        if acc.startswith(prefixes):
+            return tables
+    return ()
+
+
+def _existing_project(cur, acc: str, known: dict | None = None) -> str | None:
+    """acc if seqout holds it, else None; known comes from _prefetch_projects."""
+    if known is not None and acc in known:
+        return acc if known[acc] else None
+    for table, col in _project_tables(acc):
+        cur.execute(f"SELECT 1 FROM {table} WHERE {col} = %s", (acc,))
+        if cur.fetchone():
+            return acc
+    return None
+
+
+def _prefetch_projects(cur, accs: list[str]) -> dict[str, bool]:
+    """Batched _existing_project, one query per table."""
+    known = {a: False for a in accs if _project_tables(a)}
+    by_table: dict[tuple, list[str]] = defaultdict(list)
+    for a in known:
+        for table in _project_tables(a):
+            by_table[table].append(a)
+    for (table, col), batch in by_table.items():
+        cur.execute(f"SELECT {col} AS acc FROM {table} WHERE {col} = ANY(%s)", (batch,))
+        for r in cur.fetchall():
+            known[r["acc"]] = True
+    return known
+
+
+def _convert_one(
+    cur, raw: str, target_db: str | None, known: dict
+) -> tuple[dict, set[str]]:
+    """One conversion result and its seen set; _convert_many fills inferred."""
     acc = raw.strip().upper()
     classified = _classify_accession_query(acc)
     if classified is None:
-        return {"input": raw, "valid": False}
+        return {"input": raw, "valid": False, "exists": False, "project": None}, set()
     acc, kind = classified
-    project = _resolve_to_project(cur, acc)
+    project = _resolve_to_project(cur, acc, known)
     out: dict = {
         "input": raw,
         "valid": True,
+        "exists": project is not None,
         "kind": kind,
         "database": _db_of_accession(acc),
         "project": project,
         "related": {},
     }
     if not project:
-        return out
+        return out, set()
     cur.execute(RELATED_SQL, {"acc": project})
     grouped: dict[str, list[str]] = {}
     seen = {project}
@@ -10407,22 +10802,51 @@ def _convert_one(cur, raw: str, target_db: str | None) -> dict:
         seen.add(racc)
         grouped.setdefault(_db_of_accession(racc), []).append(racc)
     out["related"] = grouped
+    if _needs_inference(seen):
+        out["inferred"] = None
     if target_db:
         out["targets"] = grouped.get(target_db, [])
-    return out
+    return out, seen
+
+
+def _convert_many(cur, raws: list[str], target_db: str | None) -> list[dict]:
+    """_convert_one over a batch, with existence and PMID lookups batched."""
+    accs = [c[0] for r in raws if (c := _classify_accession_query(r.strip().upper()))]
+    known = _prefetch_projects(cur, accs)
+    done = [_convert_one(cur, r, target_db, known) for r in raws]
+    need = [(out, seen) for out, seen in done if "inferred" in out]
+    pmids: dict[str, list[str]] = {}
+    if need:
+        cur.execute(PMID_VARIANT_BATCH_SQL, {"acc": [o["project"] for o, _ in need]})
+        for r in cur.fetchall():
+            if r.get("pmid"):
+                pmids.setdefault(r["accession"], []).append(r["pmid"])
+    rows_by_pmid: dict[str, list[dict]] = {}
+    for out, seen in need:
+        out["inferred"] = _pmid_xref_fallback(
+            cur, out["project"], seen, pmids.get(out["project"], []), rows_by_pmid
+        )
+    return [out for out, _ in done]
+
+
+_CONVERT_DOC = (
+    "Resolve any accession (run/sample/experiment/project, any archive) to its "
+    "canonical project, then list linked projects in the other archives "
+    "(GEO/SRA/ENA/ArrayExpress/GSA) in `related`. `exists` is false and "
+    "`project` null when seqout does not hold the accession; `valid` is only the "
+    "pattern check. When nothing links to an SRA/ENA/DDBJ study, `inferred` lists "
+    "studies sharing the project's paper (PMID): an inference, not a declared "
+    "link, and a paper can cover several studies. Links are project-level; reach "
+    "runs, experiments or samples with get_study_runs, get_study_experiments or "
+    "get_study_samples on a returned project. Pass db= to also get a flat "
+    "`targets` list for that archive."
+)
 
 
 @api_app.get(
     "/convert/{accession}",
     summary="Convert an accession across databases",
-    description=(
-        "Resolve any accession (run/sample/experiment/project, any archive) to its "
-        "canonical project, then list linked projects in the other archives "
-        "(GEO/SRA/ENA/ArrayExpress/GSA). Cross-database links are project-level; to "
-        "reach runs/experiments/samples in a target archive, call "
-        "/project/{study}/runs|experiments|samples on a returned project. "
-        "Pass db= to also get a flat `targets` list for that archive."
-    ),
+    description=_CONVERT_DOC,
     operation_id="convert_accession",
 )
 @limiter.limit("100/minute")
@@ -10434,7 +10858,7 @@ def convert_accession(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                return _convert_one(cur, accession, db)
+                return _convert_many(cur, [accession], db)[0]
     except Exception:
         logger.exception("Database error in convert_accession")
         raise HTTPException(500, "Internal server error")
@@ -10442,28 +10866,30 @@ def convert_accession(
 
 @api_app.post(
     "/convert",
-    summary="Batch convert accessions across databases",
+    summary="Convert one or many accessions across databases",
     description=(
-        'Batch form of /convert/{accession}. POST {"accessions": [...], '
-        '"db": "sra"}. Each input resolves to its project plus linked projects '
-        f"in other archives. Max {MAX_CONVERT_ACCESSIONS} accessions per request."
+        f"Takes `accessions` (up to {MAX_CONVERT_ACCESSIONS}) or a single "
+        "`accession`; returns {total, results: [...]}, one result per input. "
+        + _CONVERT_DOC
     ),
     operation_id="convert_accessions",
 )
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 def convert_accessions(request: Request, payload: ConvertRequest):
-    if len(payload.accessions) > MAX_CONVERT_ACCESSIONS:
+    accessions = list(payload.accessions or [])
+    if payload.accession:
+        accessions.insert(0, payload.accession)
+    if not accessions:
+        raise HTTPException(422, "provide `accessions` or `accession`")
+    if len(accessions) > MAX_CONVERT_ACCESSIONS:
         raise HTTPException(
             413,
-            f"Too many accessions: {len(payload.accessions)} "
-            f"(max {MAX_CONVERT_ACCESSIONS})",
+            f"Too many accessions: {len(accessions)} (max {MAX_CONVERT_ACCESSIONS})",
         )
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                results = [
-                    _convert_one(cur, str(a), payload.db) for a in payload.accessions
-                ]
+                results = _convert_many(cur, [str(a) for a in accessions], payload.db)
     except Exception:
         logger.exception("Database error in convert_accessions")
         raise HTTPException(500, "Internal server error")
@@ -11032,7 +11458,8 @@ def get_project_overlap(request: Request):
         "Return the date of the newest record in the index. With ?db=<source> "
         "(geo|sra|arrayexpress|ena|gsa|dra|gea) returns that source's latest date; "
         "without it, "
-        "the overall maximum. Cached for 7 days. Returns {db, last_updated, by_source}."
+        "the overall maximum. Cached for 7 days. Returns {db, last_updated, "
+        "by_source, server_version}; server_version is the deployed commit."
     ),
     operation_id="get_last_updated",
 )
@@ -11048,11 +11475,16 @@ def get_last_updated(
         raise HTTPException(500, "Internal server error")
 
     if db:
-        return {"db": db, "last_updated": data["by_source"].get(db)}
+        return {
+            "db": db,
+            "last_updated": data["by_source"].get(db),
+            "server_version": SERVER_VERSION,
+        }
     return {
         "db": None,
         "last_updated": data["overall"],
         "by_source": data["by_source"],
+        "server_version": SERVER_VERSION,
     }
 
 
@@ -12091,14 +12523,20 @@ def get_tissue_projects(  # noqa: PLR0913 -- one query parameter each, by design
 @api_app.get(
     "/disease/aliases",
     summary="Resolve a disease name to its MONDO ids",
-    description=("GARD and NORD names"),
+    description=(
+        "Fuzzy-match a disease name against the GARD and NORD name lists "
+        "(trigram similarity or prefix; exact matches first) and return the "
+        "matching names with their MONDO ids. Returns {query, count, total, "
+        "truncated, results: [{display_name, alias, mondo_ids, sources}]}. Pass "
+        "the mondo_ids to search_enriched_samples(disease_ontology_id=...)."
+    ),
     operation_id="get_disease_aliases",
 )
 @limiter.limit("60/minute")
 def get_disease_aliases(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=200),
-    limit: int = Query(20, ge=1, le=100),
+    q: str = Query(..., min_length=1, max_length=200, description="Disease name."),
+    limit: int = Query(20, ge=1, le=100, description="Maximum names returned."),
 ):
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -12513,56 +12951,218 @@ def get_enriched_column(
 def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by design
     request: Request,
     response: Response,
-    tissue: str | None = Query(None, max_length=200),
-    disease: str | None = Query(None, max_length=200),
-    cell_type: str | None = Query(None, max_length=200),
-    assay: str | None = Query(None, max_length=200),
-    assay_category: str | None = Query(None, max_length=200),
-    phenotype: str | None = Query(None, max_length=200),
-    treatment: str | None = Query(None, max_length=200),
-    development_stage: str | None = Query(None, max_length=200),
-    sample_type: str | None = Query(None, max_length=200),
-    genetic_modification: str | None = Query(None, max_length=200),
-    strain: str | None = Query(None, max_length=200),
-    cell_line: str | None = Query(None, max_length=200),
-    ethnicity: str | None = Query(None, max_length=200),
-    tissue_primary_site: str | None = Query(None, max_length=200),
-    organism: str | None = Query(None, max_length=200),
-    sex: str | None = Query(None, max_length=32),
-    taxid: int | None = Query(None, ge=1),
-    study_accession: str | None = Query(None, max_length=64),
-    disease_ontology_id: str | None = Query(None, max_length=64),
-    tissue_ontology_id: str | None = Query(None, max_length=64),
-    cell_type_ontology_id: str | None = Query(None, max_length=64),
-    assay_ontology_id: str | None = Query(None, max_length=64),
-    development_stage_ontology_id: str | None = Query(None, max_length=64),
-    include_descendants: bool = Query(True),
-    age_min_years: float | None = Query(None, ge=0, le=200),
-    age_max_years: float | None = Query(None, ge=0, le=200),
-    min_cell_count: int | None = Query(None, ge=0),
-    max_cell_count: int | None = Query(None, ge=0),
-    min_gene_count: int | None = Query(None, ge=0),
-    max_gene_count: int | None = Query(None, ge=0),
-    has_matrix: bool = Query(False),
-    single_cell_only: bool = Query(False),
-    has_viral_reads: bool = Query(False),
-    has_bacterial_reads: bool = Query(False),
-    hpv_type: str | None = Query(None, max_length=64),
-    microbe: str | None = Query(None, max_length=200),
+    tissue: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. liver (also matches 'liver, left lobe').",
+    ),
+    disease: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. cirrhosis.",
+    ),
+    cell_type: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. T cell.",
+    ),
+    assay: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. single cell rna.",
+    ),
+    assay_category: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    phenotype: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    treatment: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    development_stage: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    sample_type: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. cell line, primary tissue.",
+    ),
+    genetic_modification: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    strain: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    cell_line: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value, e.g. HeLa.",
+    ),
+    ethnicity: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value; submitter-reported, not genetic ancestry.",
+    ),
+    tissue_primary_site: str | None = Query(
+        None,
+        max_length=200,
+        description="Case-insensitive substring of the enriched value.",
+    ),
+    organism: str | None = Query(
+        None,
+        max_length=200,
+        description="Exact scientific name (case-insensitive), e.g. Homo sapiens.",
+    ),
+    sex: str | None = Query(
+        None,
+        max_length=32,
+        description="Exact (case-insensitive): male, female. Not a substring.",
+    ),
+    taxid: int | None = Query(
+        None, ge=1, description="Exact NCBI taxon id, e.g. 9606."
+    ),
+    study_accession: str | None = Query(
+        None,
+        max_length=64,
+        description="Exact study accession, e.g. GSE123456 or SRP012345.",
+    ),
+    disease_ontology_id: str | None = Query(
+        None,
+        max_length=64,
+        description="MONDO CURIE, e.g. MONDO:0005148; includes descendants unless include_descendants=false.",
+    ),
+    tissue_ontology_id: str | None = Query(
+        None,
+        max_length=64,
+        description="UBERON CURIE; includes descendants unless include_descendants=false.",
+    ),
+    cell_type_ontology_id: str | None = Query(
+        None,
+        max_length=64,
+        description="CL CURIE; includes descendants unless include_descendants=false.",
+    ),
+    assay_ontology_id: str | None = Query(
+        None,
+        max_length=64,
+        description="EFO CURIE; includes descendants unless include_descendants=false.",
+    ),
+    development_stage_ontology_id: str | None = Query(
+        None,
+        max_length=64,
+        description="Development-stage CURIE; includes descendants unless include_descendants=false.",
+    ),
+    include_descendants: bool = Query(
+        True,
+        description="Expand *_ontology_id filters to subtypes through the ontology closure.",
+    ),
+    age_min_years: float | None = Query(
+        None,
+        ge=0,
+        le=200,
+        description="Minimum age in years; drops samples with no recorded age.",
+    ),
+    age_max_years: float | None = Query(
+        None,
+        ge=0,
+        le=200,
+        description="Maximum age in years; drops samples with no recorded age.",
+    ),
+    min_cell_count: int | None = Query(
+        None,
+        ge=0,
+        description="Minimum matrix cells per sample (read-derived); drops unmeasured samples.",
+    ),
+    max_cell_count: int | None = Query(
+        None,
+        ge=0,
+        description="Maximum matrix cells per sample (read-derived); drops unmeasured samples.",
+    ),
+    min_gene_count: int | None = Query(
+        None,
+        ge=0,
+        description="Minimum matrix genes per sample (read-derived); drops unmeasured samples.",
+    ),
+    max_gene_count: int | None = Query(
+        None,
+        ge=0,
+        description="Maximum matrix genes per sample (read-derived); drops unmeasured samples.",
+    ),
+    has_matrix: bool = Query(
+        False,
+        description="Only samples with a parsed cell-by-gene matrix. false does not filter.",
+    ),
+    single_cell_only: bool = Query(
+        False,
+        description="Only samples with a read-derived single-cell barcode call. false does not filter.",
+    ),
+    has_viral_reads: bool = Query(
+        False,
+        description="Precomputed viral flag on a small subset; for infection questions use microbe. false does not filter.",
+    ),
+    has_bacterial_reads: bool = Query(
+        False,
+        description="Precomputed bacterial flag on a small subset; for infection questions use microbe. false does not filter.",
+    ),
+    hpv_type: str | None = Query(
+        None, max_length=64, description="Substring of the top HPV type, e.g. 16."
+    ),
+    microbe: str | None = Query(
+        None,
+        max_length=200,
+        description="Substring of the detected organism name, e.g. papillomavirus; attaches per-sample quantification.",
+    ),
     microbe_class: str | None = Query(
-        None, pattern="^(virus|pathogen|culture|kitome|flora|parasite|vector)$"
+        None,
+        pattern="^(virus|pathogen|culture|kitome|flora|parasite|vector)$",
+        description="Detected organism class.",
     ),
-    microbe_min_breadth: float | None = Query(None, ge=0.0, le=1.0),
-    microbe_min_kmer_mass: float | None = Query(None, ge=0.0),
-    microbe_validated_only: bool = Query(False),
-    microbe_tier: str | None = Query(None, pattern="^(any|low_breadth|high_breadth)$"),
-    microbe_exclude_background: bool = Query(False),
+    microbe_min_breadth: float | None = Query(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum genome breadth fraction (0-1) of a detection.",
+    ),
+    microbe_min_kmer_mass: float | None = Query(
+        None,
+        ge=0.0,
+        description="Minimum kmer_mass of a detection (relative, within-run proxy).",
+    ),
+    microbe_validated_only: bool = Query(
+        False,
+        description="Same as microbe_tier=high_breadth when microbe_tier is unset.",
+    ),
+    microbe_tier: str | None = Query(
+        None,
+        pattern="^(any|low_breadth|high_breadth)$",
+        description="Breadth floor for detections: high_breadth, low_breadth (default) or any.",
+    ),
+    microbe_exclude_background: bool = Query(
+        False,
+        description="Drop reagent and skin-flora background organisms from detections.",
+    ),
     sort: str = Query(
-        "sample", pattern="^(sample|study_accession|age_days|cell_count|gene_count)$"
+        "sample",
+        pattern="^(sample|study_accession|age_days|cell_count|gene_count)$",
+        description="Sort column; cell_count/gene_count put unmeasured samples last.",
     ),
-    order: str = Query("asc", pattern="^(asc|desc)$"),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
+    order: str = Query("asc", pattern="^(asc|desc)$", description="Sort direction."),
+    limit: int = Query(100, ge=1, le=500, description="Rows per page (max 500)."),
+    offset: int = Query(
+        0, ge=0, description="Rows to skip; use next_offset from the previous page."
+    ),
 ):
     filters = {
         "tissue": tissue,
@@ -12653,7 +13253,7 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
                     total = cur.fetchone()["total"]
     except QueryCanceled:
         raise HTTPException(
-            504, "Query timed out; narrow the filters (add organism or tissue)"
+            504, _timeout_detail("Narrow the filters (add organism or tissue).", 60)
         )
     except Exception:
         logger.exception("Database error in search_enriched_samples")
@@ -13492,8 +14092,10 @@ def get_run_enriched(
     "/project/{accession}/similar",
     summary="Find similar studies",
     description=(
-        "Return the nearest studies to a project based on the precomputed 2D "
-        "embedding (geo_series.neighbors / sra_studies.neighbors). Each result "
+        "Return the nearest studies to a GEO series or SRA study. `distance` is the "
+        "cosine distance between text embeddings of the study metadata, "
+        "precomputed for the 300 nearest studies (geo_series.neighbors / "
+        "sra_studies.neighbors); the 3D map coordinates play no part. Each result "
         "includes accession, distance, title, organisms, and source. Useful for "
         "'find studies like X' / 'what else is similar to this dataset'."
     ),
@@ -13503,7 +14105,7 @@ def get_run_enriched(
 def get_project_similar(
     request: Request,
     accession: str = Path(..., pattern=rf"^(GSE|{_STUDY_PREFIX})\d+$"),
-    limit: int = Query(default=10, ge=1, le=100),
+    limit: int = Query(default=10, ge=1, le=100, description="Neighbors returned."),
 ):
     accession = accession.upper()
     try:
@@ -13705,710 +14307,6 @@ def _age_hours_to_human(value: str | None) -> str | None:
     return f"{years:g} year{'s' if years != 1 else ''}"
 
 
-MCP_INSTRUCTIONS = """\
-You are connected to seqout, a genomics study search engine covering NCBI
-GEO, SRA/ENA/DDBJ, ArrayExpress, DDBJ GEA, GSA (CNCB-NGDC, including
-GSA-Human), BioProject, publication links, download links, and
-ontology-enriched sample metadata.
-
-Your job is to choose the narrowest correct tool, preserve context, and avoid
-making users re-state accessions or filters. Do not guess when an accession can
-be classified or resolved by a tool.
-
-## DDBJ accessions
-
-DRP/DRX/DRS/DRR are DDBJ DRA and behave exactly like their SRA counterparts --
-use the same project/experiment/sample/run tools. Most DDBJ studies are mirrored
-into SRA/ENA; the ones that are not still resolve, and their FASTQ links point at
-ddbj.nig.ac.jp rather than ENA.
-
-E-GEAD-N is DDBJ GEA, DDBJ's expression archive. Despite the leading "E-" it is
-NOT ArrayExpress -- never route it to an ArrayExpress tool. Treat it like a GEO
-series: `get_project` for metadata, `get_geo_series_samples` for its sample list.
-GEA holds no reads of its own, so its FASTQs come from the linked DRA study, which
-`get_project` returns in `alias` (the same way a GSE links to its SRP). Sequencing
-experiments have that link; microarray ones legitimately have no FASTQ.
-
-## Critical Routing Rules
-
-1. Reuse existing results before searching.
-   Before calling `search_all`, `search_structured`, or a source-specific search,
-   ask: "Do I already have search results in this conversation that can answer
-   the current request?" If yes, filter/sort/summarize those rows locally.
-   Do not search again just to narrow by keyword, organism, source, year, country,
-   title, summary, organisms, updated_at, or publication fields already in hand.
-
-2. Paginate instead of starting over.
-   Search tools return up to 200 rows, `total`, and `next_cursor`.
-   - Default relevance pagination: call the same search with the same `q` plus
-     `cursor_rank=next_cursor.rank` and `cursor_acc=next_cursor.accession`.
-   - `sortby` pagination: call the same search with the same `q`, `sortby`, and
-     `order`, plus `cursor_sort=next_cursor.sort_value` and `cursor_acc`.
-   Changing `q` is a new search. Changing only cursors is continuation.
-
-3. Classify unknown accessions first.
-   Use `classify_accession` when the user gives an accession and the right tool is
-   unclear. It is pattern-only and cheap. Use `resolve_accession_project` for
-   GSM/SRS/ERS/DRS/SRX/ERX/DRX/SRR/ERR/DRR child-to-project lookup (a run resolves
-   through its experiment). Use `resolve_prj_project`
-   for PRJNA/PRJEB/PRJDA before calling study-only download tools. Use
-   `resolve_submission_studies` for a submission accession (SRA######, ERA######,
-   DRA######), which names a filing rather than a study and has no metadata of its
-   own. Use `convert_accession` when the user wants the same dataset in a named
-   archive ("the SRA study for this GSE"); it resolves any accession to its project
-   and lists the linked projects elsewhere, and `db=` narrows that to one archive.
-   `convert_accessions` is its batch form. Prefer `get_project_xref` when the user
-   just wants to see every equivalent at once.
-
-4. Prefer structured JSON tools for MCP.
-   Use JSON tools (`get_project_metadata_rows`, `get_study_download_manifest`,
-   `get_run_checksums`, `get_project_enriched`) when the agent must inspect or
-   transform data. Use script/plain-text tools only when the user explicitly asks
-   for a ready-to-run script or accession list.
-
-## Accession Routing
-
-- `GSE...` GEO series: `get_project`, `get_geo_series_samples`,
-  `get_project_metadata_rows`, `get_supplementary_files`,
-  `download_supplementary_script`, `get_project_enriched` if enriched data exists.
-- `GSM...` GEO sample: `get_sample_detail`; use `resolve_accession_project` to find
-  the parent GSE.
-- `SRP/ERP/DRP...` study: `get_project`, `get_study_experiments`,
-  `get_study_samples`, `get_study_runs`, `get_study_download_manifest`,
-  `download_study_script`, `get_project_metadata_rows`, `get_project_enriched`.
-- `SRX/ERX/DRX...` experiment: `get_experiment`, `get_experiment_runs`,
-  `get_experiment_metadata_rows`, `get_experiment_enriched`,
-  `resolve_accession_project`.
-- `SRR/ERR/DRR...` run: `get_run_checksums` for parsed FASTQ/SRA files,
-  `get_run` for raw run fields, `get_run_metadata_rows` for the joined metadata row,
-  `get_run_enriched` for ontology-enriched sample context.
-- `SRS/ERS/DRS...` or `SAM...` sample/BioSample: `get_sample_detail` for parent
-  project, experiment, sample attributes, and runs; `get_sample` only for raw
-  SRA/ENA sample metadata; `get_sample_experiments` for reverse sample->experiment.
-- `E-XXXX-NNN` ArrayExpress experiment: `get_project`, `get_ae_experiment_samples`,
-  `get_project_metadata_rows`, `get_supplementary_files`,
-  `download_supplementary_script`.
-- `PRJ...` BioProject: `get_project` can return ENA PRJ project metadata, but FASTQ
-  download tools require a resolved SRP/ERP/DRP study accession. Call
-  `resolve_prj_project` first when the user asks for FASTQs/downloads from a PRJ.
-  `PRJCA...` are GSA projects and resolve to CRA/HRA studies.
-- GSA (CNCB-NGDC) accessions: `CRA/HRA...` study, `CRX/HRX...` experiment,
-  `CRR/HRR...` run, `HRS...` sample, `PRJCA...` project (`SAMC...` BioSample).
-  `HR*` are GSA-Human (controlled-access). Use `get_project`,
-  `get_study_experiments`, `get_study_samples`, and `get_study_runs` on a CRA/HRA
-  study just like an SRA study; `get_sample_detail` on HRS/CRX/HRX.
-  CRR/HRR runs have NO per-run tool: `get_run`, `get_run_checksums`,
-  `get_run_metadata_rows` and `get_run_enriched` accept SRR/ERR/DRR only, and
-  `resolve_accession_project` does not take a GSA run either. Reach a CRR/HRR
-  through `get_study_runs` on its CRA/HRA study and read the row from that list.
-  `classify_accession` still identifies them. GSA rows carry
-  raw run/download links only where the archive publishes them — GSA-Human data is
-  typically access-controlled, so download links may be absent.
-
-## Search And Cohort Discovery
-
-Use `search_all` for ordinary keyword search across all sources. Pass
-`db=geo|sra|arrayexpress|ena|gsa|dra|gea` only when the user restricts the source. Use
-`sortby=citations|journal|year` with `order=desc|asc` when the user asks for
-most cited, journal-sorted, newest, or oldest results. Results are automatically
-enriched with publication and center fields when available: `publications`,
-`pmid`, `publication_title`, `journal`, `doi`, `authors`, `citation_count`, and
-`center_name`.
-
-Use `search_suggest` only when a query returns no or very few results and appears
-misspelled. If suggestions are returned inside `search_all`, present or use them
-instead of guessing.
-
-Use `search_nl` when the user writes a whole sentence rather than keywords
-("human transcriptome data published between 2020 and 2022"). It parses the
-sentence into structured filters with rules only -- no LLM -- runs
-`search_structured`, and echoes `parsed` so you can show or correct the
-interpretation. Anything it did not recognise becomes the full-text query.
-`dry_run=true` parses without searching, which is the cheap way to check how a
-sentence will be read before committing to it. When the user already gives
-explicit filters, call `search_structured` directly instead.
-
-ALWAYS read `parsed.warnings` before reporting `search_nl` results, and repeat
-anything in it to the user. Two cases matter:
-- Exclusions ("excluding mouse") are detected and listed in `parsed.excluded`
-  but are NOT applied -- structured search cannot express NOT. Either filter the
-  returned rows yourself or rewrite as a boolean query for `search_all`.
-- DDBJ/DRA/GEA are recognised but have no structured-search source, so those
-  records are unreachable through `search_nl` and `search_structured` at all.
-  The `source` parameter on both tools accepts only geo|sra|arrayexpress|ena|gsa
-  |all. For DRA-exclusive or GEA records use `search_all(db=dra)` or
-  `search_all(db=gea)`.
-`organism` and `library_strategy` accept several values, so "human and mouse
-RNA-seq" filters on both rather than searching one and full-texting the other.
-
-Use `search_expansion` to explain a plain-keyword result set: it returns the
-synonyms that actually reached the search per term, and how many that term has in
-total, which differ when the variant cap truncates the expansion. Reach for it when
-results look too broad or too narrow and the user asks why, not on every search.
-Structured/boolean queries are never expanded, so `chunks` is empty for them.
-
-Use `search_structured` for explicit metadata filters or cohort questions. It can
-combine `q` with:
-- `organism`: exact scientific name, such as `Homo sapiens`.
-- `library_strategy`: RNA-Seq, ChIP-Seq, WGS, ATAC-seq, etc.
-- `platform`: platform code such as ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT.
-- `instrument_model`: exact instrument model, such as Illumina NovaSeq 6000.
-- `source=geo|sra|arrayexpress|ena|gsa|all` to restrict the archive.
-- `country`, `center`, `journal`, `year_from`, `year_to`.
-- `published_after` and `published_before` as YYYY-MM-DD filter the study's
-  RELEASE date (when the dataset went public).
-- `pub_date_after` and `pub_date_before` as YYYY-MM-DD filter the linked PAPER's
-  publication date. Best-effort day-level: only studies whose paper has a full
-  day-granularity pub_date match; year/month-only pubs and studies with no linked
-  paper are excluded.
-- `assay_l1`, `assay_l2`, `geo_country`, `geo_country_code`,
-  `geo_country_code_iso2`, `geo_city`, `geo_state`, `geo_district`,
-  `geo_postcode`, and `geo_lat`/`geo_lng` with optional `geo_radius_km`.
-- `multi_platform=true` for studies with 2+ sequencing platforms.
-- `sample_tissue`, `sample_disease`, `sample_cell_type` for ontology-enriched
-  sample filters. These only find studies that have enriched v4 sample metadata.
-- `count_by=year|source|organism|country|library_strategy|instrument_model` for
-  bucket counts instead of rows.
-
-Structured-search caveats:
-- `platform` excludes GEO and ArrayExpress.
-- `instrument_model` excludes ArrayExpress, ENA, and GSA.
-- `country` excludes ArrayExpress.
-- `multi_platform` is GEO/SRA only (excludes ArrayExpress, ENA, GSA).
-- `sample_tissue`, `sample_disease`, and `sample_cell_type` prove at least one
-  enriched sample matched; call `get_project_enriched` to inspect which sample(s).
-  If the user wants the SAMPLES rather than the studies, use
-  `search_enriched_samples` instead -- these three filters answer with studies
-  and cannot express age, sex, ethnicity, treatment, or microbial criteria.
-
-Before choosing filter values, use `list_library_strategies`,
-`list_instrument_models`, `list_journals`, and `list_centers`.
-Use `search_organisms` for organism autocomplete and `get_common_name_by_scientific_name`
-for common-name display; `get_common_names_by_scientific_names` resolves a whole list
-in one call, so prefer it whenever more than one organism needs a common name.
-
-## Project Drilldown
-
-Use `get_project` for full project/study/series metadata after a search result or
-known accession. Use `get_project_metadata` only for a fast title + description.
-Use `get_project_xref` to find cross-archive equivalents, including GEO<->SRA,
-BioProject, ENA, and E-GEOD/GSE naming links. Use `get_project_similar` for
-"studies like this" on GSE or SRP accessions.
-
-Use sample-list tools when the user wants the child records:
-- GEO: `get_geo_series_samples`.
-- ArrayExpress: `get_ae_experiment_samples`.
-- SRA/ENA study: `get_study_experiments` and `get_study_samples`.
-- SRA/ENA experiment: `get_experiment` for metadata plus runs, or
-  `get_experiment_runs` for just runs.
-- SRA/ENA sample/experiment/GSM with parent context: `get_sample_detail`.
-
-`get_study_runs` previews only the first 500 runs. On a larger study, do not page
-it to find specific runs; use `find_study_runs`, which filters every run in the
-study by column and returns up to 500 matches with `capped` set when more exist.
-`find_study_experiments` and `find_geo_series_samples` search the whole study or
-series rather than the page the list tools returned, so use them to confirm one
-specific child accession exists. They are NOT exhaustive listings: each stops at
-500 rows with no cursor, offset or total, and `capped=true` only means the cap
-was reached, not that more rows exist. Never page them and never treat their
-output as the study's full child list. Their `filters` argument is an internal
-grid model whose valid columns and operators are not published in the schema; if
-you cannot construct it, fall back to `get_study_experiments` /
-`get_geo_series_samples`. A study or series that does not exist returns an empty
-result, not a 404, so an empty answer does not prove the accession is real.
-
-Use `search_highlight(q, accession)` to show which of the query's words appear in
-a project's title, summary and overall design, stemmed and synonym-expanded the
-way the search did. It covers only those three fields, so an empty `words` list
-does NOT mean the project matched for no reason -- the hit may have come from a
-field the tool does not read (center or contributor text, study type). Present it
-as "these query words appear in the description", never as the complete reason a
-result ranked.
-
-Use `ontology_term` to inspect one term in the ontology graph: it returns the
-term's source identifiers (UBERON, CL, MONDO, EFO, HGNC, MeSH, Cellosaurus
-CURIEs), its synonym cluster, and its direct children. Look it up by NAME. It
-matches an exact node name only, so it does not resolve a CURIE such as
-MONDO:0005148 even though it returns CURIEs -- pass the disease/tissue name
-instead, or use `get_disease_aliases` to go from a name to MONDO ids. A 404 means
-no node carries that exact name, which is weaker than "the concept is absent":
-treat it as "try another surface form", not as proof the search will not expand.
-`ontology_search(q)` finds those surface forms: a typo-tolerant name match that
-returns candidate node names to feed back into `ontology_term`. Pass
-`children=false` when only the identifiers and synonyms are needed -- it is much
-cheaper.
-
-## FASTQ, SRA, BAM, And Supplementary Retrieval
-
-FASTQ files exist at the run level. A study/project accession is a container for
-runs. Do not claim that GEO or ArrayExpress projects have SRA FASTQs unless a
-linked SRA/ENA accession is found with `get_project_xref` or `resolve_prj_project`.
-For GEO/ArrayExpress processed files, use supplementary-file tools instead.
-
-Preferred FASTQ workflow:
-1. If the user gives PRJ, GSM, SRS/ERS/DRS, SRX/ERX/DRX, or GSE, resolve to the
-   relevant SRP/ERP/DRP or run/experiment first.
-2. For a whole study, call `get_study_download_manifest(study, mode="fastq")`.
-   This is complete, paginated, per-file JSON. Each file has `url`, `path`,
-   `filename`, `bytes`, `md5`, `run_accession`, `experiment_accession`, and
-   `download_command`. Continue with `next_cursor` until enough files are seen.
-3. For a quick study overview, call `get_study_runs`. It returns `total_runs`,
-   `paired_runs`, `single_runs`, `total_fastq_bytes`, and a preview of up to 500
-   runs. Its `fastq_ftp`, `fastq_bytes`, and `fastq_md5` values are semicolon-joined
-   for paired-end runs.
-4. Interleaved paired FASTQ rule: if `library_layout=PAIRED` and
-   `fastq_file_count=1` or `fastq_is_interleaved=true`, do not treat that single
-   ENA FASTQ as a complete R1/R2 pair. Use SRA normalized format first, or SRA Lite
-   if normalized SRA is unavailable, then fetch/convert with `sracha get --split split-files`.
-   `get_study_download_manifest(mode="fastq")` and `download_study_script(...,
-   mode="fastq")` do this automatically when `fastq_conversion_available=true`.
-5. For one run, prefer `get_run_checksums`. It returns parsed `fastq` file records,
-   optional `sra` file record, and interleaved/conversion flags. Use `get_run` only
-   when raw run-level fields are needed.
-6. For one experiment, use `get_experiment_runs` or `get_experiment_metadata_rows`.
-7. For a ready-to-run script, use `download_study_script(study, mode)`. Modes are
-   `fastq`, `sra`, `sra_lite`, `s3`, and `gcs`. Default/recommended raw FASTQ mode
-   is `fastq`; `sra_lite` is smaller but lossy for quality scores.
-
-URL/checksum rules:
-- In raw run rows, `fastq_ftp` may be a semicolon-separated EBI host/path with no
-  scheme. Do not hand-parse unless needed; prefer manifest or checksum tools.
-- `get_study_download_manifest` and `get_run_checksums` already provide per-file
-  URL/bytes/MD5 fields suitable for download and verification. For interleaved
-  paired runs, look at `fastq_conversion_required`, `fastq_conversion_available`,
-  `recommended_fastq_source`, `source_mode`, `conversion_command`, and
-  `expected_fastq_paths`.
-- If a user asks for "MD5", "checksums", "file sizes", or "verify downloads",
-  use `get_run_checksums` for a run or `get_study_download_manifest` for a study.
-
-Other retrieval tools:
-- `get_study_bams` lists original submitted BAMs for an SRA/ENA study when present.
-- `get_supplementary_files` lists GEO/ArrayExpress supplementary or processed files
-  as JSON; `download_supplementary_script` returns a curl script.
-- Web UI pages such as `https://seqout.org/p/{accession}` have interactive download
-  sections, but use MCP tools first when answering programmatically.
-
-## Metadata Rows And Enrichment
-
-There are three different metadata layers. Keep them distinct:
-
-1. Project metadata: `get_project` and search results. These include study-level
-   title/abstract/organisms and publication/center enrichment when available.
-2. Raw flattened row metadata: `get_project_metadata_rows`,
-   `get_experiment_metadata_rows`, and `get_run_metadata_rows`. SRA/ENA rows are
-   one row per run with experiment fields, sample fields, dynamic `sample_attribute:*`
-   columns, FASTQ/SRA URLs, bytes, and MD5 fields. GEO and ArrayExpress rows are
-   flattened sample rows. Use these for "metadata table", "sample sheet",
-   "one row per run", or "metadata plus FASTQs".
-3. Ontology/AI-enriched metadata: `get_project_enriched`, `get_experiment_enriched`,
-   and `get_run_enriched`. These return normalized fields such as tissue, cell_type,
-   disease, assay, development_stage, organism/taxid, ontology IDs (UBERON, CL,
-   MONDO, EFO), low_confidence_tags, and enrichment version. Use these for "parsed",
-   "standardized", "ontology", "tissue/disease/cell type", or "enriched" metadata.
-
-When users need both sample attributes and ontology fields, call both
-`get_project_metadata_rows` and `get_project_enriched` and explain that the first is
-raw archive metadata while the second is normalized enrichment. Enriched endpoints
-may return 404 for projects without enrichment; fall back to raw metadata rows.
-For multiple GSE/SRP/ERP/DRP projects, use `bulk_project_samples_metadata` to get
-project summaries plus flattened sample rows; for one project, prefer
-`get_project_metadata_rows`.
-
-For enriched aggregate exploration:
-- `get_enriched_stats`: coverage and per-column fill/distinct counts.
-- `get_enriched_coverage`: enriched projects and samples per archive, with the
-  archive total and percentage, plus counts per organism, assay and
-  assay_category. Answers "how many are enriched", "which database/organism/assay".
-- `get_enriched_column`: call with `column=...` for top values from tissue,
-  cell_type, disease, assay, etc.
-- `get_enriched_crosstab`: call with `group=...` and `breakdown=...` for cross-tabs
-  such as organism by tissue or disease by assay.
-- `get_tissue_microbes`: per (tissue, organism) detection rate from the reads.
-  Answers "which tissues carry HPV", "how much of lung is SARS-CoV-2 positive".
-  Rates are over quantified samples only. Report `is_background`, a `class` of
-  `culture`, or `is_endogenous` alongside the rate: those organisms are
-  contamination or host genome, not infection.
-
-## Sample Cohorts (cross-project)
-
-`search_enriched_samples` is the only tool that answers with SAMPLES rather than
-studies. Reach for it whenever the question describes sample properties and
-wants the samples: "female human liver samples over 50 with cirrhosis",
-"all cervical single-cell RNA-seq samples with HPV", "how many pancreatic islet
-samples exist". Do NOT approximate it by calling `search_structured` with
-sample_tissue/sample_disease/sample_cell_type and then opening each study --
-those filters only prove a study contains one matching sample, and they answer
-with studies.
-
-How its filters behave, because guessing wrong changes the cohort:
-- tissue, disease, cell_type, assay, assay_category, phenotype, treatment,
-  development_stage, sample_type, genetic_modification, strain, cell_line,
-  ethnicity, tissue_primary_site are case-insensitive SUBSTRING matches, so
-  `liver` also matches `liver, left lobe`. Prefer a short stem (`cervi`,
-  `papilloma`) over a long exact phrase.
-- organism, sex, taxid, study_accession are EXACT (case-insensitive). `sex` is
-  deliberately not a substring: `male` would otherwise also return `female`.
-- disease_ontology_id, tissue_ontology_id, cell_type_ontology_id,
-  assay_ontology_id, development_stage_ontology_id take CURIEs and expand
-  through the ontology closure by default, so a parent term also matches its
-  subtypes. Pass include_descendants=false for the exact term only. Use
-  `get_disease_aliases` to turn a disease name into a MONDO id first, and
-  `ontology_term` to check a term exists.
-- age_min_years/age_max_years are YEARS. Samples with no recorded age are
-  excluded by an age filter, so an age range narrows to samples that reported
-  one -- say so rather than presenting the result as the whole cohort.
-- min_cell_count/max_cell_count and min_gene_count/max_gene_count are per-sample
-  matrix counts sourced from the read-derived (Pentimento) data, which covers
-  ~85k samples. Like an age filter they exclude everything with no measured
-  count, so they narrow to the measured subset - say so rather than presenting
-  the result as the whole cohort. Same for sort=cell_count/gene_count, which
-  keeps unmeasured samples but sorts them last. Read the `cells` caveat in the
-  single-cell section below. The returned per-sample fields are `cells` and
-  `genes` (not `cell_count`/`gene_count`), and `unfiltered` marks rows whose
-  `cells` are 10x barcodes rather than cells - never sum those.
-
-Read-derived (Pentimento) filters, layered on the same query:
-- `has_matrix` keeps samples with a parsed cell-by-gene matrix. This is the
-  proof tier for single-cell data and is NOT the same as `single_cell_only`,
-  which is a read-derived barcode call requiring FASTQ plus a preflightx
-  scan -- only 4.7% of studies with a counted matrix carry one.
-- `single_cell_only`, `has_viral_reads`, `has_bacterial_reads` and `hpv_type`
-  come from read-derived calls, not submitter metadata. They only constrain when
-  set to true; false does not mean "absent", it means "do not filter".
-- Any `microbe*` filter both RESTRICTS the cohort to samples with a matching
-  detection and ATTACHES the quantification per sample: `microbe_n_detections`,
-  `microbe_reads`, `microbe_kmer_mass`, `microbe_max_breadth_frac`, and a
-  `microbes` array of per-organism, per-run rows. `microbe` is a substring on
-  organism name, so `papillomavirus` catches every HPV type in one call.
-  `microbe_min_breadth`, `microbe_min_kmer_mass`, `microbe_class` and
-  `microbe_validated_only` tighten it.
-- ROUTE INFECTION QUESTIONS HERE, NOT to `has_viral_reads`/`has_bacterial_reads`.
-  Those two read a precomputed column on a 150k-sample subset and are true on
-  ~370 samples each, so "samples with HPV" answered that way understates the
-  cohort by more than 10x. Use `microbe="HPV"` (9x more samples) or
-  `microbe_class="pathogen"` for "any bacterial infection".
-- `microbe_tier` sets the breadth-of-coverage floor and defaults to
-  `low_breadth`:
-    - `high_breadth` - the strict per-kingdom flags. Use when the user wants
-      confident calls: HPV 323 samples, pathogen 998.
-    - `low_breadth` (default) - includes bacteria at >=1% genome breadth.
-      HPV 1,338, pathogen 14,345.
-    - `any` - no floor at all. Matches trace k-mer noise: `microbe_class=
-      "pathogen"` alone returns 370k samples. Only use when the user explicitly
-      asks for unfiltered detections.
-  Breadth is a FRACTION of genome, and viral genomes are ~250x smaller than
-  bacterial, so a given percentage is far weaker evidence for a virus than for a
-  bacterium. Never compare a viral and a bacterial breadth number directly.
-- So "all cervical scRNA with HPV quantification" is ONE call:
-  `search_enriched_samples(tissue="cervi", assay="single cell rna",
-  microbe="papillomavirus", single_cell_only=true)`.
-- The `microbes` array is capped at 50 rows per sample with `microbes_truncated`
-  set, but every aggregate is computed over ALL detections, so the counts stay
-  correct even when the array is short.
-- Detections are evidence, not diagnosis, and the tiers are breadth thresholds
-  rather than validated calls. Measured against reagent/skin-flora background
-  organisms clearing the same bar, `low_breadth` bacterial rows are only ~1.3x
-  enriched over contamination; `high_breadth` is ~3x. Say "reference signal
-  consistent with X", never "infected with X". Culture contaminants (Mycoplasma)
-  and vector-derived E. coli signal dominate raw bacterial counts, so report
-  `class` alongside any bacterial number. Carry the same caveats as the
-  single-cell section: panel-alignment gates only, no replicate confirmation,
-  and a null result means unscreened rather than absent.
-
-Paging is `limit`/`offset` with a true `total` and `next_offset` (null on the
-last page), so you can state the real cohort size. At least one filter is
-required. A broad cohort combined with a microbe filter is the slow shape; a 504
-means narrow it with organism or tissue rather than retrying unchanged.
-
-## Long-Read Sequencing
-
-For "long-read datasets" (PacBio, Oxford Nanopore), add `long_read=true` to
-`search_all` to restrict any keyword search to studies with a long-read
-experiment in any archive. For the corpus itself use the collection tools:
-- `get_longread_summary()`: totals, split by technology and hybrid status.
-- `get_longread_facets()`: the valid filter values (technology, platform,
-  instrument_model, library_strategy, organism, archive, assay_l1, year,
-  long_read_only).
-- `get_longread_projects(...)`: one row per study, mirrors folded into one.
-  `long_read_only` false means the study also used a short-read platform; NULL
-  means no experiment rows exist to tell (GEO-only entries). `n_experiments`
-  counts long-read experiments; `n_experiments_total` the study's total.
-Onso, PacBio's short-read instrument, is excluded from long read.
-`get_project_longread_chemistry(accession)` lists every PacBio/Oxford Nanopore run in
-one study with its chemistry call. `chemistry_confidence` is `exact` (read from the
-submitted BAM header), `declared` (ONT only, parsed from the depositor's protocol
-text), `bucket` (inferred from instrument_model alone) or `unknown`; report the tier
-beside the call. `runs` is `[]` for a study with no long-read runs.
-
-## Disease Cohorts
-
-For "what data exists on <disease>", use the disease tools rather than a keyword
-search -- they resolve through MONDO ids and their descendants, so they find
-studies whose samples were annotated with a child term the user did not name.
-
-Start with `get_disease_aliases(q)` to turn a disease name into MONDO ids. It
-returns `total` and `truncated` alongside the page, so a full page no longer
-hides further matches -- raise `limit` (max 100) or narrow `q` when truncated.
-Feed the MONDO ids to `search_enriched_samples(disease_ontology_id=...)` when
-the user wants the samples. Otherwise call `get_disease_summary`/`_facets`/
-`_projects(collection, ...)` directly with one of:
-- `collection=rare` (NIH GARD, matched by exact MONDO xref) or `collection=nord`
-  (NORD, matched by name, so a looser and larger set). Say which one you used;
-  they are not interchangeable.
-- a free-text disease name or MONDO id (e.g. `collection="fatty liver
-  disease"`). The server matches the full MONDO ontology (exact label if one
-  exists, else substring) and its descendants. `resolution` in the summary says
-  which; `matched_labels` lists the matches. A 404 means nothing in MONDO
-  matches; try a broader or differently spelled term.
-
-The two modes return different row shapes.
-
-- `get_disease_summary(collection)`: corpus totals for that collection.
-- `get_disease_facets(collection)`: the valid filter values. Call it before
-  `get_disease_projects` -- filters a collection does not carry are rejected.
-- `get_disease_projects(collection, ...)`: one row per study.
-  - `rare`/`nord`: the per-sample rollup (cells, sex, ancestry, inheritance).
-    Sort with `sort=` over cells, n_samples, n_diseases, title,
-    study_accession, assay_category, organism, plus `order=`.
-  - a free-text term: organism/assay/journal/country/FASTQ/single-cell/
-    long-read, matching `get_tissue_projects` below. Sort with `sort=` over
-    n_samples, n_experiments, pub_date, title, study_accession, organism.
-
-Reading the `rare`/`nord` rows honestly matters more here than elsewhere:
-- `scope` defaults to `human_primary` (human material that is neither an
-  immortalized line nor a derived model). `patient_derived_model`, `cell_line`,
-  and `all` show what that excludes. Every row carries all scope counters, so
-  say which scope a count came from.
-- `n_samples` counts samples matching THIS collection, not the study total --
-  controls and out-of-scope samples are not in it.
-- A null cell count means unmeasured, not zero. Blank ancestry means unrecorded.
-- `has_fastq`/`has_sra` are NULL when the study is absent from the download-links
-  table: unknown, not unavailable. Filtering accepts only true for that reason.
-- `ancestries` is the submitter-reported ethnicity string verbatim, present on
-  about 13% of studies. It is NOT inferred genetic ancestry; never present it as
-  such.
-- `inheritance` comes from HPO, Orphanet and GARD. "Not applicable" means the
-  disease has no Mendelian pattern, not that nobody looked.
-
-For a free-text term, `matched_samples` in the summary counts samples resolved
-to the matched MONDO ids; `samples` on summary and project rows is the study's
-total across every annotation.
-
-## Perturbation Studies
-
-For "single-cell CRISPR screens", "Perturb-seq datasets", "drug treatment
-single-cell data" or "which perturbation studies have a count matrix", use
-`get_perturbation_summary`/`_facets`/`_projects` rather than a keyword search.
-Detection is rule-based (named methods, guide-library and control-arm design
-tests, a ChEBI compound lexicon).
-
-- `get_perturbation_facets`: the valid filter values. Call it before
-  `get_perturbation_projects`.
-- `get_perturbation_projects(...)`: one row per study. Filter with
-  `perturbation_type` (genetic, chemical, both, other), `genetic_subtype`,
-  `perturbation_method`, `compound`, `readout_assay`, `cell_line`, `organism`,
-  `tissue`, `data_availability` (both, matrix_only, fastq_only, neither),
-  `has_matrix`, `has_fastq`, `has_control_arm`, `is_pooled`, `is_long_read`,
-  `year`, `q`. `cell_lines`/`sample_types` on each row describe the material
-  (named line; cell line/primary tissue/organoid/xenograft/iPSC-derived), not
-  the perturbation. Don't read a cell-line study as a genetic perturbation.
-- Default to `min_confidence=medium` (high and medium) when the user wants
-  studies to rely on. `low` is a single weak signal and includes many
-  false positives; say so when reporting low-tier results. `evidence` lists
-  the signals behind a row.
-- `compounds` come from sample treatment values, so designs whose drug arms
-  live in supplementary files (e.g. sci-Plex) have a method but no compounds.
-  `title_compounds` are compounds named only in the title (a receptor or
-  resistance mechanism, often, not something applied); that alone never
-  reaches medium/high, so treat a title_compounds-only row as a weak lead.
-  `other` means a cytokine or stimulation design.
-- Germline knockout mice and transgenic lines are not perturbation evidence
-  here. Doxycycline and tamoxifen (Cre/Tet inducers) are never counted as the
-  perturbation.
-- To get the data, use `has_matrix`/`has_fastq` here, then the single-cell and
-  download tools on the returned accession.
-
-## Spatial Transcriptomics
-
-For "spatial transcriptomics datasets", "Visium studies", "Xenium data" or
-"which spatial studies use single-cell resolution", use
-`get_spatial_summary`/`_facets`/`_projects` rather than a keyword search.
-Population is the existing single-cell-modality classifier (deterministic,
-not scored per row here); platform naming on top of it is regex over the
-study's own text.
-
-- `get_spatial_facets`: the valid filter values. Call it before
-  `get_spatial_projects`.
-- `get_spatial_projects(...)`: one row per study. Filter with `platform`
-  (see `get_spatial_facets` for values), `resolution` (single-cell, spot,
-  roi), `technology` (imaging, sequencing, hybrid), `data_availability`
-  (both, matrix_only, fastq_only, neither), `organism`, `tissue`,
-  `readout_assay`, `cell_line`, `sample_type`, `has_matrix`, `has_fastq`,
-  `is_long_read`, `year`, `q`.
-- `platforms` is often null: many of these studies only say "spatial
-  transcriptomics" generically, without naming a specific platform. A named
-  platform reflects a text mention (a comparison paper can name a platform
-  it did not run); treat it the same way a `title_compounds`-only
-  perturbation row is a weak lead.
-- `resolution=roi` (GeoMx DSP) is region-level, not single-cell resolution.
-  `technology` tracks `resolution` one-to-one (imaging~single-cell,
-  sequencing~spot, hybrid~roi) but is a separate column; use whichever the
-  user's question is actually about. A study naming platforms from two
-  groups collapses to single-cell/imaging, then spot/sequencing, then
-  roi/hybrid, even though `platforms` still lists every name found.
-- To get the data, use `has_matrix`/`has_fastq` here, then the single-cell
-  and download tools on the returned accession.
-
-## Tissue Collection
-
-For "what data exists on <tissue>" (e.g. liver, blood, pancreatic islet), use
-`get_tissue_summary`/`_facets`/`_projects(term, ...)` rather than a keyword
-search. `term` resolves like a free-text disease: the full UBERON ontology
-(exact label first, else substring) and its descendants, so "blood" also
-reaches "whole blood" and "peripheral blood mononuclear cell". `resolution` in
-the summary says which matched; `matched_labels` lists the matches. A 404 means
-nothing in UBERON matches.
-
-- `get_tissue_summary(term)`: corpus totals. `matched_samples` counts samples
-  resolved to the matched UBERON ids; `samples` is the matching studies' total
-  across every tissue annotation.
-- `get_tissue_facets(term)`: valid filter values (organism, assay_l1, source,
-  journal, country, year, has_fastq, has_sra, is_single_cell, is_long_read).
-  Call it before `get_tissue_projects`.
-- `get_tissue_projects(term, ...)`: one row per study. `n_samples_with_tissue`
-  counts every sample the study has any resolved tissue for; use the summary's
-  `matched_samples` for the matching count. `has_fastq`/`has_sra` are NULL when
-  the study is absent from the download-links table, which means unknown. Sort
-  with `sort=` over n_samples, n_experiments, pub_date, title, study_accession,
-  organism, plus `order=`.
-
-Every tissue lookup goes through the UBERON resolution; there is no curated
-tissue catalogue.
-
-## Single-Cell Counts And Microbial Signals
-
-`get_project_single_cell(accession)` returns per-sample cell/gene counts joined
-to read-derived species, sex and assay calls and to microbial presence flags.
-404 means the study is not in the Pentimento, which is common -- fall back to
-`get_project_enriched`. `samples` is paginated by `limit`/`offset` (default 200,
-max 1000) and there is no `total` on the page: compare against the study record's
-`n_samples_detailed` to know whether more remain, and say so if you stopped early.
-
-For a per-organism microbial breakdown, use
-`search_enriched_samples(study_accession=..., microbe=...)`: it returns the same
-detections with reads, kmer_mass, breadth_frac and n_unitigs per sample, and its
-aggregates are computed over every detection rather than a truncated page.
-
-Treat these as evidence, not diagnosis. State the limits when you report them:
-- A flag means unitigs align across at least 20% of a panel reference (50% for
-  the host-endogenous and vector-derived retroviruses MLV, MMTV, HIV1, HTLV1).
-  There is no raw-read, UMI or replicate confirmation.
-- NULL is not false. A null flag list or `measurable` false/null means nothing
-  was measurable, so an empty result is NOT an absence call. An EMPTY list means
-  it was measured and nothing was found. Those are different answers.
-- `cells` is a matrix COLUMN count. When `unfiltered` is set those columns are
-  10x barcodes, not cells, and must not be summed.
-- `kmer_mass` is a weighted k-mer count -- a relative proxy comparable between
-  organisms within a run, not an absolute k-mer number. Do not report it as one.
-- `spike_in_control` (PhiX) and `negative_control` (animalPV) are controls, and
-  `bacterial_background` is reagent kitome and skin flora. Never sum any of them
-  into viral or bacterial totals.
-
-## Publications And Citations
-
-Search results and `get_project` are enriched with publication fields from linked
-PubMed data when available. Use:
-- `get_project_cite` for citation metadata and BibTeX. `type=original` returns the
-  earliest/smallest PMID; `type=all` returns all linked publications; `format=bibtex`
-  returns plain BibTeX.
-- `find_publication` for paper-to-datasets lookup by PMID or DOI.
-- `search_author_projects` when the user wants every dataset a person authored:
-  it returns project rows (search-card compatible) plus their institutes. Prefer
-  this for "datasets/studies by <name>".
-- `search_by_author` when the user wants the publications themselves: one row per
-  PMID (title, journal, DOI, citations) with the accessions linked to each paper.
-Both only find studies linked to a PubMed publication.
-
-## Statistics And Discovery
-
-- `get_source_totals`: project/sample totals by source.
-- `get_last_updated`: index freshness overall or by source.
-- `get_growth_stats`: monthly projects, experiments, or data volume. In `mode=bases`,
-  ENA uses nucleotide bases while SRA uses FASTQ/SRA bytes; optional `db` includes
-  `sra_fastq_bytes` and `sra_sra_bytes`.
-- `get_organism_growth`: monthly counts/share for one scientific organism name.
-- `get_organism_totals`: largest organisms by total experiments, with source split.
-- `search_organisms`: organism autocomplete; prefer this over `list_organisms`.
-- `get_global_contributions`: geographic aggregation by lat/lng from unified_metadata;
-  filters include organism, assay_l1, assay_l2, place_type, address_type.
-- `get_global_contribution_filters`: valid filter values for the global map, optional
-  country/organism scope.
-- `get_country_accessions`: plain newline accession list for a country, optionally
-  organism and assay_l2 filtered.
-- `get_country_pis`: investigators for a whole country ranked by project count, with
-  no topic. Use it only for "who deposits the most from <country>".
-- `get_search_investigators`: investigators behind any search, so use this whenever
-  the question names a topic ("who works on CRISPR in India"). `senior_only=true`
-  ranks last authors (PIs); false counts every author. Never pull `get_country_pis`
-  and filter it by topic yourself.
-- `get_platform_totals`, `get_platform_growth`, `get_platform_instruments`, and
-  `get_platform_filters`: sequencing technology totals, trends, instruments, and
-  filter options.
-
-## Tools Not Exposed Or Usually Avoided In MCP
-
-- `bulk_metadata` and `bulk_project_metadata` are binary/bulk REST downloads, and
-  `download_by_query` streams an uncapped dataset-level CSV of a whole search;
-  direct users to REST or web UI when needed.
-- `download_study_runs_tsv`, `download_study_bams_tsv`, `download_study_metadata_csv`,
-  and `download_sample_detail_csv` stream TSV/CSV files. Use JSON tools instead:
-  `get_study_download_manifest`, `get_study_bams`, `get_project_metadata_rows`, and
-  `get_sample_detail`.
-- `get_clusters`, `get_projects_atlas_v1`, `get_atlas_labels_v1`, `get_map_meta`,
-  `get_map_filter`, `get_map_labels`, `get_map_countries`, and `get_map_tile` serve
-  visualization assets, not conversational answers.
-- `search_facets` and `deep_dive_terms`/`deep_dive_children` power search-page UI
-  widgets (sidebar counts, ontology drilldown). For cohort counts use
-  `search_structured(count_by=...)` instead.
-- `get_geo_series_neighbors_coords` is low-level map/similarity data; use
-  `get_project_similar` for conversational similarity.
-- `search_geo` and `search_sra` are redundant; use `search_all` with `db`.
-- `sitemap_counts` and `sitemap_accessions` are for SEO.
-- `purge_cache` is admin-only. `health_check` is REST connectivity only.
-- `list_organisms` can return hundreds of thousands of rows; use `search_organisms`
-  or `get_organism_totals(limit=...)`.
-"""
-MCP_EXCLUDED_OPERATION_IDS = {
-    "health_check",
-    "purge_cache",
-    "get_projects_atlas_v1",
-    "get_atlas_labels_v1",
-    "get_clusters",
-    "get_map_meta",
-    "get_map_labels",
-    "get_map_countries",
-    "get_map_filter",
-    "get_map_tile",
-    "get_geo_series_neighbors_coords",
-    "search_geo",
-    "search_sra",
-    "search_facets",
-    "deep_dive_terms",
-    "deep_dive_children",
-    "download_study_runs_tsv",
-    "download_study_bams_tsv",
-    "download_study_metadata_csv",
-    "download_sample_detail_csv",
-    "download_by_query",
-    "bulk_metadata",
-    "bulk_project_metadata",
-    "list_organisms",
-    # Excluded until get_sample_microbes aggregates before applying LIMIT.
-    "get_sample_microbes",
-    "sitemap_counts",
-    "sitemap_accessions",
-}
-
 ENRICHMENT_OPERATION_IDS = {
     "search_enriched_samples",
     "get_enriched_coverage",
@@ -14513,13 +14411,29 @@ def _mcp_annotate(route, component) -> None:
     component.annotations = ToolAnnotations(
         title=title, readOnlyHint=True, openWorldHint=True
     )
+    annotate_tool(component)
 
+
+_MCP_TOOL_BY_PATH = {
+    route.path: MCP_TOOL_NAMES.get(route.operation_id, route.operation_id)
+    for route in mcp_api_app.router.routes
+    if getattr(route, "operation_id", None)
+}
+_unknown_notes = set(MCP_TOOL_NOTES) - set(_MCP_TOOL_BY_PATH.values())
+if _unknown_notes:
+    raise RuntimeError(f"MCP_TOOL_NOTES names unknown tools: {sorted(_unknown_notes)}")
+set_path_tools(
+    {p: t for p, t in _MCP_TOOL_BY_PATH.items() if t not in MCP_DEPRECATED_TOOLS}
+)
 
 mcp = FastMCP.from_fastapi(
     app=mcp_api_app,
     name="seqout MCP",
+    version=SERVER_VERSION,
     instructions=MCP_INSTRUCTIONS_ACTIVE,
     mcp_component_fn=_mcp_annotate,
+    mcp_names=MCP_TOOL_NAMES,
+    middleware=[SeqoutMcpMiddleware()],
 )
 
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)

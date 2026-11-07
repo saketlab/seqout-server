@@ -23,6 +23,9 @@ jobs:
           script: |
             mkdir -p /var/www/sramap/backend
 
+      - name: Write server version
+        run: echo "${GITHUB_SHA::7}+$(date -u +%Y-%m-%dT%H:%MZ)" > VERSION
+
       - name: Deploy to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -30,7 +33,7 @@ jobs:
           username: ${{ secrets.HOSTINGER_USER }}
           key: ${{ secrets.HOSTINGER_SSH_KEY }}
           port: ${{ secrets.HOSTINGER_PORT || 22 }}
-          source: "main.py,boolean_query.py,map_assets.py,queries.py,grid_filters.py,expansions.py,deep_dive.py,beacon.py,beacon_queries.py,library_strategy.py,schemas/beacon-v2.2.0/custom/seqoutRun.json,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
+          source: "main.py,mcp_support.py,VERSION,boolean_query.py,map_assets.py,queries.py,grid_filters.py,expansions.py,deep_dive.py,beacon.py,beacon_queries.py,library_strategy.py,schemas/beacon-v2.2.0/custom/seqoutRun.json,pyproject.toml,uv.lock,data/platforms.csv,vendor/__init__.py,vendor/qf_tiler.py,vendor/qf_ingester.py"
           target: /var/www/sramap/backend
           strip_components: 0
 
@@ -65,6 +68,13 @@ jobs:
 
             curl -fs http://127.0.0.1:8000/ >/dev/null || {
               echo "::error::backend not answering on :8000 after restart"
+              exit 1
+            }
+
+            # Regression probe: q plus a release-date bound once timed out at 30 s.
+            curl -fs --max-time 25 -o /dev/null \
+              'http://127.0.0.1:8000/search/structured?q=myopia+retina&published_before=2024-06-05' || {
+              echo "::error::search_structured q+published_before probe failed"
               exit 1
             }
 
