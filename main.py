@@ -1215,7 +1215,6 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     if not accessions:
         return rows
 
-    # free-text-only aliases fall through to the batch lookup
     row_aliases = {
         r["accession"]: alias_accessions(
             _normalize_aliases(r.get("alias")), r["accession"]
@@ -1223,11 +1222,10 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
         for r in rows
         if r.get("accession")
     }
-    missing_alias = [a for a, al in row_aliases.items() if not al]
-    if missing_alias:
-        cur.execute(ALIASES_BATCH_SQL, {"acc": missing_alias})
-        for r in cur.fetchall():
-            row_aliases[r["accession"]].extend(_normalize_aliases(r["alias"]))
+    cur.execute(ALIASES_BATCH_SQL, {"acc": list(row_aliases)})
+    for r in cur.fetchall():
+        have = row_aliases[r["accession"]]
+        have.extend(a for a in _normalize_aliases(r["alias"]) if a not in have)
 
     row_candidates: dict[str, list[str]] = {}
     all_cands: set[str] = set()
