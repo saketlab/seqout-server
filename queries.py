@@ -508,6 +508,64 @@ def _ena_fold_join(acc: str) -> str:
     )
 
 
+# emit an E-GEOD-N match as its GSEN so it folds as GEO
+# LATERAL + LIMIT 1 forces a per-row PK lookup on geo_series
+_AE_GEO_JOIN = (
+    " LEFT JOIN LATERAL (SELECT g.accession, g.title, g.summary, g.updated_at,"
+    " g.published_at, g.organisms, g.countries_iso, g.instrument_models,"
+    " g.library_strategies, g.platforms FROM geo_series g"
+    f" WHERE g.accession = {_ae_fold_key('ae.accession')} LIMIT 1) gx ON TRUE"
+)
+
+
+_AEG = {
+    "accession": "COALESCE(gx.accession, ae.accession)",
+    "title": "COALESCE(gx.title, ae.title)",
+    "summary": "COALESCE(gx.summary, ae.description)",
+    "updated_at": "COALESCE(gx.updated_at, ae.release_date)",
+    "published_at": "COALESCE(gx.published_at, ae.release_date)",
+    "organisms": "COALESCE(gx.organisms, ae.organisms)",
+    "countries": "CASE WHEN gx.accession IS NULL THEN ae.countries ELSE gx.countries_iso END",
+    "source": "CASE WHEN gx.accession IS NULL THEN 'arrayexpress' ELSE 'geo' END::text",
+    "dedup_key": "COALESCE(gx.accession, ae.alias, ae.accession)",
+    "fold_key": _ae_fold_key("ae.accession"),
+    "instrument_models": "gx.instrument_models",
+    "library_strategies": "gx.library_strategies",
+    "platforms": "gx.platforms",
+}
+
+# no swap (db=arrayexpress or query-less): plain AE columns, no join
+_AE_PLAIN = {
+    "accession": "ae.accession",
+    "title": "ae.title",
+    "summary": "ae.description",
+    "updated_at": "ae.release_date",
+    "published_at": "ae.release_date",
+    "organisms": "ae.organisms",
+    "countries": "ae.countries",
+    "source": "'arrayexpress'::text",
+    "dedup_key": "COALESCE(ae.alias, ae.accession)",
+    "fold_key": _ae_fold_key("ae.accession"),
+    "instrument_models": "NULL::text[]",
+    "library_strategies": "NULL::text[]",
+    "platforms": "NULL::text[]",
+}
+
+
+def _ae_cols(swap: bool) -> tuple[dict, str]:
+    """(column exprs, join) for an ArrayExpress branch."""
+    return (_AEG, _AE_GEO_JOIN) if swap else (_AE_PLAIN, "")
+
+
+def _fill_ae(sql: str, swap: bool) -> str:
+    """Fill the {AE_GEO_JOIN} and {AEG_*} placeholders of a SQL template."""
+    cols, join = _ae_cols(swap)
+    sql = sql.replace("{AE_GEO_JOIN}", join)
+    for k, v in cols.items():
+        sql = sql.replace("{AEG_" + k + "}", v)
+    return sql
+
+
 _ENA_FOLD_KEY = "COALESCE(ena_ss.alias, ena_ss.accession)"
 _SOURCE_PREF = "CASE source WHEN 'geo' THEN 0 WHEN 'sra' THEN 1 ELSE 2 END"
 
@@ -535,9 +593,7 @@ def _sort_spec(sortby: str, order: str, alias: str) -> dict:
 
 
 def _with_folding(sql: str, ena: bool = True) -> str:
-    sql = sql.replace("{AE_FOLD}", _ae_fold_key("accession")).replace(
-        "{SOURCE_PREF}", _SOURCE_PREF
-    )
+    sql = sql.replace("{SOURCE_PREF}", _SOURCE_PREF)
     return _with_ena_folding(sql, ena) if ena else sql
 
 
@@ -580,14 +636,15 @@ all_matches AS (
 
     UNION ALL
 
-    -- ArrayExpress full-text search
-    SELECT accession, title, description AS summary, release_date AS updated_at,
-           release_date AS published_at, organisms, countries,
-           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,
-           COALESCE(alias, accession) AS dedup_key, {AE_FOLD} AS fold_key,
-           NULL::text[] AS instrument_models, NULL::text[] AS library_strategies
-    FROM arrayexpress_experiments, q
-    WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)
+    -- ArrayExpress full-text search (E-GEOD with a GSE emitted as the GSE)
+    SELECT {AEG_accession} AS accession, {AEG_title} AS title, {AEG_summary} AS summary,
+           {AEG_updated_at} AS updated_at, {AEG_published_at} AS published_at,
+           {AEG_organisms} AS organisms, {AEG_countries} AS countries,
+           (ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7 AS rank, {AEG_source} AS source,
+           {AEG_dedup_key} AS dedup_key, {AEG_fold_key} AS fold_key,
+           {AEG_instrument_models} AS instrument_models, {AEG_library_strategies} AS library_strategies
+    FROM arrayexpress_experiments ae CROSS JOIN q{AE_GEO_JOIN}
+    WHERE (ae.tsv @@ q.match_q OR ae.tsv @@ q.core_q)
 
     UNION ALL
 
@@ -671,7 +728,7 @@ ORDER BY rank DESC, accession DESC
 OFFSET COALESCE(%s::bigint, 0)
 LIMIT 201;
 """
-SEARCH_SQL = _with_folding(SEARCH_SQL)
+SEARCH_SQL = _fill_ae(_with_folding(SEARCH_SQL), swap=True)
 
 
 # Boolean/structured queries
@@ -740,14 +797,14 @@ all_matches AS (
     FROM sra_studies s, q
     WHERE (%(no_q)s OR s.tsv @@ q.match_q OR s.tsv @@ q.core_q)
     UNION ALL
-    SELECT accession, title, description AS summary, release_date AS updated_at,
-           release_date,
-           organisms, countries, NULL::text[], NULL::text[], NULL::text[],
-           NULL::text[],
-           'arrayexpress'::text, COALESCE(alias, accession), {AE_FOLD},
-           (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7
-    FROM arrayexpress_experiments, q
-    WHERE (%(no_q)s OR tsv @@ q.match_q OR tsv @@ q.core_q)
+    SELECT {AEG_accession}, {AEG_title}, {AEG_summary}, {AEG_updated_at},
+           {AEG_published_at},
+           {AEG_organisms}, {AEG_countries}, {AEG_instrument_models},
+           {AEG_library_strategies}, {AEG_platforms}, NULL::text[],
+           {AEG_source}, {AEG_dedup_key}, {AEG_fold_key},
+           (ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7
+    FROM arrayexpress_experiments ae CROSS JOIN q{AE_GEO_JOIN}
+    WHERE (%(no_q)s OR ae.tsv @@ q.match_q OR ae.tsv @@ q.core_q)
     UNION ALL
     -- organisms materialized onto ena_studies_search by transfer.ena_organisms
     -- (DISTINCT ena_samples.scientific_name), so the organism facet includes ENA.
@@ -836,8 +893,9 @@ matched AS (
 _SEARCH_MATCH_CTE = _with_folding(_SEARCH_MATCH_CTE, ena=False)
 
 
-def _inline_match_q(sql: str, q) -> str:
-    """Inline the q-dependent literals of _SEARCH_MATCH_CTE: no_q and ENA folding."""
+def _inline_match_q(sql: str, q, db) -> str:
+    """Inline the q/db-dependent parts of _SEARCH_MATCH_CTE: no_q, ENA and E-GEOD folding."""
+    sql = _fill_ae(sql, swap=bool(q) and db is None)
     return _with_ena_folding(
         sql.replace("%(no_q)s", "TRUE" if not q else "FALSE"), bool(q)
     )
@@ -1001,7 +1059,7 @@ def build_search_match_temp(
     # no_q is a SQL literal: "FALSE OR tsv @@ q" folds to "tsv @@ q" at plan
     # time, keeping the FTS index in generic/prepared plans too. "TRUE OR ..."
     # folds to TRUE for the query-less full scan.
-    sql = _inline_match_q(sql, q)
+    sql = _inline_match_q(sql, q, db)
     return sql, {"q": q, "q_variants": q_variants, "db": db}
 
 
@@ -1172,7 +1230,7 @@ def build_search_results(
     )
     # no_q inlined as a literal so "FALSE OR tsv @@ q" folds to the FTS index
     # scan at plan time (no bind-param plan surprises); see build_search_match_temp.
-    sql = _inline_match_q(sql, q)
+    sql = _inline_match_q(sql, q, db)
     return sql, params
 
 
@@ -3184,6 +3242,9 @@ def build_structured_search(
     if include_ae:
         w = []
         joins = ""
+        # query-less, the GEO branch already holds every GSE
+        aeg, ae_join = _ae_cols(bool(q) and source in (None, "all"))
+        ae_pub = aeg["published_at"]
         if geo_cte:
             # unified_metadata stores this source as 'ae'
             joins = " INNER JOIN geo_accessions ga ON ga.canonical_accession = ae.accession AND ga.source = 'ae'"
@@ -3197,13 +3258,13 @@ def build_structured_search(
         if center:
             w.append("ae.organizations::text ILIKE '%%' || %(center)s || '%%'")
         if year_from is not None:
-            w.append("ae.release_date >= make_date(%(year_from)s, 1, 1)")
+            w.append(f"{ae_pub} >= make_date(%(year_from)s, 1, 1)")
         if year_to is not None:
-            w.append("ae.release_date <= make_date(%(year_to)s, 12, 31)")
+            w.append(f"{ae_pub} <= make_date(%(year_to)s, 12, 31)")
         if published_after:
-            w.append("ae.release_date >= %(published_after)s::date")
+            w.append(f"{ae_pub} >= %(published_after)s::date")
         if published_before:
-            w.append("ae.release_date <= %(published_before)s::date")
+            w.append(f"{ae_pub} <= %(published_before)s::date")
         if sample_tissue:
             w.append(
                 "EXISTS (SELECT 1 FROM ontology_samples_v5 os"
@@ -3234,17 +3295,19 @@ def build_structured_search(
         rank = (
             "(ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7"
             if q
-            else "COALESCE(EXTRACT(EPOCH FROM ae.release_date), 0)"
+            else f"COALESCE(EXTRACT(EPOCH FROM {ae_pub}), 0)"
         )
         where = (" WHERE " + " AND ".join(w)) if w else ""
         cte_parts.append(
-            f"SELECT ae.accession, ae.title, ae.description AS summary,"
-            f" ae.release_date AS updated_at, ae.release_date AS published_at,"
-            f" ae.organisms, ae.countries,"
-            f" {rank} AS rank, 'arrayexpress'::text AS source,"
-            f" COALESCE(ae.alias, ae.accession) AS dedup_key,"
-            f" {_ae_fold_key('ae.accession')} AS fold_key, NULL::text[] AS instrument_models, NULL::text[] AS library_strategies, NULL::text[] AS platforms"
-            f" FROM arrayexpress_experiments ae{joins}{from_q}{where}"
+            f"SELECT {aeg['accession']} AS accession, {aeg['title']} AS title,"
+            f" {aeg['summary']} AS summary, {aeg['updated_at']} AS updated_at,"
+            f" {ae_pub} AS published_at,"
+            f" {aeg['organisms']} AS organisms, {aeg['countries']} AS countries,"
+            f" {rank} AS rank, {aeg['source']} AS source,"
+            f" {aeg['dedup_key']} AS dedup_key, {aeg['fold_key']} AS fold_key,"
+            f" {aeg['instrument_models']} AS instrument_models,"
+            f" {aeg['library_strategies']} AS library_strategies, {aeg['platforms']} AS platforms"
+            f" FROM arrayexpress_experiments ae{joins}{ae_join}{from_q}{where}"
         )
 
     if include_ena:
@@ -3563,14 +3626,19 @@ def build_sorted_search_sql(
         )
 
     if db in (None, "arrayexpress"):
+        aeg, ae_join = _ae_cols(db is None)
         cte_parts.append(
-            "SELECT accession, title, description AS summary,"
-            " release_date AS updated_at, release_date AS published_at, organisms, countries,"
-            " (ts_rank(tsv, q.core_q) + ts_rank(tsv, q.match_q) * 0.2) * 0.7 AS rank, 'arrayexpress'::text AS source,"
-            f" COALESCE(alias, accession) AS dedup_key, {_ae_fold_key('accession')} AS fold_key,"
-            " NULL::text[] AS instrument_models, NULL::text[] AS library_strategies"
-            " FROM arrayexpress_experiments, q"
-            " WHERE (tsv @@ q.match_q OR tsv @@ q.core_q)"
+            f"SELECT {aeg['accession']} AS accession, {aeg['title']} AS title,"
+            f" {aeg['summary']} AS summary, {aeg['updated_at']} AS updated_at,"
+            f" {aeg['published_at']} AS published_at,"
+            f" {aeg['organisms']} AS organisms, {aeg['countries']} AS countries,"
+            " (ts_rank(ae.tsv, q.core_q) + ts_rank(ae.tsv, q.match_q) * 0.2) * 0.7 AS rank,"
+            f" {aeg['source']} AS source,"
+            f" {aeg['dedup_key']} AS dedup_key, {aeg['fold_key']} AS fold_key,"
+            f" {aeg['instrument_models']} AS instrument_models,"
+            f" {aeg['library_strategies']} AS library_strategies"
+            f" FROM arrayexpress_experiments ae CROSS JOIN q{ae_join}"
+            " WHERE (ae.tsv @@ q.match_q OR ae.tsv @@ q.core_q)"
         )
 
     if db in (None, "ena"):

@@ -59,6 +59,7 @@ from mcp_support import (
     MCP_TOOL_NOTES,
     SEARCH_PAGE_SIZE,
     SeqoutMcpMiddleware,
+    _ALIAS_ACCESSION,
     alias_accessions,
     annotate_tool,
     finish_page,
@@ -1214,8 +1215,11 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
     if not accessions:
         return rows
 
+    # free-text-only aliases fall through to the batch lookup
     row_aliases = {
-        r["accession"]: _normalize_aliases(r.get("alias"))
+        r["accession"]: alias_accessions(
+            _normalize_aliases(r.get("alias")), r["accession"]
+        )
         for r in rows
         if r.get("accession")
     }
@@ -1317,8 +1321,21 @@ def _enrich_with_publications(rows: list[dict], cur) -> list[dict]:
             if cites:
                 pubs = [_citation_pub(c) for c in cites if c] or None
         row["publications"] = pubs
-        if "alias" not in row:
-            row["alias"] = alias_accessions(row_candidates.get(acc, [])[1:], acc)
+        linked = alias_accessions(row_candidates.get(acc, [])[1:], acc)
+        if "alias" in row:
+            # frontend reads the raw alias as a string; MCP swaps in the list
+            raw = row["alias"]
+            row["linked_accessions"] = linked
+            # ENA auto-generated ena-STUDY-... tags carry no name
+            row["submitter_alias"] = (
+                raw.strip()
+                if isinstance(raw, str)
+                and not _ALIAS_ACCESSION.match(raw.strip().upper())
+                and not raw.lower().startswith("ena-study-")
+                else None
+            )
+        else:
+            row["alias"] = linked
         if pubs and len(pubs) > 0:
             primary = pubs[0]
             row["pmid"] = primary.get("pmid")
@@ -3004,6 +3021,9 @@ def _check_cursor_sort(
 
 def _first_page(*cursors) -> bool:
     return all(c is None for c in cursors)
+
+
+_ENRICHED_SEARCH_TIMEOUT = "60s"  # test_mcp_timeout.py lowers it
 
 
 def _timeout_detail(hint: str, seconds: int | None = None) -> str:
@@ -13243,7 +13263,9 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         # The pool is autocommit, where SET LOCAL is a silent no-op
         with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET LOCAL statement_timeout = '60s'")
+                cur.execute(
+                    f"SET LOCAL statement_timeout = '{_ENRICHED_SEARCH_TIMEOUT}'"
+                )
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 if len(rows) < limit and (rows or offset == 0):

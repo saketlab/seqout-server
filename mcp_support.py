@@ -9,6 +9,7 @@ from mcp.types import TextContent
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
+from mcp_param_docs import param_doc
 from queries import SEARCH_PAGE_SIZE
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,15 @@ _ALIAS_ACCESSION = re.compile(r"^(?:[A-Z]{2,6}\d+|E-[A-Z]{4}-\d+)$")
 def alias_accessions(aliases: list[str], own: str | None) -> list[str]:
     """Linked accessions for a search row, without the row's own accession."""
     return [a for a in dict.fromkeys(aliases) if a != own and _ALIAS_ACCESSION.match(a)]
+
+
+def split_project_alias(row: dict) -> dict:
+    """MCP: alias becomes the linked-accession list, as on a search row."""
+    if "linked_accessions" not in row:
+        return row
+    row = dict(row)
+    row["alias"] = row.pop("linked_accessions")
+    return row
 
 
 def make_cursor(row: dict, sorted_page: bool) -> dict:
@@ -301,8 +311,11 @@ hit may come from a field this tool does not read. Present it as "these query wo
 appear in the description".""",
     "get_project": """\
 `fields=summary` returns only accession, title and description. Similar studies are \
-not included through MCP; call `get_project_similar`. `alias` links a GSE to its SRP \
-and an E-GEAD (DDBJ GEA) to its DRA study, which holds its FASTQs. DRP/DRX/DRS/DRR \
+not included through MCP; call `get_project_similar`. `alias` is the list of linked \
+accessions in other archives, the same list as on a search row: a GSE and its SRP and \
+E-GEOD, an E-GEAD (DDBJ GEA) and its DRA study, which holds its FASTQs. \
+`submitter_alias` is the submitter's free-text name for the study, never an accession; \
+it is null when there is none. DRP/DRX/DRS/DRR \
 behave like SRA; DDBJ-exclusive FASTQ links point at ddbj.nig.ac.jp. HR* (GSA-Human) \
 data is usually access-controlled, so download links may be absent.""",
     "get_geo_series_samples": "Also lists the samples of a DDBJ GEA series (E-GEAD-N).",
@@ -474,6 +487,11 @@ def annotate_tool(component: Any) -> None:
         component.description = f"{component.description.rstrip()}\n\n{note}"
     params = component.parameters or {}
     props = params.get("properties") or {}
+    for arg, schema in props.items():
+        if not (schema.get("description") or "").strip() and (
+            doc := param_doc(name, arg)
+        ):
+            schema["description"] = doc
     for arg, value in MCP_ARG_DEFAULTS.get(name, {}).items():
         if arg in props:
             props[arg]["default"] = value
@@ -515,6 +533,16 @@ class SeqoutMcpMiddleware(Middleware):
         structured = result.structured_content
         if not isinstance(structured, dict):
             return result
+        structured = split_project_alias(structured)
+        rows = structured.get("results")
+        if isinstance(rows, list) and rows and "linked_accessions" in rows[0]:
+            structured = {
+                **structured,
+                "results": [
+                    split_project_alias(r) if isinstance(r, dict) else r
+                    for r in structured["results"]
+                ],
+            }
         if ignored:
             structured = {**structured, "ignored_params": ignored}
         return ToolResult(
