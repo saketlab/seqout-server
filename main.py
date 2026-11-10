@@ -11249,18 +11249,18 @@ def _get_tissue_microbes() -> dict:
 
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            if not _relation_exists(cur, "tissue_microbe_rates"):
-                raise _NotBuiltYet("tissue_microbe_rates")
+            if not _relation_exists(cur, "tissue_microbe_rates_v2"):
+                raise _NotBuiltYet("tissue_microbe_rates_v2")
             cur.execute(TISSUE_MICROBE_RATES_SQL)
             cells = cur.fetchall()
 
-    for c in cells:
-        c["rate_pct"] = float(c["rate_pct"])
     tissues = {}
     for c in cells:
+        c["rate_pct"] = float(c["rate_pct"])
         tissues.setdefault(
-            c["tissue"],
-            {"tissue": c["tissue"], "uberon": c["uberon"], "screened": c["screened"]},
+            (c["cohort"], c["tissue"]),
+            {"cohort": c["cohort"], "tissue": c["tissue"], "uberon": c["uberon"],
+             "screened": c["screened"]},
         )
     data = {
         "cells": cells,
@@ -11277,10 +11277,14 @@ def _get_tissue_microbes() -> dict:
     "/stats/tissue-microbes",
     summary="Microbial detection rate per tissue",
     description=(
-        "One cell per (tissue, organism): `positives` samples of `screened` "
+        "One cell per (cohort, tissue, organism): `positives` samples of `screened` "
         "carry that organism, over samples the Pentimento actually quantified. "
         "`positives_confirmed` is the high-breadth subset. Cells need 2 or more "
         "contributing studies and a tissue with 200 or more screened samples.\n\n"
+        "Each cell has a `cohort`. `human` and `mouse` count Homo sapiens or Mus "
+        "musculus tissue samples only: no cell lines, reference RNA, xenografts, "
+        "organoids or TCR/BCR libraries. `all` counts every sample with a tissue. Use "
+        "one cohort at a time; the same tissue has a different `screened` in each.\n\n"
         "Contaminants are labelled, not withheld: `is_background` marks an "
         "organism the prevalence sweep flags (E. coli, C. acnes), `class` of "
         "`culture` marks cell-culture organisms such as M. hyorhinis, and "

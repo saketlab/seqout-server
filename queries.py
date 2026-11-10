@@ -5710,7 +5710,9 @@ SINGLECELL_SORTABLE = frozenset(
 SINGLECELL_SUMMARY_SQL = """
 SELECT count(*)                                            AS studies,
        sum(n_samples)                                      AS samples,
-       sum(n_cells)                                        AS cells,
+       -- reads-called counts are estimates; excluded from cells
+       sum(n_cells) FILTER (WHERE n_cells_source IS DISTINCT FROM 'reads') AS cells,
+       sum(n_cells) FILTER (WHERE n_cells_source = 'reads') AS cells_from_reads,
        count(*) FILTER (WHERE has_matrix)                  AS studies_with_matrix,
        count(*) FILTER (WHERE has_fastq)                   AS studies_with_fastq,
        count(*) FILTER (WHERE is_long_read)                AS studies_long_read,
@@ -5754,7 +5756,7 @@ def build_singlecell_projects_sql(sort: str = "year", descending: bool = True) -
     return f"""
 SELECT r.study_accession, r.title, r.organism, r.organisms, r.tissues,
        r.single_cell_modality, r.chemistries, r.cell_or_nucleus, r.assay_l1,
-       r.n_samples, r.has_matrix, r.n_cells, r.has_fastq, r.n_fastq_runs,
+       r.n_samples, r.has_matrix, r.n_cells, r.n_cells_source, r.has_fastq, r.n_fastq_runs,
        r.has_sra, r.n_runs, r.is_long_read, r.perturbation_method,
        r.intervention_kind, r.is_pooled, r.country, r.pmid, r.year
 FROM singlecell_study r
@@ -6630,10 +6632,10 @@ SELECT EXISTS(
 
 
 TISSUE_MICROBE_RATES_SQL = """
-SELECT tissue, uberon, organism, class, is_background, is_endogenous,
+SELECT cohort, tissue, uberon, organism, class, is_background, is_endogenous,
        screened, positives, positives_confirmed, studies, rate_pct
-FROM tissue_microbe_rates
-ORDER BY tissue, organism
+FROM tissue_microbe_rates_v2
+ORDER BY cohort, tissue, organism
 """
 
 
