@@ -6752,8 +6752,6 @@ _SAMPLE_SEARCH_PENTIMENTO = {
     # so it is NULL on most verified single-cell samples.
     "has_matrix": ("p.cells > 0", None),
     "single_cell_only": ("p.assay_is_single_cell IS TRUE", None),
-    "has_viral_reads": ("p.has_viral_reads IS TRUE", None),
-    "has_bacterial_reads": ("p.has_bacterial_reads IS TRUE", None),
     "hpv_type": ("p.hpv_top_type ILIKE %(f_hpv_type)s", lambda v: f"%{v}%"),
     "min_cell_count": ("p.cells >= %(f_min_cell_count)s", int),
     "max_cell_count": ("p.cells <= %(f_max_cell_count)s", int),
@@ -7105,9 +7103,8 @@ _PENTIMENTO_SAMPLE_LATERAL = """
 LEFT JOIN LATERAL (
     SELECT p.sample_accession, p.cells, p.genes, p.unfiltered, p.assay_display,
            p.assay_is_single_cell,
-           p.hpv_top_type, p.hpv_ambiguous, p.has_viral_reads,
-           p.has_viral_evidence,
-           p.has_bacterial_reads, p.viral_kmer_mass, p.bacterial_kmer_mass
+           p.hpv_top_type, p.hpv_ambiguous, p.has_viral_evidence,
+           p.viral_kmer_mass, p.bacterial_kmer_mass
     FROM pentimento_sample p
     WHERE p.sample_accession = s.sample
     LIMIT 1
@@ -7194,7 +7191,7 @@ SELECT {_SAMPLE_SEARCH_SELECT},
        (ps.sample_accession IS NOT NULL) AS pentimento_screened,
        ps.unfiltered, ps.assay_display AS pentimento_assay,
        ps.assay_is_single_cell, ps.hpv_top_type, ps.hpv_ambiguous,
-       ps.has_viral_reads, ps.has_viral_evidence, ps.has_bacterial_reads,
+       ps.has_viral_evidence,
        ps.viral_kmer_mass, ps.bacterial_kmer_mass{microbe_cols}
 FROM page s{joins}
 {order_by(f"s.{sort}")};
@@ -7340,7 +7337,7 @@ WITH counted AS (
            y_xist_ratio, sex_panel_status, sex_mixed_suspected, deep_n_reads,
            assay, assay_display, assay_is_single_cell,
            calls_ambiguous, flags, n_flags, hpv_top_type, hpv_ambiguous,
-           has_viral_reads, has_viral_evidence, has_bacterial_reads,
+           has_viral_evidence,
            viral_kmer_mass, bacterial_kmer_mass
     FROM pentimento_sample
     WHERE study_accession = %(acc)s
@@ -7372,17 +7369,13 @@ from_runs AS (
            NULL::jsonb AS flags,
            NULL::integer AS n_flags,
            NULL::text AS hpv_top_type, NULL::boolean AS hpv_ambiguous,
-           bool_or(mb.has_reads)                              AS has_viral_reads,
            bool_or(mb.has_viral_evidence)                     AS has_viral_evidence,
-           bool_or(mb.has_bacterial)                          AS has_bacterial_reads,
            sum(mb.viral_kmer_mass)                            AS viral_kmer_mass,
            sum(mb.bacterial_kmer_mass)                        AS bacterial_kmer_mass
     FROM pentimento_run r
     LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
     LEFT JOIN LATERAL (
-        SELECT bool_or(m.organism IS NOT NULL)                 AS has_reads,
-               bool_or(m.is_viral_evidence)                    AS has_viral_evidence,
-               bool_or(m.is_validated_bacterial)               AS has_bacterial,
+        SELECT bool_or(m.is_viral_evidence)                    AS has_viral_evidence,
                sum(m.kmer_mass) FILTER (WHERE m.class = 'virus') AS viral_kmer_mass,
                sum(m.kmer_mass) FILTER (
                    WHERE m.class IN ('pathogen', 'culture'))   AS bacterial_kmer_mass
@@ -7393,12 +7386,33 @@ from_runs AS (
       AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM counted)
     GROUP BY 1
+),
+page AS (
+    SELECT * FROM counted
+    UNION ALL
+    SELECT * FROM from_runs
+    ORDER BY sample_accession
+    LIMIT %(limit)s OFFSET %(offset)s
 )
-SELECT * FROM counted
-UNION ALL
-SELECT * FROM from_runs
-ORDER BY sample_accession
-LIMIT %(limit)s OFFSET %(offset)s;
+-- two probes: a run reaches its sample by GSM or by SRS, each with its own index
+SELECT p.*, lib.library_strategies, lib.library_sources
+FROM page p
+LEFT JOIN LATERAL (
+    SELECT COALESCE(array_agg(DISTINCT u.library_strategy ORDER BY u.library_strategy)
+                    FILTER (WHERE u.library_strategy IS NOT NULL),
+                    '{}'::text[]) AS library_strategies,
+           COALESCE(array_agg(DISTINCT u.library_source ORDER BY u.library_source)
+                    FILTER (WHERE u.library_source IS NOT NULL),
+                    '{}'::text[]) AS library_sources
+    FROM (
+        SELECT r.library_strategy, r.library_source
+        FROM pentimento_run r WHERE r.gsm_accession = p.sample_accession
+        UNION ALL
+        SELECT r.library_strategy, r.library_source
+        FROM pentimento_run r WHERE r.sample_accession = p.sample_accession
+    ) u
+) lib ON TRUE
+ORDER BY p.sample_accession;
 """
 
 # Single-cell status and summary

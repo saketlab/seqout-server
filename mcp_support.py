@@ -206,249 +206,295 @@ MCP_ARG_DEFAULTS: dict[str, dict[str, Any]] = {
 
 MCP_INSTRUCTIONS = """\
 seqout searches study metadata from NCBI GEO, SRA/ENA/DDBJ, ArrayExpress, DDBJ GEA \
-and GSA. Each tool description carries that tool's rules; read it before the first call.
+and GSA. Each tool description gives the rules of that tool. Read the description before \
+the first call.
 
 ## Which search tool
 - `search_all`: keywords or a boolean query (`("aging" OR aged) immun*`). `db=` limits the archive.
 - `search_structured`: explicit filters (organism, library_strategy, platform, dates, country) or `count_by` buckets.
-- `search_nl`: a whole English sentence. Read `parsed.warnings`.
+- `search_nl`: a full English sentence. Read `parsed.warnings`.
 - `search_enriched_samples`: SAMPLES (not studies) by tissue, disease, age, sex, cell type or microbe.
 - Collections for "what data exists on X": `get_disease_projects`, `get_tissue_projects`, \
 `get_singlecell_projects`, `get_spatial_projects`, `get_perturbation_projects`, `get_longread_projects`.
-Filter or sort the rows you already have before you search again.
+Before you search again, filter or sort the rows that you have.
 
 ## Search rows
-Rows carry `published_at` (release date, first public), `updated_at`, `alias` (the same \
-dataset in other archives, e.g. the SRP or E-GEOD of a GSE), organisms, library_strategies, \
-pmid and doi. Do not call `get_project` per hit for these. A dataset appears once; its \
-mirrors are in `alias`. Through MCP a page holds 50 compact rows (summary cut to 300 \
-characters). Pass `limit` (1-200) or `fields=full` for more.
+Each row has `published_at` (the release date), `updated_at`, `alias`, organisms, \
+library_strategies, pmid and doi. `alias` gives the same dataset in other archives, for \
+example the SRP or E-GEOD of a GSE. Do not call `get_project` for each row to get these \
+fields. A dataset shows only one time. Through MCP, a page has 50 compact rows, and each \
+summary has a maximum of 300 characters. For more, set `limit` (1-200) or `fields=full`.
 
 ## Paging
-Repeat the same call with the cursor from `next_cursor`: `cursor_rank` + `cursor_acc` \
-for relevance order, `cursor_sort` + `cursor_acc` with `sortby`. `has_more=false` \
-(next_cursor null) is the last page. `total` is null when unknown (`total_is_known=false`); \
-it is not zero. `sortby` replaces relevance order: use it only for newest, oldest or most cited.
+To get the next page, do the same call again with the cursor from `next_cursor`. Use \
+`cursor_rank` + `cursor_acc` for relevance order. Use `cursor_sort` + `cursor_acc` with \
+`sortby`. `has_more=false` (`next_cursor` null) shows the last page.
+
+A null `total` (`total_is_known=false`) means unknown. It does not mean zero. `sortby` \
+replaces relevance order. Use `sortby` only for newest, oldest or most cited.
 
 ## Dates
-`date_from`/`date_to`/`year_from`/`year_to` (search_all), `published_after`/`published_before` \
-and `year_*` (search_structured), `count_by=year` and `sortby=year` all use the release \
-date. `pub_date_*` is the linked paper's date.
+These parameters use the release date:
+- `search_all`: `date_from`, `date_to`, `year_from`, `year_to`.
+- `search_structured`: `published_after`, `published_before`, `year_*`.
+- `count_by=year` and `sortby=year`.
+`pub_date_*` uses the date of the linked paper.
 
 ## Accessions
 - GSE, E-XXXX-N, E-GEAD-N (DDBJ GEA, not ArrayExpress), SRP/ERP/DRP, CRA/HRA, PRJ*: `get_project`.
 - GSM, SRX/ERX/DRX, SRS/ERS/DRS, SAM*: `get_sample_detail`. SRR/ERR/DRR: `get_run_checksums` or `get_run`.
-- Same dataset in another archive, or a child accession's project: `convert_accession` (one or many).
+- Same dataset in another archive, or the project of a child accession: `convert_accession` (one or many).
 - Unknown shape: `classify_accession`. Submission (SRA/ERA/DRA + digits): `resolve_submission_studies`.
-- `exists: false` or a 404 means the accession is not in seqout. Never present it as a real dataset.
+- `exists: false` or a 404 means that the accession is not in seqout. Do not show it as a real dataset.
 
 ## Files and errors
-FASTQs are per run: `get_study_download_manifest` for a study, `get_supplementary_files` \
-for GEO/ArrayExpress processed files. A 504 is a timeout, not an empty result: narrow the call.
+FASTQ files are for each run. Use `get_study_download_manifest` for a study. Use \
+`get_supplementary_files` for the processed files of GEO/ArrayExpress. A 504 is a \
+timeout. It is not an empty result. Make the call narrower.
 """
 
 _NOTE_FASTQ = """\
-FASTQ files exist per run; a study is a container of runs. GEO and ArrayExpress \
-projects have FASTQs only through a linked SRA/ENA study (`alias`, or \
-`convert_accession`); for their processed files use `get_supplementary_files`. A PRJ \
-must first resolve to its SRP/ERP/DRP with `convert_accession`. Interleaved paired \
-runs (`library_layout=PAIRED` with `fastq_file_count=1` or `fastq_is_interleaved=true`) \
-are not a complete R1/R2 pair: use the SRA normalized format, or SRA Lite, and \
-`sracha get --split split-files`. The manifest and `download_study_script(mode="fastq")` \
-do this when `fastq_conversion_available=true`; read `fastq_conversion_required`, \
-`recommended_fastq_source`, `conversion_command` and `expected_fastq_paths`."""
+FASTQ files are for each run. A study is a container of runs. A GEO or ArrayExpress \
+project has FASTQ files only through a linked SRA/ENA study (`alias`, or \
+`convert_accession`). For the processed files of these projects, use \
+`get_supplementary_files`. For a PRJ accession, first use `convert_accession` to get its \
+SRP/ERP/DRP.
+An interleaved paired run has `library_layout=PAIRED` with `fastq_file_count=1` or \
+`fastq_is_interleaved=true`. Such a run is not a complete R1/R2 pair. Use the SRA \
+normalized format or SRA Lite, with `sracha get --split split-files`. The manifest and \
+`download_study_script(mode="fastq")` do this when `fastq_conversion_available=true`. \
+Read `fastq_conversion_required`, `recommended_fastq_source`, `conversion_command` and \
+`expected_fastq_paths`."""
 
 _NOTE_ENRICH_LAYERS = """\
-Three metadata layers. Project metadata: `get_project` and search rows. Raw flattened \
-rows: `get_project_metadata_rows`, `get_experiment_metadata_rows`, \
-`get_run_metadata_rows` (SRA/ENA: one row per run with `sample_attribute:*` columns, \
-FASTQ URLs, bytes, MD5; GEO/ArrayExpress: one row per sample). Ontology-enriched: \
-`get_project_enriched`, `get_experiment_enriched`, `get_run_enriched` (tissue, \
-cell_type, disease, assay, UBERON/CL/MONDO/EFO ids, low_confidence_tags). For both raw \
-attributes and ontology fields call both and say which is which. Enriched tools may \
-404 for unenriched projects; fall back to the raw rows."""
+There are three metadata layers.
+- Project metadata: `get_project` and search rows.
+- Raw flattened rows: `get_project_metadata_rows`, `get_experiment_metadata_rows`, \
+`get_run_metadata_rows`. SRA/ENA gives one row for each run, with `sample_attribute:*` \
+columns, FASTQ URLs, bytes and MD5. GEO/ArrayExpress gives one row for each sample.
+- Ontology-enriched fields: `get_project_enriched`, `get_experiment_enriched`, \
+`get_run_enriched` (tissue, cell_type, disease, assay, UBERON/CL/MONDO/EFO ids, \
+low_confidence_tags).
+If the user wants raw attributes and ontology fields, call the two tools and identify \
+each layer. An enriched tool can return 404 for a project that is not enriched. Then use \
+the raw rows."""
 
 _NOTE_MICROBE_EVIDENCE = """\
-Microbial calls are evidence, not diagnosis. A flag means unitigs align across at \
-least 20% of a panel reference (50% for MLV, MMTV, HIV1, HTLV1); there is no raw-read, \
-UMI or replicate confirmation. NULL is not false: a null flag list or `measurable` \
-false/null means nothing was measurable, while an EMPTY list means measured and none \
-found. `kmer_mass` is a relative within-run proxy, not an absolute count. \
-`spike_in_control` (PhiX), `negative_control` (animalPV) and `bacterial_background` \
-(reagent kitome, skin flora) are never summed into viral or bacterial totals. `cells` \
-is a matrix column count; when `unfiltered` is set they are 10x barcodes, never sum them."""
+Microbial calls are evidence. They are not a diagnosis. A flag means that unitigs align \
+across a minimum of 20% of a panel reference (50% for MLV, MMTV, HIV1, HTLV1). Raw \
+reads, UMIs and replicates do not confirm a flag. NULL is not false. A null flag list, \
+or `measurable` false or null, means that the pipeline could measure nothing. An EMPTY \
+list means that the pipeline measured the sample and found nothing.
+`kmer_mass` is a relative proxy in one run. It is not an absolute count. The viral and \
+bacterial totals never include `spike_in_control` (PhiX), `negative_control` (animalPV) \
+and `bacterial_background` (reagent kitome, skin flora). `cells` is the number of matrix \
+columns. When `unfiltered` is set, `cells` counts 10x barcodes. Do not add these counts \
+together."""
 
 MCP_TOOL_NOTES: dict[str, str] = {
     "search_all": """\
-Pass `db=geo|sra|arrayexpress|ena|gsa|dra|gea` only when the user restricts the source. \
-`long_read=true` keeps studies with a PacBio or Oxford Nanopore experiment. \
-`suggestions`/`correction` in the response mean the query looked misspelled: present \
-or use them instead of guessing. Structured search has no DRA or GEA source, so \
-DDBJ-exclusive and GEA records are reachable only here (`db=dra`, `db=gea`).""",
+Set `db=geo|sra|arrayexpress|ena|gsa|dra|gea` only when the user limits the source. \
+`long_read=true` keeps the studies that have a PacBio or Oxford Nanopore experiment. \
+`suggestions` or `correction` in the response means that the query has a possible \
+spelling error. Show them or use them. Do not guess. Structured search has no DRA or GEA \
+source. Thus, only this tool finds DDBJ-exclusive and GEA records (`db=dra`, `db=gea`).""",
     "search_structured": """\
-Filter caveats: `platform` drops GEO and ArrayExpress; `instrument_model` drops \
-ArrayExpress, ENA and GSA; `country` drops ArrayExpress; `multi_platform` is GEO/SRA \
-only; `library_strategy` drops GEO. `organism` and `library_strategy` take several \
-values. `sample_tissue`/`sample_disease`/`sample_cell_type` prove one enriched sample \
-matched (inspect with `get_project_enriched`); for the samples themselves use \
-`search_enriched_samples`. Choose filter values with `list_library_strategies`, \
+Some filters remove archives:
+- `platform` removes GEO and ArrayExpress.
+- `instrument_model` removes ArrayExpress, ENA and GSA.
+- `country` removes ArrayExpress.
+- `multi_platform` keeps only GEO and SRA.
+- `library_strategy` removes GEO.
+`organism` and `library_strategy` accept more than one value. `sample_tissue`, \
+`sample_disease` and `sample_cell_type` show that one enriched sample matched. Examine \
+the match with `get_project_enriched`. To get the samples, use \
+`search_enriched_samples`. Get filter values from `list_library_strategies`, \
 `list_instrument_models`, `list_journals`, `list_centers` and `search_organisms`.""",
     "search_nl": """\
-Rule-based, no LLM. ALWAYS read `parsed.warnings` and repeat them. Exclusions \
-("excluding mouse") are listed in `parsed.excluded` but NOT applied: filter the rows \
-yourself or use a boolean query in `search_all`. DDBJ/DRA/GEA are recognised but have \
-no structured source; use `search_all(db=dra|gea)`. `dry_run=true` parses only. When \
-the user gives explicit filters, call `search_structured`.""",
+This tool uses rules, not an LLM. ALWAYS read `parsed.warnings` and tell them to the \
+user. `parsed.excluded` lists the exclusions ("excluding mouse"), but the search does \
+NOT apply them. Filter the rows, or use a boolean query in `search_all`.
+The tool knows DDBJ/DRA/GEA, but they have no structured source. Use \
+`search_all(db=dra|gea)`. `dry_run=true` only parses the query. When the user gives \
+explicit filters, call `search_structured`.""",
     "search_expansion": """\
-Explains a plain-keyword result set: the synonyms that reached the search per term, \
-and how many exist, which differ when the variant cap truncates. Use it when results \
-look too broad or narrow and the user asks why. Boolean queries are never expanded.""",
-    "search_suggest": "Use only when a search returns no or very few results and looks misspelled.",
+This tool explains a result set from plain keywords. For each term, it gives the \
+synonyms that the search used and the number of synonyms that exist. These two numbers \
+are different when the variant cap removes synonyms. Use it when the results are too \
+broad or too narrow and the user asks for the cause. The search never expands boolean \
+queries.""",
+    "search_suggest": "Use this tool only when a search returns zero or very few results and the query has a possible spelling error.",
     "search_highlight": """\
-Covers title, summary and overall design only, stemmed and synonym-expanded like the \
-search. An empty `words` list does not mean the project matched for no reason; the \
-hit may come from a field this tool does not read. Present it as "these query words \
-appear in the description".""",
+This tool reads only the title, the summary and the overall design. It uses the same \
+stems and synonyms as the search. An empty `words` list does not show that the project \
+matched without cause. The match can come from a field that this tool does not read. \
+Tell the user: "these query words are in the description".""",
     "get_project": """\
-`fields=summary` returns only accession, title and description. Similar studies are \
-not included through MCP; call `get_project_similar`. `alias` is the list of linked \
-accessions in other archives, the same list as on a search row: a GSE and its SRP and \
-E-GEOD, an E-GEAD (DDBJ GEA) and its DRA study, which holds its FASTQs. \
-`submitter_alias` is the submitter's free-text name for the study, never an accession; \
-it is null when there is none. DRP/DRX/DRS/DRR \
-behave like SRA; DDBJ-exclusive FASTQ links point at ddbj.nig.ac.jp. HR* (GSA-Human) \
-data is usually access-controlled, so download links may be absent.""",
-    "get_geo_series_samples": "Also lists the samples of a DDBJ GEA series (E-GEAD-N).",
+`fields=summary` returns only the accession, the title and the description. Through \
+MCP, the result does not include similar studies. Call `get_project_similar`. `alias` is \
+the list of linked accessions in other archives, the same list as on a search row. \
+Examples: a GSE with its SRP and E-GEOD, or an E-GEAD (DDBJ GEA) with its DRA study, \
+which has its FASTQ files.
+`submitter_alias` is the free-text name that the submitter gave to the study. It is \
+never an accession, and it is null when there is no name. DRP/DRX/DRS/DRR accessions \
+behave as SRA accessions. FASTQ links that are only in DDBJ point to ddbj.nig.ac.jp. \
+HR* (GSA-Human) data usually has access control. Thus, download links can be absent.""",
+    "get_geo_series_samples": "This tool also lists the samples of a DDBJ GEA series (E-GEAD-N).",
     "get_study_runs": """\
-Previews the first 500 runs with `total_runs`, `paired_runs`, `single_runs` and \
-`total_fastq_bytes`. Its `fastq_ftp`, `fastq_bytes` and `fastq_md5` are \
-semicolon-joined for paired runs. For every run of a larger study, page \
-`get_study_download_manifest`. GSA runs (CRR/HRR) have no per-run tool; read them \
-from this list on their CRA/HRA study.""",
-    "get_study_download_manifest": "Complete, paginated, one entry per file with url, bytes, md5, run_accession and download_command. Follow `next_cursor`. "
+This tool shows the first 500 runs, with `total_runs`, `paired_runs`, `single_runs` and \
+`total_fastq_bytes`. For a paired run, a semicolon joins the values in `fastq_ftp`, \
+`fastq_bytes` and `fastq_md5`. To get all the runs of a larger study, page through \
+`get_study_download_manifest`. GSA runs (CRR/HRR) have no run tool. Read them from this \
+list on their CRA/HRA study.""",
+    "get_study_download_manifest": "The manifest is complete and has pages. Each entry is one file with url, bytes, md5, run_accession and download_command. Follow `next_cursor`.\n"
     + _NOTE_FASTQ,
-    "download_study_script": "Returns a shell script. Use it only when the user asks for a ready-to-run script; otherwise use `get_study_download_manifest`. Modes: fastq (default), sra, sra_lite (smaller, lossy quality scores), s3, gcs. FASTQ rules: `get_study_download_manifest`.",
-    "get_run_checksums": "The tool for MD5, checksums, file sizes or verifying downloads of one run: parsed `fastq` records, an optional `sra` record, interleaved and conversion flags. Use `get_run` only for raw run fields.",
-    "get_study_bams": "Original submitted BAMs of an SRA/ENA study, when present.",
-    "get_supplementary_files": "GEO/ArrayExpress supplementary and processed files as JSON. `download_supplementary_script` returns the curl script.",
+    "download_study_script": "This tool returns a shell script. Use it only when the user asks for a script that is ready to run. If not, use `get_study_download_manifest`. The modes are fastq (default), sra, sra_lite (smaller, with lossy quality scores), s3 and gcs. The FASTQ rules are in `get_study_download_manifest`.",
+    "get_run_checksums": "Use this tool for the MD5, the checksums and the file sizes of one run, or to verify its downloads. It returns parsed `fastq` records, an optional `sra` record, and the interleaved and conversion flags. Use `get_run` only for raw run fields.",
+    "get_study_bams": "This tool gives the original BAM files that the submitter sent for an SRA/ENA study, when they exist.",
+    "get_supplementary_files": "This tool gives the supplementary and processed files of GEO/ArrayExpress as JSON. `download_supplementary_script` returns the curl script.",
     "get_project_metadata_rows": _NOTE_ENRICH_LAYERS,
-    "get_project_enriched": "Normalized ontology fields, not raw archive metadata; see `get_project_metadata_rows` for the three metadata layers. May 404 for unenriched projects.",
-    "bulk_project_samples_metadata": "Several GSE/SRP/ERP/DRP projects at once: project summaries plus flattened sample rows. For one project prefer `get_project_metadata_rows`.",
-    "get_project_similar": "The tool for 'studies like this' on a GSE or SRP.",
-    "get_enriched_coverage": "Enriched projects and samples per archive with the archive total and percentage, plus counts per organism, assay and assay_category.",
-    "get_enriched_column": "Call with `column=` for the top values of tissue, cell_type, disease, assay and other enriched columns.",
-    "get_enriched_crosstab": "Call with `group=` and `breakdown=` for cross-tabs such as organism by tissue.",
-    "get_tissue_microbes": "Rates are over quantified samples only. Report `is_background`, a `class` of `culture`, or `is_endogenous` with the rate: those organisms are contamination or host genome, not infection.",
+    "get_project_enriched": "This tool gives normalized ontology fields. It does not give raw archive metadata. Refer to `get_project_metadata_rows` for the three metadata layers. It can return 404 for a project that is not enriched.",
+    "bulk_project_samples_metadata": "This tool accepts many GSE/SRP/ERP/DRP projects in one call. It returns project summaries and flattened sample rows. For one project, use `get_project_metadata_rows`.",
+    "get_project_similar": "Use this tool for 'studies like this' on a GSE or SRP.",
+    "get_enriched_coverage": "This tool gives the enriched projects and samples for each archive, with the archive total and the percentage. It also gives counts for each organism, assay and assay_category.",
+    "get_enriched_column": "Set `column=` to get the top values of tissue, cell_type, disease, assay and other enriched columns.",
+    "get_enriched_crosstab": "Set `group=` and `breakdown=` to get a cross-tab, for example organism by tissue.",
+    "get_tissue_microbes": "The rates use only the quantified samples. With the rate, report `is_background`, a `class` of `culture`, or `is_endogenous`. These organisms are contamination or host genome. They are not an infection.",
     "ontology_term": """\
-Looks up a term by exact NAME: source CURIEs (UBERON, CL, MONDO, EFO, HGNC, MeSH, \
-Cellosaurus), synonym cluster and direct children. It does not resolve a CURIE; pass \
-the name, or use `get_disease_aliases` for MONDO ids. A 404 means no node has that \
-exact name: try another surface form. `children=false` is much cheaper.""",
-    "ontology_search": "Typo-tolerant name match returning candidate node names to pass to `ontology_term`.",
+This tool finds a term by its exact NAME. It returns the source CURIEs (UBERON, CL, \
+MONDO, EFO, HGNC, MeSH, Cellosaurus), the synonym cluster and the direct children. It \
+does not resolve a CURIE. Give the name, or use `get_disease_aliases` for MONDO ids. A \
+404 means that no node has that exact name. Try a different form of the name. \
+`children=false` costs much less.""",
+    "ontology_search": "This tool matches names and accepts spelling errors. It returns candidate node names for `ontology_term`.",
     "search_enriched_samples": """\
-The only tool that answers with SAMPLES. Do not approximate it with \
-`search_structured` sample filters, which answer with studies.
-Filters: tissue, disease, cell_type, assay, assay_category, phenotype, treatment, \
-development_stage, sample_type, genetic_modification, strain, cell_line, ethnicity and \
-tissue_primary_site are case-insensitive SUBSTRING matches (prefer a short stem: \
-`cervi`). organism, sex, taxid and study_accession are EXACT. The *_ontology_id \
-filters take CURIEs and include descendants unless include_descendants=false; get \
-MONDO ids from `get_disease_aliases`. age_min_years/age_max_years are years and drop \
-samples with no age; min/max_cell_count and min/max_gene_count drop unmeasured \
-samples (~85k measured): say the result is the measured subset. Returned per-sample \
-counts are `cells` and `genes`.
-Read-derived filters: `has_matrix` is the proof tier for single-cell data; \
-`single_cell_only` is a barcode call needing FASTQ plus a preflightx scan (4.7% of \
-studies with a matrix). `single_cell_only`, `has_viral_reads`, `has_bacterial_reads` \
-and `hpv_type` only constrain when true.
-Infection questions use `microbe*`, NOT has_viral_reads/has_bacterial_reads (true on \
-~370 samples each, a >10x undercount). A `microbe*` filter restricts to matching \
-detections and attaches `microbe_n_detections`, `microbe_reads`, `microbe_kmer_mass`, \
-`microbe_max_breadth_frac` and a `microbes` array (capped at 50 rows with \
-`microbes_truncated`; aggregates use all detections). `microbe` is a substring \
-(`papillomavirus` catches every HPV type). `microbe_tier`: `high_breadth` (strict; HPV \
-323 samples, pathogen 998), `low_breadth` default (bacteria at >=1% breadth; HPV 1,338, \
-pathogen 14,345), `any` (no floor; trace noise, only on explicit request). Breadth is \
-a genome FRACTION; viral genomes are ~250x smaller, so never compare viral and \
-bacterial breadth. `low_breadth` bacterial rows are ~1.3x over background, \
-`high_breadth` ~3x: say "reference signal consistent with X", never "infected with \
-X", and report `class` with bacterial numbers (Mycoplasma and vector E. coli dominate).
+This is the only tool that returns SAMPLES. Do not use the sample filters of \
+`search_structured` as a replacement. Those filters return studies.
+Filters:
+- Case-insensitive SUBSTRING match: tissue, disease, cell_type, assay, assay_category, \
+phenotype, treatment, development_stage, sample_type, genetic_modification, strain, \
+cell_line, ethnicity and tissue_primary_site. Use a short stem (`cervi`).
+- EXACT match: organism, sex, taxid and study_accession.
+- The *_ontology_id filters accept CURIEs. They include descendants unless \
+include_descendants=false. Get MONDO ids from `get_disease_aliases`.
+- age_min_years and age_max_years are in years. They remove the samples that have no age.
+- min/max_cell_count and min/max_gene_count remove the samples that have no measured \
+count (~85k samples have one). Tell the user that the result is the measured subset.
+The counts in each returned sample are `cells` and `genes`.
+Read-derived filters:
+- `has_matrix` is the proof tier for single-cell data.
+- `single_cell_only` is a barcode call. It needs FASTQ and a preflightx scan (4.7% of \
+the studies that have a matrix).
+- `single_cell_only` and `hpv_type` filter only when they are set.
+Infection questions:
+For an infection question, use `microbe*`. A `microbe*` filter keeps only the detections that match. It adds \
+`microbe_n_detections`, `microbe_reads`, `microbe_kmer_mass`, \
+`microbe_max_breadth_frac` and a `microbes` array. The array has a maximum of 50 rows, \
+with `microbes_truncated`. The aggregates use all the detections.
+`microbe` is a substring (`papillomavirus` finds each HPV type). `microbe_tier` has \
+three values:
+- `high_breadth`: strict (HPV 323 samples, pathogen 998).
+- `low_breadth`: the default. Bacteria at >=1% breadth (HPV 1,338, pathogen 14,345).
+- `any`: no floor. It includes trace noise. Use it only when the user asks for it.
+Breadth is a FRACTION of the genome. Viral genomes are ~250x smaller. Thus, never \
+compare viral breadth with bacterial breadth. `low_breadth` bacterial rows are ~1.3x \
+above background, and `high_breadth` rows are ~3x. Say "reference signal consistent \
+with X". Never say "infected with X". Report `class` with bacterial numbers, because \
+Mycoplasma and vector E. coli are the most frequent.
 Example: `search_enriched_samples(tissue="cervi", assay="single cell rna", \
 microbe="papillomavirus", single_cell_only=true)`.
-Paging is limit/offset with a true `total` and `next_offset`. A broad cohort plus a \
-microbe filter is slow; on a 504 narrow by organism or tissue.""",
+The pages use limit/offset, with a true `total` and `next_offset`. A broad cohort with a \
+microbe filter is slow. On a 504, add an organism filter or a tissue filter.""",
     "get_longread_projects": """\
-One row per study, mirrors folded. `long_read_only` false means the study also used a \
-short-read platform; NULL means no experiment rows tell (GEO-only). `n_experiments` \
-counts long-read experiments, `n_experiments_total` all. Onso is excluded. Get filter \
-values from `get_longread_facets`; totals from `get_longread_summary`.""",
-    "get_project_longread_chemistry": "Every PacBio/ONT run with its chemistry call. Report `chemistry_confidence` beside the call: exact (BAM header), declared (ONT protocol text), bucket (instrument model only) or unknown. `runs` is [] for a study with no long-read runs.",
-    "get_disease_aliases": "When `truncated` is true, raise `limit` (max 100) or narrow `q`.",
-    "get_disease_summary": "See `get_disease_projects` for collections and how to read rows.",
-    "get_disease_facets": "Call before `get_disease_projects`: filters a collection does not carry are rejected.",
+Each row is one study, and the mirrors are folded into it. `long_read_only` false means \
+that the study also used a short-read platform. NULL means that no experiment rows show \
+this (GEO-only). `n_experiments` counts the long-read experiments, and \
+`n_experiments_total` counts all experiments. The collection does not include Onso. Get \
+filter values from `get_longread_facets` and totals from `get_longread_summary`.""",
+    "get_project_longread_chemistry": "This tool gives each PacBio/ONT run with its chemistry call. Report `chemistry_confidence` with the call: exact (BAM header), declared (ONT protocol text), bucket (instrument model only) or unknown. `runs` is [] for a study that has no long-read runs.",
+    "get_disease_aliases": "When `truncated` is true, increase `limit` (maximum 100) or make `q` more specific.",
+    "get_disease_summary": "Refer to `get_disease_projects` for the collections and for how to read the rows.",
+    "get_disease_facets": "Call this tool before `get_disease_projects`. The server rejects a filter that the collection does not have.",
     "get_disease_projects": """\
-For "what data exists on <disease>" prefer these tools to a keyword search: they \
-resolve through MONDO ids and descendants. `collection=rare` (NIH GARD, exact MONDO \
-xref) or `nord` (NORD, by name, looser): say which. Or a free-text disease name or \
-MONDO id: full MONDO match (exact label, else substring) plus descendants; \
-`resolution` and `matched_labels` in the summary say what matched; a 404 means no \
-MONDO match. Row shapes differ: rare/nord rows are a per-sample rollup (cells, sex, \
-ancestry, inheritance), sortable by cells, n_samples, n_diseases, title, \
-study_accession, assay_category, organism; free-text rows match `get_tissue_projects`, \
-sortable by n_samples, n_experiments, pub_date, title, study_accession, organism.
-Reading rare/nord rows: `scope` defaults to human_primary (patient_derived_model, \
-cell_line, all show what it excludes); say which scope a count used. `n_samples` \
-counts samples matching this collection, not the study total. A null cell count is \
-unmeasured; blank ancestry is unrecorded. `has_fastq`/`has_sra` NULL means unknown. \
-`ancestries` is submitter-reported ethnicity text (~13% of studies), not genetic \
-ancestry. `inheritance` comes from HPO, Orphanet, GARD; "Not applicable" means no \
-Mendelian pattern. For a free-text term, the summary's `matched_samples` counts \
-matched samples and `samples` is the studies' total.""",
+For "what data exists on <disease>", use these tools and not a keyword search. They \
+resolve the disease through MONDO ids and descendants. Set `collection=rare` (NIH GARD, \
+exact MONDO xref) or `nord` (NORD, by name, less strict), and tell the user which one. \
+As an alternative, give a free-text disease name or a MONDO id. This gives a full MONDO \
+match (exact label, or substring if there is none) with descendants. `resolution` and \
+`matched_labels` in the summary show what matched. A 404 means that there is no MONDO \
+match.
+The row shapes are different:
+- rare/nord rows are a rollup for each sample (cells, sex, ancestry, inheritance). You \
+can sort them by cells, n_samples, n_diseases, title, study_accession, assay_category, \
+organism.
+- Free-text rows are the same as `get_tissue_projects` rows. You can sort them by \
+n_samples, n_experiments, pub_date, title, study_accession, organism.
+How to read rare/nord rows:
+- `scope` has the default human_primary. The values patient_derived_model, cell_line \
+and all show what the default excludes. Tell the user which scope a count used.
+- `n_samples` counts the samples that match this collection. It is not the study total.
+- A null cell count means not measured. A blank ancestry means not recorded. \
+`has_fastq`/`has_sra` NULL means unknown.
+- `ancestries` is ethnicity text from the submitter (~13% of studies). It is not \
+genetic ancestry.
+- `inheritance` comes from HPO, Orphanet and GARD. "Not applicable" means no Mendelian \
+pattern.
+For a free-text term, `matched_samples` in the summary counts the matched samples, and \
+`samples` is the total of the studies.""",
     "get_perturbation_projects": """\
-For CRISPR screens, Perturb-seq or drug-treatment single-cell data. Rule-based \
-detection (named methods, guide-library and control-arm tests, a ChEBI lexicon). Get \
-filter values from `get_perturbation_facets`. Default to `min_confidence=medium`; \
-`low` is one weak signal with many false positives, say so. `evidence` lists the \
-signals. `compounds` come from sample treatments (designs with drug arms in \
-supplementary files have a method but no compounds); `title_compounds` alone is a \
-weak lead. `other` is a cytokine or stimulation design. `cell_lines`/`sample_types` \
-describe material, not the perturbation. Germline knockouts, transgenic lines and \
-doxycycline/tamoxifen inducers are not counted.""",
+Use this tool for CRISPR screens, Perturb-seq or single-cell data with a drug \
+treatment. The detection uses rules (named methods, tests for a guide library and a \
+control arm, a ChEBI lexicon). Get filter values from `get_perturbation_facets`. Use \
+`min_confidence=medium` as the default. `low` is one weak signal with many false \
+positives. Tell this to the user.
+`evidence` lists the signals. `compounds` come from the sample treatments. A design \
+that has its drug arms in supplementary files has a method but no compounds. \
+`title_compounds` alone is weak evidence. `other` is a cytokine design or a stimulation \
+design.
+`cell_lines` and `sample_types` describe the material, not the perturbation. The counts \
+do not include germline knockouts, transgenic lines and doxycycline/tamoxifen inducers.""",
     "get_spatial_projects": """\
-For spatial transcriptomics, Visium or Xenium data. Population is the single-cell \
-modality classifier; platform naming is regex over the study text. Get filter values \
-from `get_spatial_facets`. `platforms` is often null, and a named platform is a text \
-mention (a comparison paper can name one it did not run): a weak lead. \
-`resolution=roi` (GeoMx DSP) is region level. `technology` tracks `resolution` \
-(imaging~single-cell, sequencing~spot, hybrid~roi); a study naming two groups \
-collapses to single-cell, then spot, then roi.""",
+Use this tool for spatial transcriptomics, Visium or Xenium data. The population comes \
+from the classifier of single-cell modality. The platform names come from a regex on \
+the study text. Get filter values from `get_spatial_facets`. `platforms` is frequently \
+null. A platform name shows only that the study text names it.
+A comparison paper can name a platform that it did not use. Thus, a platform name is \
+weak evidence. `resolution=roi` (GeoMx DSP) is at the region level. `technology` \
+follows `resolution` (imaging~single-cell, sequencing~spot, hybrid~roi). A study that \
+names two groups gets one value, in this order: single-cell, then spot, then roi.""",
     "get_tissue_projects": """\
-For "what data exists on <tissue>". `term` resolves through UBERON (exact label, else \
-substring) and descendants, so "blood" reaches "whole blood"; `resolution` and \
-`matched_labels` in `get_tissue_summary` say what matched; a 404 means no match. \
-`n_samples_with_tissue` counts every sample with any resolved tissue; the summary's \
-`matched_samples` is the matching count. `has_fastq`/`has_sra` NULL means unknown. \
-Get filter values from `get_tissue_facets`. No curated tissue catalogue exists.""",
+Use this tool for "what data exists on <tissue>". `term` resolves through UBERON (exact \
+label, or substring if there is none) and descendants. Thus, "blood" finds "whole \
+blood". `resolution` and `matched_labels` in `get_tissue_summary` show what matched. A \
+404 means no match.
+`n_samples_with_tissue` counts each sample that has a resolved tissue. \
+`matched_samples` in the summary is the count of matches. `has_fastq`/`has_sra` NULL \
+means unknown. Get filter values from `get_tissue_facets`. There is no curated tissue \
+catalogue.""",
     "get_project_single_cell": """\
-404 means the study is not in the Pentimento (common): fall back to \
-`get_project_enriched`. `samples` pages by limit/offset (default 200, max 1000) with no \
-`total`: compare with the study's `n_samples_detailed` and say if you stopped early. \
-For per-organism microbial breakdowns use \
-`search_enriched_samples(study_accession=..., microbe=...)`. """
+A 404 means that the study is not in the Pentimento (this is common). Then use \
+`get_project_enriched`. `samples` has pages by limit/offset (default 200, maximum 1000) \
+and no `total`. Compare with `n_samples_detailed` of the study, and tell the user if \
+you stopped before the end. For microbial data for each organism, use \
+`search_enriched_samples(study_accession=..., microbe=...)`.
+In a multiome study, the RNA library and the ATAC library are different samples. Use \
+`library_strategies` (`RNA-Seq` or `ATAC-seq`) to identify each sample. `ssRNA-seq` means \
+strand-specific. It does not mean single-cell.
+"""
     + _NOTE_MICROBE_EVIDENCE,
-    "get_project_single_cell_summary": "Study-level totals (cells, preflightx evidence, microbe measurability). Per-sample rows and how to read microbial flags: `get_project_single_cell`.",
-    "get_project_single_cell_status": "Only the single-cell label of one study and its evidence. Totals: `get_project_single_cell_summary`; per sample: `get_project_single_cell`.",
-    "get_single_cell_overview": "Corpus statistics (study counts by data type, top tissues and organisms). For the study list use `get_singlecell_projects`.",
-    "list_single_cell_studies": "Studies with measured single-cell evidence (matrix, barcode whitelist, R1 structure). For the curated collection with filters use `get_singlecell_projects`.",
-    "get_project_cite": "`type=original` returns the earliest/smallest PMID, `type=all` every linked paper, `format=bibtex` plain BibTeX.",
-    "find_publication": "Paper to datasets, by PMID or DOI.",
-    "search_author_projects": "Every dataset a person authored, as project rows plus institutes. Prefer it for 'datasets by <name>'. Use `search_by_author` for the papers themselves. Only studies linked to PubMed are found.",
-    "search_by_author": "The publications of an author, one row per PMID with linked accessions. For the datasets use `search_author_projects`. Only studies linked to PubMed are found.",
-    "get_search_investigators": "Investigators behind any search; use it whenever the question names a topic ('who works on CRISPR in India'). `senior_only=true` ranks last authors.",
-    "get_country_pis": "Investigators of a whole country with no topic. For a topic use `get_search_investigators`; never filter this list by topic yourself.",
-    "get_growth_stats": "In `mode=bases`, ENA counts nucleotide bases while SRA counts FASTQ/SRA bytes.",
-    "get_common_names_by_scientific_names": "Takes one or many scientific names.",
-    "get_sample_detail": "Also returns the raw sample attributes; use it for any sample or experiment accession.",
+    "get_project_single_cell_summary": "This tool gives the totals of the study (cells, preflightx evidence, microbe measurability). For the rows of each sample and for how to read the microbial flags, use `get_project_single_cell`.",
+    "get_project_single_cell_status": "This tool gives only the single-cell label of one study and its evidence. For totals, use `get_project_single_cell_summary`. For each sample, use `get_project_single_cell`.",
+    "get_single_cell_overview": "This tool gives corpus statistics (study counts by data type, top tissues and organisms). For the study list, use `get_singlecell_projects`.",
+    "list_single_cell_studies": "This tool lists the studies that have measured single-cell evidence (matrix, barcode whitelist, R1 structure). For the curated collection with filters, use `get_singlecell_projects`.",
+    "get_project_cite": "`type=original` returns the earliest PMID (the smallest number). `type=all` returns each linked paper. `format=bibtex` returns plain BibTeX.",
+    "find_publication": "This tool finds the datasets of a paper, by PMID or DOI.",
+    "search_author_projects": "This tool gives each dataset that a person authored, as project rows with institutes. Use it for 'datasets by <name>'. For the papers, use `search_by_author`. It finds only the studies that have a PubMed link.",
+    "search_by_author": "This tool gives the publications of an author. Each row is one PMID with its linked accessions. For the datasets, use `search_author_projects`. It finds only the studies that have a PubMed link.",
+    "get_search_investigators": "This tool gives the investigators for a search. Use it when the question names a topic ('who works on CRISPR in India'). `senior_only=true` ranks the last authors.",
+    "get_country_pis": "This tool gives the investigators of a full country, without a topic. For a topic, use `get_search_investigators`. Never filter this list by topic.",
+    "get_growth_stats": "In `mode=bases`, ENA counts nucleotide bases and SRA counts FASTQ/SRA bytes.",
+    "get_common_names_by_scientific_names": "This tool accepts one or many scientific names.",
+    "get_sample_detail": "This tool also returns the raw sample attributes. Use it for a sample accession or an experiment accession.",
 }
 
 

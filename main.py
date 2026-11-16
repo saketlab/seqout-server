@@ -11259,8 +11259,12 @@ def _get_tissue_microbes() -> dict:
         c["rate_pct"] = float(c["rate_pct"])
         tissues.setdefault(
             (c["cohort"], c["tissue"]),
-            {"cohort": c["cohort"], "tissue": c["tissue"], "uberon": c["uberon"],
-             "screened": c["screened"]},
+            {
+                "cohort": c["cohort"],
+                "tissue": c["tissue"],
+                "uberon": c["uberon"],
+                "screened": c["screened"],
+            },
         )
     data = {
         "cells": cells,
@@ -13130,14 +13134,6 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         False,
         description="Only samples with a read-derived single-cell barcode call. false does not filter.",
     ),
-    has_viral_reads: bool = Query(
-        False,
-        description="Precomputed viral flag on a small subset; for infection questions use microbe. false does not filter.",
-    ),
-    has_bacterial_reads: bool = Query(
-        False,
-        description="Precomputed bacterial flag on a small subset; for infection questions use microbe. false does not filter.",
-    ),
     hpv_type: str | None = Query(
         None, max_length=64, description="Substring of the top HPV type, e.g. 16."
     ),
@@ -13222,8 +13218,6 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         "max_gene_count": max_gene_count,
         "has_matrix": has_matrix,
         "single_cell_only": single_cell_only,
-        "has_viral_reads": has_viral_reads,
-        "has_bacterial_reads": has_bacterial_reads,
         "hpv_type": hpv_type,
         "microbe": microbe,
         "microbe_class": microbe_class,
@@ -13600,6 +13594,16 @@ _EMPTY_PENTIMENTO_STUDY = dict.fromkeys(PENTIMENTO_STUDY_FIELDS)
         "Per-sample cell/gene counts joined to read-derived (preflightx) "
         "species, sex and assay calls and to viral/microbial presence flags. "
         "404s when the study is not in the Pentimento.\n\n"
+        "`library_strategies` and `library_sources` give the library types that "
+        "the archive declares for the runs of the sample. The archives have no "
+        "single-cell strategy. scRNA-seq has the strategy `RNA-Seq`, and "
+        "scATAC-seq has the strategy `ATAC-seq`. Only a source of "
+        "`TRANSCRIPTOMIC SINGLE CELL` or `GENOMIC SINGLE CELL` declares "
+        "single-cell. A source without `SINGLE CELL` does not show that the "
+        "sample is bulk.\n\n"
+        "The read-derived calls come from an RNA scanner. Thus, they are null on "
+        "a sample whose runs are all `ATAC-seq`. The microbe flags stay "
+        "applicable.\n\n"
         "`sc_stats` adds matrix-grained QC from the sc_stats sweep: one entry "
         "per matrix with median counts and genes per cell. The `_f_` columns "
         "are filtered at `min_counts`; the unfiltered pair counts ambient "
