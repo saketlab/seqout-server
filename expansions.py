@@ -49,11 +49,11 @@ ONTOLOGIES = (
 )
 ONTOLOGY_IDS = frozenset(o for o, _ in ONTOLOGIES)
 
-_XREF_PREFIX = "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
+XREF_PREFIX = "CASE WHEN x STARTS WITH 'CVCL_' THEN 'CVCL' ELSE split(x, ':')[0] END"
 _ENABLED = (
     "size($disabled) = 0"
     " OR size(coalesce(n.xrefs, [])) = 0"
-    f" OR size([x IN n.xrefs WHERE NOT ({_XREF_PREFIX}) IN $disabled]) > 0"
+    f" OR size([x IN n.xrefs WHERE NOT ({XREF_PREFIX}) IN $disabled]) > 0"
 )
 _CYPHER_SYNONYM_CLUSTER = f"""
 UNWIND $terms AS term

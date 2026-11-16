@@ -50,7 +50,7 @@ from deep_dive import (
     fetch_ontology_term,
     search_terms_fuzzy,
 )
-from expansions import ONTOLOGIES, expand_terms, expand_terms_explained
+from expansions import ONTOLOGIES, ONTOLOGY_IDS, expand_terms, expand_terms_explained
 from mcp_support import (
     MCP_DEPRECATED_TOOLS,
     MCP_EXCLUDED_OPERATION_IDS,
@@ -72,6 +72,7 @@ from library_strategy import (
     is_gsa_study as _is_gsa_study,
     resolve_study_for_library_strategy as _study_for_library_strategy,
 )
+from ttl_cache import purge_all as purge_registered_caches, purgeable, ttl_cached
 from grid_filters import (
     _indexed_accession,
     _jsonb_any_element,
@@ -731,63 +732,45 @@ _atlas_cache = {
     "labels_etag": "",
 }
 _growth_cache_lock = threading.Lock()
-_growth_cache: dict[tuple[str, str | None], dict] = {}
+_growth_cache: dict[tuple[str, str | None], dict] = purgeable(_growth_cache_lock, {})
 _MAX_ORGANISM_CACHE_ENTRIES = 500
 _organism_growth_cache_lock = threading.Lock()
-_organism_growth_cache: dict[str, dict] = {}
+_organism_growth_cache: dict[str, dict] = purgeable(_organism_growth_cache_lock, {})
 _organisms_list_cache_lock = threading.Lock()
-_organisms_list_cache: dict[str, dict] = {}
+_organisms_list_cache: dict[str, dict] = purgeable(_organisms_list_cache_lock, {})
 _organism_totals_cache_lock = threading.Lock()
-_organism_totals_cache: dict[str, dict] = {}
-_global_contributions_cache_lock = threading.Lock()
-_global_contributions_cache = {"ready": False, "data": [], "built_at": 0.0}
+_organism_totals_cache: dict[str, dict] = purgeable(_organism_totals_cache_lock, {})
 _global_contributions_query_cache_lock = threading.Lock()
-_global_contributions_query_cache: dict[tuple, dict] = {}
+_global_contributions_query_cache: dict[tuple, dict] = purgeable(
+    _global_contributions_query_cache_lock, {}
+)
 _country_filters_cache_lock = threading.Lock()
-_country_filters_cache: dict[tuple, dict] = {}
+_country_filters_cache: dict[tuple, dict] = purgeable(_country_filters_cache_lock, {})
 _country_accessions_cache_lock = threading.Lock()
-_country_accessions_cache: dict[tuple, dict] = {}
+_country_accessions_cache: dict[tuple, dict] = purgeable(
+    _country_accessions_cache_lock, {}
+)
 _country_pis_cache_lock = threading.Lock()
-_country_pis_cache: dict[tuple, dict] = {}
+_country_pis_cache: dict[tuple, dict] = purgeable(_country_pis_cache_lock, {})
 _spelling_cache_lock = threading.Lock()
 _spelling_cache: dict = {"ready": False, "symspell": None}
-_source_totals_cache_lock = threading.Lock()
-_source_totals_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_perturbation_facets_cache_lock = threading.Lock()
-_perturbation_facets_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_spatial_facets_cache_lock = threading.Lock()
-_spatial_facets_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_single_cell_overview_cache_lock = threading.Lock()
-_single_cell_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_pentimento_overview_cache_lock = threading.Lock()
-_pentimento_overview_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_tissue_microbes_cache_lock = threading.Lock()
-_tissue_microbes_cache = {"ready": False, "data": {}, "built_at": 0.0}
 _MAX_ONTOLOGY_TERM_CACHE_ENTRIES = 500
 _ontology_term_cache_lock = threading.Lock()
-_ontology_term_cache: dict[tuple[str, str], dict] = {}
-_sc_quality_cache_lock = threading.Lock()
-_sc_quality_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_sc_quality_samples_lock = threading.Lock()
-_sc_quality_samples_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_last_updated_cache_lock = threading.Lock()
-_last_updated_cache = {"ready": False, "data": {}, "built_at": 0.0}
-_sitemap_counts_cache_lock = threading.Lock()
-_sitemap_counts_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_ontology_term_cache: dict[tuple[str, str], dict] = purgeable(
+    _ontology_term_cache_lock, {}
+)
 _enriched_crosstab_cache_lock = threading.Lock()
-_enriched_crosstab_cache: dict = {}
-_enriched_coverage_cache_lock = threading.Lock()
-_enriched_coverage_cache = {"ready": False, "data": {}, "built_at": 0.0}
+_enriched_crosstab_cache: dict = purgeable(_enriched_crosstab_cache_lock, {})
 _MAX_COVERAGE_VALUES = 500
 _BROAD_SEARCH_MIN_TOTAL = 5000
 _MAX_BROAD_FACETS_CACHE_ENTRIES = 500
 _broad_facets_cache_lock = threading.Lock()
-_broad_facets_cache: dict[tuple, dict] = {}
+_broad_facets_cache: dict[tuple, dict] = purgeable(_broad_facets_cache_lock, {})
 _search_results_cache_lock = threading.Lock()
-_search_results_cache: dict[tuple, dict] = {}
+_search_results_cache: dict[tuple, dict] = purgeable(_search_results_cache_lock, {})
 _MAX_SEARCH_RESULTS_CACHE_ENTRIES = 300
 _author_projects_cache_lock = threading.Lock()
-_author_projects_cache: dict[tuple, dict] = {}
+_author_projects_cache: dict[tuple, dict] = purgeable(_author_projects_cache_lock, {})
 _AUTHOR_PROJECTS_CACHE_TTL = 24 * 3600
 _MAX_AUTHOR_PROJECTS_CACHE_ENTRIES = 500
 _AUTHOR_PROJECTS_FETCH_CAP = 2000
@@ -3388,58 +3371,9 @@ def purge_cache(request: Request):
     with _map_assets_lock:
         _map_assets_state["ready"] = False
         _MAP_CURRENT_FILE.unlink(missing_ok=True)
-    with _growth_cache_lock:
-        _growth_cache.clear()
     with _spelling_cache_lock:
         _spelling_cache["ready"] = False
-    with _global_contributions_cache_lock:
-        _global_contributions_cache["ready"] = False
-    with _global_contributions_filters_cache_lock:
-        _global_contributions_filters_cache["ready"] = False
-    with _global_contributions_query_cache_lock:
-        _global_contributions_query_cache.clear()
-    with _country_filters_cache_lock:
-        _country_filters_cache.clear()
-    with _country_accessions_cache_lock:
-        _country_accessions_cache.clear()
-    with _country_pis_cache_lock:
-        _country_pis_cache.clear()
-    with _organism_growth_cache_lock:
-        _organism_growth_cache.clear()
-    with _ontology_term_cache_lock:
-        _ontology_term_cache.clear()
-    with _organisms_list_cache_lock:
-        _organisms_list_cache.clear()
-    with _organism_totals_cache_lock:
-        _organism_totals_cache.clear()
-    with _platform_growth_cache_lock:
-        _platform_growth_cache.clear()
-    with _platform_filters_cache_lock:
-        _platform_filters_cache.clear()
-    with _source_totals_cache_lock:
-        _source_totals_cache["ready"] = False
-    with _perturbation_facets_cache_lock:
-        _perturbation_facets_cache["ready"] = False
-    with _single_cell_overview_cache_lock:
-        _single_cell_overview_cache["ready"] = False
-    with _pentimento_overview_cache_lock:
-        _pentimento_overview_cache["ready"] = False
-    with _tissue_microbes_cache_lock:
-        _tissue_microbes_cache["ready"] = False
-    with _sc_quality_cache_lock:
-        _sc_quality_cache["ready"] = False
-    with _last_updated_cache_lock:
-        _last_updated_cache["ready"] = False
-    with _enriched_crosstab_cache_lock:
-        _enriched_crosstab_cache.clear()
-    with _enriched_coverage_cache_lock:
-        _enriched_coverage_cache["ready"] = False
-    with _broad_facets_cache_lock:
-        _broad_facets_cache.clear()
-    with _search_results_cache_lock:
-        _search_results_cache.clear()
-    with _author_projects_cache_lock:
-        _author_projects_cache.clear()
+    purge_registered_caches()
     return {"message": "All caches purged."}
 
 
@@ -4012,21 +3946,10 @@ def _query_global_contributions(
             return cur.fetchall()
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_global_contributions_cached() -> list[dict]:
     """Return unfiltered contributions from cache (7-day TTL)."""
-    with _global_contributions_cache_lock:
-        now = time.time()
-        if (
-            _global_contributions_cache["ready"]
-            and (now - _global_contributions_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _global_contributions_cache["data"]
-
-        data = _query_global_contributions()
-        _global_contributions_cache["ready"] = True
-        _global_contributions_cache["data"] = data
-        _global_contributions_cache["built_at"] = now
-        return data
+    return _query_global_contributions()
 
 
 def _get_filtered_global_contributions_cached(
@@ -4058,25 +3981,9 @@ def _get_filtered_global_contributions_cached(
     return data
 
 
-_global_contributions_filters_cache_lock = threading.Lock()
-_global_contributions_filters_cache: dict = {
-    "ready": False,
-    "data": {},
-    "built_at": 0.0,
-}
-
-
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_global_contributions_filters() -> dict:
     """Return cached filter options (organisms, assay_l1, assay_l2)."""
-    with _global_contributions_filters_cache_lock:
-        now = time.time()
-        if (
-            _global_contributions_filters_cache["ready"]
-            and (now - _global_contributions_filters_cache["built_at"])
-            < _GROWTH_CACHE_TTL
-        ):
-            return _global_contributions_filters_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(GLOBAL_CONTRIBUTIONS_FILTERS_SQL)
@@ -4102,11 +4009,6 @@ def _get_global_contributions_filters() -> dict:
             filters["place_type"].append(entry)
         elif kind == "address_type":
             filters["address_type"].append(entry)
-
-    with _global_contributions_filters_cache_lock:
-        _global_contributions_filters_cache["ready"] = True
-        _global_contributions_filters_cache["data"] = filters
-        _global_contributions_filters_cache["built_at"] = time.time()
 
     return filters
 
@@ -4530,8 +4432,8 @@ def get_platform_totals(request: Request):
     }
 
 
-_platform_growth_cache: dict[str, dict] = {}
 _platform_growth_cache_lock = threading.Lock()
+_platform_growth_cache: dict[str, dict] = purgeable(_platform_growth_cache_lock, {})
 
 
 @api_app.get(
@@ -4676,8 +4578,8 @@ def get_platform_instruments(
     }
 
 
-_platform_filters_cache: dict[str, dict] = {}
 _platform_filters_cache_lock = threading.Lock()
+_platform_filters_cache: dict[str, dict] = purgeable(_platform_filters_cache_lock, {})
 
 
 @api_app.get(
@@ -4989,7 +4891,8 @@ def ontology_term(
     description=(
         "Typo-tolerant lookup of ontology graph terms by name (Lucene fuzzy match, "
         "edit distance scaled to word length), best match first. Use it to find the "
-        "exact `term` to pass to /ontology/term. "
+        "exact `term` to pass to /ontology/term. `ontology` keeps the terms of one "
+        "source, e.g. CL to map a cell-type label to the Cell Ontology. "
         "Returns {query, terms: [{name, has_children, xrefs, score}], took_ms}."
     ),
     operation_id="ontology_search",
@@ -4999,10 +4902,17 @@ def ontology_search(
     request: Request,
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=100),
+    ontology: str | None = Query(
+        None,
+        description="Keep only terms with an id from this ontology. One of: "
+        + ", ".join(o for o, _ in ONTOLOGIES),
+    ),
 ):
+    if ontology is not None and ontology not in ONTOLOGY_IDS:
+        raise HTTPException(400, f"Unknown ontology: {ontology}")
     start = time.perf_counter()
     try:
-        terms = search_terms_fuzzy(neo4j_driver, q, limit=limit)
+        terms = search_terms_fuzzy(neo4j_driver, q, limit=limit, ontology=ontology)
     except Exception:
         logger.exception("ontology_search failed for q=%r", q)
         raise HTTPException(500, "Internal server error")
@@ -10978,28 +10888,24 @@ def get_project_cite(
     operation_id="sitemap_counts",
 )
 def sitemap_counts(request: Request):
-    with _sitemap_counts_cache_lock:
-        if (
-            _sitemap_counts_cache["ready"]
-            and (time.time() - _sitemap_counts_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _sitemap_counts_cache["data"]
     try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SITEMAP_COUNTS_SQL)
-                row = cur.fetchone()
-                # Exact page counts where bounds are built; estimate otherwise.
-                cur.execute(SITEMAP_BOUNDS_COUNTS_SQL, (SITEMAP_PAGE_SIZE,))
-                bounds = {r["source"]: r["count"] for r in cur.fetchall()}
+        return _sitemap_counts_data()
     except Exception:
         logger.exception("Database error in sitemap_counts")
         raise HTTPException(500, "Internal server error")
+
+
+@ttl_cached(_GROWTH_CACHE_TTL)
+def _sitemap_counts_data() -> dict:
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SITEMAP_COUNTS_SQL)
+            row = cur.fetchone()
+            # Exact page counts where bounds are built; estimate otherwise.
+            cur.execute(SITEMAP_BOUNDS_COUNTS_SQL, (SITEMAP_PAGE_SIZE,))
+            bounds = {r["source"]: r["count"] for r in cur.fetchall()}
     counts = {k: bounds.get(k, v) for k, v in row.items()}
-    data = {**counts, "total": sum(counts.values())}
-    with _sitemap_counts_cache_lock:
-        _sitemap_counts_cache.update(ready=True, data=data, built_at=time.time())
-    return data
+    return {**counts, "total": sum(counts.values())}
 
 
 @api_app.get(
@@ -11042,14 +10948,8 @@ def sitemap_accessions(
     return {"accessions": [r["accession"] for r in rows], "page": page, "limit": limit}
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_source_totals() -> dict:
-    with _source_totals_cache_lock:
-        if (
-            _source_totals_cache["ready"]
-            and (time.time() - _source_totals_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _source_totals_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(SOURCE_TOTALS_SQL)
@@ -11062,8 +10962,6 @@ def _get_source_totals() -> dict:
         }
         for source in _STATS_SOURCES
     }
-    with _source_totals_cache_lock:
-        _source_totals_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11100,14 +10998,8 @@ def _get_project_overlap() -> dict:
     return data
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_last_updated() -> dict:
-    with _last_updated_cache_lock:
-        if (
-            _last_updated_cache["ready"]
-            and (time.time() - _last_updated_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _last_updated_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(LAST_UPDATED_SQL)
@@ -11119,8 +11011,6 @@ def _get_last_updated() -> dict:
         "by_source": {s: (v.isoformat() if v else None) for s, v in raw.items()},
         "overall": overall.isoformat() if overall else None,
     }
-    with _last_updated_cache_lock:
-        _last_updated_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11142,15 +11032,8 @@ def get_source_totals(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_single_cell_overview() -> dict:
-    with _single_cell_overview_cache_lock:
-        if (
-            _single_cell_overview_cache["ready"]
-            and (time.time() - _single_cell_overview_cache["built_at"])
-            < _GROWTH_CACHE_TTL
-        ):
-            return _single_cell_overview_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(SINGLE_CELL_OVERVIEW_SQL)
@@ -11164,8 +11047,6 @@ def _get_single_cell_overview() -> dict:
         "top_tissues": row["top_tissues"] or [],
         "top_organisms": row["top_organisms"] or [],
     }
-    with _single_cell_overview_cache_lock:
-        _single_cell_overview_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11187,15 +11068,8 @@ def get_single_cell_overview(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_pentimento_overview() -> dict:
-    with _pentimento_overview_cache_lock:
-        if (
-            _pentimento_overview_cache["ready"]
-            and (time.time() - _pentimento_overview_cache["built_at"])
-            < _GROWTH_CACHE_TTL
-        ):
-            return _pentimento_overview_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(PENTIMENTO_OVERVIEW_SQL)
@@ -11216,8 +11090,6 @@ def _get_pentimento_overview() -> dict:
         "assay_groups": row["assay_groups"] or [],
         "assay_by_tissue": row["assay_by_tissue"] or [],
     }
-    with _pentimento_overview_cache_lock:
-        _pentimento_overview_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11239,14 +11111,8 @@ def get_pentimento_overview(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_tissue_microbes() -> dict:
-    with _tissue_microbes_cache_lock:
-        if (
-            _tissue_microbes_cache["ready"]
-            and (time.time() - _tissue_microbes_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _tissue_microbes_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if not _relation_exists(cur, "tissue_microbe_rates_v2"):
@@ -11272,8 +11138,6 @@ def _get_tissue_microbes() -> dict:
         "min_studies": 2,
         "min_screened": 200,
     }
-    with _tissue_microbes_cache_lock:
-        _tissue_microbes_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11307,14 +11171,8 @@ def get_tissue_microbes(request: Request):
         raise HTTPException(500, "Internal server error")
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_sc_quality() -> dict:
-    with _sc_quality_cache_lock:
-        if (
-            _sc_quality_cache["ready"]
-            and (time.time() - _sc_quality_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _sc_quality_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if not _relation_exists(cur, "sc_quality_by_year"):
@@ -11359,8 +11217,6 @@ def _get_sc_quality() -> dict:
         "min_matrices": 10,
         "min_studies": 3,
     }
-    with _sc_quality_cache_lock:
-        _sc_quality_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11398,15 +11254,8 @@ def get_sc_quality(request: Request):
 _SC_QUALITY_PER_CELL = 60
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_sc_quality_samples() -> dict:
-    with _sc_quality_samples_lock:
-        if (
-            _sc_quality_samples_cache["ready"]
-            and (time.time() - _sc_quality_samples_cache["built_at"])
-            < _GROWTH_CACHE_TTL
-        ):
-            return _sc_quality_samples_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if not _relation_exists(cur, "sc_quality_matrix"):
@@ -11427,8 +11276,6 @@ def _get_sc_quality_samples() -> dict:
         "n_total": total,
         "per_technology_year": _SC_QUALITY_PER_CELL,
     }
-    with _sc_quality_samples_lock:
-        _sc_quality_samples_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -11959,24 +11806,18 @@ def get_perturbation_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_perturbation_facets(request: Request):
-    with _perturbation_facets_cache_lock:
-        if (
-            _perturbation_facets_cache["ready"]
-            and (time.time() - _perturbation_facets_cache["built_at"])
-            < _GROWTH_CACHE_TTL
-        ):
-            return _perturbation_facets_cache["data"]
     try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(PERTURBATION_FACETS_SQL)
-            rows = cur.fetchall()
+        return _perturbation_facets_data()
     except Exception:
         logger.exception("Database error in get_perturbation_facets")
         raise HTTPException(500, "Internal server error")
-    data = _facet_rows_to_dict(rows)
-    with _perturbation_facets_cache_lock:
-        _perturbation_facets_cache.update(ready=True, data=data, built_at=time.time())
-    return data
+
+
+@ttl_cached(_GROWTH_CACHE_TTL)
+def _perturbation_facets_data() -> dict:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(PERTURBATION_FACETS_SQL)
+        return _facet_rows_to_dict(cur.fetchall())
 
 
 @api_app.get(
@@ -12124,23 +11965,18 @@ def get_spatial_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_spatial_facets(request: Request):
-    with _spatial_facets_cache_lock:
-        if (
-            _spatial_facets_cache["ready"]
-            and (time.time() - _spatial_facets_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _spatial_facets_cache["data"]
     try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SPATIAL_FACETS_SQL)
-            rows = cur.fetchall()
+        return _spatial_facets_data()
     except Exception:
         logger.exception("Database error in get_spatial_facets")
         raise HTTPException(500, "Internal server error")
-    data = _facet_rows_to_dict(rows)
-    with _spatial_facets_cache_lock:
-        _spatial_facets_cache.update(ready=True, data=data, built_at=time.time())
-    return data
+
+
+@ttl_cached(_GROWTH_CACHE_TTL)
+def _spatial_facets_data() -> dict:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(SPATIAL_FACETS_SQL)
+        return _facet_rows_to_dict(cur.fetchall())
 
 
 @api_app.get(
@@ -12854,14 +12690,8 @@ def _coverage_source_row(row: dict, totals: dict) -> dict:
     return out
 
 
+@ttl_cached(_GROWTH_CACHE_TTL)
 def _get_enriched_coverage() -> dict:
-    with _enriched_coverage_cache_lock:
-        if (
-            _enriched_coverage_cache["ready"]
-            and (time.time() - _enriched_coverage_cache["built_at"]) < _GROWTH_CACHE_TTL
-        ):
-            return _enriched_coverage_cache["data"]
-
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             if not _relation_exists(cur, "enriched_coverage"):
@@ -12891,8 +12721,6 @@ def _get_enriched_coverage() -> dict:
             for r in rows
         ]
 
-    with _enriched_coverage_cache_lock:
-        _enriched_coverage_cache.update(ready=True, data=data, built_at=time.time())
     return data
 
 
@@ -14156,19 +13984,14 @@ def _list_filter(sql: str, params: tuple = ()) -> list[dict]:
             return cur.fetchall()
 
 
-_filter_list_cache_lock = threading.Lock()
-_filter_list_cache: dict[str, dict] = {}
+@ttl_cached(_GROWTH_CACHE_TTL)
+def _library_strategies() -> list[dict]:
+    return _list_filter(LIST_LIBRARY_STRATEGIES_SQL)
 
 
-def _cached_list_filter(sql: str) -> list[dict]:
-    with _filter_list_cache_lock:
-        entry = _filter_list_cache.get(sql)
-        if entry and (time.time() - entry["built_at"]) < _GROWTH_CACHE_TTL:
-            return entry["data"]
-    rows = _list_filter(sql)
-    with _filter_list_cache_lock:
-        _filter_list_cache[sql] = {"data": rows, "built_at": time.time()}
-    return rows
+@ttl_cached(_GROWTH_CACHE_TTL)
+def _instrument_models() -> list[dict]:
+    return _list_filter(LIST_INSTRUMENT_MODELS_SQL)
 
 
 @api_app.get(
@@ -14184,7 +14007,7 @@ def _cached_list_filter(sql: str) -> list[dict]:
 @limiter.limit("100/minute")
 def list_library_strategies(request: Request):
     try:
-        rows = _cached_list_filter(LIST_LIBRARY_STRATEGIES_SQL)
+        rows = _library_strategies()
     except Exception:
         logger.exception("Database error in list_library_strategies")
         raise HTTPException(500, "Internal server error")
@@ -14204,7 +14027,7 @@ def list_library_strategies(request: Request):
 @limiter.limit("100/minute")
 def list_instrument_models(request: Request):
     try:
-        rows = _cached_list_filter(LIST_INSTRUMENT_MODELS_SQL)
+        rows = _instrument_models()
     except Exception:
         logger.exception("Database error in list_instrument_models")
         raise HTTPException(500, "Internal server error")

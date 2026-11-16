@@ -7259,7 +7259,7 @@ WITH counted AS (
     LEFT JOIN sra_studies ss ON ss.accession = r.study_accession
     WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
       AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM counted)
+      AND NOT EXISTS (SELECT 1 FROM counted WHERE sample_accession <> %(acc)s)
     ORDER BY 1
     LIMIT %(limit)s
 ), x AS (
@@ -7384,7 +7384,7 @@ from_runs AS (
     ) mb ON TRUE
     WHERE (r.study_accession = %(acc)s OR ss.alias = %(acc)s)
       AND COALESCE(r.gsm_accession, r.sample_accession) IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM counted)
+      AND NOT EXISTS (SELECT 1 FROM counted WHERE sample_accession <> %(acc)s)
     GROUP BY 1
 ),
 page AS (

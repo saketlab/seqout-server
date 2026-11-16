@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from expansions import extract_graph_terms
+from expansions import XREF_PREFIX, extract_graph_terms
 
 # For each query term, count its children (synonym-transparent). Batched over
 # all terms in one round-trip. Two WITH steps because Cypher won't let a grouping
@@ -82,12 +82,19 @@ RETURN child.name AS name,
 
 # Fuzzy name lookup via Lucene. Needs the index, created once:
 #   CREATE FULLTEXT INDEX term_name_fulltext IF NOT EXISTS FOR (t:Term) ON EACH [t.name]
-_CYPHER_FUZZY = """
-CALL db.index.fulltext.queryNodes('term_name_fulltext', $lucene, {limit: $limit})
+# $ontology keeps the terms that carry an id of one source. The filter runs on a
+# pool larger than $limit, else a gene named like a cell type takes its place.
+_CYPHER_FUZZY = f"""
+CALL db.index.fulltext.queryNodes('term_name_fulltext', $lucene, {{limit: $pool}})
 YIELD node, score
+WHERE $ontology IS NULL OR any(x IN coalesce(node.xrefs, []) WHERE
+      {XREF_PREFIX} = $ontology)
 RETURN node.name AS name, coalesce(node.has_children, false) AS has_children,
        coalesce(node.xrefs, []) AS xrefs, score
+ORDER BY score DESC
+LIMIT $limit
 """
+_FUZZY_POOL = 1000
 
 _HOPS_MAX = 4
 _SYNONYM_LIMIT = 500
@@ -184,13 +191,23 @@ def _fuzzy_lucene(q: str) -> str:
     return " ".join(parts)
 
 
-def search_terms_fuzzy(neo4j_driver, q: str, limit: int = 20) -> list[dict]:
-    """Typo-tolerant term search: [{name, has_children, xrefs, score}], best first."""
+def search_terms_fuzzy(
+    neo4j_driver, q: str, limit: int = 20, ontology: str | None = None
+) -> list[dict]:
+    """Typo-tolerant term search: [{name, has_children, xrefs, score}], best first.
+
+    `ontology` ("CL", "UBERON", ...) keeps only terms with an id of that source.
+    """
     lucene = _fuzzy_lucene(q)
     if not lucene:
         return []
     records, _, _ = neo4j_driver.execute_query(
-        _CYPHER_FUZZY, lucene=lucene, limit=limit, database_="neo4j"
+        _CYPHER_FUZZY,
+        lucene=lucene,
+        limit=limit,
+        pool=_FUZZY_POOL if ontology else limit,
+        ontology=ontology,
+        database_="neo4j",
     )
     return [dict(r) for r in records]
 
@@ -200,3 +217,17 @@ if __name__ == "__main__":
     assert _fuzzy_lucene("IL-6") == "+il +6"
     assert _fuzzy_lucene('t (cd4+) AND "x~"') == "+t +cd4~1 +and~1 +x"
     assert _fuzzy_lucene("   ") == ""
+
+    class _Driver:
+        def execute_query(self, cypher, **kw):
+            self.cypher, self.kw = cypher, kw
+            return [{"name": "b cell", "xrefs": ["CL:0000236"]}], None, None
+
+    d = _Driver()
+    assert search_terms_fuzzy(d, "B cel", limit=5) == [
+        {"name": "b cell", "xrefs": ["CL:0000236"]}
+    ]
+    assert (d.kw["pool"], d.kw["ontology"], d.kw["limit"]) == (5, None, 5)
+    search_terms_fuzzy(d, "B cel", limit=5, ontology="CL")
+    assert (d.kw["pool"], d.kw["ontology"], d.kw["limit"]) == (_FUZZY_POOL, "CL", 5)
+    assert search_terms_fuzzy(d, " ", ontology="CL") == []
