@@ -1,12 +1,32 @@
 """Search paging, compact rows and the MCP layer."""
 
+import difflib
 import json
 import logging
 import re
 from typing import Any
 
+import httpx
 from mcp.types import TextContent
 
+from accessions import (
+    AE_PATTERN,
+    BIOSAMPLE_PATTERN,
+    EXPERIMENT_PATTERN,
+    GEA_PATTERN,
+    GEO_SAMPLE_PATTERN,
+    GEO_SERIES_PATTERN,
+    GSA_EXPERIMENT_PATTERN,
+    GSA_RUN_PATTERN,
+    GSA_SAMPLE_PATTERN,
+    GSA_STUDY_PATTERN,
+    PRJ_PATTERN,
+    RUN_PATTERN,
+    SAMPLE_PATTERN,
+    STUDY_PATTERN,
+    SUBMISSION_REGEX,
+)
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 from mcp_param_docs import param_doc
@@ -51,6 +71,25 @@ def split_project_alias(row: dict) -> dict:
     return row
 
 
+def normalize_mcp_aliases(structured: dict) -> dict:
+    """Apply split_project_alias to top-level, nested project, and result rows."""
+    out = split_project_alias(structured)
+    project = out.get("project")
+    if isinstance(project, dict) and "linked_accessions" in project:
+        out = {**out, "project": split_project_alias(project)}
+    rows = out.get("results")
+    if isinstance(rows, list) and any(
+        isinstance(r, dict) and "linked_accessions" in r for r in rows
+    ):
+        out = {
+            **out,
+            "results": [
+                split_project_alias(r) if isinstance(r, dict) else r for r in rows
+            ],
+        }
+    return out
+
+
 def make_cursor(row: dict, sorted_page: bool) -> dict:
     if sorted_page:
         return {"sort_value": row.get("sort_val"), "accession": row["accession"]}
@@ -82,8 +121,10 @@ def finish_page(
     }
 
 
-def sql_total(rows: list[dict]) -> int | None:
-    return rows[0].get("total_count") if rows else 0
+def sql_total(rows: list[dict], *, first_page: bool = True) -> int | None:
+    if rows:
+        return rows[0].get("total_count")
+    return 0 if first_page else None
 
 
 def compact_row(row: dict) -> dict:
@@ -166,12 +207,16 @@ MCP_EXCLUDED_OPERATION_IDS = {
     "download_by_query",
     "bulk_metadata",
     "bulk_project_metadata",
+    "bulk_project_samples_metadata",
     "list_organisms",
     # Excluded until get_sample_microbes aggregates before applying LIMIT.
     "get_sample_microbes",
     "sitemap_counts",
     "sitemap_accessions",
+    "get_country_accessions",
     "get_country_points",
+    "get_ae_experiment_samples",
+    "get_sc_quality_samples",
     "get_platform_filters",
     "get_global_contributions",
     "get_global_contribution_filters",
@@ -186,7 +231,7 @@ MCP_EXCLUDED_OPERATION_IDS = {
 
 MCP_TOOL_NAMES = {"convert_accessions": "convert_accession"}
 
-# unlisted but callable for one release; calls are logged
+# unlisted but callable for backwards compatibility; calls are logged
 MCP_DEPRECATED_TOOLS = {
     "get_project_xref": "convert_accession",
     "resolve_prj_project": "convert_accession",
@@ -194,307 +239,343 @@ MCP_DEPRECATED_TOOLS = {
     "get_project_metadata": "get_project(fields=summary)",
     "get_common_name_by_scientific_name": "get_common_names_by_scientific_names",
     "get_sample": "get_sample_detail",
+    "get_project_metadata_rows": "get_metadata_rows",
+    "get_experiment_metadata_rows": "get_metadata_rows",
+    "get_run_metadata_rows": "get_metadata_rows",
+    "get_project_enriched": "get_enriched_metadata",
+    "get_experiment_enriched": "get_enriched_metadata",
+    "get_run_enriched": "get_enriched_metadata",
+    "get_project_single_cell_status": "get_project_single_cell(view=status)",
+    "get_project_single_cell_summary": "get_project_single_cell(view=summary)",
+    "list_library_strategies": "list_filter_values(field=library_strategy)",
+    "list_instrument_models": "list_filter_values(field=instrument_model)",
+    "list_journals": "list_filter_values(field=journal)",
+    "list_centers": "list_filter_values(field=center)",
+    "get_longread_summary": "get_collection_overview(collection=longread)",
+    "get_longread_facets": "get_collection_overview(collection=longread)",
+    "get_singlecell_summary": "get_collection_overview(collection=singlecell)",
+    "get_singlecell_facets": "get_collection_overview(collection=singlecell)",
+    "get_perturbation_summary": "get_collection_overview(collection=perturbation)",
+    "get_perturbation_facets": "get_collection_overview(collection=perturbation)",
+    "get_spatial_summary": "get_collection_overview(collection=spatial)",
+    "get_spatial_facets": "get_collection_overview(collection=spatial)",
+    "get_country_summary": "get_collection_overview(collection=country)",
+    "get_country_facets": "get_collection_overview(collection=country)",
+    "get_tissue_summary": "get_collection_overview(collection=tissue)",
+    "get_tissue_facets": "get_collection_overview(collection=tissue)",
+    "get_disease_summary": "get_collection_overview(collection=disease)",
+    "get_disease_facets": "get_collection_overview(collection=disease)",
 }
 
-# REST keeps the route defaults
+# REST keeps the route defaults; MCP caps the page size.
 MCP_ARG_DEFAULTS: dict[str, dict[str, Any]] = {
     "search_all": {"limit": 50, "fields": "compact"},
     "search_structured": {"limit": 50, "fields": "compact"},
     "search_nl": {"limit": 50, "fields": "compact"},
     "get_project": {"include_neighbors": False},
+    "get_sample_detail": {"include_neighbors": False},
+    "ontology_term": {"children": False},
+    "get_metadata_rows": {"limit": 50},
+    "get_project_metadata_rows": {"limit": 50},
+    "get_experiment_metadata_rows": {"limit": 50},
+    "get_enriched_metadata": {"limit": 50},
+    "get_project_enriched": {"limit": 50},
+    "get_study_download_manifest": {"limit": 50},
+    "get_study_experiments": {"limit": 50, "envelope": True},
+    "get_study_samples": {"limit": 50},
+    "get_geo_series_samples": {"limit": 50, "envelope": True},
+    "get_project_single_cell": {"limit": 50},
+    "search_enriched_samples": {"limit": 50},
+    "search_author_projects": {"limit": 50},
+    "list_single_cell_studies": {"limit": 50},
+    "get_organism_totals": {"limit": 50},
+    "get_tissue_microbes": {"limit": 100},
+    "list_filter_values": {"limit": 50},
+    "list_journals": {"limit": 50},
+    "list_centers": {"limit": 50},
 }
 
 MCP_INSTRUCTIONS = """\
 seqout searches study metadata from NCBI GEO, SRA/ENA/DDBJ, ArrayExpress, DDBJ GEA \
-and GSA. Each tool description gives the rules of that tool. Read the description before \
-the first call.
+and GSA. Read a tool's description before its first call.
 
 ## Which search tool
-- `search_all`: keywords or a boolean query (`("aging" OR aged) immun*`). `db=` limits the archive.
+- `search_all`: keywords or boolean query (`("aging" OR aged) immun*`). `db=` limits the archive.
 - `search_structured`: explicit filters (organism, library_strategy, platform, dates, country) or `count_by` buckets.
-- `search_nl`: a full English sentence. Read `parsed.warnings`.
+- `search_nl`: a full English sentence. Always read `parsed.warnings`.
 - `search_enriched_samples`: SAMPLES (not studies) by tissue, disease, age, sex, cell type or microbe.
-- Collections for "what data exists on X": `get_disease_projects`, `get_tissue_projects`, \
-`get_singlecell_projects`, `get_spatial_projects`, `get_perturbation_projects`, `get_longread_projects`.
-Before you search again, filter or sort the rows that you have.
+- Collections for "what data exists on X": call `get_collection_overview` for totals + valid filter values, \
+then `get_disease_projects`, `get_tissue_projects`, `get_singlecell_projects`, `get_spatial_projects`, \
+`get_perturbation_projects`, `get_longread_projects`, or `get_country_projects`.
+Filter or sort rows you already have before running another search.
 
-## Search rows
-Each row has `published_at` (the release date), `updated_at`, `alias`, organisms, \
-library_strategies, pmid and doi. `alias` gives the same dataset in other archives, for \
-example the SRP or E-GEOD of a GSE. Do not call `get_project` for each row to get these \
-fields. A dataset shows only one time. Through MCP, a page has 50 compact rows, and each \
-summary has a maximum of 300 characters. For more, set `limit` (1-200) or `fields=full`.
+## Search rows & paging
+Each row includes `published_at` (release date), `updated_at`, `alias` (linked accessions in other archives), \
+organisms, library_strategies, pmid and doi. Do not call `get_project` per row for those fields. Mirrors are folded. \
+MCP returns 50 compact rows (summaries capped at 300 chars); raise `limit` (1-200) or set `fields=full` if needed.
 
-## Paging
-To get the next page, do the same call again with the cursor from `next_cursor`. Use \
-`cursor_rank` + `cursor_acc` for relevance order. Use `cursor_sort` + `cursor_acc` with \
-`sortby`. `has_more=false` (`next_cursor` null) shows the last page.
-
-A null `total` (`total_is_known=false`) means unknown. It does not mean zero. `sortby` \
-replaces relevance order. Use `sortby` only for newest, oldest or most cited.
+Follow `next_cursor`: `cursor_rank`+`cursor_acc` for relevance order, `cursor_sort`+`cursor_acc` with `sortby`. \
+`has_more=false` (`next_cursor=null`) is the last page. A null `total` (`total_is_known=false`) means unknown, not zero. \
+Use `sortby` only for newest, oldest or most cited.
 
 ## Dates
-These parameters use the release date:
-- `search_all`: `date_from`, `date_to`, `year_from`, `year_to`.
-- `search_structured`: `published_after`, `published_before`, `year_*`.
-- `count_by=year` and `sortby=year`.
-`pub_date_*` uses the date of the linked paper.
+Release date: `search_all` (`date_from`/`date_to`/`year_*`), `search_structured` (`published_after`/`published_before`/`year_*`), \
+`count_by=year`, `sortby=year`. Linked paper date: `pub_date_*`.
 
-## Accessions
-- GSE, E-XXXX-N, E-GEAD-N (DDBJ GEA, not ArrayExpress), SRP/ERP/DRP, CRA/HRA, PRJ*: `get_project`.
-- GSM, SRX/ERX/DRX, SRS/ERS/DRS, SAM*: `get_sample_detail`. SRR/ERR/DRR: `get_run_checksums` or `get_run`.
-- Same dataset in another archive, or the project of a child accession: `convert_accession` (one or many).
-- Unknown shape: `classify_accession`. Submission (SRA/ERA/DRA + digits): `resolve_submission_studies`.
-- `exists: false` or a 404 means that the accession is not in seqout. Do not show it as a real dataset.
+## Accessions & metadata layers
+- Projects (`GSE`, `E-XXXX-N`, `E-GEAD-N`, `SRP/ERP/DRP`, `CRA/HRA`, `PRJ*`): `get_project`.
+- Samples/experiments (`GSM`, `SRX/ERX/DRX`, `SRS/ERS/DRS`, `SAM*`): `get_sample_detail`. Runs (`SRR/ERR/DRR`): `get_run_checksums` or `get_run`.
+- Raw flattened rows (FASTQ URLs, `sample_attribute:*`): `get_metadata_rows`. Ontology-normalized fields: `get_enriched_metadata`.
+- Cross-archive links or parent project: `convert_accession` (one or many). Unknown shape: `classify_accession`. Submission (`SRA/ERA/DRA`+digits): `resolve_submission_studies`.
+- `exists: false` or 404 means absent from seqout; never invent datasets.
 
-## Files and errors
-FASTQ files are for each run. Use `get_study_download_manifest` for a study. Use \
-`get_supplementary_files` for the processed files of GEO/ArrayExpress. A 504 is a \
-timeout. It is not an empty result. Make the call narrower.
+## Files & errors
+FASTQ files belong to runs (`get_study_download_manifest` for a study); GEO/ArrayExpress processed files use `get_supplementary_files`. \
+A 504 is a timeout, never an empty result; narrow filters and retry.
 """
 
-_NOTE_FASTQ = """\
-FASTQ files are for each run. A study is a container of runs. A GEO or ArrayExpress \
-project has FASTQ files only through a linked SRA/ENA study (`alias`, or \
-`convert_accession`). For the processed files of these projects, use \
-`get_supplementary_files`. For a PRJ accession, first use `convert_accession` to get its \
-SRP/ERP/DRP.
-An interleaved paired run has `library_layout=PAIRED` with `fastq_file_count=1` or \
-`fastq_is_interleaved=true`. Such a run is not a complete R1/R2 pair. Use the SRA \
-normalized format or SRA Lite, with `sracha get --split split-files`. The manifest and \
-`download_study_script(mode="fastq")` do this when `fastq_conversion_available=true`. \
-Read `fastq_conversion_required`, `recommended_fastq_source`, `conversion_command` and \
-`expected_fastq_paths`."""
+_NOTE_FASTQ = (
+    "FASTQ files belong to runs; GEO/ArrayExpress projects only have FASTQs via a linked "
+    "SRA/ENA/DRA study (`alias` or `convert_accession`) — use `get_supplementary_files` for "
+    "their processed files. Resolve PRJ* via `convert_accession` to SRP/ERP/DRP first. "
+    "Paired runs with `fastq_is_interleaved=true` (1 FASTQ) are not R1/R2 pairs; use "
+    "`recommended_fastq_source`, `conversion_command`, and `expected_fastq_paths` (sracha split-files)."
+)
 
-_NOTE_ENRICH_LAYERS = """\
-There are three metadata layers.
-- Project metadata: `get_project` and search rows.
-- Raw flattened rows: `get_project_metadata_rows`, `get_experiment_metadata_rows`, \
-`get_run_metadata_rows`. SRA/ENA gives one row for each run, with `sample_attribute:*` \
-columns, FASTQ URLs, bytes and MD5. GEO/ArrayExpress gives one row for each sample.
-- Ontology-enriched fields: `get_project_enriched`, `get_experiment_enriched`, \
-`get_run_enriched` (tissue, cell_type, disease, assay, UBERON/CL/MONDO/EFO ids, \
-low_confidence_tags).
-If the user wants raw attributes and ontology fields, call the two tools and identify \
-each layer. An enriched tool can return 404 for a project that is not enriched. Then use \
-the raw rows."""
+_NOTE_MICROBE_EVIDENCE = (
+    "Microbial calls are evidence, not a diagnosis (unitigs across >=20% reference, >=50% for "
+    "MLV/MMTV/HIV1/HTLV1). NULL or `measurable` false/null means unmeasured; `[]` means measured "
+    "and negative. `kmer_mass` is relative within one run. Viral/bacterial totals exclude "
+    "`spike_in_control`, `negative_control` and `bacterial_background`. Do not add unfiltered "
+    "barcode `cells` counts to filtered cell counts."
+)
 
-_NOTE_MICROBE_EVIDENCE = """\
-Microbial calls are evidence. They are not a diagnosis. A flag means that unitigs align \
-across a minimum of 20% of a panel reference (50% for MLV, MMTV, HIV1, HTLV1). Raw \
-reads, UMIs and replicates do not confirm a flag. NULL is not false. A null flag list, \
-or `measurable` false or null, means that the pipeline could measure nothing. An EMPTY \
-list means that the pipeline measured the sample and found nothing.
-`kmer_mass` is a relative proxy in one run. It is not an absolute count. The viral and \
-bacterial totals never include `spike_in_control` (PhiX), `negative_control` (animalPV) \
-and `bacterial_background` (reagent kitome, skin flora). `cells` is the number of matrix \
-columns. When `unfiltered` is set, `cells` counts 10x barcodes. Do not add these counts \
-together."""
+# MCP descriptions that replace the REST docstring.
+MCP_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "search_all": (
+        'Full-text or boolean search (`("aging" OR aged) immun*`) across GEO, SRA, ArrayExpress, '
+        "ENA, GSA, DRA and GEA. Mirrors fold onto one row (GEO > SRA > rest). Set `db=` only to "
+        "limit archives; only this tool finds DDBJ DRA/GEA (`db=dra|gea`). `country` accepts names "
+        "or ISO-2 codes. `long_read=true` keeps PacBio/ONT studies. Surface `suggestions`/`correction` "
+        "on possible typos."
+    ),
+    "search_structured": (
+        "Filtered search or `count_by` bucket counts across GEO, SRA, ArrayExpress, ENA and GSA "
+        "(no DRA/GEA). `q` accepts plain keywords (ontology-expanded) or boolean syntax (literal). "
+        "`organism` and `library_strategy` accept lists; `country` accepts names or ISO-2 codes. "
+        "Archive exclusions: `library_strategy` drops GEO; `platform` drops GEO/AE; `country` drops AE; "
+        "`instrument_model` drops AE/ENA/GSA; `multi_platform` keeps GEO/SRA only. In `count_by`, "
+        "ENA/GSA lack `instrument_model`/`library_strategy` (and ENA lacks `country`). "
+        "`sample_tissue`/`sample_disease`/`sample_cell_type` return studies with >=1 matching sample "
+        "(inspect via `get_enriched_metadata`; for sample rows use `search_enriched_samples`). "
+        "Discover filter values via `list_filter_values` and `search_organisms`."
+    ),
+    "search_nl": (
+        "Rule-based English query parser + search (not an LLM). Always report `parsed.warnings` to "
+        "the user. `parsed.excluded` lists negations ('excluding mouse') that are NOT applied; filter "
+        "rows or use boolean `search_all`. For DDBJ/DRA/GEA use `search_all(db=dra|gea)`. Use "
+        "`dry_run=true` to inspect parsed filters; prefer `search_structured` when filters are explicit."
+    ),
+    "search_expansion": (
+        "Show the ontology synonyms used by plain-keyword search and how many exist before the "
+        "variant cap. Use when a user asks why results are broad or narrow. Boolean queries are never expanded."
+    ),
+    "search_highlight": (
+        "Highlight query stems/synonyms in a project's title, summary and overall design. An empty "
+        "`words` list does not mean a false match (the hit may be in contributors or samples)."
+    ),
+    "get_project": (
+        "Full metadata for one project (`GSE`, `SRP/ERP/DRP`, `PRJ*`, `CRA/HRA`, `E-XXXX-N`, `E-GEAD-N`). "
+        "`fields=summary` returns only accession, title and description. MCP omits similarity neighbors "
+        "(`include_neighbors=false`; use `get_project_similar`). `alias` is the linked-accession list; "
+        "`submitter_alias` is submitter free text (or null). `HR*` (GSA-Human) is usually access-controlled."
+    ),
+    "get_sample_detail": (
+        "Sample/experiment metadata, raw attributes, runs, and slim parent `project` (omits neighbors; "
+        "use `get_project_similar`). Accepts `GSM`, `SRX/ERX/DRX`, `SRS/ERS/DRS`, `SAM*`."
+    ),
+    "get_study_experiments": (
+        "Paginated experiments for an SRA/ENA/DRA/GSA study (`SRP/ERP/DRP/PRJ*/CRA/HRA`). "
+        "Returns `{study_accession, total, count, offset, has_more, next_offset, experiments}`."
+    ),
+    "get_study_samples": (
+        "Paginated distinct samples referenced by an SRA/DRA/GEA study (`SRP/DRP/ERP/PRJ*/E-GEAD-N`). "
+        "Returns `{study_accession, total, count, offset, has_more, next_offset, samples}`."
+    ),
+    "get_geo_series_samples": (
+        "Paginated samples for a GEO series (`GSE`), ArrayExpress experiment (`E-XXXX-N`), or "
+        "DDBJ GEA series (`E-GEAD-N`). Returns `{accession, total, count, offset, has_more, next_offset, samples}`."
+    ),
+    "get_study_runs": (
+        "First 500 runs plus `total_runs`, `paired_runs`, `single_runs` and `total_fastq_bytes`. "
+        "Paired runs join `fastq_ftp`/`fastq_bytes`/`fastq_md5` with `;`. Page larger studies via "
+        "`get_study_download_manifest`. GSA runs (`CRR/HRR`) have no single-run tool; read them here."
+    ),
+    "get_study_download_manifest": (
+        "Paginated per-file download manifest (`url`, `bytes`, `md5`, `run_accession`, `download_command`) "
+        "for a study; follow `next_cursor`. " + _NOTE_FASTQ
+    ),
+    "download_study_script": (
+        "Generate a ready-to-run bash download script for a study (`mode`: fastq, sra, sra_lite, s3, gcs). "
+        "Use only when the user asks for a runnable script; otherwise use `get_study_download_manifest`."
+    ),
+    "get_run_checksums": (
+        "Parsed FASTQ/SRA download URLs, byte sizes, MD5 checksums, and interleaved/conversion flags "
+        "for one run (`SRR/ERR/DRR`). Prefer over `get_run` for download verification."
+    ),
+    "get_metadata_rows": (
+        "Paginated raw flattened metadata rows for a project (`GSE`, `SRP/ERP/DRP`, `PRJ*`, `CRA/HRA`, "
+        "`E-XXXX-N`, `E-GEAD-N`), experiment (`SRX/ERX/DRX`), or run (`SRR/ERR/DRR`). SRA/ENA/GSA "
+        "returns one row per run with `sample_attribute:*`, FASTQ URLs, bytes and MD5; GEO/AE/GEA "
+        "returns one row per sample. For ontology-normalized fields, use `get_enriched_metadata`."
+    ),
+    "get_enriched_metadata": (
+        "Ontology-normalized sample metadata (`tissue`, `cell_type`, `disease`, `assay`, UBERON/CL/MONDO/EFO "
+        "IDs, `low_confidence_tags`) for a project, experiment (`SRX/ERX/DRX`), or run (`SRR/ERR/DRR`). "
+        "404 if not enriched — fall back to `get_metadata_rows` for raw archive attributes."
+    ),
+    "get_project_single_cell": (
+        "Single-cell counts, QC (`sc_stats`), read-derived calls (preflightx), long-read chemistry, and "
+        "microbial detections for a study. `view=status` checks single-cell classification + evidence "
+        "(works for any study); `view=summary` gives study-level totals; `view=samples` (default) pages "
+        "per-sample rows (compare with `n_samples_detailed` and note if truncated). 404 if absent from "
+        "Pentimento (use `get_enriched_metadata`). In multiome studies, `RNA-Seq` and `ATAC-seq` are "
+        "separate samples (`ssRNA-seq` is strand-specific, not single-cell). "
+        + _NOTE_MICROBE_EVIDENCE
+    ),
+    "get_collection_overview": (
+        "Corpus totals (`summary`) and valid filter values (`facets`) for any curated/ontology collection "
+        "in one call (`include=both|summary|facets`). Call before `get_*_projects` to discover exact "
+        "filter values and resolution metadata (`resolution`, `matched_labels`). "
+        "Global collections (`longread`, `singlecell`, `perturbation`, `spatial`) omit `target`. "
+        "Scoped collections require `target`: `country` (ISO-2, e.g. `IN`), `tissue` (name or UBERON CURIE), "
+        "`disease` (`rare`, `nord`, disease name, or MONDO CURIE)."
+    ),
+    "get_longread_projects": (
+        "Filter PacBio/Oxford Nanopore studies (mirrors folded; excludes Onso). `long_read_only=false` "
+        "means hybrid short+long read; NULL means no experiment rows (GEO-only). `n_experiments` is "
+        "long-read count vs `n_experiments_total`. Get filter values/totals from "
+        "`get_collection_overview(collection='longread')`."
+    ),
+    "get_singlecell_projects": (
+        "Filter curated single-cell studies by chemistry, cell/nucleus, modality, tissue, organism, "
+        "matrix/FASTQ availability, and `perturbation_method` (text-detected named method; null means "
+        "none detected). Get filter values/totals from `get_collection_overview(collection='singlecell')`."
+    ),
+    "get_perturbation_projects": (
+        "Filter single-cell CRISPR/Perturb-seq/drug perturbation studies (rule-based; excludes germline "
+        "knockouts, transgenics, dox/tamoxifen inducers). Prefer `min_confidence=medium`; warn users "
+        "that `low` has many false positives. `compounds` come from sample treatments (empty when arms "
+        "are in supplementary files); `title_compounds` alone is weak evidence (`low`). `cell_lines` and "
+        "`sample_types` describe material. Get filter values from "
+        "`get_collection_overview(collection='perturbation')`."
+    ),
+    "get_spatial_projects": (
+        "Filter spatial transcriptomics studies (Visium, Xenium, MERFISH, CosMx, GeoMx DSP, ...). "
+        "`platforms` is text-mined and often null — a mention does not prove use (e.g. comparison papers). "
+        "`resolution` (`single-cell`, `spot`, `roi` for GeoMx DSP) maps to `technology` "
+        "(`imaging`, `sequencing`, `hybrid`). Get filter values from "
+        "`get_collection_overview(collection='spatial')`."
+    ),
+    "get_country_projects": (
+        "Filter studies submitted from one ISO-2 country (`code`, e.g. `IN`, `US`). `has_fastq`/`has_sra` "
+        "NULL means unknown. Get filter values/totals from "
+        "`get_collection_overview(collection='country', target=...)`."
+    ),
+    "get_tissue_projects": (
+        "Filter studies for a tissue (`term` name or UBERON CURIE + descendants). Check `resolution` and "
+        "`matched_labels`; 404 means no UBERON match. Keyset-paginated via `cursor_sort`+`cursor_acc`. "
+        "`has_fastq`/`has_sra` NULL means unknown. Get filter values/totals from "
+        "`get_collection_overview(collection='tissue', target=...)`."
+    ),
+    "get_disease_projects": (
+        "Filter studies for a disease via MONDO IDs and descendants. `collection='rare'` (NIH GARD, exact "
+        "MONDO xref, offset-paged) or `'nord'` (NORD, name-matched, offset-paged) return sample-rollup rows "
+        "with default `scope=human_primary` (report scope used; `ancestries` is submitter ethnicity text; "
+        "`n_samples` is collection-matched count). Free-text names or MONDO CURIEs (e.g. `MONDO:0005148`) "
+        "return cursor-paged study rows (`cursor_sort`+`cursor_acc`). Get valid filters from "
+        "`get_collection_overview(collection='disease', target=...)`; invalid mode filters return 400."
+    ),
+    "get_project_longread_chemistry": (
+        "Per-run PacBio/ONT chemistry calls for a study (`runs=[]` if none). Report `chemistry_confidence`: "
+        "`exact` (BAM header), `declared` (ONT protocol text), `bucket` (instrument model), or `unknown`."
+    ),
+    "get_tissue_microbes": (
+        "Paginated/filterable microbial detection rates per `(cohort, tissue, organism)` over Pentimento-"
+        "quantified samples (`studies>=2`, `screened>=200`). Use one `cohort` (`human`, `mouse`, `all`) "
+        "at a time. Always flag `is_background`, `class='culture'`, or `is_endogenous` (contamination/host, "
+        "not infection)."
+    ),
+    "ontology_term": (
+        "Look up an ontology graph node by exact NAME (any case; not CURIEs — use `get_disease_aliases` "
+        "for MONDO IDs or `ontology_search` for fuzzy lookup). Returns source CURIEs, `MAPS_TO` synonyms, "
+        "and optional direct children (`children=false` by default in MCP)."
+    ),
+    "search_enriched_samples": (
+        "Search SAMPLES (not studies) by enriched ontology, QC, and microbial detections. "
+        "Substring filters: `tissue`, `disease`, `cell_type`, `assay`, `assay_category`, `phenotype`, "
+        "`treatment`, `development_stage`, `sample_type`, `genetic_modification`, `strain`, `cell_line`, "
+        "`ethnicity`, `tissue_primary_site` (use short stems like `cervi`). Exact: `organism`, `sex`, "
+        "`taxid`, `study_accession`. `*_ontology_id` accepts CURIEs (+ descendants unless `include_descendants=false`). "
+        "Age/cell/gene bounds exclude unmeasured samples (tell the user). `has_matrix` is single-cell proof; "
+        "`single_cell_only` needs preflightx FASTQ scan (~4.7% of matrix studies). "
+        "For infections use `microbe*`: `microbe_tier` is `low_breadth` (default, >=1% bacterial), "
+        "`high_breadth` (strict), or `any` (noisy). Never compare viral vs bacterial breadth (viral genomes "
+        "are ~250x smaller). Say 'reference signal consistent with X', never 'infected', and report `class`. "
+        "On 504, add `organism` or `tissue`."
+    ),
+    "get_search_investigators": (
+        "Rank investigators (PIs) publishing on a search topic ('who works on CRISPR in India'). "
+        "Supports keywords/boolean `q` and archive/organism/assay/country filters; `senior_only=true` "
+        "ranks last authors. For a whole country without a topic, use `get_country_pis`."
+    ),
+    "list_filter_values": (
+        "Enumerate valid filter values sorted by frequency for `search_structured`: "
+        "`field=library_strategy|instrument_model|journal|center`."
+    ),
+    "convert_accession": (
+        "Resolve one (`accession`) or many (`accessions`, max 500) accessions across GEO, SRA, ENA, "
+        "DDBJ, ArrayExpress, BioProject and GSA, mapping child accessions to their parent study and "
+        "listing cross-archive mirrors. `exists: false` means not in seqout."
+    ),
+    "get_single_cell_overview": (
+        "Corpus-level single-cell statistics (totals, top tissues/organisms). For filtered study lists, "
+        "use `get_singlecell_projects`."
+    ),
+    "list_single_cell_studies": (
+        "List studies with measured single-cell evidence (matrix, barcode whitelist, R1 structure). "
+        "For curated filters, use `get_singlecell_projects`."
+    ),
+    "get_sc_quality": (
+        "Single-cell QC quantiles (median UMI `ncount` and genes `nfeature` p25/p50/p75) by release year "
+        "and technology across filtered matrices."
+    ),
+    "search_author_projects": (
+        "Datasets authored by a person (project rows + institutes) via linked PubMed papers. "
+        "For the paper list, use `search_by_author`."
+    ),
+    "search_by_author": (
+        "PubMed publications of an author with linked dataset accessions. "
+        "For project rows, use `search_author_projects`."
+    ),
+}
 
+# Notes appended for tools outside MCP_TOOL_DESCRIPTIONS.
 MCP_TOOL_NOTES: dict[str, str] = {
-    "search_all": """\
-Set `db=geo|sra|arrayexpress|ena|gsa|dra|gea` only when the user limits the source. \
-`long_read=true` keeps the studies that have a PacBio or Oxford Nanopore experiment. \
-`suggestions` or `correction` in the response means that the query has a possible \
-spelling error. Show them or use them. Do not guess. Structured search has no DRA or GEA \
-source. Thus, only this tool finds DDBJ-exclusive and GEA records (`db=dra`, `db=gea`).""",
-    "search_structured": """\
-Some filters remove archives:
-- `platform` removes GEO and ArrayExpress.
-- `instrument_model` removes ArrayExpress, ENA and GSA.
-- `country` removes ArrayExpress.
-- `multi_platform` keeps only GEO and SRA.
-- `library_strategy` removes GEO.
-`organism` and `library_strategy` accept more than one value. `sample_tissue`, \
-`sample_disease` and `sample_cell_type` show that one enriched sample matched. Examine \
-the match with `get_project_enriched`. To get the samples, use \
-`search_enriched_samples`. Get filter values from `list_library_strategies`, \
-`list_instrument_models`, `list_journals`, `list_centers` and `search_organisms`.""",
-    "search_nl": """\
-This tool uses rules, not an LLM. ALWAYS read `parsed.warnings` and tell them to the \
-user. `parsed.excluded` lists the exclusions ("excluding mouse"), but the search does \
-NOT apply them. Filter the rows, or use a boolean query in `search_all`.
-The tool knows DDBJ/DRA/GEA, but they have no structured source. Use \
-`search_all(db=dra|gea)`. `dry_run=true` only parses the query. When the user gives \
-explicit filters, call `search_structured`.""",
-    "search_expansion": """\
-This tool explains a result set from plain keywords. For each term, it gives the \
-synonyms that the search used and the number of synonyms that exist. These two numbers \
-are different when the variant cap removes synonyms. Use it when the results are too \
-broad or too narrow and the user asks for the cause. The search never expands boolean \
-queries.""",
-    "search_suggest": "Use this tool only when a search returns zero or very few results and the query has a possible spelling error.",
-    "search_highlight": """\
-This tool reads only the title, the summary and the overall design. It uses the same \
-stems and synonyms as the search. An empty `words` list does not show that the project \
-matched without cause. The match can come from a field that this tool does not read. \
-Tell the user: "these query words are in the description".""",
-    "get_project": """\
-`fields=summary` returns only the accession, the title and the description. Through \
-MCP, the result does not include similar studies. Call `get_project_similar`. `alias` is \
-the list of linked accessions in other archives, the same list as on a search row. \
-Examples: a GSE with its SRP and E-GEOD, or an E-GEAD (DDBJ GEA) with its DRA study, \
-which has its FASTQ files.
-`submitter_alias` is the free-text name that the submitter gave to the study. It is \
-never an accession, and it is null when there is no name. DRP/DRX/DRS/DRR accessions \
-behave as SRA accessions. FASTQ links that are only in DDBJ point to ddbj.nig.ac.jp. \
-HR* (GSA-Human) data usually has access control. Thus, download links can be absent.""",
-    "get_geo_series_samples": "This tool also lists the samples of a DDBJ GEA series (E-GEAD-N).",
-    "get_study_runs": """\
-This tool shows the first 500 runs, with `total_runs`, `paired_runs`, `single_runs` and \
-`total_fastq_bytes`. For a paired run, a semicolon joins the values in `fastq_ftp`, \
-`fastq_bytes` and `fastq_md5`. To get all the runs of a larger study, page through \
-`get_study_download_manifest`. GSA runs (CRR/HRR) have no run tool. Read them from this \
-list on their CRA/HRA study.""",
-    "get_study_download_manifest": "The manifest is complete and has pages. Each entry is one file with url, bytes, md5, run_accession and download_command. Follow `next_cursor`.\n"
-    + _NOTE_FASTQ,
-    "download_study_script": "This tool returns a shell script. Use it only when the user asks for a script that is ready to run. If not, use `get_study_download_manifest`. The modes are fastq (default), sra, sra_lite (smaller, with lossy quality scores), s3 and gcs. The FASTQ rules are in `get_study_download_manifest`.",
-    "get_run_checksums": "Use this tool for the MD5, the checksums and the file sizes of one run, or to verify its downloads. It returns parsed `fastq` records, an optional `sra` record, and the interleaved and conversion flags. Use `get_run` only for raw run fields.",
-    "get_study_bams": "This tool gives the original BAM files that the submitter sent for an SRA/ENA study, when they exist.",
-    "get_supplementary_files": "This tool gives the supplementary and processed files of GEO/ArrayExpress as JSON. `download_supplementary_script` returns the curl script.",
-    "get_project_metadata_rows": _NOTE_ENRICH_LAYERS,
-    "get_project_enriched": "This tool gives normalized ontology fields. It does not give raw archive metadata. Refer to `get_project_metadata_rows` for the three metadata layers. It can return 404 for a project that is not enriched.",
-    "bulk_project_samples_metadata": "This tool accepts many GSE/SRP/ERP/DRP projects in one call. It returns project summaries and flattened sample rows. For one project, use `get_project_metadata_rows`.",
-    "get_project_similar": "Use this tool for 'studies like this' on a GSE or SRP.",
-    "get_enriched_coverage": "This tool gives the enriched projects and samples for each archive, with the archive total and the percentage. It also gives counts for each organism, assay and assay_category.",
-    "get_enriched_column": "Set `column=` to get the top values of tissue, cell_type, disease, assay and other enriched columns.",
-    "get_enriched_crosstab": "Set `group=` and `breakdown=` to get a cross-tab, for example organism by tissue.",
-    "get_tissue_microbes": "The rates use only the quantified samples. With the rate, report `is_background`, a `class` of `culture`, or `is_endogenous`. These organisms are contamination or host genome. They are not an infection.",
-    "ontology_term": """\
-This tool finds a term by its exact NAME. It returns the source CURIEs (UBERON, CL, \
-MONDO, EFO, HGNC, MeSH, Cellosaurus), the synonym cluster and the direct children. It \
-does not resolve a CURIE. Give the name, or use `get_disease_aliases` for MONDO ids. A \
-404 means that no node has that exact name. Try a different form of the name. \
-`children=false` costs much less.""",
-    "ontology_search": "This tool matches names and accepts spelling errors. It returns candidate node names for `ontology_term`.",
-    "search_enriched_samples": """\
-This is the only tool that returns SAMPLES. Do not use the sample filters of \
-`search_structured` as a replacement. Those filters return studies.
-Filters:
-- Case-insensitive SUBSTRING match: tissue, disease, cell_type, assay, assay_category, \
-phenotype, treatment, development_stage, sample_type, genetic_modification, strain, \
-cell_line, ethnicity and tissue_primary_site. Use a short stem (`cervi`).
-- EXACT match: organism, sex, taxid and study_accession.
-- The *_ontology_id filters accept CURIEs. They include descendants unless \
-include_descendants=false. Get MONDO ids from `get_disease_aliases`.
-- age_min_years and age_max_years are in years. They remove the samples that have no age.
-- min/max_cell_count and min/max_gene_count remove the samples that have no measured \
-count (~85k samples have one). Tell the user that the result is the measured subset.
-The counts in each returned sample are `cells` and `genes`.
-Read-derived filters:
-- `has_matrix` is the proof tier for single-cell data.
-- `single_cell_only` is a barcode call. It needs FASTQ and a preflightx scan (4.7% of \
-the studies that have a matrix).
-- `single_cell_only` and `hpv_type` filter only when they are set.
-Infection questions:
-For an infection question, use `microbe*`. A `microbe*` filter keeps only the detections that match. It adds \
-`microbe_n_detections`, `microbe_reads`, `microbe_kmer_mass`, \
-`microbe_max_breadth_frac` and a `microbes` array. The array has a maximum of 50 rows, \
-with `microbes_truncated`. The aggregates use all the detections.
-`microbe` is a substring (`papillomavirus` finds each HPV type). `microbe_tier` has \
-three values:
-- `high_breadth`: strict (HPV 323 samples, pathogen 998).
-- `low_breadth`: the default. Bacteria at >=1% breadth (HPV 1,338, pathogen 14,345).
-- `any`: no floor. It includes trace noise. Use it only when the user asks for it.
-Breadth is a FRACTION of the genome. Viral genomes are ~250x smaller. Thus, never \
-compare viral breadth with bacterial breadth. `low_breadth` bacterial rows are ~1.3x \
-above background, and `high_breadth` rows are ~3x. Say "reference signal consistent \
-with X". Never say "infected with X". Report `class` with bacterial numbers, because \
-Mycoplasma and vector E. coli are the most frequent.
-Example: `search_enriched_samples(tissue="cervi", assay="single cell rna", \
-microbe="papillomavirus", single_cell_only=true)`.
-The pages use limit/offset, with a true `total` and `next_offset`. A broad cohort with a \
-microbe filter is slow. On a 504, add an organism filter or a tissue filter.""",
-    "get_longread_projects": """\
-Each row is one study, and the mirrors are folded into it. `long_read_only` false means \
-that the study also used a short-read platform. NULL means that no experiment rows show \
-this (GEO-only). `n_experiments` counts the long-read experiments, and \
-`n_experiments_total` counts all experiments. The collection does not include Onso. Get \
-filter values from `get_longread_facets` and totals from `get_longread_summary`.""",
-    "get_project_longread_chemistry": "This tool gives each PacBio/ONT run with its chemistry call. Report `chemistry_confidence` with the call: exact (BAM header), declared (ONT protocol text), bucket (instrument model only) or unknown. `runs` is [] for a study that has no long-read runs.",
-    "get_disease_aliases": "When `truncated` is true, increase `limit` (maximum 100) or make `q` more specific.",
-    "get_disease_summary": "Refer to `get_disease_projects` for the collections and for how to read the rows.",
-    "get_disease_facets": "Call this tool before `get_disease_projects`. The server rejects a filter that the collection does not have.",
-    "get_disease_projects": """\
-For "what data exists on <disease>", use these tools and not a keyword search. They \
-resolve the disease through MONDO ids and descendants. Set `collection=rare` (NIH GARD, \
-exact MONDO xref) or `nord` (NORD, by name, less strict), and tell the user which one. \
-As an alternative, give a free-text disease name or a MONDO id. This gives a full MONDO \
-match (exact label, or substring if there is none) with descendants. `resolution` and \
-`matched_labels` in the summary show what matched. A 404 means that there is no MONDO \
-match.
-The row shapes are different:
-- rare/nord rows are a rollup for each sample (cells, sex, ancestry, inheritance). You \
-can sort them by cells, n_samples, n_diseases, title, study_accession, assay_category, \
-organism.
-- Free-text rows are the same as `get_tissue_projects` rows. You can sort them by \
-n_samples, n_experiments, pub_date, title, study_accession, organism.
-How to read rare/nord rows:
-- `scope` has the default human_primary. The values patient_derived_model, cell_line \
-and all show what the default excludes. Tell the user which scope a count used.
-- `n_samples` counts the samples that match this collection. It is not the study total.
-- A null cell count means not measured. A blank ancestry means not recorded. \
-`has_fastq`/`has_sra` NULL means unknown.
-- `ancestries` is ethnicity text from the submitter (~13% of studies). It is not \
-genetic ancestry.
-- `inheritance` comes from HPO, Orphanet and GARD. "Not applicable" means no Mendelian \
-pattern.
-For a free-text term, `matched_samples` in the summary counts the matched samples, and \
-`samples` is the total of the studies.""",
-    "get_perturbation_projects": """\
-Use this tool for CRISPR screens, Perturb-seq or single-cell data with a drug \
-treatment. The detection uses rules (named methods, tests for a guide library and a \
-control arm, a ChEBI lexicon). Get filter values from `get_perturbation_facets`. Use \
-`min_confidence=medium` as the default. `low` is one weak signal with many false \
-positives. Tell this to the user.
-`evidence` lists the signals. `compounds` come from the sample treatments. A design \
-that has its drug arms in supplementary files has a method but no compounds. \
-`title_compounds` alone is weak evidence. `other` is a cytokine design or a stimulation \
-design.
-`cell_lines` and `sample_types` describe the material, not the perturbation. The counts \
-do not include germline knockouts, transgenic lines and doxycycline/tamoxifen inducers.""",
-    "get_spatial_projects": """\
-Use this tool for spatial transcriptomics, Visium or Xenium data. The population comes \
-from the classifier of single-cell modality. The platform names come from a regex on \
-the study text. Get filter values from `get_spatial_facets`. `platforms` is frequently \
-null. A platform name shows only that the study text names it.
-A comparison paper can name a platform that it did not use. Thus, a platform name is \
-weak evidence. `resolution=roi` (GeoMx DSP) is at the region level. `technology` \
-follows `resolution` (imaging~single-cell, sequencing~spot, hybrid~roi). A study that \
-names two groups gets one value, in this order: single-cell, then spot, then roi.""",
-    "get_tissue_projects": """\
-Use this tool for "what data exists on <tissue>". `term` resolves through UBERON (exact \
-label, or substring if there is none) and descendants. Thus, "blood" finds "whole \
-blood". `resolution` and `matched_labels` in `get_tissue_summary` show what matched. A \
-404 means no match.
-`n_samples_with_tissue` counts each sample that has a resolved tissue. \
-`matched_samples` in the summary is the count of matches. `has_fastq`/`has_sra` NULL \
-means unknown. Get filter values from `get_tissue_facets`. There is no curated tissue \
-catalogue.""",
-    "get_project_single_cell": """\
-A 404 means that the study is not in the Pentimento (this is common). Then use \
-`get_project_enriched`. `samples` has pages by limit/offset (default 200, maximum 1000) \
-and no `total`. Compare with `n_samples_detailed` of the study, and tell the user if \
-you stopped before the end. For microbial data for each organism, use \
-`search_enriched_samples(study_accession=..., microbe=...)`.
-In a multiome study, the RNA library and the ATAC library are different samples. Use \
-`library_strategies` (`RNA-Seq` or `ATAC-seq`) to identify each sample. `ssRNA-seq` means \
-strand-specific. It does not mean single-cell.
-"""
-    + _NOTE_MICROBE_EVIDENCE,
-    "get_project_single_cell_summary": "This tool gives the totals of the study (cells, preflightx evidence, microbe measurability). For the rows of each sample and for how to read the microbial flags, use `get_project_single_cell`.",
-    "get_project_single_cell_status": "This tool gives only the single-cell label of one study and its evidence. For totals, use `get_project_single_cell_summary`. For each sample, use `get_project_single_cell`.",
-    "get_single_cell_overview": "This tool gives corpus statistics (study counts by data type, top tissues and organisms). For the study list, use `get_singlecell_projects`.",
-    "list_single_cell_studies": "This tool lists the studies that have measured single-cell evidence (matrix, barcode whitelist, R1 structure). For the curated collection with filters, use `get_singlecell_projects`.",
-    "get_project_cite": "`type=original` returns the earliest PMID (the smallest number). `type=all` returns each linked paper. `format=bibtex` returns plain BibTeX.",
-    "find_publication": "This tool finds the datasets of a paper, by PMID or DOI.",
-    "search_author_projects": "This tool gives each dataset that a person authored, as project rows with institutes. Use it for 'datasets by <name>'. For the papers, use `search_by_author`. It finds only the studies that have a PubMed link.",
-    "search_by_author": "This tool gives the publications of an author. Each row is one PMID with its linked accessions. For the datasets, use `search_author_projects`. It finds only the studies that have a PubMed link.",
-    "get_search_investigators": "This tool gives the investigators for a search. Use it when the question names a topic ('who works on CRISPR in India'). `senior_only=true` ranks the last authors.",
-    "get_country_pis": "This tool gives the investigators of a full country, without a topic. For a topic, use `get_search_investigators`. Never filter this list by topic.",
+    "search_suggest": "Use only when a search returns zero/very few results and may have a typo.",
+    "get_study_bams": "Original submitter-uploaded BAM files for an SRA/ENA study, when present.",
+    "get_supplementary_files": "GEO/ArrayExpress/GEA supplementary & processed files as JSON (`download_supplementary_script` for a curl script).",
+    "get_project_similar": "Use for 'studies like this' on a GSE or SRP.",
+    "get_enriched_coverage": "Enriched project/sample counts and approximate % coverage per archive, organism, assay and assay_category.",
+    "get_enriched_column": "Top values for one enriched column (`tissue`, `cell_type`, `disease`, `assay`, ...).",
+    "get_enriched_crosstab": "2D cross-tab of curated enriched columns (e.g. `group=organism`, `breakdown=tissue`).",
+    "ontology_search": "Fuzzy lookup returning exact node names to pass to `ontology_term`.",
+    "get_disease_aliases": "When `truncated=true`, raise `limit` (max 100) or narrow `q`.",
+    "get_project_cite": "`type=original` gives earliest PMID; `type=all` gives all linked papers; `format=bibtex` returns BibTeX.",
+    "find_publication": "Find datasets linked to a paper by `pmid` or `doi`.",
+    "get_country_pis": "Investigators for a whole country without a topic. For a topic, use `get_search_investigators`.",
     "get_growth_stats": "In `mode=bases`, ENA counts nucleotide bases and SRA counts FASTQ/SRA bytes.",
-    "get_common_names_by_scientific_names": "This tool accepts one or many scientific names.",
-    "get_sample_detail": "This tool also returns the raw sample attributes. Use it for a sample accession or an experiment accession.",
+    "get_common_names_by_scientific_names": "Accepts one or a list of scientific names.",
 }
 
 
@@ -522,38 +603,374 @@ def set_path_tools(paths: dict[str, str]) -> None:
     PATH_TOOL_PATTERNS[:] = path_tool_patterns(paths)
 
 
-def annotate_tool(component: Any) -> None:
-    """MCP-only description notes, defaults and a closed input schema."""
-    name = component.name
-    component.description = replace_rest_paths(
-        component.description or "", PATH_TOOL_PATTERNS
+def _schema_accepts_array(schema: dict) -> bool:
+    if schema.get("type") == "array":
+        return True
+    return any(
+        isinstance(branch, dict) and branch.get("type") == "array"
+        for branch in schema.get("anyOf") or ()
     )
-    note = MCP_TOOL_NOTES.get(name)
-    if note:
-        component.description = f"{component.description.rstrip()}\n\n{note}"
+
+
+_SIMPLE_CHOICE_RE = re.compile(r"^\^\(([A-Za-z0-9_|-]+)\)\$$")
+_REST_DEFAULT_RE = re.compile(
+    r"\s*(?:\(default [^)]+\)|;?\s*omit for every row\.?|\bDefault:?\s+\d+\.?)",
+    re.IGNORECASE,
+)
+
+
+def clean_param_schema(schema: dict) -> dict:
+    """Strip Pydantic schema bloat: titles, nullable anyOf wrappers, and simple choice regexes."""
+    out = dict(schema)
+    out.pop("title", None)
+
+    any_of = out.get("anyOf")
+    if isinstance(any_of, list) and len(any_of) == 2:
+        non_null = [
+            b for b in any_of if isinstance(b, dict) and b.get("type") != "null"
+        ]
+        if len(non_null) == 1:
+            out.pop("anyOf")
+            branch = clean_param_schema(non_null[0])
+            for k, v in branch.items():
+                out.setdefault(k, v)
+            if out.get("default") is None:
+                out.pop("default", None)
+    elif isinstance(any_of, list):
+        out["anyOf"] = [
+            clean_param_schema(b) if isinstance(b, dict) else b for b in any_of
+        ]
+
+    if isinstance(out.get("items"), dict):
+        out["items"] = clean_param_schema(out["items"])
+
+    pattern = out.get("pattern")
+    if isinstance(pattern, str):
+        match = _SIMPLE_CHOICE_RE.match(pattern)
+        if match:
+            out.pop("pattern")
+            out["enum"] = match.group(1).split("|")
+
+    return out
+
+
+def annotate_tool(component: Any) -> None:
+    """MCP-only descriptions, compact JSON schemas, defaults and closed input schema."""
+    name = component.name
+    if name in MCP_TOOL_DESCRIPTIONS:
+        component.description = MCP_TOOL_DESCRIPTIONS[name]
+    else:
+        component.description = replace_rest_paths(
+            component.description or "", PATH_TOOL_PATTERNS
+        )
+        note = MCP_TOOL_NOTES.get(name)
+        if note:
+            component.description = f"{component.description.rstrip()}\n\n{note}"
+
     params = component.parameters or {}
+    params.pop("title", None)
     props = params.get("properties") or {}
+    cleaned_props: dict[str, Any] = {}
+    defaults = MCP_ARG_DEFAULTS.get(name, {})
     for arg, schema in props.items():
-        if not (schema.get("description") or "").strip() and (
-            doc := param_doc(name, arg)
-        ):
-            schema["description"] = doc
-    for arg, value in MCP_ARG_DEFAULTS.get(name, {}).items():
-        if arg in props:
-            props[arg]["default"] = value
-            desc = props[arg].get("description", "").rstrip()
-            props[arg]["description"] = (
-                f"{desc} MCP default: {json.dumps(value)}.".lstrip()
-            )
+        s = clean_param_schema(schema)
+        if not (s.get("description") or "").strip() and (doc := param_doc(name, arg)):
+            s["description"] = doc
+        if arg in defaults:
+            s["default"] = defaults[arg]
+            desc = _REST_DEFAULT_RE.sub("", s.get("description", "")).strip()
+            if desc and not desc.endswith((".", "!", "?")):
+                desc += "."
+            s["description"] = f"{desc} Default: {json.dumps(defaults[arg])}.".lstrip()
+        cleaned_props[arg] = s
+
+    params["properties"] = cleaned_props
     params["additionalProperties"] = False
-    TOOL_PARAMS[name] = frozenset(props)
+    TOOL_PARAMS[name] = frozenset(cleaned_props)
+    TOOL_ARRAY_PARAMS[name] = frozenset(
+        arg for arg, schema in cleaned_props.items() if _schema_accepts_array(schema)
+    )
 
 
 TOOL_PARAMS: dict[str, frozenset[str]] = {}
+TOOL_ARRAY_PARAMS: dict[str, frozenset[str]] = {}
+
+_ACCESSION_ARG_KEYS = frozenset(
+    {"accession", "study", "run", "submission", "study_accession"}
+)
+
+# wrong parameter name -> real names to suggest, in order
+_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "query": ("q",),
+    "text": ("q",),
+    "search": ("q",),
+    "keyword": ("q",),
+    "keywords": ("q",),
+    "db": ("source", "archive"),
+    "database": ("db", "source", "archive"),
+    "source": ("db", "archive"),
+    "archive": ("db", "source"),
+    "date_from": ("published_after", "year_from"),
+    "date_to": ("published_before", "year_to"),
+    "published_after": ("date_from", "year_from"),
+    "published_before": ("date_to", "year_to"),
+    "start_date": ("date_from", "published_after"),
+    "end_date": ("date_to", "published_before"),
+    "start_year": ("year_from", "year"),
+    "end_year": ("year_to", "year"),
+    "page_size": ("limit",),
+    "max_results": ("limit",),
+    "per_page": ("limit",),
+    "top": ("limit",),
+    "sort_by": ("sortby", "sort"),
+    "sortby": ("sort",),
+    "sort": ("sortby",),
+    "term": ("target", "collection", "q"),
+    "collection": ("term",),
+    "code": ("target",),
+    "disease_name": ("target", "collection", "disease"),
+    "tissue_name": ("target", "term", "tissue", "sample_tissue"),
+    "facet": ("field", "include"),
+    "filter": ("field",),
+    "dimension": ("field", "column"),
+    "study_accession": ("study", "accession"),
+    "project": ("accession", "study"),
+    "project_accession": ("accession", "study"),
+    "study_id": ("study", "accession"),
+    "run_accession": ("run", "accession"),
+    "run": ("accession",),
+    "experiment": ("accession",),
+    "experiment_accession": ("accession",),
+    "sample": ("accession",),
+    "sample_accession": ("accession",),
+    "country_code": ("code", "target", "geo_country_code_iso2", "country"),
+    "species": ("organism",),
+    "taxon": ("organism", "taxid"),
+    "assay_type": ("library_strategy", "assay", "assay_l1"),
+}
+
+# first match wins; GEA before ArrayExpress, as in accessions.py
+_ACCESSION_ROUTING: tuple[tuple[tuple[re.Pattern[str], ...], str, str], ...] = (
+    (
+        (GEO_SERIES_PATTERN,),
+        "a GEO series",
+        "Use `get_project`, `get_geo_series_samples`, or `get_supplementary_files`; "
+        "for FASTQ runs, call `convert_accession` to find the linked SRP/ERP/DRP study.",
+    ),
+    (
+        (GEO_SAMPLE_PATTERN,),
+        "a GEO sample",
+        "Use `get_sample_detail` or resolve its parent series with `convert_accession`.",
+    ),
+    (
+        (STUDY_PATTERN,),
+        "an SRA/ENA/DDBJ study",
+        "Use `get_project`, `get_study_runs`, `get_study_download_manifest`, or `get_study_experiments`.",
+    ),
+    (
+        (EXPERIMENT_PATTERN, GSA_EXPERIMENT_PATTERN),
+        "an experiment accession",
+        "Use `get_experiment`, `get_experiment_runs`, `get_sample_detail`, or resolve its study with `convert_accession`.",
+    ),
+    (
+        (SAMPLE_PATTERN, BIOSAMPLE_PATTERN, GSA_SAMPLE_PATTERN),
+        "a sample/BioSample accession",
+        "Use `get_sample_detail`, `get_sample_experiments`, or resolve its study with `convert_accession`.",
+    ),
+    (
+        (RUN_PATTERN,),
+        "a sequencing run",
+        "Use `get_run_checksums`, `get_run`, or resolve its study with `convert_accession`.",
+    ),
+    (
+        (GSA_RUN_PATTERN,),
+        "a GSA sequencing run (no single-run endpoint)",
+        "Resolve its parent CRA/HRA study with `convert_accession`, then call `get_study_runs` or `get_study_download_manifest`.",
+    ),
+    (
+        (PRJ_PATTERN,),
+        "a BioProject accession",
+        "Use `get_project` or resolve to its GSE/SRP/ERP/DRP with `convert_accession`.",
+    ),
+    (
+        (GSA_STUDY_PATTERN,),
+        "a GSA study",
+        "Use `get_project`, `get_study_runs`, or `get_study_download_manifest`.",
+    ),
+    (
+        (GEA_PATTERN,),
+        "a DDBJ GEA series",
+        "Use `get_project`, `get_geo_series_samples`, or `get_supplementary_files`; "
+        "for FASTQ runs, use `convert_accession` to find its linked DRA study.",
+    ),
+    (
+        (AE_PATTERN,),
+        "an ArrayExpress experiment",
+        "Use `get_project`, `get_geo_series_samples`, or `get_supplementary_files`; "
+        "for FASTQ runs, use `convert_accession` to find a linked ENA/SRA study.",
+    ),
+    (
+        (re.compile(SUBMISSION_REGEX),),
+        "a submission accession",
+        "Use `resolve_submission_studies`.",
+    ),
+)
+
+
+def suggest_param(bad_key: str, known: frozenset[str]) -> list[str]:
+    """Suggest valid parameter names for an unrecognized argument."""
+    suggestions: list[str] = []
+    for cand in _PARAM_ALIASES.get(bad_key.lower(), ()):
+        if cand in known and cand not in suggestions:
+            suggestions.append(cand)
+    for cand in difflib.get_close_matches(bad_key, sorted(known), n=2, cutoff=0.55):
+        if cand not in suggestions:
+            suggestions.append(cand)
+    return suggestions
+
+
+def accession_routing_hint(value: str, tool_name: str, field: str) -> str:
+    """Routing guidance for an accession that fails a tool's path regex."""
+    norm = value.strip().upper()
+    for pats, kind_desc, guidance in _ACCESSION_ROUTING:
+        if any(pat.match(norm) for pat in pats):
+            return (
+                f"Invalid `{field}` {value!r} for `{tool_name}`: `{norm}` is {kind_desc}. "
+                f"{guidance}"
+            )
+    return (
+        f"Invalid `{field}` {value!r} for `{tool_name}`: unrecognized accession format. "
+        "Call `classify_accession` or `convert_accession` to identify it."
+    )
+
+
+def prepare_mcp_args(tool_name: str, raw_args: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate, apply MCP defaults, coerce scalar-to-list, and normalize accessions."""
+    args = dict(raw_args or {})
+    known = TOOL_PARAMS.get(tool_name)
+    if known is not None:
+        unknown = sorted(k for k in args if k not in known)
+        if unknown:
+            parts = []
+            for k in unknown:
+                sugg = suggest_param(k, known)
+                if sugg:
+                    quoted = ", ".join(f"`{s}`" for s in sugg)
+                    parts.append(f"`{k}` (did you mean {quoted}?)")
+                else:
+                    parts.append(f"`{k}`")
+            valid_list = ", ".join(sorted(known)) if known else "(none)"
+            raise ToolError(
+                f"Unknown parameter(s) for `{tool_name}`: {'; '.join(parts)}. "
+                f"Valid parameters: {valid_list}."
+            )
+
+    for k, v in MCP_ARG_DEFAULTS.get(tool_name, {}).items():
+        if args.get(k) is None:
+            args[k] = v
+
+    # drop None so optional params don't go out as null
+    args = {k: v for k, v in args.items() if v is not None}
+
+    array_params = TOOL_ARRAY_PARAMS.get(tool_name, frozenset())
+    for k in array_params:
+        if k in args and isinstance(args[k], str):
+            args[k] = [args[k]]
+
+    if tool_name == "classify_accession":
+        if isinstance(args.get("accession"), str):
+            args["accession"] = args["accession"].strip()
+    else:
+        for k in _ACCESSION_ARG_KEYS:
+            if isinstance(args.get(k), str):
+                args[k] = args[k].strip().upper()
+        if isinstance(args.get("accessions"), list):
+            args["accessions"] = [
+                a.strip().upper() if isinstance(a, str) else a
+                for a in args["accessions"]
+            ]
+
+    return args
+
+
+_DATE_ERROR_TYPES = frozenset(
+    {"date_from_datetime_inexact", "date_parsing", "date_from_datetime_parsing"}
+)
+
+
+def http_422_detail(exc: BaseException | None) -> list | None:
+    """Validation errors of the FastAPI 422 that caused a tool error, if any."""
+    while exc is not None and not isinstance(exc, httpx.HTTPStatusError):
+        exc = exc.__cause__
+    if exc is None or exc.response.status_code != 422:
+        return None
+    try:
+        payload = exc.response.json()
+    except ValueError:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return detail if isinstance(detail, list) and detail else None
+
+
+def translate_mcp_error(tool_name: str, detail: list) -> str | None:
+    """Turn the validation errors of a FastAPI 422 into a short MCP error."""
+    messages: list[str] = []
+    for item in detail:
+        if not isinstance(item, dict):
+            continue
+        loc = item.get("loc") or []
+        err_type = item.get("type") or ""
+        val = item.get("input")
+        msg = item.get("msg") or ""
+        field = str(loc[-1]) if loc else "input"
+
+        if (
+            tool_name == "convert_accession"
+            and loc == ["body"]
+            and err_type == "missing"
+        ):
+            messages.append(
+                "`convert_accession` requires `accession` (one string) or "
+                "`accessions` (a non-empty list of strings)."
+            )
+            continue
+
+        pattern = (item.get("ctx") or {}).get("pattern") or ""
+        if err_type in _DATE_ERROR_TYPES or pattern == r"^\d{4}-\d{2}-\d{2}$":
+            messages.append(
+                f"Invalid date for `{field}`: got {val!r}. "
+                "Use YYYY-MM-DD (or `year_from`/`year_to` for whole years)."
+            )
+            continue
+
+        # FastMCP sends the unfilled path template when a path argument is absent
+        if err_type == "missing" or val == f"{{{field}}}":
+            messages.append(f"Missing required parameter `{field}` for `{tool_name}`.")
+            continue
+
+        if err_type == "string_pattern_mismatch":
+            choice_match = _SIMPLE_CHOICE_RE.match(pattern)
+            if choice_match:
+                choices = ", ".join(choice_match.group(1).split("|"))
+                messages.append(
+                    f"Invalid value {val!r} for `{field}` in `{tool_name}`. "
+                    f"Expected one of: {choices}."
+                )
+            elif field in _ACCESSION_ARG_KEYS and isinstance(val, str):
+                messages.append(accession_routing_hint(val, tool_name, field))
+            else:
+                messages.append(
+                    f"Invalid format for `{field}` in `{tool_name}`: got {val!r} ({msg})."
+                )
+            continue
+
+        messages.append(f"Invalid `{field}` for `{tool_name}`: {msg} (got {val!r}).")
+
+    return " ".join(messages) if messages else None
 
 
 class SeqoutMcpMiddleware(Middleware):
-    """MCP defaults, ignored-argument report, deprecated-tool hiding, line JSON."""
+    """MCP defaults, strict arg validation, normalization, error hints, line JSON."""
 
     async def on_list_tools(self, context, call_next):
         tools = await call_next(context)
@@ -561,36 +978,26 @@ class SeqoutMcpMiddleware(Middleware):
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         name = context.message.name
-        args = dict(context.message.arguments or {})
         if name in MCP_DEPRECATED_TOOLS:
             logger.warning(
                 "deprecated MCP tool %s called; use %s",
                 name,
                 MCP_DEPRECATED_TOOLS[name],
             )
-        known = TOOL_PARAMS.get(name)
-        ignored = sorted(k for k in args if known is not None and k not in known)
-        for k in ignored:
-            del args[k]
-        for k, v in MCP_ARG_DEFAULTS.get(name, {}).items():
-            args.setdefault(k, v)
+        args = prepare_mcp_args(name, context.message.arguments)
         message = context.message.model_copy(update={"arguments": args})
-        result = await call_next(context.copy(message=message))
+        try:
+            result = await call_next(context.copy(message=message))
+        except Exception as exc:
+            detail = http_422_detail(exc)
+            friendly = translate_mcp_error(name, detail) if detail else None
+            if friendly is not None:
+                raise ToolError(friendly) from None
+            raise
         structured = result.structured_content
         if not isinstance(structured, dict):
             return result
-        structured = split_project_alias(structured)
-        rows = structured.get("results")
-        if isinstance(rows, list) and rows and "linked_accessions" in rows[0]:
-            structured = {
-                **structured,
-                "results": [
-                    split_project_alias(r) if isinstance(r, dict) else r
-                    for r in structured["results"]
-                ],
-            }
-        if ignored:
-            structured = {**structured, "ignored_params": ignored}
+        structured = normalize_mcp_aliases(structured)
         return ToolResult(
             content=[TextContent(type="text", text=line_json(structured))],
             structured_content=structured,

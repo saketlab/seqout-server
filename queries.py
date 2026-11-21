@@ -31,6 +31,82 @@ def _as_list(value):
     return [value]
 
 
+# archive spelling variants by ISO-3166-1 alpha-2 code
+_COUNTRY_ALIASES: dict[str, tuple[str, ...]] = {
+    "US": ("USA", "United States", "United States of America", "U.S.A."),
+    "GB": ("UK", "United Kingdom", "Great Britain", "England"),
+    "KR": ("South Korea", "Korea", "Republic of Korea", "Korea, Republic of"),
+    "CN": ("China", "P.R. China", "PR China", "People's Republic of China"),
+    "TW": ("Taiwan", "Taiwan, Province of China"),
+    "RU": ("Russia", "Russian Federation"),
+    "IR": ("Iran", "Iran, Islamic Republic of"),
+    "CZ": ("Czech Republic", "Czechia"),
+    "NL": ("Netherlands", "The Netherlands"),
+    "TR": ("Turkey", "Turkiye", "Türkiye"),
+    "VN": ("Vietnam", "Viet Nam"),
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _country_lookup() -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+    """Build (code -> all variants, lower(variant) -> code) lazily."""
+    by_code: dict[str, list[str]] = {}
+    try:
+        from i18n_iso_countries import get_alpha2_codes, get_country_name
+
+        for code in get_alpha2_codes():
+            c = code.upper()
+            variants = [c]
+            try:
+                full = get_country_name(code=c, language="en")
+            except Exception:
+                full = None
+            if full:
+                short = full.strip().split(",")[0].strip()
+                if short and short not in variants:
+                    variants.append(short)
+                if full.strip() not in variants:
+                    variants.append(full.strip())
+            by_code[c] = variants
+    except Exception:
+        pass
+
+    for code, extras in _COUNTRY_ALIASES.items():
+        variants = by_code.setdefault(code, [code])
+        for ex in extras:
+            if ex not in variants:
+                variants.append(ex)
+
+    code_map = {c: tuple(vs) for c, vs in by_code.items()}
+    name_to_code: dict[str, str] = {}
+    for c, vs in code_map.items():
+        for v in vs:
+            name_to_code.setdefault(v.lower(), c)
+    return code_map, name_to_code
+
+
+def expand_country_variants(values) -> list[str]:
+    """Expand country names or ISO-2 codes to match both ISO-2 and archive names."""
+    items = _as_list(values) or []
+    code_map, name_to_code = _country_lookup()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        s = str(raw).strip()
+        if not s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+        code = name_to_code.get(s.lower())
+        if code:
+            for v in code_map.get(code, ()):
+                if v not in seen:
+                    seen.add(v)
+                    out.append(v)
+    return out
+
+
 STUDY_PUBLICATIONS_BATCH_SQL = """
 SELECT accession, publications
 FROM study_publications
@@ -959,7 +1035,7 @@ def _search_filter_clauses(
         params["organism"] = organism
     if country:
         dim_clauses["country"] = "matched.countries && %(country)s::text[]"
-        params["country"] = list(country)
+        params["country"] = expand_country_variants(country)
     if library_strategy:
         dim_clauses["library_strategy"] = (
             "matched.library_strategies && %(library_strategy)s::text[]"
@@ -2203,12 +2279,28 @@ WHERE sample_accession = %s
 LIMIT 1;
 """
 
+ENA_SAMPLE_TO_EXPERIMENTS_SQL = """
+SELECT DISTINCT experiment_accession AS accession
+FROM ena_experiments
+WHERE sample_accession = %s
+ORDER BY experiment_accession
+LIMIT 500;
+"""
+
 # caller must pass accession already uppercased
 GSA_SAMPLE_TO_EXPERIMENT_SQL = """
 SELECT DISTINCT experiment_accession
 FROM gsa_experiments
-WHERE sample_accession = %s
+WHERE sample_accession = %s AND experiment_accession IS NOT NULL
 LIMIT 1;
+"""
+
+GSA_SAMPLE_TO_EXPERIMENTS_SQL = """
+SELECT DISTINCT experiment_accession AS accession
+FROM gsa_experiments
+WHERE sample_accession = %s AND experiment_accession IS NOT NULL
+ORDER BY experiment_accession
+LIMIT 500;
 """
 
 # caller must pass accession already uppercased
@@ -2217,6 +2309,14 @@ SELECT accession
 FROM sra_experiments
 WHERE samples @> ARRAY[%s]
 LIMIT 1;
+"""
+
+SRA_SAMPLE_TO_EXPERIMENTS_SQL = """
+SELECT DISTINCT accession
+FROM sra_experiments
+WHERE samples @> ARRAY[%s]
+ORDER BY accession
+LIMIT 500;
 """
 
 # caller must pass accession already uppercased
@@ -2316,6 +2416,21 @@ SELECT study
 FROM dra_experiments
 WHERE accession = %s
 LIMIT 1;
+"""
+
+DRA_SAMPLE_TO_EXPERIMENT_SQL = """
+SELECT accession
+FROM dra_experiments
+WHERE samples @> ARRAY[%s]
+LIMIT 1;
+"""
+
+DRA_SAMPLE_TO_EXPERIMENTS_SQL = """
+SELECT DISTINCT accession
+FROM dra_experiments
+WHERE samples @> ARRAY[%s]
+ORDER BY accession
+LIMIT 500;
 """
 
 DRA_SAMPLE_TO_STUDY_SQL = """
@@ -3019,6 +3134,7 @@ def build_structured_search(
         params["platform"] = platform
     if country:
         params["country"] = country
+        params["country_variants"] = expand_country_variants([country])
     if center:
         params["center"] = center
     if year_from is not None:
@@ -3097,7 +3213,7 @@ def build_structured_search(
             w.append(
                 "EXISTS (SELECT 1 FROM geo_contributors gc"
                 " WHERE gc.accession = g.accession"
-                " AND gc.address_country = %(country)s)"
+                " AND gc.address_country = ANY(%(country_variants)s::text[]))"
             )
         if center:
             w.append(
@@ -3179,7 +3295,7 @@ def build_structured_search(
                 " WHERE " + " AND ".join(ec) + ")"
             )
         if country:
-            w.append("s.countries @> ARRAY[%(country)s]")
+            w.append("s.countries && %(country_variants)s::text[]")
         if center:
             w.append(
                 "EXISTS (SELECT 1 FROM sra_submissions sub"
@@ -3335,7 +3451,7 @@ def build_structured_search(
             if platform:
                 ec.append("ee.instrument_platform = %(platform)s")
             if country:
-                ec.append("ee.country = %(country)s")
+                ec.append("ee.country = ANY(%(country_variants)s::text[])")
             w.append(
                 "EXISTS (SELECT 1 FROM ena_experiments ee"
                 " WHERE " + " AND ".join(ec) + ")"
@@ -3425,7 +3541,7 @@ def build_structured_search(
             if platform:
                 ec.append("ge.instrument_platform = %(platform)s")
             if country:
-                ec.append("ge.country = %(country)s")
+                ec.append("ge.country = ANY(%(country_variants)s::text[])")
             w.append(
                 "EXISTS (SELECT 1 FROM gsa_experiments ge"
                 " WHERE " + " AND ".join(ec) + ")"
@@ -5775,6 +5891,7 @@ PERTURBATION_ARRAY_FILTERS = {
     "compound": "compounds",
     "readout_assay": "readout_assays",
     "cell_line": "cell_lines",
+    "sample_type": "sample_types",
 }
 PERTURBATION_SCALAR_FILTERS = (
     "perturbation_type",
@@ -5999,6 +6116,7 @@ COUNTRY_SCALAR_FILTERS = {
     "organism": "organism",
     "assay_l1": "assay_l1",
     "source": "source",
+    "year": "year",
 }
 COUNTRY_BOOL_FILTERS = ("has_fastq", "has_sra", "is_single_cell")
 COUNTRY_SORTABLE = frozenset(
@@ -6095,35 +6213,49 @@ ONTOLOGY_TERM_SORTABLE = frozenset(
 )
 
 
+_ONTOLOGY_CURIE_RE = re.compile(r"^[A-Za-z]+:\d+$")
+
+
 def resolve_ontology_term(cur, kind: str, term: str) -> dict:
-    """Resolve free text to UBERON/MONDO ids plus all closure descendants.
-    Exact normalized-label match first; substring only as a fallback, since
-    "type 1" also matches "type 10".
+    """Resolve free text or an exact CURIE (MONDO:..., UBERON:...) to ids plus
+    all closure descendants. Exact CURIE/normalized-label match first; substring
+    only as a fallback, since "type 1" also matches "type 10".
 
     Returns {"ids", "resolution" ('exact'|'substring'|'none'), "matched_labels"};
     matched_labels are the matches before descendant expansion.
     """
     ontology = _ONTOLOGY_TERM_TABLES[kind]["ontology"]
-    normalized = re.sub(r"[^a-z0-9]+", "", term.lower())
-    if not normalized:
-        return {"ids": [], "resolution": "none", "matched_labels": []}
-
-    cur.execute(
-        "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
-        "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') = %(term)s",
-        {"ontology": ontology, "term": normalized},
-    )
-    seed = cur.fetchall()
+    stripped = term.strip()
+    seed = []
     resolution = "exact"
-    if not seed:
+    if _ONTOLOGY_CURIE_RE.match(stripped):
         cur.execute(
             "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
-            "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') "
-            "LIKE '%%' || %(term)s || '%%'",
+            "AND upper(id) = %(curie)s",
+            {"ontology": ontology, "curie": stripped.upper()},
+        )
+        seed = cur.fetchall()
+
+    if not seed:
+        normalized = re.sub(r"[^a-z0-9]+", "", stripped.lower())
+        if not normalized:
+            return {"ids": [], "resolution": "none", "matched_labels": []}
+
+        cur.execute(
+            "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
+            "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') = %(term)s",
             {"ontology": ontology, "term": normalized},
         )
         seed = cur.fetchall()
-        resolution = "substring"
+        if not seed:
+            cur.execute(
+                "SELECT id, label FROM ontology_terms WHERE ontology = %(ontology)s "
+                "AND regexp_replace(lower(label), '[^a-z0-9]+', '', 'g') "
+                "LIKE '%%' || %(term)s || '%%'",
+                {"ontology": ontology, "term": normalized},
+            )
+            seed = cur.fetchall()
+            resolution = "substring"
     if not seed:
         return {"ids": [], "resolution": "none", "matched_labels": []}
 
@@ -6143,6 +6275,8 @@ def resolve_ontology_term(cur, kind: str, term: str) -> dict:
 
 _ONTOLOGY_TERM_WHERE = (
     build_filtered_where({}, _ONTOLOGY_TERM_SCALAR_FILTERS, _ONTOLOGY_TERM_BOOL_FILTERS)
+    + "\n      AND (%(year)s::int IS NULL"
+    + "\n           OR extract(year FROM r.pub_date)::int = %(year)s::int)"
     + _search_clause()
 )
 
@@ -7242,6 +7376,15 @@ WHERE r.study_accession = %s
 GROUP BY s.study_accession
 ORDER BY n DESC
 LIMIT 1;
+"""
+
+# a reads-only study with no GSE or pentimento_study row is served under its own accession
+PENTIMENTO_RESOLVE_RUNS_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM pentimento_run
+    WHERE study_accession = %s
+      AND COALESCE(gsm_accession, sample_accession) IS NOT NULL
+) AS linked;
 """
 
 # gates the Pentimento tab; same run-row fallback as PENTIMENTO_SAMPLES_SQL

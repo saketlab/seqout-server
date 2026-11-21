@@ -8,7 +8,9 @@ import logging
 import os
 from collections import defaultdict
 import pathlib
+import contextlib
 import contextvars
+import functools
 import re
 import shutil
 import threading
@@ -55,6 +57,7 @@ from mcp_support import (
     MCP_DEPRECATED_TOOLS,
     MCP_EXCLUDED_OPERATION_IDS,
     MCP_INSTRUCTIONS,
+    MCP_TOOL_DESCRIPTIONS,
     MCP_TOOL_NAMES,
     MCP_TOOL_NOTES,
     SEARCH_PAGE_SIZE,
@@ -71,6 +74,39 @@ from library_strategy import (
     is_ena_study as _is_ena_study,
     is_gsa_study as _is_gsa_study,
     resolve_study_for_library_strategy as _study_for_library_strategy,
+)
+from accessions import (
+    AE_PATTERN,
+    AE_REGEX,
+    BIOSAMPLE_PATTERN,
+    BULK_PATTERN,
+    EXPERIMENT_PATTERN,
+    EXPERIMENT_REGEX,
+    GEA_PATTERN,
+    GEO_SAMPLE_PATTERN,
+    GEO_SAMPLE_REGEX,
+    GEO_SERIES_PATTERN,
+    GEO_SERIES_REGEX,
+    GSA_EXPERIMENT_PATTERN,
+    GSA_RUN_PATTERN,
+    GSA_SAMPLE_PATTERN,
+    GSA_STUDY_PATTERN,
+    METADATA_ENTITY_REGEX,
+    PRJ_PATTERN,
+    PRJ_REGEX,
+    PROJECT_PATTERN,
+    PROJECT_REGEX,
+    RUN_PATTERN,
+    RUN_REGEX,
+    SAMPLE_OR_ENA_REGEX,
+    SAMPLE_PATTERN,
+    SAMPLE_REGEX,
+    STUDY_EXPERIMENTS_REGEX,
+    STUDY_PATTERN,
+    SUBMISSION_REGEX,
+    _EXPERIMENT_PREFIX,
+    _SAMPLE_PREFIX,
+    _STUDY_PREFIX,
 )
 from ttl_cache import purge_all as purge_registered_caches, purgeable, ttl_cached
 from grid_filters import (
@@ -102,12 +138,15 @@ from queries import (
     DRA_EXPERIMENT_SQL,
     DRA_EXPERIMENT_TO_STUDY_SQL,
     DRA_SAMPLE_SQL,
+    DRA_SAMPLE_TO_EXPERIMENT_SQL,
+    DRA_SAMPLE_TO_EXPERIMENTS_SQL,
     DRA_SAMPLE_TO_STUDY_SQL,
     DRA_SEARCH_SQL,
     DRA_STUDY_EXPERIMENTS_SQL,
     ENA_EXPERIMENT_SQL,
     ENA_SAMPLE_SQL,
     ENA_SAMPLE_TO_EXPERIMENT_SQL,
+    ENA_SAMPLE_TO_EXPERIMENTS_SQL,
     ENA_SEARCH_SQL,
     ENA_STUDY_EXPERIMENTS_SQL,
     ENRICHED_COLUMN_VALUES_SQL,
@@ -202,6 +241,7 @@ from queries import (
     GSA_EXPERIMENT_SQL,
     GSA_SAMPLE_SQL,
     GSA_SAMPLE_TO_EXPERIMENT_SQL,
+    GSA_SAMPLE_TO_EXPERIMENTS_SQL,
     GSA_SEARCH_SQL,
     GSA_STUDY_EXPERIMENTS_SQL,
     GSA_STUDY_RUNS_PREVIEW_SQL,
@@ -235,6 +275,7 @@ from queries import (
     PRJ_TO_SRA_STUDY_SQL,
     PENTIMENTO_RESOLVE_SQL,
     PENTIMENTO_RESOLVE_GSM_SQL,
+    PENTIMENTO_RESOLVE_RUNS_SQL,
     PENTIMENTO_SAMPLE_CELLS_SQL,
     PENTIMENTO_MICROBES_SQL,
     PENTIMENTO_SAMPLES_SQL,
@@ -279,6 +320,7 @@ from queries import (
     SRA_EXPERIMENT_SQL,
     SRA_EXPERIMENT_TO_STUDY_SQL,
     SRA_SAMPLE_TO_EXPERIMENT_SQL,
+    SRA_SAMPLE_TO_EXPERIMENTS_SQL,
     SRA_SAMPLE_TO_STUDY_SQL,
     SRA_SEARCH_SQL,
     PROJECTS_BY_PMID_SQL,
@@ -325,51 +367,6 @@ load_dotenv()
 
 ENRICHMENT_ENABLED = True
 
-
-_STUDY_PREFIX = r"[SED]RP"
-_EXPERIMENT_PREFIX = r"[SED]RX"
-_SAMPLE_PREFIX = r"[SED]RS"
-_RUN_PREFIX = r"[SED]RR"
-
-STUDY_PATTERN = re.compile(rf"^({_STUDY_PREFIX})\d+$", re.IGNORECASE)
-SAMPLE_PATTERN = re.compile(rf"^({_SAMPLE_PREFIX})\d+$", re.IGNORECASE)
-EXPERIMENT_PATTERN = re.compile(rf"^({_EXPERIMENT_PREFIX})\d+$", re.IGNORECASE)
-RUN_PATTERN = re.compile(rf"^({_RUN_PREFIX})\d+$", re.IGNORECASE)
-GEO_SERIES_PATTERN = re.compile(r"^GSE\d+$", re.IGNORECASE)
-GEO_SAMPLE_PATTERN = re.compile(r"^GSM\d+$", re.IGNORECASE)
-BIOSAMPLE_PATTERN = re.compile(r"^SAM[A-Z]+\d+$", re.IGNORECASE)
-AE_PATTERN = re.compile(r"^E-[A-Z]{4}-\d+$", re.IGNORECASE)
-# "GEAD" is four letters, so E-GEAD-N also matches AE_PATTERN: always test GEA first.
-_GEA_PREFIX = r"[Ee]-[Gg][Ee][Aa][Dd]-"
-GEA_PATTERN = re.compile(rf"^{_GEA_PREFIX}\d+$")
-PRJ_PATTERN = re.compile(r"^PRJ[A-Z]+\d+$", re.IGNORECASE)
-# GSA (CNCB-NGDC) accessions; PRJCA/SAMC already match PRJ/BIOSAMPLE above.
-GSA_STUDY_PATTERN = re.compile(r"^(CRA|HRA)\d+$", re.IGNORECASE)
-GSA_RUN_PATTERN = re.compile(r"^(CRR|HRR)\d+$", re.IGNORECASE)
-GSA_EXPERIMENT_PATTERN = re.compile(r"^(CRX|HRX)\d+$", re.IGNORECASE)
-GSA_SAMPLE_PATTERN = re.compile(r"^HRS\d+$", re.IGNORECASE)
-# CRA/HRA are GSA study accessions; they turn up as similarity neighbours, so a
-# project lookup has to accept them like any other archive's project accession.
-PROJECT_PATTERN = re.compile(
-    rf"^(GSE|{_STUDY_PREFIX}|CRA|HRA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
-)
-BULK_PATTERN = re.compile(
-    rf"^(GSE|{_STUDY_PREFIX}|PRJNA|[Ee]-[A-Za-z]{{4}}-)\d+$", re.IGNORECASE
-)
-
-STUDY_REGEX = rf"^{_STUDY_PREFIX}\d+$"
-RUN_REGEX = rf"^{_RUN_PREFIX}\d+$"
-SAMPLE_REGEX = rf"^{_SAMPLE_PREFIX}\d+$"
-EXPERIMENT_REGEX = rf"^({_EXPERIMENT_PREFIX}|CRX|HRX)\d+$"
-GEO_SAMPLE_REGEX = r"^GSM\d+$"
-PRJ_REGEX = r"^PRJ[A-Z]+\d+$"
-# SRA/ENA/DDBJ submission accession (SRA######, ERA######, DRA######).
-SUBMISSION_REGEX = r"^[SED]RA\d+$"
-PROJECT_REGEX = rf"^(GSE|{_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|[Ee]-[A-Za-z]{{4}}-)\d+$"
-STUDY_EXPERIMENTS_REGEX = rf"^({_STUDY_PREFIX}|PRJ[A-Z]+|CRA|HRA|{_GEA_PREFIX})\d+$"
-SAMPLE_OR_ENA_REGEX = rf"^({_SAMPLE_PREFIX}|SAM[A-Z]+|HRS)\d+$"
-GEO_SERIES_REGEX = r"^GSE\d+$"
-AE_REGEX = r"^[Ee]-[A-Za-z]{4}-\d+$"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -824,7 +821,54 @@ neo4j_driver = GraphDatabase.driver(
     max_transaction_retry_time=3.0,
 )
 
-limiter = Limiter(key_func=get_remote_address)
+# in-process MCP calls always see scope["client"] = ("127.0.0.1", 123)
+_MCP_CLIENT_IP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_client_ip", default=None
+)
+
+
+def _client_ip_from_headers(headers) -> str | None:
+    xff = headers.get("x-forwarded-for") or ""
+    if xff:
+        first = xff.split(",", 1)[0].strip()
+        if first:
+            return first
+    real_ip = (headers.get("x-real-ip") or "").strip()
+    return real_ip or None
+
+
+def _rate_limit_key(request: Request) -> str:
+    return (
+        _MCP_CLIENT_IP.get()
+        or _client_ip_from_headers(request.headers)
+        or get_remote_address(request)
+    )
+
+
+class McpClientIpMiddleware:
+    """Propagate the outer HTTP client IP into in-process FastMCP ASGI calls."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {
+            k.decode("latin1").lower(): v.decode("latin1")
+            for k, v in scope.get("headers") or ()
+        }
+        ip = _client_ip_from_headers(headers) or (
+            scope["client"][0] if scope.get("client") else None
+        )
+        token = _MCP_CLIENT_IP.set(ip)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _MCP_CLIENT_IP.reset(token)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
 api_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 api_app.state.limiter = limiter
 
@@ -1599,6 +1643,17 @@ _EXPERIMENT_FILTER_COLUMNS = {
 }
 
 
+def _page_sql(
+    sql: str, params: list, limit: int | None, offset: int
+) -> tuple[str, list]:
+    """Append LIMIT/OFFSET; an offset applies with or without a limit."""
+    if limit is not None:
+        return sql + "\nLIMIT %s OFFSET %s", [*params, limit, offset]
+    if offset:
+        return sql + "\nOFFSET %s", [*params, offset]
+    return sql, params
+
+
 def _fetch_geo_series_samples(
     cur, accession: str, source: str, limit: int | None = None, offset: int = 0
 ) -> list[dict]:
@@ -1609,17 +1664,12 @@ def _fetch_geo_series_samples(
         if not gea:
             sql += f"\nORDER BY {_AE_SAMPLE_ACCESSION_EXPR}"
         params: list = [accession]
-        if limit is not None:
-            sql += "\nLIMIT %s OFFSET %s"
-            params += [limit, offset]
+        sql, params = _page_sql(sql, params, limit, offset)
         cur.execute(sql, tuple(params))
         transform = _transform_gea_sample_to_geo if gea else _transform_ae_sample_to_geo
         return [transform(s) for s in cur.fetchall()]
     sql = GEO_SERIES_SAMPLES_SQL.rstrip().rstrip(";") + "\nORDER BY s.accession"
-    params = [accession]
-    if limit is not None:
-        sql += "\nLIMIT %s OFFSET %s"
-        params += [limit, offset]
+    sql, params = _page_sql(sql, [accession], limit, offset)
     cur.execute(sql, tuple(params))
     return cur.fetchall()
 
@@ -1706,6 +1756,16 @@ def _is_dra_only_study(cur, study: str) -> bool:
     return bool(row and row["only_dra"])
 
 
+def _reject_gea_runs(study: str, files_tool: str) -> None:
+    """400 a GEA accession on the run routes."""
+    if _is_gea_study(study):
+        raise HTTPException(
+            400,
+            f"{study} is a DDBJ GEA series and has no SRA runs; use "
+            f"{files_tool} for processed files or get_project to find its linked DRA study",
+        )
+
+
 def _reject_gea_study(study: str) -> None:
     """404 a GEA accession on the experiment routes."""
     if _is_gea_study(study):
@@ -1770,16 +1830,14 @@ def _fetch_study_experiments(
     source: str | None = None,
 ) -> list[dict]:
     sql, ena_style = _study_experiments_sql(cur, study, source)
-    if limit is None:
+    if limit is None and not offset:
         cur.execute(sql, (study,))
         return cur.fetchall()
     base = sql.rstrip().rstrip(";")
-    paged = base + (
-        "\nLIMIT %s OFFSET %s"
-        if ena_style
-        else "\nORDER BY accession\nLIMIT %s OFFSET %s"
-    )
-    cur.execute(paged, (study, limit, offset))
+    if not ena_style:
+        base += "\nORDER BY accession"
+    paged, params = _page_sql(base, [study], limit, offset)
+    cur.execute(paged, tuple(params))
     return cur.fetchall()
 
 
@@ -2923,59 +2981,42 @@ _NEO4J_EXPAND_COOLDOWN = 30.0
 # One list, four endpoints. expansions.ONTOLOGIES is the source of truth for
 # which ids exist (it mirrors ontology-scripts/GRAPH.md "What's ingested").
 _EXCLUDE_ONTOLOGY_DOC = (
-    "Ontology ids whose synonyms must not be used for query expansion: "
+    "Ontology IDs to exclude from synonym expansion: "
     + ", ".join(o for o, _ in ONTOLOGIES)
-    + ". Unknown ids are ignored."
+    + "."
 )
 _CASE_SENSITIVE_DOC = (
-    "Match the query's words with their exact case (whole words, title and "
-    "summary only), so LINE excludes 'cell line'. Follows the same OR/AND/NOT "
-    "structure as the query; no spelling correction."
+    "Exact-case whole-word match in title/summary only; skips spelling correction."
 )
-_LONG_READ_DOC = (
-    "Only studies with PacBio or Oxford Nanopore sequencing, in any archive"
-)
-_Q_DOC = (
-    'Keywords, or a boolean query such as ("aging" OR aged) immun*. Plain '
-    "keywords are expanded with ontology synonyms; boolean queries are not."
-)
+_LONG_READ_DOC = "Only studies with PacBio or Oxford Nanopore sequencing."
+_Q_DOC = 'Keywords (ontology-expanded) or boolean query e.g. ("aging" OR aged) immun* (literal).'
 _CURSOR_RANK_DOC = (
-    "Relevance paging: `next_cursor.rank` of the previous page, sent with cursor_acc."
+    "Relevance paging: previous `next_cursor.rank` (pair with cursor_acc)."
 )
-_CURSOR_ACC_DOC = "`next_cursor.accession` of the previous page."
+_CURSOR_ACC_DOC = "Previous `next_cursor.accession`."
 _CURSOR_SORT_DOC = (
-    "Sorted paging (with sortby): `next_cursor.sort_value` of the previous page, "
-    "sent with cursor_acc."
+    "Sorted paging: previous `next_cursor.sort_value` (pair with cursor_acc)."
 )
-_OFFSET_DOC = "Rows to skip, an alternative to the cursors."
-_SORTBY_DOC = (
-    "Replaces relevance order; year is the release date. Use only when the user "
-    "asks for newest, oldest, most cited or by journal."
-)
-_ORDER_DOC = "Sort direction for sortby."
-_LIMIT_DOC = f"Rows per page, 1-{SEARCH_PAGE_SIZE}. Default {SEARCH_PAGE_SIZE}."
-_FIELDS_DOC = (
-    "compact: core fields with the summary cut to 300 characters; full: every "
-    "field, with publications and submitter."
-)
+_OFFSET_DOC = "Rows to skip."
+_SORTBY_DOC = "Replaces relevance order (year = release date); use only for newest/oldest/most-cited."
+_ORDER_DOC = "Sort direction."
+_LIMIT_DOC = f"Rows per page (1-{SEARCH_PAGE_SIZE}). Default {SEARCH_PAGE_SIZE}."
+_FIELDS_DOC = "compact: core fields, 300-char summary; full: all fields."
 _ORGANISM_DOC = "Exact scientific name, e.g. Homo sapiens (case-insensitive)."
 _LIBRARY_STRATEGY_DOC = (
-    "Library strategies (RNA-Seq, ChIP-Seq, WGS, ...); a study matches any of "
-    "them. Values: list_library_strategies."
+    "Library strategies (RNA-Seq, ChIP-Seq, WGS, ...); see list_filter_values."
 )
-_INSTRUMENT_DOC = "Exact instrument models, e.g. Illumina NovaSeq 6000. Values: list_instrument_models."
-_PLATFORM_DOC = "Platform codes such as ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT."
+_INSTRUMENT_DOC = (
+    "Exact instrument model (e.g. Illumina NovaSeq 6000); see list_filter_values."
+)
+_PLATFORM_DOC = "Platform code (ILLUMINA, OXFORD_NANOPORE, PACBIO_SMRT, ...)."
 _MULTI_PLATFORM_DOC = "Only studies with 2+ sequencing platforms."
-_YEAR_FROM_DOC = "Lower bound on the release year (first public), inclusive."
-_YEAR_TO_DOC = "Upper bound on the release year (first public), inclusive."
-_DATE_FROM_DOC = (
-    "YYYY-MM-DD; lower bound on the release date (first public). Overrides year_from."
-)
-_DATE_TO_DOC = (
-    "YYYY-MM-DD; upper bound on the release date (first public). Overrides year_to."
-)
-_COUNT_BY_DOC = "Return bucket counts instead of rows; year buckets the release year."
-_GEO_DOC = "Submitter location from unified_metadata (case-insensitive exact match)."
+_YEAR_FROM_DOC = "Min release year (inclusive)."
+_YEAR_TO_DOC = "Max release year (inclusive)."
+_DATE_FROM_DOC = "Min release date YYYY-MM-DD (overrides year_from)."
+_DATE_TO_DOC = "Max release date YYYY-MM-DD (overrides year_to)."
+_COUNT_BY_DOC = "Return bucket counts instead of rows (year = release year)."
+_GEO_DOC = "Submitter location (case-insensitive exact match)."
 _FILTERED_RETRY = "Retry with a more specific q or narrower filters."
 _STRUCTURED_RETRY = (
     "Retry without the slowest filter (sample_*, geo_*, center), or use "
@@ -2984,32 +3025,68 @@ _STRUCTURED_RETRY = (
 
 
 def _check_cursor_sort(
-    sortby: str | None, cursor_sort: str, cursor_acc: str | None
+    sortby: str | None, cursor_sort: str, cursor_acc: str | None, label: str = "sortby"
 ) -> None:
     """400 on a sort cursor the sort column cannot cast, instead of a SQL error."""
     if not sortby or cursor_acc is None:
         raise HTTPException(400, "cursor_sort needs sortby and cursor_acc")
     try:
-        if sortby == "year":
+        if sortby in ("year", "pub_date"):
             date.fromisoformat(cursor_sort)
-        elif sortby == "citations":
+        elif sortby in ("citations", "n_samples", "n_experiments"):
             int(cursor_sort)
     except ValueError:
         raise HTTPException(
-            400, f"cursor_sort {cursor_sort!r} does not fit sortby={sortby}"
+            400, f"cursor_sort {cursor_sort!r} does not fit {label}={sortby}"
         )
+
+
+def _require_cursor_pair(name: str, cursor, cursor_acc: str | None) -> None:
+    if (cursor is None) != (cursor_acc is None):
+        raise HTTPException(
+            400, f"{name} and cursor_acc must both be provided together"
+        )
+
+
+def _boolean_tsq(
+    q: str | None, *, force: bool = False, expand: bool = True
+) -> str | None:
+    """tsquery text of a boolean q, or None when q is plain or nothing survives."""
+    if not q or not (force or is_boolean_query(q)):
+        return None
+    return to_tsquery_string(replace_query_hyphens(q, expand=expand)) or None
 
 
 def _first_page(*cursors) -> bool:
     return all(c is None for c in cursors)
 
 
-_ENRICHED_SEARCH_TIMEOUT = "60s"  # test_mcp_timeout.py lowers it
+_SEARCH_TIMEOUT_S = 60
+_SEARCH_STATEMENT_TIMEOUT = f"{_SEARCH_TIMEOUT_S}s"  # test_mcp_timeout.py lowers it
+
+
+def _set_search_timeout(cur) -> None:
+    """Needs an open transaction: the pool is autocommit."""
+    cur.execute(f"SET LOCAL statement_timeout = '{_SEARCH_STATEMENT_TIMEOUT}'")
 
 
 def _timeout_detail(hint: str, seconds: int | None = None) -> str:
     seconds = seconds or int(_DEFAULT_STATEMENT_TIMEOUT.rstrip("s"))
     return f"Timed out after {seconds} s. This is not an empty result. {hint}"
+
+
+@contextlib.contextmanager
+def _db_errors(label: str, hint: str, seconds: int | None = None):
+    """Map a statement timeout to 504 and any other database error to 500."""
+    try:
+        yield
+    except HTTPException:
+        raise
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail(hint, seconds))
+    except Exception:
+        logger.exception("Database error in %s", label)
+        raise HTTPException(500, "Internal server error")
 
 
 # X-Search-Total/X-Search-Expansion feed the Nginx log contract; threadpool
@@ -4393,10 +4470,7 @@ if os.path.exists(_platform_csv):
 @api_app.get(
     "/stats/platform-totals",
     summary="Total experiments per platform",
-    description=(
-        "Return total experiment counts per sequencing platform across databases. "
-        "Also available at /platforms."
-    ),
+    description="Return total experiment counts per sequencing platform across databases.",
     operation_id="get_platform_totals",
 )
 @limiter.limit("20/minute")
@@ -4608,15 +4682,12 @@ def get_platform_filters(
             }
 
     t0 = time.perf_counter()
-    try:
-        with pool.connection() as conn:
+    with _db_errors("get_platform_filters", _FILTERED_RETRY, 30):
+        with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SET LOCAL statement_timeout = '30s'")
                 cur.execute(PLATFORM_FILTERS_SQL, (platform,))
                 rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_platform_filters")
-        raise HTTPException(500, "Internal server error")
 
     organisms = []
     assays = []
@@ -4676,11 +4747,11 @@ def search_geo(
 def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
     start = time.perf_counter()
 
-    try:
-        with pool.connection() as conn:
-            q_variants = _search_query_variants(q, disabled)
+    with _db_errors("search_geo", _FILTERED_RETRY, _SEARCH_TIMEOUT_S):
+        q_variants = _search_query_variants(q, disabled)
+        with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET LOCAL statement_timeout = '60s'")
+                _set_search_timeout(cur)
                 rows = _run_search(
                     cur,
                     GEO_SEARCH_SQL,
@@ -4688,11 +4759,6 @@ def _search_geo_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     q,
                 )
                 _enrich_page(rows, cur)
-    except QueryCanceled:
-        raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
-    except Exception:
-        logger.exception("Database error in search_geo")
-        raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
     return {
@@ -4735,11 +4801,11 @@ def search_sra(
 def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=()):
     start = time.perf_counter()
 
-    try:
-        with pool.connection() as conn:
-            q_variants = _search_query_variants(q, disabled)
+    with _db_errors("search_sra", _FILTERED_RETRY, _SEARCH_TIMEOUT_S):
+        q_variants = _search_query_variants(q, disabled)
+        with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET LOCAL statement_timeout = '60s'")
+                _set_search_timeout(cur)
                 rows = _run_search(
                     cur,
                     SRA_SEARCH_SQL,
@@ -4747,11 +4813,6 @@ def _search_sra_impl(request, q, cursor_rank, cursor_acc, offset=None, disabled=
                     q,
                 )
                 _enrich_page(rows, cur)
-    except QueryCanceled:
-        raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
-    except Exception:
-        logger.exception("Database error in search_sra")
-        raise HTTPException(500, "Internal server error")
 
     took_ms = (time.perf_counter() - start) * 1000
     return {
@@ -5080,7 +5141,7 @@ def search_highlight(
     structured: bool = Query(
         False,
         description="Mark only the words as typed, no ontology synonyms — the "
-        "highlight twin of /search's structured mode.",
+        "highlight twin of search_all's structured mode.",
     ),
     exclude_ontology: list[str] | None = Query(None, description=_EXCLUDE_ONTOLOGY_DOC),
 ):
@@ -5216,6 +5277,7 @@ def _autocorrect_search(request, result, original_q, user_boolean, rerun):
     result["results"] = corrected["results"]
     for key in ("total", "total_is_known", "has_more", "next_cursor"):
         result[key] = corrected.get(key)
+    # later pages still serve the corrected stream; only page 1 carries the notice
     first_page = _first_page(
         rerun["offset"], rerun["cursor_rank"], rerun["cursor_acc"], rerun["cursor_sort"]
     )
@@ -5278,7 +5340,8 @@ def search(
     ),
     organism: str | None = Query(None, description=_ORGANISM_DOC),
     country: list[str] | None = Query(
-        None, description="Country names; a study matches any of them."
+        None,
+        description="Country names or ISO-2 codes (e.g. India, IN, USA, US); a study matches any of them.",
     ),
     library_strategy: list[str] | None = Query(None, description=_LIBRARY_STRATEGY_DOC),
     library_source: list[str] | None = Query(
@@ -5303,6 +5366,14 @@ def search(
         raise HTTPException(400, "date_from must be <= date_to")
     if cursor_sort is not None:
         _check_cursor_sort(sortby, cursor_sort, cursor_acc)
+    if cursor_rank is not None:
+        if sortby:
+            raise HTTPException(
+                400,
+                "With sortby, paginate with cursor_sort and cursor_acc (not cursor_rank)",
+            )
+        if cursor_acc is None:
+            raise HTTPException(400, "cursor_rank requires cursor_acc")
 
     def run():
         return _search_impl(
@@ -5409,12 +5480,8 @@ def _search_impl(
     # Neo4j expansion, no spelling correction. Works across filters, sort, and db
     # scope. tsq == "" means nothing usable survived translation (e.g. a lone "*"),
     # so treat it as an ordinary query.
-    boolean_tsq = None
     user_boolean = bool(q) and is_boolean_query(q)
-    if q and (structured or user_boolean):
-        _tsq = to_tsquery_string(replace_query_hyphens(q, expand=not structured))
-        if _tsq:
-            boolean_tsq = _tsq
+    boolean_tsq = _boolean_tsq(q, force=structured, expand=not structured)
 
     # Sidebar-filtered search: server-side filters, paginated over the same match
     # set as the facets so list and counts agree. Honors sortby (default
@@ -5477,9 +5544,9 @@ def _search_impl(
     if boolean_tsq is not None:
         start = time.perf_counter()
         try:
-            with pool.connection() as conn:
+            with pool.connection() as conn, conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     # No _run_search: its trailing-prefix fallback rewrites a
                     # plainto core_q and would corrupt a to_tsquery.
                     if sortby:
@@ -5515,7 +5582,9 @@ def _search_impl(
         except PgSyntaxError:
             raise HTTPException(400, "could not parse boolean query")
         except QueryCanceled:
-            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
+            raise HTTPException(
+                504, _timeout_detail(_FILTERED_RETRY, _SEARCH_TIMEOUT_S)
+            )
         except Exception:
             logger.exception("Database error in search (boolean)")
             raise HTTPException(500, "Internal server error")
@@ -5527,31 +5596,33 @@ def _search_impl(
                 sorted_page=bool(sortby),
                 first_page=first_page,
                 offset=offset,
-                total=sql_total(rows) if sortby else None,
+                total=sql_total(rows, first_page=first_page) if sortby else None,
             ),
             "took_ms": round(took_ms, 2),
         }
     elif sortby:
         start = time.perf_counter()
         try:
-            with pool.connection() as conn:
-                q_variants = _search_query_variants(q, exclude_ontology or ())
-                sql, params = build_sorted_search_sql(
-                    q=q,
-                    q_variants=q_variants,
-                    sortby=sortby,
-                    order=order,
-                    db=db,
-                    cursor_sort=cursor_sort,
-                    cursor_acc=cursor_acc,
-                    offset=offset,
-                )
+            q_variants = _search_query_variants(q, exclude_ontology or ())
+            sql, params = build_sorted_search_sql(
+                q=q,
+                q_variants=q_variants,
+                sortby=sortby,
+                order=order,
+                db=db,
+                cursor_sort=cursor_sort,
+                cursor_acc=cursor_acc,
+                offset=offset,
+            )
+            with pool.connection() as conn, conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     rows = _run_search(cur, sql, params, q)
                     _enrich_page(rows, cur)
         except QueryCanceled:
-            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
+            raise HTTPException(
+                504, _timeout_detail(_FILTERED_RETRY, _SEARCH_TIMEOUT_S)
+            )
         except Exception:
             logger.exception("Database error in search (sorted)")
             raise HTTPException(500, "Internal server error")
@@ -5563,7 +5634,7 @@ def _search_impl(
                 sorted_page=True,
                 first_page=first_page,
                 offset=offset,
-                total=sql_total(rows),
+                total=sql_total(rows, first_page=first_page),
             ),
             "took_ms": round(took_ms, 2),
         }
@@ -5578,10 +5649,10 @@ def _search_impl(
     elif db in _SEARCH_SQL_BY_DB:
         start = time.perf_counter()
         try:
-            with pool.connection() as conn:
-                q_variants = _search_query_variants(q, exclude_ontology or ())
+            q_variants = _search_query_variants(q, exclude_ontology or ())
+            with pool.connection() as conn, conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     rows = _run_search(
                         cur,
                         _SEARCH_SQL_BY_DB[db],
@@ -5590,7 +5661,9 @@ def _search_impl(
                     )
                     _enrich_page(rows, cur)
         except QueryCanceled:
-            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
+            raise HTTPException(
+                504, _timeout_detail(_FILTERED_RETRY, _SEARCH_TIMEOUT_S)
+            )
         except Exception:
             logger.exception("Database error in search_%s", db)
             raise HTTPException(500, "Internal server error")
@@ -5605,11 +5678,11 @@ def _search_impl(
     else:
         start = time.perf_counter()
 
-        try:
-            with pool.connection() as conn:
-                q_variants = _search_query_variants(q, exclude_ontology or ())
+        with _db_errors("search", _FILTERED_RETRY, _SEARCH_TIMEOUT_S):
+            q_variants = _search_query_variants(q, exclude_ontology or ())
+            with pool.connection() as conn, conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     rows = _run_search(
                         cur,
                         SEARCH_SQL,
@@ -5624,11 +5697,6 @@ def _search_impl(
                         q,
                     )
                     _enrich_page(rows, cur)
-        except QueryCanceled:
-            raise HTTPException(504, _timeout_detail(_FILTERED_RETRY))
-        except Exception:
-            logger.exception("Database error in search")
-            raise HTTPException(500, "Internal server error")
 
         took_ms = (time.perf_counter() - start) * 1000
         result = {
@@ -5680,7 +5748,7 @@ def _search_filtered(
             # SET LOCAL is transaction-scoped, so it auto-resets when this block
             # ends (even on timeout) and never leaks into the pooled connection.
             if query_less:
-                conn.execute("SET LOCAL statement_timeout = '60s'")
+                _set_search_timeout(conn)
             if boolean_tsq:
                 fts_q, q_variants = boolean_tsq, [boolean_tsq]
             else:
@@ -5708,7 +5776,8 @@ def _search_filtered(
         raise HTTPException(400, "could not parse boolean query")
     except QueryCanceled:
         raise HTTPException(
-            504, _timeout_detail(_FILTERED_RETRY, 60 if query_less else None)
+            504,
+            _timeout_detail(_FILTERED_RETRY, _SEARCH_TIMEOUT_S if query_less else None),
         )
     except Exception:
         logger.exception("Database error in filtered search")
@@ -5768,7 +5837,7 @@ def _compute_search_facets(
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Match /search's ceiling so broad-query totals materialize
                     # instead of dying on the pool default.
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     # Single FTS pass: materialize the match set, then reuse it.
                     msql, mparams = build_search_match_temp(
                         q=structured_tsq or q,
@@ -6088,7 +6157,7 @@ def get_search_investigators(
                 with conn.cursor(row_factory=dict_row) as cur:
                     # Broad queries need the same
                     # ceiling as /search/facets; the pool default is short.
-                    cur.execute("SET LOCAL statement_timeout = '60s'")
+                    _set_search_timeout(cur)
                     msql, mparams = build_search_match_temp(
                         q=boolean_tsq or nq,
                         q_variants=(
@@ -6111,6 +6180,8 @@ def get_search_investigators(
                     rows = cur.fetchall()
     except PgSyntaxError:
         raise HTTPException(400, "could not parse boolean query")
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail(_FILTERED_RETRY, _SEARCH_TIMEOUT_S))
     except Exception:
         logger.exception("Database error in get_search_investigators")
         raise HTTPException(500, "Internal server error")
@@ -6299,9 +6370,7 @@ def get_project(
     response.headers["Cache-Control"] = (
         _PROJECT_CACHE_CONTROL if ENRICHMENT_ENABLED else "no-store"
     )
-    if not include_neighbors:
-        for key in ("neighbors", "coords_2d", "coords_3d"):
-            row.pop(key, None)
+    _strip_project_neighbors(row, not include_neighbors)
     return row
 
 
@@ -6403,10 +6472,14 @@ def get_study_experiments(
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    envelope: bool = Query(
+        False,
+        description="Wrap the rows with total, count, offset, has_more and next_offset.",
+    ),
 ):
     study = study.upper()
     _reject_gea_study(study)
-    try:
+    with _db_errors("get_study_experiments", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 study = _canonical_study(cur, study)
@@ -6418,11 +6491,14 @@ def get_study_experiments(
                 result = _fetch_study_experiments(
                     cur, study, limit=limit, offset=offset, source=source
                 )
-    except Exception:
-        logger.exception("Database error in get_study_experiments")
-        raise HTTPException(500, "Internal server error")
     response.headers["X-Total-Count"] = str(total)
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    if envelope:
+        return {
+            "study_accession": study,
+            **_offset_page(total, len(result), offset),
+            "experiments": result,
+        }
     return result
 
 
@@ -6479,9 +6555,11 @@ def get_study_samples(
     request: Request,
     response: Response,
     study: str = Path(..., pattern=STUDY_EXPERIMENTS_REGEX),
+    limit: int | None = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     study = study.upper()
-    try:
+    with _db_errors("get_study_samples", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if study.startswith("PRJ"):
@@ -6497,13 +6575,14 @@ def get_study_samples(
                 else:
                     cur.execute(STUDY_SAMPLES_SRA_SQL, (study,))
                 rows = cur.fetchall()
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_study_samples")
-        raise HTTPException(500, "Internal server error")
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    return {"study_accession": study, "total": len(rows), "samples": rows}
+    total = len(rows)
+    page = rows[offset : offset + limit] if limit is not None else rows[offset:]
+    return {
+        "study_accession": study,
+        **_offset_page(total, len(page), offset),
+        "samples": page,
+    }
 
 
 _URL_SCHEMES = ("http://", "https://", "ftp://", "s3://", "gs://")
@@ -6836,7 +6915,9 @@ def get_study_runs(
         preview_sql = GSA_STUDY_RUNS_PREVIEW_SQL if is_gsa else STUDY_RUNS_PREVIEW_SQL
     # Both the GSA SQL and the (single-%s) standard resolve-CTE take one param.
     params = (study,)
-    try:
+    with _db_errors(
+        "get_study_runs", "Use get_study_download_manifest with a smaller limit."
+    ):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(summary_sql, params)
@@ -6852,9 +6933,6 @@ def get_study_runs(
 
                 cur.execute(preview_sql, params)
                 rows = _annotate_run_downloads(cur.fetchall())
-    except Exception:
-        logger.exception("Database error in get_study_runs")
-        raise HTTPException(500, "Internal server error")
 
     return {
         "total_runs": summary["total_runs"],
@@ -7055,17 +7133,7 @@ def get_experiment(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SRA_EXPERIMENT_SQL, (accession,))
-                experiment = cur.fetchone()
-                if not experiment:
-                    cur.execute(ENA_EXPERIMENT_SQL, (accession,))
-                    experiment = cur.fetchone()
-                if not experiment:
-                    cur.execute(GSA_EXPERIMENT_SQL, (accession,))
-                    experiment = cur.fetchone()
-                if not experiment:
-                    cur.execute(DRA_EXPERIMENT_SQL, (accession,))
-                    experiment = cur.fetchone()
+                experiment, _ = _fetch_experiment(cur, accession)
                 if experiment:
                     cur.execute(EXPERIMENT_RUNS_SQL, (accession,))
                     experiment["runs"] = _annotate_run_downloads(cur.fetchall())
@@ -7455,6 +7523,58 @@ def download_study_metadata_csv(
     )
 
 
+def _get_project_metadata_rows_data(accession: str, limit: int, cursor: int) -> dict:
+    accession = accession.upper()
+    with _db_errors("get_project_metadata_rows", "Retry with a smaller limit."):
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if accession.startswith("GSE"):
+                    rows = flatten_geo_series(cur, accession)
+                    source = "geo"
+                elif accession.startswith("E-GEAD-"):
+                    # Before the E- branch: GEAD is four letters, so E-GEAD-N
+                    # also matches ArrayExpress E-XXXX-N shape.
+                    rows = flatten_gea_experiment(cur, accession)
+                    source = "gea"
+                elif accession.startswith("E-"):
+                    rows = flatten_ae_experiment(cur, accession)
+                    source = "arrayexpress"
+                else:
+                    exp_map, sample_map, sample_attrs = _prepare_study_metadata(
+                        cur, accession
+                    )
+                    is_gsa = _is_gsa_study(accession)
+                    cur.execute(
+                        GSA_STUDY_RUNS_SQL if is_gsa else STUDY_RUNS_SQL, (accession,)
+                    )
+                    rows = []
+                    while True:
+                        batch = cur.fetchmany(500)
+                        if not batch:
+                            break
+                        rows.extend(
+                            _study_metadata_row(
+                                accession, run, exp_map, sample_map, sample_attrs
+                            )
+                            for run in batch
+                        )
+                        if len(rows) >= MAX_METADATA_ROWS:
+                            break
+                    if not rows and accession.startswith("PRJ"):
+                        rows = flatten_sra_study(cur, accession)
+                    if is_gsa:
+                        source = "gsa"
+                    elif accession.startswith("PRJ"):
+                        source = "ena"
+                    else:
+                        source = "sra"
+
+    truncated = len(rows) >= MAX_METADATA_ROWS
+    if truncated:
+        rows = rows[:MAX_METADATA_ROWS]
+    return _rows_response(accession, source, rows, cursor, limit, truncated=truncated)
+
+
 @api_app.get(
     "/project/{accession}/metadata/rows",
     summary="Get project metadata rows as JSON",
@@ -7474,57 +7594,7 @@ def get_project_metadata_rows(
     limit: int = Query(500, ge=1, le=1000),
     cursor: int = Query(0, ge=0),
 ):
-    accession = accession.upper()
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                if accession.startswith("GSE"):
-                    rows = flatten_geo_series(cur, accession)
-                    source = "geo"
-                elif accession.startswith("E-GEAD-"):
-                    # Before the E- branch: GEAD is four letters, so E-GEAD-N
-                    # also matches ArrayExpress E-XXXX-N shape.
-                    rows = flatten_gea_experiment(cur, accession)
-                    source = "gea"
-                elif accession.startswith("E-"):
-                    rows = flatten_ae_experiment(cur, accession)
-                    source = "arrayexpress"
-                else:
-                    exp_map, sample_map, sample_attrs = _prepare_study_metadata(
-                        cur, accession
-                    )
-                    cur.execute(STUDY_RUNS_SQL, (accession,))
-                    rows = []
-                    while True:
-                        batch = cur.fetchmany(500)
-                        if not batch:
-                            break
-                        rows.extend(
-                            _study_metadata_row(
-                                accession, run, exp_map, sample_map, sample_attrs
-                            )
-                            for run in batch
-                        )
-                        if len(rows) >= MAX_METADATA_ROWS:
-                            break
-                    if not rows and accession.startswith("PRJ"):
-                        rows = flatten_sra_study(cur, accession)
-                    if _is_gsa_study(accession):
-                        source = "gsa"
-                    elif accession.startswith("PRJ"):
-                        source = "ena"
-                    else:
-                        source = "sra"
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_project_metadata_rows")
-        raise HTTPException(500, "Internal server error")
-
-    truncated = len(rows) >= MAX_METADATA_ROWS
-    if truncated:
-        rows = rows[:MAX_METADATA_ROWS]
-    return _rows_response(accession, source, rows, cursor, limit, truncated=truncated)
+    return _get_project_metadata_rows_data(accession, limit, cursor)
 
 
 def _rows_response(
@@ -7554,25 +7624,9 @@ def _rows_response(
     }
 
 
-@api_app.get(
-    "/experiment/{accession}/metadata/rows",
-    summary="Get experiment metadata rows as JSON",
-    description=(
-        "Return per-run JSON metadata rows for a single SRA/ENA experiment "
-        "(SRX/ERX/DRX), in the same row format as /project/{accession}/metadata/rows "
-        "but scoped to this experiment's runs."
-    ),
-    operation_id="get_experiment_metadata_rows",
-)
-@limiter.limit("100/minute")
-def get_experiment_metadata_rows(
-    request: Request,
-    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
-    limit: int = Query(500, ge=1, le=1000),
-    cursor: int = Query(0, ge=0),
-):
+def _get_experiment_metadata_rows_data(accession: str, limit: int, cursor: int) -> dict:
     accession = accession.upper()
-    try:
+    with _db_errors("get_experiment_metadata_rows", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 ctx = _build_exp_context(cur, accession)
@@ -7591,31 +7645,33 @@ def get_experiment_metadata_rows(
                     )
                     for run in cur.fetchall()
                 ]
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_experiment_metadata_rows")
-        raise HTTPException(500, "Internal server error")
 
     return _rows_response(accession, ctx["source"], rows, cursor, limit)
 
 
 @api_app.get(
-    "/run/{run}/metadata/rows",
-    summary="Get run metadata row as JSON",
+    "/experiment/{accession}/metadata/rows",
+    summary="Get experiment metadata rows as JSON",
     description=(
-        "Return the single JSON metadata row for one run accession (SRR/ERR/DRR), "
-        "in the same row format as /project/{accession}/metadata/rows."
+        "Return per-run JSON metadata rows for a single SRA/ENA experiment "
+        "(SRX/ERX/DRX), in the same row format as /project/{accession}/metadata/rows "
+        "but scoped to this experiment's runs."
     ),
-    operation_id="get_run_metadata_rows",
+    operation_id="get_experiment_metadata_rows",
 )
-@limiter.limit("1000/minute")
-def get_run_metadata_rows(
+@limiter.limit("100/minute")
+def get_experiment_metadata_rows(
     request: Request,
-    run: str = Path(..., pattern=RUN_REGEX),
+    accession: str = Path(..., pattern=EXPERIMENT_REGEX),
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
 ):
+    return _get_experiment_metadata_rows_data(accession, limit, cursor)
+
+
+def _get_run_metadata_rows_data(run: str) -> dict:
     run = run.upper()
-    try:
+    with _db_errors("get_run_metadata_rows", "Retry shortly."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(RUN_DOWNLOAD_SQL, (run,))
@@ -7637,13 +7693,50 @@ def get_run_metadata_rows(
                 row = _study_metadata_row(
                     study, run_row, exp_map, sample_map, sample_attrs
                 )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_run_metadata_rows")
-        raise HTTPException(500, "Internal server error")
 
     return _rows_response(run, source, [row], 0, 1)
+
+
+@api_app.get(
+    "/run/{run}/metadata/rows",
+    summary="Get run metadata row as JSON",
+    description=(
+        "Return the single JSON metadata row for one run accession (SRR/ERR/DRR), "
+        "in the same row format as /project/{accession}/metadata/rows."
+    ),
+    operation_id="get_run_metadata_rows",
+)
+@limiter.limit("1000/minute")
+def get_run_metadata_rows(
+    request: Request,
+    run: str = Path(..., pattern=RUN_REGEX),
+):
+    return _get_run_metadata_rows_data(run)
+
+
+@api_app.get(
+    "/metadata/{accession}/rows",
+    summary="Get flattened metadata rows for any project, experiment or run",
+    description=(
+        "Return paginated raw flattened JSON metadata rows for a project (GSE, "
+        "SRP/ERP/DRP, PRJ*, CRA/HRA, E-XXXX-N, E-GEAD-N), experiment (SRX/ERX/DRX), "
+        "or run (SRR/ERR/DRR)."
+    ),
+    operation_id="get_metadata_rows",
+)
+@limiter.limit("100/minute")
+def get_metadata_rows(
+    request: Request,
+    accession: str = Path(..., pattern=METADATA_ENTITY_REGEX),
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: int = Query(0, ge=0),
+):
+    acc = accession.upper()
+    if re.fullmatch(RUN_REGEX, acc):
+        return _get_run_metadata_rows_data(acc)
+    if re.fullmatch(EXPERIMENT_REGEX, acc):
+        return _get_experiment_metadata_rows_data(acc, limit, cursor)
+    return _get_project_metadata_rows_data(acc, limit, cursor)
 
 
 _DOWNLOAD_HELPER = r"""# Verify file integrity.
@@ -7892,23 +7985,27 @@ def _prepare_study_metadata(cur, study: str) -> tuple[dict, dict, dict]:
     return exp_map, sample_map, sample_attrs
 
 
+def _fetch_experiment(cur, accession: str) -> tuple[dict | None, str | None]:
+    """Experiment row and the archive that holds it; SRA is tried first."""
+    for sql, source in (
+        (SRA_EXPERIMENT_SQL, "sra"),
+        (ENA_EXPERIMENT_SQL, "ena"),
+        (GSA_EXPERIMENT_SQL, "gsa"),
+        (DRA_EXPERIMENT_SQL, "dra"),
+    ):
+        cur.execute(sql, (accession,))
+        if exp := cur.fetchone():
+            return exp, source
+    return None, None
+
+
 def _build_exp_context(cur, accession: str) -> dict | None:
-    """Build the per-run metadata context for a single SRA/ENA experiment.
+    """Build the per-run metadata context for a single experiment.
 
     Returns {study, source, exp_map, sample_map, sample_attrs} ready for
     _study_metadata_row(), or None if the experiment is unknown.
     """
-    cur.execute(SRA_EXPERIMENT_SQL, (accession,))
-    exp = cur.fetchone()
-    source = "sra"
-    if not exp:
-        cur.execute(ENA_EXPERIMENT_SQL, (accession,))
-        exp = cur.fetchone()
-        source = "ena"
-    if not exp:
-        cur.execute(GSA_EXPERIMENT_SQL, (accession,))
-        exp = cur.fetchone()
-        source = "gsa"
+    exp, source = _fetch_experiment(cur, accession)
     if not exp:
         return None
 
@@ -8034,6 +8131,7 @@ def get_study_download_manifest(
     cursor: int = Query(0, ge=0),
 ):
     study = study.upper()
+    _reject_gea_runs(study, "get_supplementary_files")
     cfg = _DOWNLOAD_MODES.get(mode)
     if not cfg:
         raise HTTPException(400, f"Invalid mode: {mode}")
@@ -8046,13 +8144,17 @@ def get_study_download_manifest(
     seen = 0
     has_more = False
     summary: dict = {}
+    is_gsa = _is_gsa_study(study)
 
-    try:
+    with _db_errors("get_study_download_manifest", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SUMMARY_SQL, (study,))
+                cur.execute(
+                    GSA_STUDY_RUNS_SUMMARY_SQL if is_gsa else STUDY_RUNS_SUMMARY_SQL,
+                    (study,),
+                )
                 summary = cur.fetchone() or {}
-                cur.execute(STUDY_RUNS_SQL, (study,))
+                cur.execute(GSA_STUDY_RUNS_SQL if is_gsa else STUDY_RUNS_SQL, (study,))
                 while True:
                     batch = cur.fetchmany(500)
                     if not batch:
@@ -8095,9 +8197,6 @@ def get_study_download_manifest(
                             break
                     if has_more:
                         break
-    except Exception:
-        logger.exception("Database error in get_study_download_manifest")
-        raise HTTPException(500, "Internal server error")
 
     return {
         "study_accession": study,
@@ -8131,6 +8230,7 @@ def download_study_script(
     mode: str = Path(..., pattern=_DOWNLOAD_MODE_REGEX),
 ):
     study = study.upper()
+    _reject_gea_runs(study, "download_supplementary_script")
     cfg = _DOWNLOAD_MODES.get(mode)
     if not cfg:
         raise HTTPException(400, f"Invalid mode: {mode}")
@@ -8140,6 +8240,7 @@ def download_study_script(
     bytes_key = cfg.get("bytes_key")
     method = cfg["method"]
     label = cfg["label"]
+    is_gsa = _is_gsa_study(study)
 
     lines: list[str] = []
     expected_paths: list[str] = []
@@ -8151,7 +8252,7 @@ def download_study_script(
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(STUDY_RUNS_SQL, (study,))
+                cur.execute(GSA_STUDY_RUNS_SQL if is_gsa else STUDY_RUNS_SQL, (study,))
                 while True:
                     batch = cur.fetchmany(500)
                     if not batch:
@@ -8208,6 +8309,11 @@ def download_study_script(
                             download_count += 1
                             if mode == "fastq" and entry.get("fastq_is_interleaved"):
                                 interleaved_direct_count += 1
+    except QueryCanceled:
+        raise HTTPException(
+            504,
+            _timeout_detail("Use get_study_download_manifest with a smaller limit."),
+        )
     except Exception:
         logger.exception("Error generating download script for %s", study)
         raise HTTPException(500, "Internal error generating download script")
@@ -8508,8 +8614,9 @@ def get_sample(
     except Exception:
         logger.exception("Database error in get_sample")
         raise HTTPException(500, "Internal server error")
-    if sample:
-        response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    if not sample:
+        raise HTTPException(404, f"Sample not found: {accession}")
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
     return sample
 
 
@@ -8518,7 +8625,33 @@ SAMPLE_DETAIL_REGEX = (
 )
 
 
-def _resolve_sample_detail(cur, accession: str) -> dict:
+def _offset_page(total: int, count: int, offset: int) -> dict:
+    has_more = offset + count < total
+    return {
+        "total": total,
+        "count": count,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": offset + count if has_more else None,
+    }
+
+
+def _strip_project_neighbors(project: dict | None, slim: bool) -> None:
+    if slim and project:
+        for key in ("neighbors", "coords_2d", "coords_3d"):
+            project.pop(key, None)
+
+
+def _parent_project(cur, accession: str, slim: bool) -> dict | None:
+    project = _fetch_project_row(cur, accession.upper(), slim=slim)
+    if project:
+        _enrich_with_publications([project], cur)
+        _strip_project_neighbors(project, slim)
+    _attach_library_strategies(project, accession, cur)
+    return project
+
+
+def _resolve_sample_detail(cur, accession: str, *, slim: bool = False) -> dict:
     """Resolve any sample/experiment accession to full detail.
 
     Returns a dict with:
@@ -8542,11 +8675,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
             raise HTTPException(404, f"No parent series found for {acc}")
 
         series_acc = series_row["accession"]
-        cur.execute(PROJECT_GEO_SQL, (series_acc,))
-        project = cur.fetchone()
-        if project:
-            _enrich_with_publications([project], cur)
-        _attach_library_strategies(project, series_acc, cur)
+        project = _parent_project(cur, series_acc, slim)
 
         result = {
             "sample_type": "geo_sample",
@@ -8559,14 +8688,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         return result
 
     if EXPERIMENT_PATTERN.match(acc) or GSA_EXPERIMENT_PATTERN.match(acc):
-        cur.execute(SRA_EXPERIMENT_SQL, (acc,))
-        experiment = cur.fetchone()
-        if not experiment:
-            cur.execute(ENA_EXPERIMENT_SQL, (acc,))
-            experiment = cur.fetchone()
-        if not experiment:
-            cur.execute(GSA_EXPERIMENT_SQL, (acc,))
-            experiment = cur.fetchone()
+        experiment, _ = _fetch_experiment(cur, acc)
         if not experiment:
             raise HTTPException(404, f"Experiment not found: {acc}")
 
@@ -8574,16 +8696,7 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
         if not study_acc:
             raise HTTPException(404, f"No parent study found for {acc}")
 
-        if study_acc.startswith(("CRA", "HRA")):
-            cur.execute(PROJECT_GSA_SQL, (study_acc,))
-        elif study_acc.startswith("PRJ"):
-            cur.execute(PROJECT_ENA_SQL, (study_acc,))
-        else:
-            cur.execute(PROJECT_SRA_SQL, (study_acc,))
-        project = cur.fetchone()
-        if project:
-            _enrich_with_publications([project], cur)
-        _attach_library_strategies(project, study_acc, cur)
+        project = _parent_project(cur, study_acc, slim)
 
         sample = None
         samples_list = experiment.get("samples") or []
@@ -8607,35 +8720,22 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     if not sample:
         raise HTTPException(404, f"Sample not found: {acc}")
 
-    cur.execute(SRA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
-    exp_row = cur.fetchone()
     experiment = None
     runs = []
-
-    if exp_row:
-        exp_acc = exp_row["accession"]
-        cur.execute(SRA_EXPERIMENT_SQL, (exp_acc,))
-        experiment = cur.fetchone()
-        cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
-        runs = _annotate_run_downloads(cur.fetchall())
-    else:
-        cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
-        exp_row = cur.fetchone()
-        if exp_row:
-            exp_acc = exp_row["experiment_accession"]
-            cur.execute(ENA_EXPERIMENT_SQL, (exp_acc,))
+    for to_exp_sql, key, exp_sql in (
+        (SRA_SAMPLE_TO_EXPERIMENT_SQL, "accession", SRA_EXPERIMENT_SQL),
+        (ENA_SAMPLE_TO_EXPERIMENT_SQL, "experiment_accession", ENA_EXPERIMENT_SQL),
+        (GSA_SAMPLE_TO_EXPERIMENT_SQL, "experiment_accession", GSA_EXPERIMENT_SQL),
+        (DRA_SAMPLE_TO_EXPERIMENT_SQL, "accession", DRA_EXPERIMENT_SQL),
+    ):
+        cur.execute(to_exp_sql, (acc,))
+        if exp_row := cur.fetchone():
+            exp_acc = exp_row[key]
+            cur.execute(exp_sql, (exp_acc,))
             experiment = cur.fetchone()
             cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
             runs = _annotate_run_downloads(cur.fetchall())
-        else:
-            cur.execute(GSA_SAMPLE_TO_EXPERIMENT_SQL, (acc,))
-            exp_row = cur.fetchone()
-            if exp_row:
-                exp_acc = exp_row["experiment_accession"]
-                cur.execute(GSA_EXPERIMENT_SQL, (exp_acc,))
-                experiment = cur.fetchone()
-                cur.execute(EXPERIMENT_RUNS_SQL, (exp_acc,))
-                runs = _annotate_run_downloads(cur.fetchall())
+            break
 
     study_acc = None
     if experiment:
@@ -8643,21 +8743,21 @@ def _resolve_sample_detail(cur, accession: str) -> dict:
     else:
         _no_seqscan(cur, SRA_SAMPLE_TO_STUDY_SQL, (acc,))
         study_row = cur.fetchone()
+        # DRA experiment lookup has the same predicate; skip after its miss
+        if not study_row and exp_row:
+            _no_seqscan(cur, DRA_SAMPLE_TO_STUDY_SQL, (acc,))
+            study_row = cur.fetchone()
         if study_row:
             study_acc = study_row["accession"]
+        else:
+            # a GSA row can name the study without an experiment accession
+            cur.execute(GSA_SAMPLE_TO_STUDY_SQL, (acc,))
+            if gsa_row := cur.fetchone():
+                study_acc = gsa_row["study"]
 
     project = None
     if study_acc:
-        if study_acc.startswith(("CRA", "HRA")):
-            cur.execute(PROJECT_GSA_SQL, (study_acc,))
-        elif study_acc.startswith("PRJ"):
-            cur.execute(PROJECT_ENA_SQL, (study_acc,))
-        else:
-            cur.execute(PROJECT_SRA_SQL, (study_acc,))
-        project = cur.fetchone()
-        if project:
-            _enrich_with_publications([project], cur)
-        _attach_library_strategies(project, study_acc, cur)
+        project = _parent_project(cur, study_acc, slim)
 
     result = {
         "sample_type": "sra_sample",
@@ -8685,20 +8785,21 @@ def get_sample_detail(
     request: Request,
     response: Response,
     accession: str = Path(..., pattern=SAMPLE_DETAIL_REGEX),
+    include_neighbors: bool = Query(
+        True,
+        description="Include the parent project's similarity graph: neighbors, coords_2d, coords_3d.",
+    ),
 ):
     accession = accession.upper()
     # Sample/experiment metadata is effectively immutable; let the CDN serve
     # repeat loads instead of re-running the resolve chain each time.
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    try:
+    with _db_errors("get_sample_detail", "Retry shortly."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                return _resolve_sample_detail(cur, accession)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_sample_detail")
-        raise HTTPException(500, "Internal server error")
+                return _resolve_sample_detail(
+                    cur, accession, slim=not include_neighbors
+                )
 
 
 @api_app.get(
@@ -8929,13 +9030,17 @@ def get_geo_series_samples(
     accession: str = Path(...),
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    envelope: bool = Query(
+        False,
+        description="Wrap the rows with total, count, offset, has_more and next_offset.",
+    ),
 ):
     accession = accession.upper()
     source = _accession_source(accession)
     if source not in ["geo", "arrayexpress", "gea"]:
         raise HTTPException(400, f"Invalid accession format: {accession}")
 
-    try:
+    with _db_errors("get_geo_series_samples", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # Cheap indexed count + a SQL-paginated page so large
@@ -8944,10 +9049,13 @@ def get_geo_series_samples(
                 rows = _fetch_geo_series_samples(
                     cur, accession, source, limit=limit, offset=offset
                 )
-    except Exception:
-        logger.exception("Database error in get_geo_series_samples")
-        raise HTTPException(500, "Internal server error")
     response.headers["X-Total-Count"] = str(total)
+    if envelope:
+        return {
+            "accession": accession,
+            **_offset_page(total, len(rows), offset),
+            "samples": rows,
+        }
     return rows
 
 
@@ -8998,6 +9106,7 @@ def get_ae_experiment_samples(
     request: Request,
     accession: str = Path(..., pattern=AE_REGEX),
 ):
+    accession = accession.upper()
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -9163,6 +9272,7 @@ def bulk_project_metadata(request: Request, payload: AccessionsRequest):
     ),
     operation_id="bulk_project_samples_metadata",
 )
+@limiter.limit("20/minute")
 def bulk_project_samples_metadata(request: Request, payload: AccessionsRequest):
     accessions = payload.accessions
 
@@ -9171,54 +9281,46 @@ def bulk_project_samples_metadata(request: Request, payload: AccessionsRequest):
         if not isinstance(acc, str):
             raise HTTPException(400, f"Invalid accession type: {type(acc).__name__}")
         normalized = acc.strip().upper()
-        if not PROJECT_PATTERN.match(normalized):
-            raise HTTPException(400, f"Invalid accession format: {acc}")
+        if not (
+            GEO_SERIES_PATTERN.match(normalized) or STUDY_PATTERN.match(normalized)
+        ):
+            raise HTTPException(
+                400,
+                f"Unsupported accession for bulk_project_samples_metadata: {acc} "
+                "(expected GSE or SRP/ERP/DRP)",
+            )
         validated.append(normalized)
 
     _require_bulk_limit(validated)
 
-    try:
+    with _db_errors(
+        "bulk_project_samples_metadata", "Retry with fewer accessions per call."
+    ):
         out = []
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 for acc in validated:
-                    if acc.startswith("GSE"):
-                        cur.execute(PROJECT_GEO_SQL, (acc,))
-                        project = cur.fetchone()
-                        if not project:
-                            continue
-                        samples = flatten_geo_series(cur, acc)
-                        out.append(
-                            {
-                                "accession": acc,
-                                "title": project.get("title"),
-                                "description": project.get("summary"),
-                                "overall_design": project.get("overall_design"),
-                                "source": "geo",
-                                "samples": samples,
-                            }
-                        )
-                    else:
-                        cur.execute(PROJECT_SRA_SQL, (acc,))
-                        project = cur.fetchone()
-                        if not project:
-                            continue
-                        samples = flatten_sra_study(cur, acc)
-                        out.append(
-                            {
-                                "accession": acc,
-                                "title": project.get("title"),
-                                "description": project.get("abstract"),
-                                "overall_design": None,
-                                "source": "sra",
-                                "samples": samples,
-                            }
-                        )
+                    project = _fetch_project_row(cur, acc, slim=True)
+                    if not project:
+                        continue
+                    geo = acc.startswith("GSE")
+                    flatten = flatten_geo_series if geo else flatten_sra_study
+                    out.append(
+                        {
+                            "accession": acc,
+                            "title": project.get("title"),
+                            "description": project.get(
+                                "summary" if geo else "abstract"
+                            ),
+                            "overall_design": project.get("overall_design")
+                            if geo
+                            else None,
+                            "source": "geo" if geo else "sra",
+                            "samples": flatten(cur, acc),
+                        }
+                    )
 
         return out
-    except Exception:
-        logger.exception("Database error in bulk_project_samples_metadata")
-        raise HTTPException(500, "Internal server error")
 
 
 # Dataset-level columns only: one row per matching study, no per-sample fan-out.
@@ -9353,10 +9455,7 @@ def download_by_query(
     # detection, hyphen rewrite, Neo4j synonym expansion, sidebar filters. The
     # one deliberate omission is spelling auto-correction -- the client sends the
     # corrected query it is displaying, so correcting again would be a no-op.
-    boolean_tsq = None
-    if q and (structured or is_boolean_query(q)):
-        if _tsq := to_tsquery_string(replace_query_hyphens(q, expand=not structured)):
-            boolean_tsq = _tsq
+    boolean_tsq = _boolean_tsq(q, force=structured, expand=not structured)
     filters["case_sensitive_q"] = q if case_sensitive and q else None
     q = replace_query_hyphens(q, expand=not structured) if q else ""
 
@@ -9676,7 +9775,9 @@ def search_author_projects(
     if cached is not None:
         return cached
 
-    try:
+    with _db_errors(
+        "search_author_projects", "Retry with a more specific author name."
+    ):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # One CTE run: fetch the full deduped set (capped), then paginate
@@ -9715,9 +9816,6 @@ def search_author_projects(
                 # Enrich only the page we return.
                 results = rows[:limit]
                 _enrich_with_publications(results, cur)
-    except Exception:
-        logger.exception("Database error in search_author_projects")
-        raise HTTPException(500, "Internal server error")
 
     result = {"q": q, "total": total, "results": results, "institutes": institutes}
     with _author_projects_cache_lock:
@@ -9820,6 +9918,8 @@ def _execute_structured(sql: str, params: dict, count_by: str | None) -> dict:
                 rows = cur.fetchall()
                 if not count_by:
                     _enrich_page(rows, cur)
+    except PgSyntaxError:
+        raise HTTPException(400, "could not parse boolean query")
     except QueryCanceled:
         logger.warning("structured search timed out: %s", params)
         raise HTTPException(504, _timeout_detail(_STRUCTURED_RETRY))
@@ -9839,7 +9939,10 @@ def _execute_structured(sql: str, params: dict, count_by: str | None) -> dict:
     else:
         result = {
             **finish_page(
-                rows, sorted_page=False, first_page=first_page, total=sql_total(rows)
+                rows,
+                sorted_page=False,
+                first_page=first_page,
+                total=sql_total(rows, first_page=first_page),
             ),
             "took_ms": round(took_ms, 2),
         }
@@ -9863,8 +9966,6 @@ _NL_STRATEGY = {
     "rnaseq": "RNA-Seq",
     "rna seq": "RNA-Seq",
     "gene expression": "RNA-Seq",
-    "scrna": "RNA-Seq",
-    "single cell rna": "RNA-Seq",
     "chip-seq": "ChIP-Seq",
     "chipseq": "ChIP-Seq",
     "chip seq": "ChIP-Seq",
@@ -9973,7 +10074,19 @@ _NL_SOURCE_PATS = _compile_nl_phrases(_NL_SOURCE)
 _NL_UNSUPPORTED_SOURCE_PATS = _compile_nl_phrases(_NL_UNSUPPORTED_SOURCE)
 
 _NL_Y = r"(?:19|20)\d{2}"
-_NL_RE_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
+_NL_D = r"\d{4}-\d{2}-\d{2}"
+_NL_RE_ISO = re.compile(_NL_D)
+_NL_RE_ISO_RANGE = re.compile(
+    rf"(?:between|from)\s+({_NL_D})\s*(?:to|and|-|–|through|until)\s*({_NL_D})"
+)
+_NL_RE_ISO_SINGLE = re.compile(
+    rf"\b(since|after|from|before|until|by|on)\s+({_NL_D})\b"
+)
+# group 1 is the phrase kept in q; a trailing "rna-seq" belongs to it
+_NL_RE_SC = re.compile(
+    r"\b(single[- ]cell|scrna(?:[- ]?seq)?|snrna(?:[- ]?seq)?|single[- ]nucleus)"
+    r"(?:\s+rna[- ]?seq)?\b"
+)
 _NL_RE_LASTN = re.compile(r"last\s+(\d{1,2})\s+years?")
 _NL_RE_RANGE = re.compile(
     rf"(?:between|from)\s+({_NL_Y})\s*(?:to|and|-|–|through|until)\s*({_NL_Y})"
@@ -9985,7 +10098,12 @@ _NL_RE_TOKEN = re.compile(r"[a-z0-9]+")
 
 _NL_NEG_CATEGORIES = (
     ("organism", _NL_ORGANISM_PATS),
-    ("library_strategy", _NL_STRATEGY_PATS),
+    # exclusion only; positive single-cell wording stays in q
+    (
+        "library_strategy",
+        _NL_STRATEGY_PATS
+        + _compile_nl_phrases({"scrna": "RNA-Seq", "single cell rna": "RNA-Seq"}),
+    ),
     ("source", _NL_SOURCE_PATS),
 )
 
@@ -10057,7 +10175,23 @@ def _parse_nl_query(text: str, today_year: int) -> dict:
                 f"More than one source named ({values}); searched all sources."
             )
 
+    # keep single-cell phrasing in q; library_strategy=RNA-Seq excludes GEO
+    sc_phrases = _NL_RE_SC.findall(low)
+    has_sc_phrase = bool(sc_phrases)
+    if has_sc_phrase:
+        warnings.append(
+            "Single-cell phrasing detected; structured search matches keywords only. "
+            "For curated single-cell studies or cell-level filters, use "
+            "`get_singlecell_projects` or `search_enriched_samples`."
+        )
+
+    low = _NL_RE_SC.sub("\x00", low)
     consume_all(_NL_STRATEGY_PATS, "library_strategy")
+    for phrase in sc_phrases:
+        low = low.replace("\x00", phrase, 1)
+    if has_sc_phrase and filters.get("library_strategy") == ["RNA-Seq"]:
+        filters.pop("library_strategy", None)
+        matched.pop("library_strategy", None)
     consume_all(_NL_ORGANISM_PATS, "organism")
     consume_all(_NL_SOURCE_PATS, "source", multi=False)
 
@@ -10077,13 +10211,38 @@ def _parse_nl_query(text: str, today_year: int) -> dict:
             f"{'|'.join(unsupported)}) instead."
         )
 
+    iso_rng = _NL_RE_ISO_RANGE.search(low)
+    iso_dir = _NL_RE_ISO_SINGLE.findall(low)
     iso = _NL_RE_ISO.findall(low)
-    if iso:
+    if iso_rng:
+        a, b = sorted((iso_rng.group(1), iso_rng.group(2)))
+        filters["published_after"] = a
+        filters["published_before"] = b
+        low = low[: iso_rng.start()] + " " + low[iso_rng.end() :]
+        matched["dates"] = [a, b]
+    elif iso_dir:
+        low = _NL_RE_ISO_SINGLE.sub(" ", low)
+        matched_iso: list[str] = []
+        for kw, dt in iso_dir:
+            matched_iso.append(f"{kw} {dt}")
+            if kw in ("before", "until", "by"):
+                filters["published_before"] = dt
+            elif kw in ("since", "after", "from"):
+                filters["published_after"] = dt
+            else:  # "on YYYY-MM-DD"
+                filters["published_after"] = filters["published_before"] = dt
+        matched["dates"] = matched_iso
+    elif iso:
         low = _NL_RE_ISO.sub(" ", low)
         iso_sorted = sorted(iso)
         filters["published_after"] = iso_sorted[0]
         if len(iso_sorted) > 1:
             filters["published_before"] = iso_sorted[-1]
+        else:
+            warnings.append(
+                f"Bare date {iso_sorted[0]} interpreted as published_after={iso_sorted[0]}; "
+                "use 'before YYYY-MM-DD', 'after YYYY-MM-DD', or call search_structured directly."
+            )
         matched["dates"] = iso_sorted
     else:
         m = _NL_RE_LASTN.search(low)
@@ -10101,9 +10260,13 @@ def _parse_nl_query(text: str, today_year: int) -> dict:
             matched["dates"] = f"{min(a, b)}-{max(a, b)}"
         elif single:
             kw, yr = single.group(1), int(single.group(2))
-            if kw in ("before", "until", "by"):
+            if kw == "before":
+                filters["year_to"] = yr - 1
+            elif kw in ("until", "by"):
                 filters["year_to"] = yr
-            elif kw in ("since", "after", "from"):
+            elif kw == "after":
+                filters["year_from"] = yr + 1
+            elif kw in ("since", "from"):
                 filters["year_from"] = yr
             else:  # "in YYYY"
                 filters["year_from"] = filters["year_to"] = yr
@@ -10168,6 +10331,7 @@ def search_nl(
     limit: int | None = Query(None, ge=1, le=SEARCH_PAGE_SIZE, description=_LIMIT_DOC),
     fields: str = Query("full", pattern="^(compact|full)$", description=_FIELDS_DOC),
 ):
+    _require_cursor_pair("cursor_rank", cursor_rank, cursor_acc)
     parsed = _parse_nl_query(q, date.today().year)
     filters = parsed["filters"]
     if source:
@@ -10204,19 +10368,19 @@ def search_nl(
     "/search/structured",
     summary="Structured search with filters",
     description=(
-        "Search across GEO, SRA, ArrayExpress, and ENA with structured filters "
+        "Search across GEO, SRA, ArrayExpress, ENA, and GSA with structured filters "
         "(organism, library_strategy, platform, country, center, year range, "
         "journal, instrument_model, assay_l1/assay_l2, geo_* location fields, "
         "published_after/published_before (study release date), "
         "pub_date_after/pub_date_before (linked-paper publication date), "
         "multi_platform, and enriched sample "
         "filters sample_tissue/sample_disease/sample_cell_type) optionally "
-        "combined with full-text search. "
+        "combined with full-text or boolean search. "
         "At least one of q or a filter parameter is required. "
         "Use cursors (rank + accession) for pagination. "
         "Each row has `published_at` (release date) and `alias` (the same dataset "
         "in other archives). "
-        "Returns {results: object[], total: int, total_is_known: bool, "
+        "Returns {results: object[], total: int | null, total_is_known: bool, "
         "has_more: bool, took_ms: float, "
         "next_cursor: {rank: float, accession: string} | null}; "
         "`next_cursor` is null on the last page."
@@ -10237,7 +10401,8 @@ def search_structured(
         None, description=_PLATFORM_DOC + " Excludes GEO and ArrayExpress."
     ),
     country: str | None = Query(
-        None, description="Submitter country name. Excludes ArrayExpress."
+        None,
+        description="Submitter country name or ISO-2 code (e.g. India or IN). Excludes ArrayExpress.",
     ),
     center: str | None = Query(
         None, description="Submitting center or organization (substring)."
@@ -10323,7 +10488,10 @@ def search_structured(
     limit: int | None = Query(None, ge=1, le=SEARCH_PAGE_SIZE, description=_LIMIT_DOC),
     fields: str = Query("full", pattern="^(compact|full)$", description=_FIELDS_DOC),
 ):
-    if q:
+    _require_cursor_pair("cursor_rank", cursor_rank, cursor_acc)
+
+    boolean_tsq = _boolean_tsq(q, expand=False)
+    if q and boolean_tsq is None:
         q = replace_query_hyphens(q)
 
     has_geo_filter = any(
@@ -10393,11 +10561,14 @@ def search_structured(
         raise HTTPException(403, "Enriched sample filters are temporarily disabled")
 
     q_variants = None
-    if q:
-        q_variants = _search_query_variants(q)
+    fts_q = boolean_tsq if boolean_tsq is not None else q
+    if fts_q:
+        q_variants = (
+            [boolean_tsq] if boolean_tsq is not None else _search_query_variants(q)
+        )
 
     sql, params = build_structured_search(
-        q=q,
+        q=fts_q,
         q_variants=q_variants,
         organism=organism,
         library_strategy=library_strategy,
@@ -10433,6 +10604,8 @@ def search_structured(
         sample_cell_type=sample_cell_type,
         count_by=count_by,
     )
+    if boolean_tsq is not None:
+        sql = structured_search_sql(sql)
 
     return _limited_search(
         lambda: _execute_structured(sql, params, count_by), limit, fields, False
@@ -11161,14 +11334,63 @@ def _get_tissue_microbes() -> dict:
     operation_id="get_tissue_microbes",
 )
 @limiter.limit("60/minute")
-def get_tissue_microbes(request: Request):
+def get_tissue_microbes(
+    request: Request,
+    cohort: str | None = Query(None, pattern="^(human|mouse|all)$"),
+    tissue: str | None = Query(None, max_length=200),
+    organism: str | None = Query(None, max_length=200),
+    exclude_background: bool = Query(False),
+    limit: int | None = Query(None, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+):
     try:
-        return _get_tissue_microbes()
+        data = _get_tissue_microbes()
     except _NotBuiltYet:
         raise HTTPException(503, "Tissue microbe stats are being prepared.")
     except Exception:
         logger.exception("Database error in get_tissue_microbes")
         raise HTTPException(500, "Internal server error")
+
+    if (
+        cohort is None
+        and tissue is None
+        and organism is None
+        and not exclude_background
+        and limit is None
+        and offset == 0
+    ):
+        return data
+
+    cells = data["cells"]
+    tissues = data["tissues"]
+    if cohort is not None:
+        cells = [c for c in cells if c.get("cohort") == cohort]
+        tissues = [t for t in tissues if t.get("cohort") == cohort]
+    if tissue:
+        needle = tissue.strip().lower()
+        cells = [c for c in cells if needle in (c.get("tissue") or "").lower()]
+        tissues = [t for t in tissues if needle in (t.get("tissue") or "").lower()]
+    if organism:
+        needle = organism.strip().lower()
+        cells = [c for c in cells if needle in (c.get("organism") or "").lower()]
+    if exclude_background:
+        cells = [
+            c
+            for c in cells
+            if not c.get("is_background")
+            and c.get("class") != "culture"
+            and not c.get("is_endogenous")
+        ]
+
+    total = len(cells)
+    page = cells[offset : offset + limit] if limit is not None else cells[offset:]
+    return {
+        "cells": page,
+        "tissues": tissues[:100] if offset == 0 else [],
+        **_offset_page(total, len(page), offset),
+        "min_studies": data["min_studies"],
+        "min_screened": data["min_screened"],
+    }
 
 
 @ttl_cached(_GROWTH_CACHE_TTL)
@@ -11415,6 +11637,8 @@ def _ontology_summary(kind: str, term: str) -> dict:
             row = cur.fetchone()
     except HTTPException:
         raise
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail("Retry with a more specific term."))
     except Exception:
         logger.exception("Database error in %s summary", kind)
         raise HTTPException(500, "Internal server error")
@@ -11431,6 +11655,8 @@ def _ontology_facets(kind: str, term: str) -> dict[str, list]:
             rows = cur.fetchall()
     except HTTPException:
         raise
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail("Retry with a more specific term."))
     except Exception:
         logger.exception("Database error in %s facets", kind)
         raise HTTPException(500, "Internal server error")
@@ -11450,19 +11676,8 @@ def _ontology_facets(kind: str, term: str) -> dict[str, list]:
 )
 @limiter.limit("60/minute")
 def get_disease_summary(request: Request, collection: str):
-    if collection not in DISEASE_COLLECTIONS:
-        return _ontology_summary("disease", collection)
-    sql = build_disease_summary_sql(collection)
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql)
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_disease_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, f"{collection} disease stats not available")
-    return row
+    with _db_errors("get_disease_summary", "Retry shortly."):
+        return _collection_summary_data("disease", collection)
 
 
 def _facet_rows_to_dict(rows) -> dict[str, list]:
@@ -11485,17 +11700,8 @@ def _facet_rows_to_dict(rows) -> dict[str, list]:
 )
 @limiter.limit("60/minute")
 def get_disease_facets(request: Request, collection: str):
-    if collection not in DISEASE_COLLECTIONS:
-        return _ontology_facets("disease", collection)
-    sql = build_disease_facets_sql(collection)
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_disease_facets")
-        raise HTTPException(500, "Internal server error")
-    return _facet_rows_to_dict(rows)
+    with _db_errors("get_disease_facets", "Retry shortly."):
+        return _collection_facets_data("disease", collection)
 
 
 _LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
@@ -11518,16 +11724,8 @@ _LONGREAD_SORT_PATTERN = f"^({'|'.join(sorted(LONGREAD_SORTABLE))})$"
 )
 @limiter.limit("60/minute")
 def get_longread_summary(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(LONGREAD_SUMMARY_SQL)
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_longread_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, "long-read stats not available")
-    return row
+    with _db_errors("get_longread_summary", "Retry shortly."):
+        return _collection_summary_data("longread", None)
 
 
 @api_app.get(
@@ -11543,14 +11741,8 @@ def get_longread_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_longread_facets(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(LONGREAD_FACETS_SQL)
-            rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_longread_facets")
-        raise HTTPException(500, "Internal server error")
-    return _facet_rows_to_dict(rows)
+    with _db_errors("get_longread_facets", "Retry shortly."):
+        return _collection_facets_data("longread", None)
 
 
 @api_app.get(
@@ -11613,7 +11805,7 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
         "has_exact_chemistry": has_exact_chemistry,
         "q": q,
     }
-    try:
+    with _db_errors("get_longread_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_longread_count_sql(), params)
             total_row = cur.fetchone()
@@ -11622,9 +11814,6 @@ def get_longread_projects(  # noqa: PLR0913 -- one query parameter each, by desi
                 {**params, "limit": limit, "offset": offset},
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_longread_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
         "count": len(rows),
@@ -11649,16 +11838,8 @@ _SINGLECELL_SORT_PATTERN = f"^({'|'.join(sorted(SINGLECELL_SORTABLE))})$"
 )
 @limiter.limit("60/minute")
 def get_singlecell_summary(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SINGLECELL_SUMMARY_SQL)
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_singlecell_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, "single-cell stats not available")
-    return row
+    with _db_errors("get_singlecell_summary", "Retry shortly."):
+        return _collection_summary_data("singlecell", None)
 
 
 @api_app.get(
@@ -11673,14 +11854,8 @@ def get_singlecell_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_singlecell_facets(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SINGLECELL_FACETS_SQL)
-            rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_singlecell_facets")
-        raise HTTPException(500, "Internal server error")
-    return _facet_rows_to_dict(rows)
+    with _db_errors("get_singlecell_facets", "Retry shortly."):
+        return _collection_facets_data("singlecell", None)
 
 
 @api_app.get(
@@ -11745,7 +11920,7 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
         "is_long_read": is_long_read,
         "q": q,
     }
-    try:
+    with _db_errors("get_singlecell_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_singlecell_count_sql(), params)
             total_row = cur.fetchone()
@@ -11754,9 +11929,6 @@ def get_singlecell_projects(  # noqa: PLR0913 -- one query parameter each, by de
                 {**params, "limit": limit, "offset": offset},
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_singlecell_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
         "count": len(rows),
@@ -11781,16 +11953,8 @@ _PERTURBATION_SORT_PATTERN = f"^({'|'.join(sorted(PERTURBATION_SORTABLE))})$"
 )
 @limiter.limit("60/minute")
 def get_perturbation_summary(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(PERTURBATION_SUMMARY_SQL)
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_perturbation_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, "perturbation stats not available")
-    return row
+    with _db_errors("get_perturbation_summary", "Retry shortly."):
+        return _collection_summary_data("perturbation", None)
 
 
 @api_app.get(
@@ -11806,18 +11970,8 @@ def get_perturbation_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_perturbation_facets(request: Request):
-    try:
-        return _perturbation_facets_data()
-    except Exception:
-        logger.exception("Database error in get_perturbation_facets")
-        raise HTTPException(500, "Internal server error")
-
-
-@ttl_cached(_GROWTH_CACHE_TTL)
-def _perturbation_facets_data() -> dict:
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(PERTURBATION_FACETS_SQL)
-        return _facet_rows_to_dict(cur.fetchall())
+    with _db_errors("get_perturbation_facets", "Retry shortly."):
+        return _collection_facets_data("perturbation", None)
 
 
 @api_app.get(
@@ -11870,6 +12024,7 @@ def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by 
     compound: str | None = Query(None, max_length=200),
     readout_assay: str | None = Query(None, max_length=100),
     cell_line: str | None = Query(None, max_length=200),
+    sample_type: str | None = Query(None, max_length=100),
     organism: str | None = Query(None, max_length=200),
     tissue: str | None = Query(None, max_length=200),
     year: int | None = Query(None, ge=1900, le=2100),
@@ -11894,6 +12049,7 @@ def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by 
         "compound": compound,
         "readout_assay": readout_assay,
         "cell_line": cell_line,
+        "sample_type": sample_type,
         "organism": organism,
         "tissue": tissue,
         "year": year,
@@ -11904,7 +12060,7 @@ def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by 
         "is_long_read": is_long_read,
         "q": q,
     }
-    try:
+    with _db_errors("get_perturbation_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_perturbation_count_sql(), params)
             total_row = cur.fetchone()
@@ -11913,9 +12069,6 @@ def get_perturbation_projects(  # noqa: PLR0913 -- one query parameter each, by 
                 {**params, "limit": limit, "offset": offset},
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_perturbation_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
         "count": len(rows),
@@ -11941,16 +12094,8 @@ _SPATIAL_SORT_PATTERN = f"^({'|'.join(sorted(SPATIAL_SORTABLE))})$"
 )
 @limiter.limit("60/minute")
 def get_spatial_summary(request: Request):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(SPATIAL_SUMMARY_SQL)
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_spatial_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, "spatial stats not available")
-    return row
+    with _db_errors("get_spatial_summary", "Retry shortly."):
+        return _collection_summary_data("spatial", None)
 
 
 @api_app.get(
@@ -11965,18 +12110,8 @@ def get_spatial_summary(request: Request):
 )
 @limiter.limit("60/minute")
 def get_spatial_facets(request: Request):
-    try:
-        return _spatial_facets_data()
-    except Exception:
-        logger.exception("Database error in get_spatial_facets")
-        raise HTTPException(500, "Internal server error")
-
-
-@ttl_cached(_GROWTH_CACHE_TTL)
-def _spatial_facets_data() -> dict:
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(SPATIAL_FACETS_SQL)
-        return _facet_rows_to_dict(cur.fetchall())
+    with _db_errors("get_spatial_facets", "Retry shortly."):
+        return _collection_facets_data("spatial", None)
 
 
 @api_app.get(
@@ -12051,7 +12186,7 @@ def get_spatial_projects(  # noqa: PLR0913, one query parameter each, by design
         "is_long_read": is_long_read,
         "q": q,
     }
-    try:
+    with _db_errors("get_spatial_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_spatial_count_sql(), params)
             total_row = cur.fetchone()
@@ -12060,9 +12195,6 @@ def get_spatial_projects(  # noqa: PLR0913, one query parameter each, by design
                 {**params, "limit": limit, "offset": offset},
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_spatial_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
         "count": len(rows),
@@ -12116,16 +12248,8 @@ _COUNTRY_SORT_PATTERN = f"^({'|'.join(sorted(COUNTRY_SORTABLE))})$"
 )
 @limiter.limit("60/minute")
 def get_country_summary(request: Request, code: str = Depends(_country_code)):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(COUNTRY_SUMMARY_SQL, {"code": code})
-            row = cur.fetchone()
-    except Exception:
-        logger.exception("Database error in get_country_summary")
-        raise HTTPException(500, "Internal server error")
-    if not row:
-        raise HTTPException(503, "country stats not available")
-    return row
+    with _db_errors("get_country_summary", "Retry shortly."):
+        return _collection_summary_data("country", code)
 
 
 @api_app.get(
@@ -12140,14 +12264,8 @@ def get_country_summary(request: Request, code: str = Depends(_country_code)):
 )
 @limiter.limit("60/minute")
 def get_country_facets(request: Request, code: str = Depends(_country_code)):
-    try:
-        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(COUNTRY_FACETS_SQL, {"code": code})
-            rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_country_facets")
-        raise HTTPException(500, "Internal server error")
-    return _facet_rows_to_dict(rows)
+    with _db_errors("get_country_facets", "Retry shortly."):
+        return _collection_facets_data("country", code)
 
 
 @api_app.get(
@@ -12171,6 +12289,7 @@ def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     organism: str | None = None,
     assay_l1: str | None = None,
     source: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
     has_fastq: bool | None = None,
     has_sra: bool | None = None,
     is_single_cell: bool | None = None,
@@ -12185,12 +12304,13 @@ def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "organism": organism,
         "assay_l1": assay_l1,
         "source": source,
+        "year": year,
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "is_single_cell": is_single_cell,
         "q": q,
     }
-    try:
+    with _db_errors("get_country_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_country_count_sql(), params)
             total_row = cur.fetchone()
@@ -12199,9 +12319,6 @@ def get_country_projects(  # noqa: PLR0913 -- one query parameter each, by desig
                 {**params, "limit": limit, "offset": offset},
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_country_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "total": total_row["total"],
         "count": len(rows),
@@ -12249,6 +12366,9 @@ def _ontology_projects(  # noqa: PLR0913 -- one query parameter each, by design
     sort = sort or "pub_date"
     if sort not in ONTOLOGY_TERM_SORTABLE:
         raise HTTPException(400, f"sort={sort!r} is not a valid sort for a {kind} term")
+    _require_cursor_pair("cursor_sort", cursor_sort, cursor_acc)
+    if cursor_sort is not None:
+        _check_cursor_sort(sort, cursor_sort, cursor_acc, label="sort")
     try:
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             resolved = _resolve_or_404(cur, kind, term)
@@ -12256,6 +12376,7 @@ def _ontology_projects(  # noqa: PLR0913 -- one query parameter each, by design
                 cur,
                 kind,
                 {
+                    "year": None,
                     **filters,
                     "ids": resolved["ids"],
                     "q": q,
@@ -12268,6 +12389,8 @@ def _ontology_projects(  # noqa: PLR0913 -- one query parameter each, by design
             )
     except HTTPException:
         raise
+    except QueryCanceled:
+        raise HTTPException(504, _timeout_detail("Retry with narrower filters."))
     except Exception:
         logger.exception("Database error in %s projects", kind)
         raise HTTPException(500, "Internal server error")
@@ -12347,6 +12470,7 @@ def get_tissue_projects(  # noqa: PLR0913 -- one query parameter each, by design
     source: str | None = None,
     journal: str | None = None,
     country: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
     has_fastq: bool | None = None,
     has_sra: bool | None = None,
     is_single_cell: bool | None = None,
@@ -12364,6 +12488,7 @@ def get_tissue_projects(  # noqa: PLR0913 -- one query parameter each, by design
         "source": source,
         "journal": journal,
         "country": country,
+        "year": year,
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "is_single_cell": is_single_cell,
@@ -12429,7 +12554,7 @@ def get_disease_aliases(
         "recorded. A null cell count means unmeasured, and blank ancestry means "
         "unrecorded. `has_fastq` and `has_sra` are NULL when the study is "
         "absent from the download-links table, which means unknown, not "
-        "unavailable; filtering on them accepts only true for that reason. "
+        "unavailable; NULL rows never match true or false. "
         "`inheritance` is the mode of inheritance from HPO and "
         "Orphanet, plus GARD's own where it publishes one; a disease can carry "
         "more than one, and 'Not applicable' means the disease has no Mendelian "
@@ -12472,10 +12597,11 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
     source: str | None = None,
     journal: str | None = None,
     country: str | None = None,
+    year: int | None = Query(None, ge=1900, le=2100),
     is_single_cell: bool | None = None,
     is_long_read: bool | None = None,
     q: str | None = Query(None, max_length=200),
-    scope: str = Query(DEFAULT_SCOPE, pattern=_SCOPE_PATTERN),
+    scope: str | None = Query(None, pattern=_SCOPE_PATTERN),
     sort: str | None = Query(None, pattern=_SORT_PATTERN),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=200),
@@ -12489,12 +12615,37 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "source": source,
         "journal": journal,
         "country": country,
+        "year": year,
         "has_fastq": has_fastq,
         "has_sra": has_sra,
         "is_single_cell": is_single_cell,
         "is_long_read": is_long_read,
     }
+    catalogue = {
+        "category": category,
+        "specialty": specialty,
+        "group": group,
+        "nord_type": nord_type,
+        "ancestry": ancestry,
+        "inheritance": inheritance,
+        "disease": disease,
+        "assay_category": assay_category,
+    }
     if collection not in DISEASE_COLLECTIONS:
+        catalogue_only = {**catalogue, "scope": scope}
+        if bad := sorted(k for k, v in catalogue_only.items() if v is not None):
+            raise HTTPException(
+                400,
+                f"Filter(s) {', '.join(bad)} apply only to curated collections "
+                f"({', '.join(sorted(DISEASE_COLLECTIONS))}), not free-text disease '{collection}'. "
+                f"Available filters: {', '.join(sorted(filters))}.",
+            )
+        if offset:
+            raise HTTPException(
+                400,
+                f"Free-text disease '{collection}' uses cursor pagination "
+                "(cursor_sort + cursor_acc from next_cursor), not offset.",
+            )
         page = _ontology_projects(
             "disease",
             collection,
@@ -12507,18 +12658,15 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
             cursor_acc=cursor_acc,
         )
         return {"collection": collection, **page}
+    if cursor_sort is not None or cursor_acc is not None:
+        raise HTTPException(
+            400,
+            f"Collection '{collection}' uses offset pagination (offset), "
+            "not cursor_sort/cursor_acc.",
+        )
+    scope = scope or DEFAULT_SCOPE
     allowed = disease_projects_params(collection)
-    supplied = {
-        "category": category,
-        "specialty": specialty,
-        "group": group,
-        "nord_type": nord_type,
-        "ancestry": ancestry,
-        "inheritance": inheritance,
-        "disease": disease,
-        "assay_category": assay_category,
-        **filters,
-    }
+    supplied = {**catalogue, **filters}
     # rejected: ignoring one returns an unfiltered page that looks filtered
     if bad := sorted(
         k for k, v in supplied.items() if v is not None and k not in allowed
@@ -12535,7 +12683,7 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         raise HTTPException(
             400, f"sort={sort!r} does not apply to collection '{collection}'"
         )
-    try:
+    with _db_errors("get_disease_projects", "Retry with narrower filters."):
         with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(build_disease_count_sql(collection, scope), params)
             total_row = cur.fetchone()
@@ -12549,9 +12697,6 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
                 },
             )
             rows = cur.fetchall()
-    except Exception:
-        logger.exception("Database error in get_disease_projects")
-        raise HTTPException(500, "Internal server error")
     return {
         "collection": collection,
         "total": total_row["total"],
@@ -12562,6 +12707,127 @@ def get_disease_projects(  # noqa: PLR0913 -- one query parameter each, by desig
         "order": order,
         "results": rows,
     }
+
+
+def _stats_row(sql: str, label: str, params: dict | None = None) -> dict:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(503, f"{label} stats not available")
+    return row
+
+
+def _facets(sql: str, params: dict | None = None) -> dict[str, list]:
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return _facet_rows_to_dict(cur.fetchall())
+
+
+_COLLECTION_SUMMARY = {
+    c: ttl_cached(_GROWTH_CACHE_TTL)(functools.partial(_stats_row, sql, label))
+    for c, (sql, label) in {
+        "longread": (LONGREAD_SUMMARY_SQL, "long-read"),
+        "singlecell": (SINGLECELL_SUMMARY_SQL, "single-cell"),
+        "perturbation": (PERTURBATION_SUMMARY_SQL, "perturbation"),
+        "spatial": (SPATIAL_SUMMARY_SQL, "spatial"),
+    }.items()
+}
+_COLLECTION_FACETS = {
+    c: ttl_cached(_GROWTH_CACHE_TTL)(functools.partial(_facets, sql))
+    for c, sql in {
+        "longread": LONGREAD_FACETS_SQL,
+        "singlecell": SINGLECELL_FACETS_SQL,
+        "perturbation": PERTURBATION_FACETS_SQL,
+        "spatial": SPATIAL_FACETS_SQL,
+    }.items()
+}
+
+
+def _is_ontology_target(collection: str, target: str | None) -> bool:
+    return collection == "tissue" or (
+        collection == "disease" and target not in DISEASE_COLLECTIONS
+    )
+
+
+def _collection_summary_data(collection: str, target: str | None) -> dict:
+    """Summary row of a collection. A country target is an ISO-2 code."""
+    if _is_ontology_target(collection, target):
+        return _ontology_summary(collection, target)
+    if collection == "disease":
+        return _stats_row(build_disease_summary_sql(target), f"{target} disease")
+    if collection == "country":
+        return _stats_row(COUNTRY_SUMMARY_SQL, "country", {"code": target})
+    return _COLLECTION_SUMMARY[collection]()
+
+
+def _collection_facets_data(collection: str, target: str | None) -> dict[str, list]:
+    """Facet values of a collection. A country target is an ISO-2 code."""
+    if _is_ontology_target(collection, target):
+        return _ontology_facets(collection, target)
+    if collection == "disease":
+        return _facets(build_disease_facets_sql(target))
+    if collection == "country":
+        return _facets(COUNTRY_FACETS_SQL, {"code": target})
+    return _COLLECTION_FACETS[collection]()
+
+
+@api_app.get(
+    "/collections/overview",
+    summary="Summary totals and facet values for any collection",
+    description=(
+        "Return corpus totals (`summary`) and valid filter values (`facets`) for "
+        "longread, singlecell, perturbation, spatial, country, tissue or disease "
+        "collections in one request."
+    ),
+    operation_id="get_collection_overview",
+)
+@limiter.limit("60/minute")
+def get_collection_overview(
+    request: Request,
+    collection: str = Query(
+        ...,
+        pattern="^(longread|singlecell|perturbation|spatial|country|tissue|disease)$",
+    ),
+    target: str | None = Query(None, max_length=200),
+    include: str = Query("both", pattern="^(both|summary|facets)$"),
+    max_values_per_facet: int = Query(25, ge=1, le=200),
+):
+    if not ENRICHMENT_ENABLED and collection in ("disease", "tissue"):
+        raise HTTPException(
+            403, f"Enriched collection '{collection}' is temporarily disabled"
+        )
+    scoped = collection in ("country", "tissue", "disease")
+    norm_target = (target or "").strip() or None
+    if scoped and not norm_target:
+        hints = {
+            "country": "an ISO-2 code (e.g. 'IN', 'US')",
+            "tissue": "a tissue name or UBERON CURIE (e.g. 'liver')",
+            "disease": "'rare', 'nord', a disease name, or a MONDO CURIE (e.g. 'MONDO:0005148')",
+        }
+        raise HTTPException(
+            400, f"Collection '{collection}' requires `target`: {hints[collection]}"
+        )
+    if not scoped and norm_target:
+        raise HTTPException(
+            400, f"Collection '{collection}' does not take `target`; omit `target`"
+        )
+    if collection == "country" and norm_target:
+        norm_target = _country_code(norm_target)
+
+    out: dict = {"collection": collection}
+    if norm_target is not None:
+        out["target"] = norm_target
+    with _db_errors(
+        "get_collection_overview", "Retry with include=summary or narrower target."
+    ):
+        if include in ("both", "summary"):
+            out["summary"] = _collection_summary_data(collection, norm_target)
+        if include in ("both", "facets"):
+            facets = _collection_facets_data(collection, norm_target)
+            out["facets"] = {k: v[:max_values_per_facet] for k, v in facets.items()}
+            out["max_values_per_facet"] = max_values_per_facet
+    return out
 
 
 @api_app.get(
@@ -13083,13 +13349,15 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
         raise HTTPException(400, str(e))
 
     start = time.perf_counter()
-    try:
+    with _db_errors(
+        "search_enriched_samples",
+        "Narrow the filters (add organism or tissue).",
+        _SEARCH_TIMEOUT_S,
+    ):
         # The pool is autocommit, where SET LOCAL is a silent no-op
         with pool.connection() as conn, conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    f"SET LOCAL statement_timeout = '{_ENRICHED_SEARCH_TIMEOUT}'"
-                )
+                _set_search_timeout(cur)
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 if len(rows) < limit and (rows or offset == 0):
@@ -13097,13 +13365,6 @@ def search_enriched_samples(  # noqa: PLR0913 -- one query parameter each, by de
                 else:
                     cur.execute(count_sql, count_params)
                     total = cur.fetchone()["total"]
-    except QueryCanceled:
-        raise HTTPException(
-            504, _timeout_detail("Narrow the filters (add organism or tissue).", 60)
-        )
-    except Exception:
-        logger.exception("Database error in search_enriched_samples")
-        raise HTTPException(500, "Internal server error")
     response.headers["Cache-Control"] = _SEARCH_FACETS_CACHE_CONTROL
     return {
         "filters": active,
@@ -13143,20 +13404,21 @@ def get_project_enriched(
     limit: int | None = Query(None, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    accession = accession.upper()
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    try:
+    return _get_project_enriched_data(
+        accession.upper(), human_readable_age, limit, offset
+    )
+
+
+def _get_project_enriched_data(
+    accession: str, human_readable_age: bool, limit: int | None, offset: int
+) -> dict:
+    with _db_errors("get_project_enriched", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                result = _fetch_project_enriched(
+                return _fetch_project_enriched(
                     cur, accession, human_readable_age, limit=limit, offset=offset
                 )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_project_enriched")
-        raise HTTPException(500, "Internal server error")
-    return result
 
 
 def _resolve_prj(cur, accession: str) -> dict:
@@ -13174,7 +13436,7 @@ def _resolve_prj(cur, accession: str) -> dict:
 def _resolve_pentimento_accession(
     cur, accession: str, *, shallow: bool = False
 ) -> str | None:
-    """Caller accession -> the GSE the atlas is keyed under, or None."""
+    """Caller accession -> the accession the atlas is keyed under, or None."""
     acc = accession.upper()
     if not shallow and acc.startswith("PRJ"):
         resolved = _resolve_prj(cur, acc)
@@ -13185,11 +13447,13 @@ def _resolve_pentimento_accession(
     row = cur.fetchone()
     if row:
         return row["gse"]
-    if shallow:
-        return None
-    cur.execute(PENTIMENTO_RESOLVE_GSM_SQL, (acc,))
-    row = cur.fetchone()
-    return row["study_accession"] if row else None
+    if not shallow:
+        cur.execute(PENTIMENTO_RESOLVE_GSM_SQL, (acc,))
+        row = cur.fetchone()
+        if row:
+            return row["study_accession"]
+    cur.execute(PENTIMENTO_RESOLVE_RUNS_SQL, (acc,))
+    return acc if cur.fetchone()["linked"] else None
 
 
 def _attach_pentimento_labels(cur, study: str, samples: list[dict]) -> None:
@@ -13237,6 +13501,47 @@ def _evidence_block(row: dict) -> dict:
     }
 
 
+def _fetch_single_cell_status(accession: str) -> dict:
+    with _db_errors("get_project_single_cell_status", "Retry shortly."):
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession, shallow=True)
+                acc = (resolved or accession).upper()
+                cur.execute(SINGLE_CELL_STATUS_SQL, {"acc": acc})
+                row = cur.fetchone()
+                if not row or not (row["in_unified"] or row["in_pentimento"]):
+                    raise HTTPException(404, "Accession not found")
+    return {
+        "accession": acc,
+        "queried_as": accession.upper(),
+        "source": row["source"],
+        "single_cell_status": row["single_cell_status"],
+        "in_unified_metadata": row["in_unified"],
+        "in_pentimento": row["in_pentimento"],
+        "evidence": _evidence_block(row),
+    }
+
+
+def _fetch_single_cell_summary(accession: str) -> dict:
+    with _db_errors("get_project_single_cell_summary", "Retry shortly."):
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                resolved = _resolve_pentimento_accession(cur, accession)
+                if not resolved:
+                    raise HTTPException(404, "Study not in the Pentimento")
+                cur.execute(SINGLE_CELL_SUMMARY_SQL, {"acc": resolved})
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(404, "Study not in the Pentimento")
+
+    return {
+        **row,
+        "queried_as": accession.upper(),
+        "evidence": _evidence_block(row),
+        "microbe_measured": (row["n_runs_measurable"] or 0) > 0,
+    }
+
+
 @api_app.get(
     "/project/{accession}/single-cell/status",
     summary="Is this study single-cell, and what is that based on",
@@ -13252,29 +13557,7 @@ def get_project_single_cell_status(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                resolved = _resolve_pentimento_accession(cur, accession, shallow=True)
-                acc = (resolved or accession).upper()
-                cur.execute(SINGLE_CELL_STATUS_SQL, {"acc": acc})
-                row = cur.fetchone()
-                if not row or not (row["in_unified"] or row["in_pentimento"]):
-                    raise HTTPException(404, "Accession not found")
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_project_single_cell_status")
-        raise HTTPException(500, "Internal server error")
-    return {
-        "accession": acc,
-        "queried_as": accession.upper(),
-        "source": row["source"],
-        "single_cell_status": row["single_cell_status"],
-        "in_unified_metadata": row["in_unified"],
-        "in_pentimento": row["in_pentimento"],
-        "evidence": _evidence_block(row),
-    }
+    return _fetch_single_cell_status(accession)
 
 
 @api_app.get(
@@ -13290,28 +13573,7 @@ def get_project_single_cell_summary(
     accession: str = Path(..., pattern=PROJECT_REGEX),
 ):
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                resolved = _resolve_pentimento_accession(cur, accession)
-                if not resolved:
-                    raise HTTPException(404, "Study not in the Pentimento")
-                cur.execute(SINGLE_CELL_SUMMARY_SQL, {"acc": resolved})
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(404, "Study not in the Pentimento")
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_project_single_cell_summary")
-        raise HTTPException(500, "Internal server error")
-
-    return {
-        **row,
-        "queried_as": accession.upper(),
-        "evidence": _evidence_block(row),
-        "microbe_measured": (row["n_runs_measurable"] or 0) > 0,
-    }
+    return _fetch_single_cell_summary(accession)
 
 
 @api_app.get(
@@ -13462,12 +13724,17 @@ def get_project_single_cell(
     request: Request,
     response: Response,
     accession: str = Path(..., pattern=PROJECT_REGEX),
+    view: str = Query("samples", pattern="^(samples|summary|status)$"),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     all_rows: bool = Query(False),
 ):
     response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
-    try:
+    if view == "status":
+        return _fetch_single_cell_status(accession)
+    if view == "summary":
+        return _fetch_single_cell_summary(accession)
+    with _db_errors("get_project_single_cell", "Retry with a smaller limit."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 resolved = _resolve_pentimento_accession(cur, accession)
@@ -13497,11 +13764,6 @@ def get_project_single_cell(
                     cur.execute(LONGREAD_CHEMISTRY_SQL, {"acc": resolved})
                     longread_chemistry = cur.fetchall()
                     _attach_chemistry_confidence_label(longread_chemistry)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_project_single_cell")
-        raise HTTPException(500, "Internal server error")
     return {
         **study,
         "samples": samples,
@@ -13860,6 +14122,46 @@ def _fetch_project_enriched(
     }
 
 
+def _get_experiment_enriched_data(accession: str, human_readable_age: bool) -> dict:
+    accession = accession.upper()
+    with _db_errors("get_experiment_enriched", "Retry shortly."):
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                ctx = _build_exp_context(cur, accession)
+                if ctx is None:
+                    raise HTTPException(
+                        404, f"No experiment found for accession {accession}"
+                    )
+                study = ctx["study"]
+                samples = set(ctx["sample_map"].keys())
+                if not study or not samples:
+                    raise HTTPException(404, f"No enriched metadata for {accession}")
+                return _fetch_project_enriched(
+                    cur, study, human_readable_age, sample_filter=samples
+                )
+
+
+def _get_run_enriched_data(run: str, human_readable_age: bool) -> dict:
+    run = run.upper()
+    with _db_errors("get_run_enriched", "Retry shortly."):
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(RUN_DOWNLOAD_SQL, (run,))
+                run_row = cur.fetchone()
+                if not run_row:
+                    raise HTTPException(404, f"No run found for accession {run}")
+                exp_acc = (run_row.get("experiment_accession") or "").upper()
+                ctx = _build_exp_context(cur, exp_acc) if exp_acc else None
+                if not ctx or not ctx["study"] or not ctx["sample_map"]:
+                    raise HTTPException(404, f"No enriched metadata for {run}")
+                return _fetch_project_enriched(
+                    cur,
+                    ctx["study"],
+                    human_readable_age,
+                    sample_filter=set(ctx["sample_map"].keys()),
+                )
+
+
 @api_app.get(
     "/experiment/{accession}/enriched",
     summary="Get ontology-enriched metadata for an experiment's sample(s)",
@@ -13878,27 +14180,7 @@ def get_experiment_enriched(
         True, description="Convert age from hours to human-readable format"
     ),
 ):
-    accession = accession.upper()
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                ctx = _build_exp_context(cur, accession)
-                if ctx is None:
-                    raise HTTPException(
-                        404, f"No experiment found for accession {accession}"
-                    )
-                study = ctx["study"]
-                samples = set(ctx["sample_map"].keys())
-                if not study or not samples:
-                    raise HTTPException(404, f"No enriched metadata for {accession}")
-                return _fetch_project_enriched(
-                    cur, study, human_readable_age, sample_filter=samples
-                )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_experiment_enriched")
-        raise HTTPException(500, "Internal server error")
+    return _get_experiment_enriched_data(accession, human_readable_age)
 
 
 @api_app.get(
@@ -13919,29 +14201,37 @@ def get_run_enriched(
         True, description="Convert age from hours to human-readable format"
     ),
 ):
-    run = run.upper()
-    try:
-        with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(RUN_DOWNLOAD_SQL, (run,))
-                run_row = cur.fetchone()
-                if not run_row:
-                    raise HTTPException(404, f"No run found for accession {run}")
-                exp_acc = (run_row.get("experiment_accession") or "").upper()
-                ctx = _build_exp_context(cur, exp_acc) if exp_acc else None
-                if not ctx or not ctx["study"] or not ctx["sample_map"]:
-                    raise HTTPException(404, f"No enriched metadata for {run}")
-                return _fetch_project_enriched(
-                    cur,
-                    ctx["study"],
-                    human_readable_age,
-                    sample_filter=set(ctx["sample_map"].keys()),
-                )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Database error in get_run_enriched")
-        raise HTTPException(500, "Internal server error")
+    return _get_run_enriched_data(run, human_readable_age)
+
+
+@api_app.get(
+    "/enriched/{accession}",
+    summary="Get ontology-enriched metadata for a project, experiment or run",
+    description=(
+        "Return ontology-normalized sample metadata (tissue, cell_type, disease, "
+        "assay, UBERON/CL/MONDO/EFO IDs) for a project, experiment (SRX/ERX/DRX), "
+        "or run (SRR/ERR/DRR)."
+    ),
+    operation_id="get_enriched_metadata",
+)
+@limiter.limit("100/minute")
+def get_enriched_metadata(
+    request: Request,
+    response: Response,
+    accession: str = Path(..., pattern=METADATA_ENTITY_REGEX),
+    human_readable_age: bool = Query(
+        True, description="Convert age from hours to human-readable format"
+    ),
+    limit: int | None = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    acc = accession.upper()
+    response.headers["Cache-Control"] = _PROJECT_CACHE_CONTROL
+    if re.fullmatch(RUN_REGEX, acc):
+        return _get_run_enriched_data(acc, human_readable_age)
+    if re.fullmatch(EXPERIMENT_REGEX, acc):
+        return _get_experiment_enriched_data(acc, human_readable_age)
+    return _get_project_enriched_data(acc, human_readable_age, limit, offset)
 
 
 @api_app.get(
@@ -14079,6 +14369,36 @@ def list_centers(
 
 
 @api_app.get(
+    "/filters/values",
+    summary="Enumerate valid filter values for structured search",
+    description=(
+        "Return values sorted by frequency for library_strategy, instrument_model, "
+        "journal or center."
+    ),
+    operation_id="list_filter_values",
+)
+@limiter.limit("100/minute")
+def list_filter_values(
+    request: Request,
+    field: str = Query(
+        ..., pattern="^(library_strategy|instrument_model|journal|center)$"
+    ),
+    limit: int = Query(default=50, ge=1, le=5000),
+):
+    with _db_errors("list_filter_values", "Retry with a smaller limit."):
+        if field == "library_strategy":
+            all_rows = _library_strategies()
+        elif field == "instrument_model":
+            all_rows = _instrument_models()
+        elif field == "journal":
+            all_rows = _list_filter(LIST_JOURNALS_SQL, (limit,))
+        else:
+            all_rows = _list_filter(LIST_CENTERS_SQL, (limit,))
+    rows = all_rows[:limit]
+    return {"field": field, "total": len(all_rows), "count": len(rows), "values": rows}
+
+
+@api_app.get(
     "/sample/{accession}/experiments",
     summary="List experiments referencing a sample",
     description=(
@@ -14093,29 +14413,30 @@ def get_sample_experiments(
     accession: str = Path(..., pattern=SAMPLE_OR_ENA_REGEX),
 ):
     accession = accession.upper()
-    try:
+    with _db_errors("get_sample_experiments", "Retry shortly."):
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(SRA_SAMPLE_TO_EXPERIMENT_SQL, (accession,))
-                row = cur.fetchone()
+                rows = []
                 source = "sra"
-                if not row:
-                    cur.execute(ENA_SAMPLE_TO_EXPERIMENT_SQL, (accession,))
-                    row = cur.fetchone()
-                    source = "ena"
-                if not row:
-                    cur.execute(GSA_SAMPLE_TO_EXPERIMENT_SQL, (accession,))
-                    row = cur.fetchone()
-                    source = "gsa"
-    except Exception:
-        logger.exception("Database error in get_sample_experiments")
-        raise HTTPException(500, "Internal server error")
-    if not row:
+                for sql, src in (
+                    (SRA_SAMPLE_TO_EXPERIMENTS_SQL, "sra"),
+                    (ENA_SAMPLE_TO_EXPERIMENTS_SQL, "ena"),
+                    (GSA_SAMPLE_TO_EXPERIMENTS_SQL, "gsa"),
+                    (DRA_SAMPLE_TO_EXPERIMENTS_SQL, "dra"),
+                ):
+                    cur.execute(sql, (accession,))
+                    rows = cur.fetchall()
+                    if rows:
+                        source = src
+                        break
+    if not rows:
         raise HTTPException(404, f"No experiment found for sample {accession}")
-    experiment = row.get("accession") or row.get("experiment_accession")
+    experiments = [r["accession"] for r in rows if r["accession"]]
     return {
         "sample_accession": accession,
-        "experiment_accession": experiment,
+        "experiment_accession": experiments[0],
+        "experiments": experiments,
+        "total": len(experiments),
         "source": source,
     }
 
@@ -14175,6 +14496,7 @@ ENRICHMENT_OPERATION_IDS = {
     "get_project_enriched",
     "get_experiment_enriched",
     "get_run_enriched",
+    "get_enriched_metadata",
 }
 
 if not ENRICHMENT_ENABLED:
@@ -14198,9 +14520,11 @@ _ENRICHMENT_DISABLED_PATHS = (
     re.compile(r"^/project/[^/]+/enriched/?$", re.IGNORECASE),
     re.compile(r"^/experiment/[^/]+/enriched/?$", re.IGNORECASE),
     re.compile(r"^/run/[^/]+/enriched/?$", re.IGNORECASE),
+    re.compile(r"^/enriched/[^/]+/?$", re.IGNORECASE),
     re.compile(r"^/stats/enriched(?:/.*)?$", re.IGNORECASE),
     re.compile(r"^/samples/search/?$", re.IGNORECASE),
     re.compile(r"^/disease(?:/.*)?$", re.IGNORECASE),
+    re.compile(r"^/tissue(?:/.*)?$", re.IGNORECASE),
     re.compile(r"^/beacon(?:/.*)?$", re.IGNORECASE),
 )
 
@@ -14260,7 +14584,11 @@ def _mcp_annotate(route, component) -> None:
         _MCP_TITLE_ACRONYMS.get(w, w.capitalize()) for w in component.name.split("_")
     )
     component.annotations = ToolAnnotations(
-        title=title, readOnlyHint=True, openWorldHint=True
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
     )
     annotate_tool(component)
 
@@ -14270,11 +14598,20 @@ _MCP_TOOL_BY_PATH = {
     for route in mcp_api_app.router.routes
     if getattr(route, "operation_id", None)
 }
-_unknown_notes = set(MCP_TOOL_NOTES) - set(_MCP_TOOL_BY_PATH.values())
+_expected_mcp_docs = (set(MCP_TOOL_NOTES) | set(MCP_TOOL_DESCRIPTIONS)) - (
+    set() if ENRICHMENT_ENABLED else ENRICHMENT_OPERATION_IDS
+)
+_unknown_notes = _expected_mcp_docs - set(_MCP_TOOL_BY_PATH.values())
 if _unknown_notes:
-    raise RuntimeError(f"MCP_TOOL_NOTES names unknown tools: {sorted(_unknown_notes)}")
+    raise RuntimeError(
+        f"MCP_TOOL_NOTES/MCP_TOOL_DESCRIPTIONS names unknown tools: {sorted(_unknown_notes)}"
+    )
+# a deprecated route's path names the tool that replaces it
 set_path_tools(
-    {p: t for p, t in _MCP_TOOL_BY_PATH.items() if t not in MCP_DEPRECATED_TOOLS}
+    {
+        p: MCP_DEPRECATED_TOOLS.get(t, t).split("(")[0]
+        for p, t in _MCP_TOOL_BY_PATH.items()
+    }
 )
 
 mcp = FastMCP.from_fastapi(
@@ -14307,6 +14644,7 @@ combined_app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 combined_app.add_middleware(EnrichmentDisabledMiddleware)
 combined_app.add_middleware(AnalyticsMiddleware)
 combined_app.add_middleware(SearchHeadersMiddleware)
+combined_app.add_middleware(McpClientIpMiddleware)
 
 app = combined_app
 
